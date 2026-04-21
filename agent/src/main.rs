@@ -87,6 +87,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/health", get(api_health))
         .route("/api/me", get(http_pages::api_me))
         .route("/api/pairing/start", post(http_pages::api_pairing_start))
+        .route("/api/pairing/current", get(http_pages::api_pairing_current))
         .route("/api/pairing/exchange", post(http_pages::api_pairing_exchange))
         .route("/api/auth/logout", post(http_pages::api_logout))
         // terminal
@@ -115,10 +116,8 @@ async fn main() -> anyhow::Result<()> {
     // Dev: serve server-rendered pages, Vite dev server handles the SPA
     #[cfg(debug_assertions)]
     let app = app
-        .route("/", get(http_pages::root))
-        .route("/login", get(http_pages::login_page))
-        .route("/app", get(http_pages::app_root))
-        .route("/app/", get(http_pages::app_root));
+        .route("/", get(http_pages::app_root))
+        .route("/login", get(http_pages::login_page));
 
     // Prod: embedded web assets with SPA fallback
     #[cfg(not(debug_assertions))]
@@ -136,13 +135,13 @@ async fn main() -> anyhow::Result<()> {
     let pairing = http_pages::create_pairing_code(&state).context("create pairing code")?;
     info!(pairing_code = %pairing.code, "pair to continue");
 
-    let tunnel_task = tokio::spawn(async move { tunnel::ensure_quick_tunnel(addr, cloudflared).await });
-
-    match tunnel_task.await {
-        Ok(Ok(url)) => info!(%url, "quick tunnel ready"),
-        Ok(Err(err)) => warn!(error=%err, "quick tunnel failed"),
-        Err(err) => warn!(error=%err, "quick tunnel task failed"),
-    }
+    // Start tunnel in background — don't block the HTTP server
+    tokio::spawn(async move {
+        match tunnel::ensure_quick_tunnel(addr, cloudflared).await {
+            Ok(url) => info!(%url, "quick tunnel ready"),
+            Err(err) => warn!(error=%err, "quick tunnel failed"),
+        }
+    });
 
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())

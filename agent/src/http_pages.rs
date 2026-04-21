@@ -4,7 +4,7 @@ use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 #[cfg(debug_assertions)]
-use axum::response::{Html, Redirect};
+use axum::response::Html;
 use axum::Json;
 use axum_extra::extract::cookie::{Cookie, CookieJar, SameSite};
 use chrono::DateTime;
@@ -47,6 +47,36 @@ pub async fn api_pairing_start(State(state): State<Arc<AppState>>) -> impl IntoR
         Ok(resp) => (StatusCode::OK, Json(resp)).into_response(),
         Err(err) => {
             warn!(error = %err, "failed to create pairing code");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+pub async fn api_pairing_current(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let res: anyhow::Result<Option<StartPairingResponse>> = (|| {
+        let conn = Connection::open(&state.db_path)?;
+        let now = now_ts();
+        let mut stmt = conn.prepare(
+            "SELECT code, expires_at FROM pairing_codes WHERE used_at IS NULL AND expires_at > ?1 ORDER BY expires_at DESC LIMIT 1",
+        )?;
+        let mut rows = stmt.query(params![now])?;
+        match rows.next()? {
+            Some(row) => {
+                let code: String = row.get(0)?;
+                let expires_at_ts: i64 = row.get(1)?;
+                let expires_at = DateTime::<chrono::Utc>::from_timestamp(expires_at_ts, 0)
+                    .ok_or_else(|| anyhow::anyhow!("invalid timestamp"))?;
+                Ok(Some(StartPairingResponse { code, expires_at }))
+            }
+            None => Ok(None),
+        }
+    })();
+
+    match res {
+        Ok(Some(resp)) => (StatusCode::OK, Json(serde_json::json!(resp))).into_response(),
+        Ok(None) => StatusCode::NOT_FOUND.into_response(),
+        Err(err) => {
+            warn!(error=%err, "failed to get current pairing code");
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }
@@ -173,15 +203,6 @@ pub async fn api_me(State(state): State<Arc<AppState>>, jar: CookieJar) -> impl 
 }
 
 #[cfg(debug_assertions)]
-pub async fn root(jar: CookieJar) -> impl IntoResponse {
-    if jar.get("oxiremote_session").is_some() {
-        Redirect::to("/app").into_response()
-    } else {
-        Redirect::to("/login").into_response()
-    }
-}
-
-#[cfg(debug_assertions)]
 pub async fn login_page() -> impl IntoResponse {
     Html(
         r#"<!doctype html>
@@ -218,7 +239,7 @@ pub async fn login_page() -> impl IntoResponse {
             body: JSON.stringify({ code })
           });
           if (!res.ok) throw new Error('Invalid or expired code');
-          location.href = '/app';
+          location.href = '/';
         } catch (e) {
           errEl.textContent = e.message || 'Pairing failed';
         }
@@ -234,16 +255,11 @@ pub async fn app_root(
     State(state): State<Arc<AppState>>,
     jar: CookieJar,
 ) -> axum::response::Response {
-    let Some(cookie) = jar.get("oxiremote_session") else {
-        return Redirect::to("/login").into_response();
-    };
+    let authed = require_auth(&state.signing_key, &jar).is_some();
 
-    if crate::auth::verify_session(&state.signing_key, cookie.value()).is_none() {
-        return Redirect::to("/login").into_response();
-    }
-
-    Html(
-        r#"<!doctype html>
+    if authed {
+        return Html(
+            r#"<!doctype html>
 <html>
   <head>
     <meta charset="utf-8" />
@@ -255,6 +271,63 @@ pub async fn app_root(
     <script type="module" src="http://localhost:5173/src/main.tsx"></script>
   </body>
 </html>"#,
-    )
+        )
+        .into_response();
+    }
+
+    // Not authed — show pairing code
+    let code = (|| -> anyhow::Result<Option<String>> {
+        let conn = Connection::open(&state.db_path)?;
+        let now = now_ts();
+        let mut stmt = conn.prepare(
+            "SELECT code FROM pairing_codes WHERE used_at IS NULL AND expires_at > ?1 ORDER BY expires_at DESC LIMIT 1",
+        )?;
+        let mut rows = stmt.query(params![now])?;
+        match rows.next()? {
+            Some(row) => Ok(Some(row.get(0)?)),
+            None => Ok(None),
+        }
+    })()
+    .unwrap_or(None);
+
+    let code_display = code.unwrap_or_else(|| "—".to_string());
+
+    Html(format!(
+        r#"<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>OxiRemote</title>
+    <style>
+      body {{ font-family: system-ui, -apple-system, sans-serif; background: #0a0e14; color: #e0e0e0; display: flex; justify-content: center; align-items: center; min-height: 100vh; margin: 0; }}
+      .card {{ text-align: center; max-width: 400px; padding: 32px; }}
+      h1 {{ font-size: 22px; margin-bottom: 4px; }}
+      .sub {{ color: #888; font-size: 14px; margin-bottom: 24px; }}
+      .code-box {{ background: #141a22; border: 1px solid #2a3040; border-radius: 12px; padding: 24px; }}
+      .code {{ font-family: monospace; font-size: 32px; font-weight: bold; letter-spacing: 0.3em; color: #60a5fa; }}
+      .hint {{ color: #666; font-size: 12px; margin-top: 16px; }}
+    </style>
+  </head>
+  <body>
+    <div class="card">
+      <h1>OxiRemote</h1>
+      <p class="sub">Enter this code on your phone to connect.</p>
+      <div class="code-box">
+        <div class="code">{code_display}</div>
+      </div>
+      <p class="hint">Waiting for device to pair…</p>
+    </div>
+    <script>
+      setInterval(async () => {{
+        try {{
+          const r = await fetch('/api/me');
+          if (r.ok) location.reload();
+        }} catch {{}}
+      }}, 3000);
+    </script>
+  </body>
+</html>"#
+    ))
     .into_response()
 }

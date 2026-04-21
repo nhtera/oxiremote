@@ -1,4 +1,4 @@
-import { NavLink, Outlet } from 'react-router-dom'
+import { NavLink, Outlet, useNavigate } from 'react-router-dom'
 
 const navItems = [
   { to: '/', label: 'Home', icon: '⌂' },
@@ -9,6 +9,13 @@ const navItems = [
 ]
 
 export default function AppLayout() {
+  const navigate = useNavigate()
+
+  const handleLogout = async () => {
+    await fetch('/api/auth/logout', { method: 'POST' })
+    navigate('/login')
+  }
+
   return (
     <div className="flex flex-col md:flex-row min-h-dvh">
       {/* Desktop sidebar */}
@@ -33,6 +40,14 @@ export default function AppLayout() {
             {item.label}
           </NavLink>
         ))}
+        <div className="mt-auto border-t border-border">
+          <button
+            onClick={handleLogout}
+            className="w-full px-4 py-2.5 text-sm text-left text-text-muted hover:text-danger hover:bg-surface-hover transition-colors"
+          >
+            Logout
+          </button>
+        </div>
       </nav>
 
       {/* Main content */}

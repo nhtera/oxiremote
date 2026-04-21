@@ -32,6 +32,20 @@ type CreateTerminalSessionRequest = {
   rows: number
 }
 
+type SessionHandle = {
+  term: Terminal
+  fit: FitAddon
+  ws: WebSocket | null
+  connected: boolean
+}
+
+const TERM_THEME = {
+  background: '#16171d',
+  foreground: '#f3f4f6',
+  cursor: '#6cb4ff',
+  selectionBackground: '#2a2b3580',
+}
+
 function wsUrl(path: string) {
   const proto = location.protocol === 'https:' ? 'wss:' : 'ws:'
   return `${proto}//${location.host}${path}`
@@ -44,19 +58,49 @@ export default function TerminalPage() {
   const [isConnected, setIsConnected] = useState(false)
   const [reconnectNonce, setReconnectNonce] = useState(0)
 
-  function reconnectSession() {
-    setReconnectNonce((n) => n + 1)
-  }
-
   const containerRef = useRef<HTMLDivElement | null>(null)
-  const termRef = useRef<Terminal | null>(null)
-  const fitRef = useRef<FitAddon | null>(null)
-  const wsRef = useRef<WebSocket | null>(null)
+  const handlesRef = useRef<Map<string, SessionHandle>>(new Map())
   const activeIdRef = useRef<string | null>(null)
 
   const active = useMemo(() => sessions.find((s) => s.id === activeId) ?? null, [sessions, activeId])
 
   useEffect(() => { activeIdRef.current = activeId }, [activeId])
+
+  function reconnectSession() {
+    if (!activeId) return
+    const handle = handlesRef.current.get(activeId)
+    if (handle?.ws) {
+      handle.ws.close()
+      handle.ws = null
+    }
+    setReconnectNonce((n) => n + 1)
+  }
+
+  function getOrCreateHandle(id: string): SessionHandle {
+    const existing = handlesRef.current.get(id)
+    if (existing) return existing
+
+    const term = new Terminal({
+      cursorBlink: true,
+      fontSize: 14,
+      fontFamily: 'ui-monospace, Consolas, monospace',
+      theme: TERM_THEME,
+    })
+    const fit = new FitAddon()
+    term.loadAddon(fit)
+
+    const handle: SessionHandle = { term, fit, ws: null, connected: false }
+    handlesRef.current.set(id, handle)
+    return handle
+  }
+
+  function destroyHandle(id: string) {
+    const handle = handlesRef.current.get(id)
+    if (!handle) return
+    handle.ws?.close()
+    handle.term.dispose()
+    handlesRef.current.delete(id)
+  }
 
   async function refreshSessions() {
     setErr(null)
@@ -67,17 +111,20 @@ export default function TerminalPage() {
     }
     const data = (await res.json()) as TerminalSessionMeta[]
     setSessions(data)
+
+    // Clean up handles for sessions that no longer exist
+    const ids = new Set(data.map((s) => s.id))
+    for (const id of handlesRef.current.keys()) {
+      if (!ids.has(id)) destroyHandle(id)
+    }
   }
 
   async function createSession() {
     setErr(null)
-    const t = termRef.current
-    if (!t) {
-      setErr('Terminal not ready')
-      return
-    }
-    const cols = t.cols
-    const rows = t.rows
+    // Use default size or active terminal size
+    const activeHandle = activeId ? handlesRef.current.get(activeId) : null
+    const cols = activeHandle?.term.cols ?? 80
+    const rows = activeHandle?.term.rows ?? 24
     const body: CreateTerminalSessionRequest = { cols, rows }
     const res = await fetch('/api/terminal/sessions', {
       method: 'POST',
@@ -95,39 +142,34 @@ export default function TerminalPage() {
 
   useEffect(() => {
     refreshSessions()
+    return () => {
+      // Cleanup all handles on unmount
+      for (const id of handlesRef.current.keys()) destroyHandle(id)
+    }
   }, [])
 
+  // Mount/unmount terminal DOM when activeId changes
   useEffect(() => {
     const el = containerRef.current
-    if (!el) return
+    if (!el || !activeId) return
 
-    const term = new Terminal({
-      cursorBlink: true,
-      fontSize: 14,
-      fontFamily: 'ui-monospace, Consolas, monospace',
-      theme: {
-        background: '#16171d',
-        foreground: '#f3f4f6',
-        cursor: '#6cb4ff',
-        selectionBackground: '#2a2b3580',
-      },
-    })
-    const fit = new FitAddon()
-    term.loadAddon(fit)
-    term.open(el)
-    fit.fit()
+    const handle = getOrCreateHandle(activeId)
 
-    termRef.current = term
-    fitRef.current = fit
+    // Clear container and mount this terminal
+    el.replaceChildren()
+    handle.term.open(el)
+    handle.fit.fit()
+    handle.term.focus()
+
+    setIsConnected(handle.connected)
 
     const debouncedResize = debounce(() => {
-      fit.fit()
-      const id = activeIdRef.current
-      if (id && termRef.current) {
-        fetch(`/api/terminal/sessions/${id}/resize`, {
+      handle.fit.fit()
+      if (activeIdRef.current === activeId) {
+        fetch(`/api/terminal/sessions/${activeId}/resize`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ cols: termRef.current.cols, rows: termRef.current.rows }),
+          body: JSON.stringify({ cols: handle.term.cols, rows: handle.term.rows }),
         })
       }
     }, 200)
@@ -137,51 +179,62 @@ export default function TerminalPage() {
 
     return () => {
       ro.disconnect()
-      term.dispose()
-      termRef.current = null
-      fitRef.current = null
     }
-  }, [])
+  }, [activeId])
 
+  // WebSocket lifecycle per session
   useEffect(() => {
     if (!activeId) return
-    const term = termRef.current
-    if (!term) return
+    const handle = handlesRef.current.get(activeId)
+    if (!handle) return
 
-    term.clear()
-    term.reset()
+    const sessionId = activeId
 
-    const url = wsUrl(`/api/terminal/sessions/${activeId}/ws`)
-    const ws = new WebSocket(url)
-    wsRef.current = ws
+    // Only create a new WS if needed
+    if (!handle.ws || handle.ws.readyState > WebSocket.OPEN) {
+      if (handle.ws) {
+        handle.ws.close()
+        handle.ws = null
+      }
 
-    ws.onopen = () => setIsConnected(true)
-    ws.onclose = () => {
-      setIsConnected(false)
-      term.writeln('\r\n\x1b[33m[disconnected]\x1b[0m')
-    }
-    ws.onmessage = (ev) => {
-      try {
-        const msg = JSON.parse(ev.data) as WsOut
-        if (msg.t === 'output') term.write(msg.data)
-        else if (msg.t === 'exit') {
-          term.writeln(`\r\n\x1b[90m[process exited: ${msg.code ?? '?'}]\x1b[0m`)
-          refreshSessions()
+      const url = wsUrl(`/api/terminal/sessions/${sessionId}/ws`)
+      const ws = new WebSocket(url)
+      handle.ws = ws
+
+      ws.onopen = () => {
+        handle.connected = true
+        if (activeIdRef.current === sessionId) setIsConnected(true)
+      }
+      ws.onclose = () => {
+        handle.connected = false
+        if (activeIdRef.current === sessionId) {
+          setIsConnected(false)
+          handle.term.writeln('\r\n\x1b[33m[disconnected]\x1b[0m')
         }
-      } catch {}
+      }
+      ws.onmessage = (ev) => {
+        try {
+          const msg = JSON.parse(ev.data) as WsOut
+          if (msg.t === 'output') handle.term.write(msg.data)
+          else if (msg.t === 'exit') {
+            handle.term.writeln(`\r\n\x1b[90m[process exited: ${msg.code ?? '?'}]\x1b[0m`)
+            refreshSessions()
+          }
+        } catch {}
+      }
+    } else {
+      setIsConnected(handle.connected)
     }
 
-    const onData = term.onData((data) => {
-      if (ws.readyState === WebSocket.OPEN) {
-        ws.send(JSON.stringify({ t: 'input', data }))
+    // Always attach input listener for the active session
+    const onData = handle.term.onData((data) => {
+      if (handle.ws?.readyState === WebSocket.OPEN) {
+        handle.ws.send(JSON.stringify({ t: 'input', data }))
       }
     })
 
     return () => {
       onData.dispose()
-      ws.close()
-      wsRef.current = null
-      setIsConnected(false)
     }
   }, [activeId, reconnectNonce])
 

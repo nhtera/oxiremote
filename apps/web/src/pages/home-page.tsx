@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { Link } from 'react-router-dom'
+import { Link, Navigate } from 'react-router-dom'
 
 type SessionSummary = { total: number; running: number }
 type GitSummary = { staged: number; changed: number }
@@ -38,19 +38,7 @@ export default function HomePage() {
   }, [])
 
   if (!authed) {
-    return (
-      <div className="flex items-center justify-center h-full p-8">
-        <div className="text-center">
-          <h1 className="text-xl font-semibold mb-2">OxiRemote</h1>
-          <p className="text-text-secondary text-sm mb-4">
-            Not authenticated. Pair first.
-          </p>
-          <a href="/login" className="text-accent hover:text-accent-hover text-sm underline">
-            Go to login
-          </a>
-        </div>
-      </div>
-    )
+    return <Navigate to="/login" replace />
   }
 
   return (
