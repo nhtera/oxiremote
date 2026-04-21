@@ -1,0 +1,11 @@
+node_modules/
+
+# Rust
+agent/target/
+
+# Local plans + Claude config are project artifacts; keep out of git
+plans/
+.claude/
+
+# OxiRemote local state
+.oxiremote/

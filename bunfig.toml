@@ -1,0 +1,3 @@
+[install]
+# Keep lockfile deterministic, faster CI, and avoid surprise postinstall scripts by default.
+production = false

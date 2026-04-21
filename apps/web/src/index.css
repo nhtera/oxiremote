@@ -1,0 +1,44 @@
+@import "tailwindcss";
+
+@theme {
+  --color-surface: #16171d;
+  --color-surface-alt: #1f2028;
+  --color-surface-hover: #2a2b35;
+  --color-border: #2e303a;
+  --color-text-primary: #f3f4f6;
+  --color-text-secondary: #9ca3af;
+  --color-text-muted: #6b7280;
+  --color-accent: #6cb4ff;
+  --color-accent-hover: #93c9ff;
+  --color-danger: #f87171;
+  --color-success: #4ade80;
+  --color-warning: #fbbf24;
+  --font-mono: ui-monospace, Consolas, "Courier New", monospace;
+}
+
+body {
+  @apply bg-surface text-text-primary m-0;
+  font-family: system-ui, -apple-system, sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+#root {
+  min-height: 100dvh;
+  display: flex;
+  flex-direction: column;
+}
+
+.btn-primary {
+  @apply px-3 py-1.5 bg-accent/15 text-accent border border-accent/30 rounded-md
+    hover:bg-accent/25 transition-colors cursor-pointer;
+}
+
+.btn-secondary {
+  @apply px-3 py-1.5 bg-surface-alt text-text-secondary border border-border rounded-md
+    hover:bg-surface-hover hover:text-text-primary transition-colors cursor-pointer;
+}
+
+.btn-danger {
+  @apply px-3 py-1.5 bg-danger/15 text-danger border border-danger/30 rounded-md
+    hover:bg-danger/25 transition-colors cursor-pointer;
+}
