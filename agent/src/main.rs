@@ -4,6 +4,8 @@ mod files;
 mod git;
 mod http_pages;
 mod preview;
+#[cfg(not(debug_assertions))]
+mod static_files;
 mod terminal_api;
 mod terminal_pty;
 mod terminal_ws;
@@ -82,11 +84,7 @@ async fn main() -> anyhow::Result<()> {
     });
 
     let app = Router::new()
-        .route("/", get(http_pages::root))
         .route("/api/health", get(api_health))
-        .route("/login", get(http_pages::login_page))
-        .route("/app", get(http_pages::app_root))
-        .route("/app/", get(http_pages::app_root))
         .route("/api/me", get(http_pages::api_me))
         .route("/api/pairing/start", post(http_pages::api_pairing_start))
         .route("/api/pairing/exchange", post(http_pages::api_pairing_exchange))
@@ -112,7 +110,21 @@ async fn main() -> anyhow::Result<()> {
         // preview proxy
         .route("/api/previews", get(preview::api_previews_list).post(preview::api_previews_create))
         .route("/api/previews/{id}", axum::routing::delete(preview::api_previews_delete))
-        .route("/preview/{id}/{*rest}", axum::routing::any(preview::preview_proxy_handler))
+        .route("/preview/{id}/{*rest}", axum::routing::any(preview::preview_proxy_handler));
+
+    // Dev: serve server-rendered pages, Vite dev server handles the SPA
+    #[cfg(debug_assertions)]
+    let app = app
+        .route("/", get(http_pages::root))
+        .route("/login", get(http_pages::login_page))
+        .route("/app", get(http_pages::app_root))
+        .route("/app/", get(http_pages::app_root));
+
+    // Prod: embedded web assets with SPA fallback
+    #[cfg(not(debug_assertions))]
+    let app = app.fallback(static_files::spa_handler);
+
+    let app = app
         .with_state(state.clone())
         .layer(TraceLayer::new_for_http());
 

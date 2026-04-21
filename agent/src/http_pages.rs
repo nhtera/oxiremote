@@ -2,7 +2,9 @@ use std::sync::Arc;
 
 use axum::extract::State;
 use axum::http::StatusCode;
-use axum::response::{Html, IntoResponse, Redirect};
+use axum::response::IntoResponse;
+#[cfg(debug_assertions)]
+use axum::response::{Html, Redirect};
 use axum::Json;
 use axum_extra::extract::cookie::{Cookie, CookieJar, SameSite};
 use chrono::DateTime;
@@ -170,6 +172,7 @@ pub async fn api_me(State(state): State<Arc<AppState>>, jar: CookieJar) -> impl 
     (StatusCode::OK, Json(MeResponse { session_id })).into_response()
 }
 
+#[cfg(debug_assertions)]
 pub async fn root(jar: CookieJar) -> impl IntoResponse {
     if jar.get("oxiremote_session").is_some() {
         Redirect::to("/app").into_response()
@@ -178,6 +181,7 @@ pub async fn root(jar: CookieJar) -> impl IntoResponse {
     }
 }
 
+#[cfg(debug_assertions)]
 pub async fn login_page() -> impl IntoResponse {
     Html(
         r#"<!doctype html>
@@ -225,6 +229,7 @@ pub async fn login_page() -> impl IntoResponse {
     )
 }
 
+#[cfg(debug_assertions)]
 pub async fn app_root(
     State(state): State<Arc<AppState>>,
     jar: CookieJar,

@@ -7,6 +7,7 @@
     "dev:web": "bun --cwd apps/web dev",
     "dev:agent": "cargo run --manifest-path agent/Cargo.toml",
     "build": "bun run build:web && cargo build --manifest-path agent/Cargo.toml",
+    "build:release": "bun run build:web && cargo build --release --manifest-path agent/Cargo.toml",
     "build:web": "bun --cwd apps/web build",
     "typecheck:web": "bun --cwd apps/web run typecheck",
     "lint:web": "bun --cwd apps/web lint"
