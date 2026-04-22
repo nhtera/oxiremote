@@ -80,9 +80,8 @@ export default function FilesPage() {
   const breadcrumbs = currentPath.split('/').filter(Boolean)
 
   return (
-    <div className="flex h-[calc(100dvh-4rem)] md:h-dvh font-mono">
-      {/* Left panel — file list */}
-      <div className="w-56 md:w-72 border-r border-border overflow-auto p-2 shrink-0">
+    <div className="flex flex-col md:flex-row h-[calc(100dvh-8rem)] md:h-dvh font-mono pb-4 gap-2">
+      <div className="w-full md:w-72 border-b md:border-b-0 md:border-r border-border overflow-auto p-2 shrink-0 max-h-[36dvh] md:max-h-none">
         <div className="mb-2 text-xs text-text-muted">
           <span
             className="cursor-pointer underline hover:text-text-primary"
@@ -144,14 +143,14 @@ export default function FilesPage() {
 
         {openFile ? (
           <>
-            <div className="flex items-center gap-2 mb-2 shrink-0">
+            <div className="flex items-center gap-2 mb-2 shrink-0 sticky top-0 bg-surface py-1">
               <span className="flex-1 text-xs text-text-secondary truncate">
                 {openFile}{dirty ? ' *' : ''}
               </span>
               <button
                 onClick={saveFile}
                 disabled={!dirty || saving}
-                className="btn-primary text-xs disabled:opacity-40"
+                className="btn-primary text-xs min-h-10 disabled:opacity-40"
               >
                 {saving ? 'Saving…' : 'Save'}
               </button>

@@ -10,7 +10,7 @@ use rusqlite::{params, Connection, OptionalExtension};
 use tracing::warn;
 use uuid::Uuid;
 
-use crate::auth::require_auth;
+use crate::auth::require_active_auth;
 use crate::db::now_ts;
 use crate::terminal_pty::{
     build_default_command, spawn_terminal_session, CreateTerminalSessionRequest,
@@ -23,7 +23,7 @@ pub async fn api_terminal_sessions_list(
     State(state): State<Arc<AppState>>,
     jar: CookieJar,
 ) -> impl IntoResponse {
-    let Some(owner_session_id) = require_auth(&state.signing_key, &jar) else {
+    let Some(owner_session_id) = require_active_auth(&state.db_path, &state.signing_key, &jar) else {
         return StatusCode::UNAUTHORIZED.into_response();
     };
 
@@ -66,15 +66,28 @@ pub async fn api_terminal_sessions_create(
     jar: CookieJar,
     Json(req): Json<CreateTerminalSessionRequest>,
 ) -> impl IntoResponse {
-    let Some(owner_session_id) = require_auth(&state.signing_key, &jar) else {
+    let Some(owner_session_id) = require_active_auth(&state.db_path, &state.signing_key, &jar) else {
         return StatusCode::UNAUTHORIZED.into_response();
     };
 
-    let existing = state
-        .terminal_sessions
-        .iter()
-        .filter(|e| e.value().owner_session_id == owner_session_id)
-        .count();
+    let existing: anyhow::Result<i64> = (|| {
+        let conn = Connection::open(&state.db_path)?;
+        conn.query_row(
+            "SELECT COUNT(*) FROM terminal_sessions WHERE owner_session_id=?1 AND status='running'",
+            params![owner_session_id],
+            |row| row.get(0),
+        )
+        .map_err(Into::into)
+    })();
+
+    let existing = match existing {
+        Ok(count) => count as usize,
+        Err(err) => {
+            warn!(error=%err, "count terminal sessions failed");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
+
     if existing >= MAX_TERMINAL_SESSIONS_PER_USER {
         return StatusCode::TOO_MANY_REQUESTS.into_response();
     }
@@ -150,7 +163,7 @@ pub async fn api_terminal_session_resize(
     AxumPath(id): AxumPath<String>,
     Json(req): Json<ResizeTerminalRequest>,
 ) -> impl IntoResponse {
-    let Some(owner_session_id) = require_auth(&state.signing_key, &jar) else {
+    let Some(owner_session_id) = require_active_auth(&state.db_path, &state.signing_key, &jar) else {
         return StatusCode::UNAUTHORIZED.into_response();
     };
 
@@ -223,7 +236,7 @@ pub async fn api_terminal_session_close(
     jar: CookieJar,
     AxumPath(id): AxumPath<String>,
 ) -> impl IntoResponse {
-    let Some(owner_session_id) = require_auth(&state.signing_key, &jar) else {
+    let Some(owner_session_id) = require_active_auth(&state.db_path, &state.signing_key, &jar) else {
         return StatusCode::UNAUTHORIZED.into_response();
     };
 

@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use tokio::process::Command;
 use tracing::warn;
 
-use crate::auth::require_auth;
+use crate::auth::require_active_auth;
 use crate::AppState;
 
 fn workspace_root(state: &AppState) -> &Path {
@@ -61,7 +61,7 @@ pub async fn api_git_status(
     State(state): State<Arc<AppState>>,
     jar: CookieJar,
 ) -> impl IntoResponse {
-    let Some(_) = require_auth(&state.signing_key, &jar) else {
+    let Some(_) = require_active_auth(&state.db_path, &state.signing_key, &jar) else {
         return StatusCode::UNAUTHORIZED.into_response();
     };
 
@@ -97,7 +97,7 @@ pub async fn api_git_diff(
     jar: CookieJar,
     Query(q): Query<DiffQuery>,
 ) -> impl IntoResponse {
-    let Some(_) = require_auth(&state.signing_key, &jar) else {
+    let Some(_) = require_active_auth(&state.db_path, &state.signing_key, &jar) else {
         return StatusCode::UNAUTHORIZED.into_response();
     };
 
@@ -135,7 +135,7 @@ pub async fn api_git_stage(
     jar: CookieJar,
     Json(req): Json<StageRequest>,
 ) -> impl IntoResponse {
-    let Some(_) = require_auth(&state.signing_key, &jar) else {
+    let Some(_) = require_active_auth(&state.db_path, &state.signing_key, &jar) else {
         return StatusCode::UNAUTHORIZED.into_response();
     };
 
@@ -159,7 +159,7 @@ pub async fn api_git_unstage(
     jar: CookieJar,
     Json(req): Json<StageRequest>,
 ) -> impl IntoResponse {
-    let Some(_) = require_auth(&state.signing_key, &jar) else {
+    let Some(_) = require_active_auth(&state.db_path, &state.signing_key, &jar) else {
         return StatusCode::UNAUTHORIZED.into_response();
     };
 
@@ -188,7 +188,7 @@ pub async fn api_git_commit(
     jar: CookieJar,
     Json(req): Json<CommitRequest>,
 ) -> impl IntoResponse {
-    let Some(_) = require_auth(&state.signing_key, &jar) else {
+    let Some(_) = require_active_auth(&state.db_path, &state.signing_key, &jar) else {
         return StatusCode::UNAUTHORIZED.into_response();
     };
 

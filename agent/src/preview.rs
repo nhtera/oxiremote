@@ -10,7 +10,7 @@ use axum_extra::extract::cookie::CookieJar;
 use serde::{Deserialize, Serialize};
 use tracing::warn;
 
-use crate::auth::require_auth;
+use crate::auth::require_active_auth;
 use crate::AppState;
 
 #[derive(Clone, Serialize)]
@@ -37,7 +37,7 @@ pub async fn api_previews_create(
     jar: CookieJar,
     Json(body): Json<CreatePreviewReq>,
 ) -> impl IntoResponse {
-    if require_auth(&state.signing_key, &jar).is_none() {
+    if require_active_auth(&state.db_path, &state.signing_key, &jar).is_none() {
         return (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
     }
     if body.port == 0 {
@@ -58,7 +58,7 @@ pub async fn api_previews_list(
     State(state): State<Arc<AppState>>,
     jar: CookieJar,
 ) -> impl IntoResponse {
-    if require_auth(&state.signing_key, &jar).is_none() {
+    if require_active_auth(&state.db_path, &state.signing_key, &jar).is_none() {
         return (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
     }
     let targets: Vec<PreviewTarget> = state
@@ -74,7 +74,7 @@ pub async fn api_previews_delete(
     jar: CookieJar,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
-    if require_auth(&state.signing_key, &jar).is_none() {
+    if require_active_auth(&state.db_path, &state.signing_key, &jar).is_none() {
         return (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
     }
     match state.preview_targets.remove(&id) {
@@ -89,7 +89,7 @@ pub async fn preview_proxy_handler(
     Path((id, rest)): Path<(String, String)>,
     req: Request,
 ) -> axum::response::Response {
-    if require_auth(&state.signing_key, &jar).is_none() {
+    if require_active_auth(&state.db_path, &state.signing_key, &jar).is_none() {
         return (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
     }
     let target = match state.preview_targets.get(&id) {
@@ -232,4 +232,77 @@ async fn pump_ws(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{path::PathBuf, sync::Arc};
+
+    use axum::{extract::State, response::IntoResponse, Json};
+    use axum_extra::extract::cookie::{Cookie, CookieJar};
+    use dashmap::DashMap;
+    use rusqlite::{params, Connection};
+
+    use super::*;
+    use crate::{auth::{insert_or_update_device, sign_session}, db::{init_db, now_ts}, terminal_pty::TerminalSession};
+
+    fn test_state(name: &str) -> Arc<AppState> {
+        let db_path = std::env::temp_dir().join(format!(
+            "oxiremote-preview-{name}-{}-{}.sqlite",
+            std::process::id(),
+            now_ts()
+        ));
+        let _ = std::fs::remove_file(&db_path);
+        init_db(&db_path).unwrap();
+
+        Arc::new(AppState {
+            db_path,
+            signing_key: b"01234567890123456789012345678901".to_vec(),
+            secure_cookies: false,
+            terminal_sessions: DashMap::<String, Arc<TerminalSession>>::new(),
+            preview_targets: DashMap::<String, PreviewTarget>::new(),
+            pairing_attempts: DashMap::new(),
+            workspace_root: PathBuf::from("."),
+        })
+    }
+
+    fn authed_jar(state: &AppState) -> CookieJar {
+        let session_id = "session-preview";
+        let device_id = "device-preview";
+        let now = now_ts();
+        let conn = Connection::open(&state.db_path).unwrap();
+        conn.execute(
+            "INSERT INTO sessions(session_id, created_at, last_seen_at, device_id) VALUES (?1, ?2, ?2, ?3)",
+            params![session_id, now, device_id],
+        )
+        .unwrap();
+        insert_or_update_device(&state.db_path, device_id, "Phone", None).unwrap();
+
+        let token = sign_session(&state.signing_key, session_id);
+        CookieJar::new().add(Cookie::new("oxiremote_session", token))
+    }
+
+    #[tokio::test]
+    async fn preview_list_requires_auth() {
+        let state = test_state("unauth");
+        let response = api_previews_list(State(state), CookieJar::new()).await.into_response();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn preview_create_allows_active_auth() {
+        let state = test_state("auth");
+        let response = api_previews_create(
+            State(state.clone()),
+            authed_jar(state.as_ref()),
+            Json(CreatePreviewReq {
+                port: 3000,
+                label: Some("dev server".into()),
+            }),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
 }

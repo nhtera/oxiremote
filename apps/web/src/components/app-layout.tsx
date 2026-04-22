@@ -51,12 +51,12 @@ export default function AppLayout() {
       </nav>
 
       {/* Main content */}
-      <main className="flex-1 min-h-0 overflow-auto pb-16 md:pb-0">
+      <main className="flex-1 min-h-0 overflow-auto pb-20 md:pb-0">
         <Outlet />
       </main>
 
       {/* Mobile bottom tabs */}
-      <nav className="md:hidden fixed bottom-0 inset-x-0 bg-surface-alt border-t border-border flex z-50">
+      <nav className="md:hidden fixed bottom-0 inset-x-0 bg-surface-alt border-t border-border flex z-50" style={{ paddingBottom: 'env(safe-area-inset-bottom, 0px)' }}>
         {navItems.map((item) => (
           <NavLink
             key={item.to}

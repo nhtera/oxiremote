@@ -100,36 +100,40 @@ export default function GitPage() {
 
       {err && <div className="text-danger text-sm mb-3">{err}</div>}
 
-      <div className="flex flex-col md:flex-row gap-4">
+      <div className="flex flex-col md:flex-row gap-4 pb-4">
         {/* File lists */}
         <div className="flex-1 min-w-0">
           <h3 className="text-xs text-text-muted mb-2">Staged ({staged.length})</h3>
           {staged.length === 0 && <div className="text-xs text-text-muted">Nothing staged</div>}
-          {staged.map((e) => (
-            <FileRow
-              key={`s-${e.path}`}
-              entry={e}
-              onDiff={() => viewDiff(e.path, true)}
-              actionLabel="Unstage"
-              onAction={() => unstagePaths([e.path])}
-              disabled={loading}
-            />
-          ))}
+          <div className="grid gap-1.5">
+            {staged.map((e) => (
+              <FileRow
+                key={`s-${e.path}`}
+                entry={e}
+                onDiff={() => viewDiff(e.path, true)}
+                actionLabel="Unstage"
+                onAction={() => unstagePaths([e.path])}
+                disabled={loading}
+              />
+            ))}
+          </div>
 
           <h3 className="text-xs text-text-muted mb-2 mt-4">Changes ({unstaged.length})</h3>
           {unstaged.length === 0 && (
             <div className="text-xs text-text-muted">Working tree clean</div>
           )}
-          {unstaged.map((e) => (
-            <FileRow
-              key={`u-${e.path}`}
-              entry={e}
-              onDiff={() => viewDiff(e.path, false)}
-              actionLabel="Stage"
-              onAction={() => stagePaths([e.path])}
-              disabled={loading}
-            />
-          ))}
+          <div className="grid gap-1.5">
+            {unstaged.map((e) => (
+              <FileRow
+                key={`u-${e.path}`}
+                entry={e}
+                onDiff={() => viewDiff(e.path, false)}
+                actionLabel="Stage"
+                onAction={() => stagePaths([e.path])}
+                disabled={loading}
+              />
+            ))}
+          </div>
 
           {/* Commit box */}
           <div className="mt-5">

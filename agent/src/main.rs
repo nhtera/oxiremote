@@ -38,6 +38,7 @@ pub struct AppState {
     pub secure_cookies: bool,
     pub terminal_sessions: DashMap<String, Arc<TerminalSession>>,
     pub preview_targets: DashMap<String, PreviewTarget>,
+    pub pairing_attempts: DashMap<String, i64>,
     pub workspace_root: PathBuf,
 }
 
@@ -80,16 +81,17 @@ async fn main() -> anyhow::Result<()> {
         secure_cookies,
         terminal_sessions: DashMap::new(),
         preview_targets: DashMap::new(),
+        pairing_attempts: DashMap::new(),
         workspace_root,
     });
 
     let app = Router::new()
         .route("/api/health", get(api_health))
         .route("/api/me", get(http_pages::api_me))
-        .route("/api/pairing/start", post(http_pages::api_pairing_start))
-        .route("/api/pairing/current", get(http_pages::api_pairing_current))
         .route("/api/pairing/exchange", post(http_pages::api_pairing_exchange))
         .route("/api/auth/logout", post(http_pages::api_logout))
+        .route("/api/devices", get(http_pages::api_devices_list))
+        .route("/api/devices/{id}/revoke", post(http_pages::api_device_revoke))
         // terminal
         .route(
             "/api/terminal/sessions",

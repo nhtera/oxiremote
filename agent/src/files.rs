@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use tokio::fs;
 use tracing::warn;
 
-use crate::auth::require_auth;
+use crate::auth::require_active_auth;
 use crate::AppState;
 
 const MAX_FILE_SIZE: u64 = 1_048_576; // 1 MB
@@ -47,7 +47,7 @@ pub async fn api_files_list(
     jar: CookieJar,
     Query(q): Query<ListQuery>,
 ) -> impl IntoResponse {
-    let Some(_) = require_auth(&state.signing_key, &jar) else {
+    let Some(_) = require_active_auth(&state.db_path, &state.signing_key, &jar) else {
         return StatusCode::UNAUTHORIZED.into_response();
     };
 
@@ -110,7 +110,7 @@ pub async fn api_files_read(
     jar: CookieJar,
     Query(q): Query<ReadQuery>,
 ) -> impl IntoResponse {
-    let Some(_) = require_auth(&state.signing_key, &jar) else {
+    let Some(_) = require_active_auth(&state.db_path, &state.signing_key, &jar) else {
         return StatusCode::UNAUTHORIZED.into_response();
     };
 
@@ -153,7 +153,7 @@ pub async fn api_files_write(
     jar: CookieJar,
     Json(req): Json<WriteRequest>,
 ) -> impl IntoResponse {
-    let Some(_) = require_auth(&state.signing_key, &jar) else {
+    let Some(_) = require_active_auth(&state.db_path, &state.signing_key, &jar) else {
         return StatusCode::UNAUTHORIZED.into_response();
     };
 
@@ -171,7 +171,6 @@ pub async fn api_files_write(
         Ok(r) => r,
         Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     };
-    // Check parent exists and resolves within root
     if let Some(parent) = file_path.parent() {
         if let Ok(canon_parent) = parent.canonicalize() {
             if !canon_parent.starts_with(&canon_root) {
@@ -179,6 +178,13 @@ pub async fn api_files_write(
             }
         } else {
             return (StatusCode::BAD_REQUEST, "parent directory does not exist").into_response();
+        }
+    }
+    if file_path.exists() {
+        match file_path.canonicalize() {
+            Ok(canon_file) if canon_file.starts_with(&canon_root) => {}
+            Ok(_) => return (StatusCode::BAD_REQUEST, "path escapes workspace").into_response(),
+            Err(_) => return (StatusCode::BAD_REQUEST, "invalid path").into_response(),
         }
     }
 

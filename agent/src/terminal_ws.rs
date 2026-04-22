@@ -9,7 +9,7 @@ use axum_extra::extract::cookie::CookieJar;
 use rusqlite::{params, Connection};
 use tracing::warn;
 
-use crate::auth::require_auth;
+use crate::auth::require_active_auth;
 use crate::db::now_ts;
 use crate::terminal_pty::{WsIn, WsOut, WS_MAX_TEXT_BYTES};
 use crate::AppState;
@@ -20,7 +20,7 @@ pub async fn api_terminal_session_ws(
     AxumPath(id): AxumPath<String>,
     ws: WebSocketUpgrade,
 ) -> impl IntoResponse {
-    let Some(owner_session_id) = require_auth(&state.signing_key, &jar) else {
+    let Some(owner_session_id) = require_active_auth(&state.db_path, &state.signing_key, &jar) else {
         return StatusCode::UNAUTHORIZED.into_response();
     };
 

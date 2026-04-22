@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
+import { useSearchParams } from 'react-router-dom'
 import { Terminal } from 'xterm'
 import { FitAddon } from 'xterm-addon-fit'
 import 'xterm/css/xterm.css'
@@ -46,14 +47,25 @@ const TERM_THEME = {
   selectionBackground: '#2a2b3580',
 }
 
+const CONTROL_KEYS = [
+  { label: 'Ctrl+C', value: '' },
+  { label: 'Esc', value: '' },
+  { label: 'Tab', value: '\t' },
+  { label: '↑', value: '[A' },
+  { label: '↓', value: '[B' },
+  { label: '←', value: '[D' },
+  { label: '→', value: '[C' },
+]
+
 function wsUrl(path: string) {
   const proto = location.protocol === 'https:' ? 'wss:' : 'ws:'
   return `${proto}//${location.host}${path}`
 }
 
 export default function TerminalPage() {
+  const [searchParams, setSearchParams] = useSearchParams()
   const [sessions, setSessions] = useState<TerminalSessionMeta[]>([])
-  const [activeId, setActiveId] = useState<string | null>(null)
+  const [activeId, setActiveId] = useState<string | null>(searchParams.get('session'))
   const [err, setErr] = useState<string | null>(null)
   const [isConnected, setIsConnected] = useState(false)
   const [reconnectNonce, setReconnectNonce] = useState(0)
@@ -64,7 +76,19 @@ export default function TerminalPage() {
 
   const active = useMemo(() => sessions.find((s) => s.id === activeId) ?? null, [sessions, activeId])
 
-  useEffect(() => { activeIdRef.current = activeId }, [activeId])
+  useEffect(() => {
+    activeIdRef.current = activeId
+    if (activeId) {
+      const q = new URLSearchParams(searchParams)
+      q.set('session', activeId)
+      setSearchParams(q, { replace: true })
+    }
+  }, [activeId, searchParams, setSearchParams])
+
+  function setSelectedSession(id: string) {
+    setActiveId(id)
+    window.localStorage.setItem('oxi:last-terminal-session', id)
+  }
 
   function reconnectSession() {
     if (!activeId) return
@@ -104,7 +128,7 @@ export default function TerminalPage() {
 
   async function refreshSessions() {
     setErr(null)
-    const res = await fetch('/api/terminal/sessions')
+    const res = await fetch('/api/terminal/sessions', { credentials: 'include' })
     if (!res.ok) {
       setErr('Not authorized. Pair first at /login.')
       return
@@ -112,7 +136,17 @@ export default function TerminalPage() {
     const data = (await res.json()) as TerminalSessionMeta[]
     setSessions(data)
 
-    // Clean up handles for sessions that no longer exist
+    const remembered = searchParams.get('session') || window.localStorage.getItem('oxi:last-terminal-session')
+    const rememberedSession = remembered ? data.find((s) => s.id === remembered) ?? null : null
+    const bestId = rememberedSession?.status === 'running'
+      ? rememberedSession.id
+      : data.find((s) => s.status === 'running')?.id ?? rememberedSession?.id ?? data[0]?.id ?? null
+
+    if (bestId !== activeIdRef.current) {
+      setActiveId(bestId)
+      if (bestId) window.localStorage.setItem('oxi:last-terminal-session', bestId)
+    }
+
     const ids = new Set(data.map((s) => s.id))
     for (const id of handlesRef.current.keys()) {
       if (!ids.has(id)) destroyHandle(id)
@@ -121,7 +155,6 @@ export default function TerminalPage() {
 
   async function createSession() {
     setErr(null)
-    // Use default size or active terminal size
     const activeHandle = activeId ? handlesRef.current.get(activeId) : null
     const cols = activeHandle?.term.cols ?? 80
     const rows = activeHandle?.term.rows ?? 24
@@ -129,6 +162,7 @@ export default function TerminalPage() {
     const res = await fetch('/api/terminal/sessions', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
+      credentials: 'include',
       body: JSON.stringify(body),
     })
     if (!res.ok) {
@@ -137,25 +171,43 @@ export default function TerminalPage() {
     }
     const data = (await res.json()) as CreateTerminalSessionResponse
     await refreshSessions()
-    setActiveId(data.id)
+    setSelectedSession(data.id)
+  }
+
+  function sendInput(data: string) {
+    if (!activeId) return
+    const handle = handlesRef.current.get(activeId)
+    if (handle?.ws?.readyState === WebSocket.OPEN) {
+      handle.ws.send(JSON.stringify({ t: 'input', data }))
+      handle.term.focus()
+    }
+  }
+
+  async function closeActiveSession() {
+    if (!activeId) return
+    const res = await fetch(`/api/terminal/sessions/${activeId}/close`, {
+      method: 'POST',
+      credentials: 'include',
+    })
+    if (!res.ok) {
+      setErr('Failed to close session')
+      return
+    }
+    await refreshSessions()
   }
 
   useEffect(() => {
     refreshSessions()
     return () => {
-      // Cleanup all handles on unmount
       for (const id of handlesRef.current.keys()) destroyHandle(id)
     }
   }, [])
 
-  // Mount/unmount terminal DOM when activeId changes
   useEffect(() => {
     const el = containerRef.current
     if (!el || !activeId) return
 
     const handle = getOrCreateHandle(activeId)
-
-    // Clear container and mount this terminal
     el.replaceChildren()
     handle.term.open(el)
     handle.fit.fit()
@@ -168,6 +220,7 @@ export default function TerminalPage() {
       if (activeIdRef.current === activeId) {
         fetch(`/api/terminal/sessions/${activeId}/resize`, {
           method: 'POST',
+          credentials: 'include',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ cols: handle.term.cols, rows: handle.term.rows }),
         })
@@ -182,7 +235,6 @@ export default function TerminalPage() {
     }
   }, [activeId])
 
-  // WebSocket lifecycle per session
   useEffect(() => {
     if (!activeId) return
     const handle = handlesRef.current.get(activeId)
@@ -190,7 +242,6 @@ export default function TerminalPage() {
 
     const sessionId = activeId
 
-    // Only create a new WS if needed
     if (!handle.ws || handle.ws.readyState > WebSocket.OPEN) {
       if (handle.ws) {
         handle.ws.close()
@@ -226,7 +277,6 @@ export default function TerminalPage() {
       setIsConnected(handle.connected)
     }
 
-    // Always attach input listener for the active session
     const onData = handle.term.onData((data) => {
       if (handle.ws?.readyState === WebSocket.OPEN) {
         handle.ws.send(JSON.stringify({ t: 'input', data }))
@@ -240,57 +290,72 @@ export default function TerminalPage() {
 
   return (
     <div className="flex flex-col h-full p-3 md:p-4 gap-3">
-      {/* Header */}
-      <div className="flex items-center gap-2 shrink-0">
-        <h2 className="text-base font-semibold m-0">Terminal</h2>
-        <button onClick={createSession} className="btn-primary text-xs">
-          + New
-        </button>
-        <button onClick={refreshSessions} className="btn-secondary text-xs">
-          Refresh
-        </button>
+      <div className="flex flex-wrap items-center gap-2 shrink-0 sticky top-0 z-10 bg-surface/95 backdrop-blur py-1">
+        <h2 className="text-base font-semibold m-0 mr-auto">Terminal</h2>
+        <span className={`text-[11px] px-2 py-1 rounded-full border ${isConnected ? 'text-success border-success/30 bg-success/10' : 'text-warning border-warning/30 bg-warning/10'}`}>
+          {activeId ? (isConnected ? 'Connected' : 'Disconnected') : 'No session'}
+        </span>
+        <button onClick={createSession} className="btn-primary text-xs min-h-10">+ New</button>
+        <button onClick={refreshSessions} className="btn-secondary text-xs min-h-10">Refresh</button>
         {!isConnected && activeId && (
-          <button onClick={reconnectSession} className="btn-secondary text-xs text-warning">
-            Reconnect
-          </button>
+          <button onClick={reconnectSession} className="btn-secondary text-xs min-h-10 text-warning">Reconnect</button>
         )}
-        {err && <span className="text-danger text-xs">{err}</span>}
+        {activeId && (
+          <button onClick={closeActiveSession} className="btn-danger text-xs min-h-10">Close</button>
+        )}
+        {err && <span className="text-danger text-xs basis-full">{err}</span>}
       </div>
 
-      <div className="flex gap-3 flex-1 min-h-0">
-        {/* Sessions sidebar */}
-        <aside className="w-44 md:w-56 shrink-0 overflow-y-auto">
+      <div className="flex flex-col md:flex-row gap-3 flex-1 min-h-0">
+        <aside className="w-full md:w-56 shrink-0 overflow-hidden">
           <div className="text-xs text-text-muted mb-2">Sessions</div>
-          <div className="grid gap-1.5">
+          <div className="flex md:grid overflow-x-auto gap-1.5 pb-1">
             {sessions.map((s) => (
               <button
                 key={s.id}
-                onClick={() => setActiveId(s.id)}
-                className={`text-left px-2.5 py-2 rounded-md border text-xs transition-colors ${
+                onClick={() => setSelectedSession(s.id)}
+                className={`text-left px-2.5 py-2 rounded-md border text-xs transition-colors min-w-[120px] md:min-w-0 ${
                   s.id === activeId
                     ? 'bg-surface-hover border-accent/40 text-text-primary'
                     : 'bg-surface-alt border-border text-text-secondary hover:bg-surface-hover'
                 }`}
               >
                 <div className="font-medium truncate">{s.name ?? s.id.slice(0, 8)}</div>
-                <div className="text-text-muted mt-0.5">{s.status}</div>
+                <div className="text-text-muted mt-0.5 truncate">{s.status}</div>
               </button>
             ))}
-            {sessions.length === 0 && (
-              <div className="text-xs text-text-muted">No sessions</div>
-            )}
+            {sessions.length === 0 && <div className="text-xs text-text-muted">No sessions</div>}
           </div>
         </aside>
 
-        {/* Terminal view */}
-        <div className="flex-1 flex flex-col min-w-0">
+        <div className="flex-1 flex flex-col min-w-0 gap-2">
           <div
             ref={containerRef}
-            className="flex-1 border border-border rounded-lg overflow-hidden min-h-[300px]"
+            onClick={() => handlesRef.current.get(activeId ?? '')?.term.focus()}
+            className="flex-1 border border-border rounded-lg overflow-hidden min-h-[50dvh] md:min-h-[300px]"
           />
+
+          <div className="flex flex-wrap gap-1.5">
+            {CONTROL_KEYS.map((key) => (
+              <button
+                key={key.label}
+                onClick={() => sendInput(key.value)}
+                className="btn-secondary text-xs py-1 px-2"
+              >
+                {key.label}
+              </button>
+            ))}
+            <button onClick={() => navigator.clipboard.readText().then(sendInput).catch(() => setErr('Paste unavailable'))} className="btn-secondary text-xs py-1 px-2">
+              Paste
+            </button>
+            <button onClick={() => sendInput('clear\n')} className="btn-secondary text-xs py-1 px-2">
+              Clear
+            </button>
+          </div>
+
           {active && (
-            <div className="mt-1.5 text-xs text-text-muted">
-              {active.id.slice(0, 8)} &middot; {active.cols}x{active.rows}
+            <div className="text-xs text-text-muted">
+              {active.id.slice(0, 8)} · {active.cols}x{active.rows} · {active.status}
             </div>
           )}
         </div>

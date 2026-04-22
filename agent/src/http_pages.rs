@@ -1,21 +1,24 @@
 use std::sync::Arc;
 
-use axum::extract::State;
-use axum::http::StatusCode;
+use axum::extract::{Path, State};
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 #[cfg(debug_assertions)]
 use axum::response::Html;
 use axum::Json;
 use axum_extra::extract::cookie::{Cookie, CookieJar, SameSite};
 use chrono::DateTime;
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use time::Duration as TimeDuration;
 use tracing::warn;
 use uuid::Uuid;
 
 use crate::auth::{
-    new_pairing_code, require_auth, sign_session, PAIRING_TTL_SECS, SESSION_TTL_SECS,
+    bind_session_to_device, clear_stale_pairing_attempts, client_ip_key, insert_or_update_device,
+    is_valid_pairing_attempt, list_trusted_devices, random_device_id, rate_limit_key, require_active_auth,
+    revoke_device, sanitize_device_label, should_allow_pairing_attempt, sign_session,
+    touch_session_and_device, new_pairing_code, PAIRING_TTL_SECS, SESSION_TTL_SECS,
 };
 use crate::db::now_ts;
 use crate::AppState;
@@ -42,62 +45,35 @@ pub fn create_pairing_code(state: &AppState) -> anyhow::Result<StartPairingRespo
     Ok(StartPairingResponse { code, expires_at })
 }
 
-pub async fn api_pairing_start(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    match create_pairing_code(&state) {
-        Ok(resp) => (StatusCode::OK, Json(resp)).into_response(),
-        Err(err) => {
-            warn!(error = %err, "failed to create pairing code");
-            StatusCode::INTERNAL_SERVER_ERROR.into_response()
-        }
-    }
-}
-
-pub async fn api_pairing_current(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    let res: anyhow::Result<Option<StartPairingResponse>> = (|| {
-        let conn = Connection::open(&state.db_path)?;
-        let now = now_ts();
-        let mut stmt = conn.prepare(
-            "SELECT code, expires_at FROM pairing_codes WHERE used_at IS NULL AND expires_at > ?1 ORDER BY expires_at DESC LIMIT 1",
-        )?;
-        let mut rows = stmt.query(params![now])?;
-        match rows.next()? {
-            Some(row) => {
-                let code: String = row.get(0)?;
-                let expires_at_ts: i64 = row.get(1)?;
-                let expires_at = DateTime::<chrono::Utc>::from_timestamp(expires_at_ts, 0)
-                    .ok_or_else(|| anyhow::anyhow!("invalid timestamp"))?;
-                Ok(Some(StartPairingResponse { code, expires_at }))
-            }
-            None => Ok(None),
-        }
-    })();
-
-    match res {
-        Ok(Some(resp)) => (StatusCode::OK, Json(serde_json::json!(resp))).into_response(),
-        Ok(None) => StatusCode::NOT_FOUND.into_response(),
-        Err(err) => {
-            warn!(error=%err, "failed to get current pairing code");
-            StatusCode::INTERNAL_SERVER_ERROR.into_response()
-        }
-    }
-}
 
 #[derive(Deserialize)]
 pub struct ExchangePairingRequest {
     code: String,
+    device_label: Option<String>,
 }
 
 pub async fn api_pairing_exchange(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     jar: CookieJar,
     Json(req): Json<ExchangePairingRequest>,
 ) -> impl IntoResponse {
     let code = req.code.trim().to_uppercase();
-    if code.len() < 6 || code.len() > 16 {
+    if !is_valid_pairing_attempt(&code) {
         return StatusCode::BAD_REQUEST.into_response();
     }
 
-    let res: anyhow::Result<String> = (|| {
+    clear_stale_pairing_attempts(&state.pairing_attempts, 60);
+    let ip = client_ip_key(&headers);
+    let rate_key = rate_limit_key(&ip, &code);
+    if !should_allow_pairing_attempt(&state.pairing_attempts, &rate_key, 5, 60) {
+        return (StatusCode::TOO_MANY_REQUESTS, "too many pairing attempts").into_response();
+    }
+
+    let user_agent = headers.get("user-agent").and_then(|v| v.to_str().ok());
+    let label = sanitize_device_label(req.device_label.as_deref(), user_agent);
+
+    let res: anyhow::Result<(String, String)> = (|| {
         let conn = Connection::open(&state.db_path)?;
         let now = now_ts();
 
@@ -126,16 +102,26 @@ pub async fn api_pairing_exchange(
         }
 
         let session_id = Uuid::new_v4().to_string();
+        let device_id = random_device_id();
         conn.execute(
-            "INSERT INTO sessions(session_id, created_at, last_seen_at) VALUES (?1, ?2, ?2)",
-            params![session_id, now],
+            "INSERT INTO sessions(session_id, created_at, last_seen_at, device_id) VALUES (?1, ?2, ?2, ?3)",
+            params![session_id, now, device_id],
         )?;
 
-        Ok(session_id)
+        Ok((session_id, device_id))
     })();
 
     match res {
-        Ok(session_id) => {
+        Ok((session_id, device_id)) => {
+            if let Err(err) = insert_or_update_device(&state.db_path, &device_id, &label, user_agent) {
+                warn!(error=%err, "device insert failed");
+                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            }
+            if let Err(err) = bind_session_to_device(&state.db_path, &session_id, &device_id) {
+                warn!(error=%err, "bind session to device failed");
+                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            }
+
             let cookie_value = sign_session(&state.signing_key, &session_id);
             let cookie = Cookie::build(("oxiremote_session", cookie_value))
                 .http_only(true)
@@ -148,7 +134,7 @@ pub async fn api_pairing_exchange(
             (
                 StatusCode::OK,
                 jar.add(cookie),
-                Json(serde_json::json!({"ok": true})),
+                Json(serde_json::json!({"ok": true, "device_id": device_id})),
             )
                 .into_response()
         }
@@ -157,6 +143,63 @@ pub async fn api_pairing_exchange(
             StatusCode::UNAUTHORIZED.into_response()
         }
     }
+}
+
+#[derive(Serialize)]
+struct DeviceListResponse {
+    devices: Vec<crate::auth::TrustedDevice>,
+}
+
+pub async fn api_devices_list(State(state): State<Arc<AppState>>, jar: CookieJar) -> impl IntoResponse {
+    let Some(_session_id) = require_active_auth(&state.db_path, &state.signing_key, &jar) else {
+        return StatusCode::UNAUTHORIZED.into_response();
+    };
+
+    match list_trusted_devices(&state.db_path) {
+        Ok(devices) => (StatusCode::OK, Json(DeviceListResponse { devices })).into_response(),
+        Err(err) => {
+            warn!(error=%err, "list devices failed");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+pub async fn api_device_revoke(
+    State(state): State<Arc<AppState>>,
+    jar: CookieJar,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let Some(session_id) = require_active_auth(&state.db_path, &state.signing_key, &jar) else {
+        return StatusCode::UNAUTHORIZED.into_response();
+    };
+
+    if let Err(err) = revoke_device(&state.db_path, &id) {
+        warn!(error=%err, "revoke device failed");
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
+
+    let current_device: anyhow::Result<Option<String>> = (|| {
+        let conn = Connection::open(&state.db_path)?;
+        conn.query_row(
+            "SELECT device_id FROM sessions WHERE session_id=?1",
+            params![session_id],
+            |row| row.get(0),
+        ).optional().map_err(Into::into)
+    })();
+
+    let should_clear_cookie = matches!(current_device, Ok(Some(device_id)) if device_id == id);
+    if should_clear_cookie {
+        let cookie = Cookie::build(("oxiremote_session", ""))
+            .http_only(true)
+            .secure(state.secure_cookies)
+            .same_site(SameSite::Lax)
+            .path("/")
+            .max_age(TimeDuration::seconds(0))
+            .build();
+        return (StatusCode::OK, jar.add(cookie), Json(serde_json::json!({"ok": true}))).into_response();
+    }
+
+    (StatusCode::OK, Json(serde_json::json!({"ok": true}))).into_response()
 }
 
 pub async fn api_logout(State(state): State<Arc<AppState>>, jar: CookieJar) -> impl IntoResponse {
@@ -181,21 +224,11 @@ struct MeResponse {
 }
 
 pub async fn api_me(State(state): State<Arc<AppState>>, jar: CookieJar) -> impl IntoResponse {
-    let Some(session_id) = require_auth(&state.signing_key, &jar) else {
+    let Some(session_id) = require_active_auth(&state.db_path, &state.signing_key, &jar) else {
         return StatusCode::UNAUTHORIZED.into_response();
     };
 
-    let res: anyhow::Result<()> = (|| {
-        let conn = Connection::open(&state.db_path)?;
-        let now = now_ts();
-        conn.execute(
-            "UPDATE sessions SET last_seen_at=?2 WHERE session_id=?1",
-            params![session_id, now],
-        )?;
-        Ok(())
-    })();
-
-    if let Err(err) = res {
+    if let Err(err) = touch_session_and_device(&state.db_path, &session_id) {
         warn!(error=%err, "failed to update last_seen_at");
     }
 
@@ -255,7 +288,7 @@ pub async fn app_root(
     State(state): State<Arc<AppState>>,
     jar: CookieJar,
 ) -> axum::response::Response {
-    let authed = require_auth(&state.signing_key, &jar).is_some();
+    let authed = require_active_auth(&state.db_path, &state.signing_key, &jar).is_some();
 
     if authed {
         return Html(
@@ -317,17 +350,123 @@ pub async fn app_root(
         <div class="code">{code_display}</div>
       </div>
       <p class="hint">Waiting for device to pair…</p>
+      <script>
+        setInterval(async () => {{
+          try {{
+            const r = await fetch('/api/me');
+            if (r.ok) location.reload();
+          }} catch {{}}
+        }}, 3000);
+      </script>
     </div>
-    <script>
-      setInterval(async () => {{
-        try {{
-          const r = await fetch('/api/me');
-          if (r.ok) location.reload();
-        }} catch {{}}
-      }}, 3000);
-    </script>
   </body>
 </html>"#
     ))
     .into_response()
 }
+
+#[cfg(test)]
+mod tests {
+    use std::{path::PathBuf, sync::Arc};
+
+    use axum::{extract::State, http::{header::SET_COOKIE, HeaderValue}};
+    use axum_extra::extract::cookie::CookieJar;
+    use dashmap::DashMap;
+
+    use super::*;
+    use crate::{db::init_db, preview::PreviewTarget, terminal_pty::TerminalSession};
+
+    fn test_state(name: &str) -> Arc<AppState> {
+        let db_path = std::env::temp_dir().join(format!(
+            "oxiremote-http-{name}-{}-{}.sqlite",
+            std::process::id(),
+            now_ts()
+        ));
+        let _ = std::fs::remove_file(&db_path);
+        init_db(&db_path).unwrap();
+
+        Arc::new(AppState {
+            db_path,
+            signing_key: b"01234567890123456789012345678901".to_vec(),
+            secure_cookies: false,
+            terminal_sessions: DashMap::<String, Arc<TerminalSession>>::new(),
+            preview_targets: DashMap::<String, PreviewTarget>::new(),
+            pairing_attempts: DashMap::new(),
+            workspace_root: PathBuf::from("."),
+        })
+    }
+
+    #[test]
+    fn exchange_request_accepts_optional_label() {
+        let req = ExchangePairingRequest {
+            code: "ABC123".into(),
+            device_label: Some("My iPhone".into()),
+        };
+        assert_eq!(req.code, "ABC123");
+        assert_eq!(req.device_label.as_deref(), Some("My iPhone"));
+    }
+
+    #[tokio::test]
+    async fn pairing_exchange_succeeds_once_and_rejects_reuse() {
+        let state = test_state("pair-reuse");
+        let pairing = create_pairing_code(state.as_ref()).unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert("user-agent", HeaderValue::from_static("test-device"));
+
+        let ok = api_pairing_exchange(
+            State(state.clone()),
+            headers.clone(),
+            CookieJar::new(),
+            Json(ExchangePairingRequest {
+                code: pairing.code.clone(),
+                device_label: Some("My Phone".into()),
+            }),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(ok.status(), StatusCode::OK);
+        assert!(ok.headers().get(SET_COOKIE).is_some());
+
+        let reused = api_pairing_exchange(
+            State(state),
+            headers,
+            CookieJar::new(),
+            Json(ExchangePairingRequest {
+                code: pairing.code,
+                device_label: None,
+            }),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(reused.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn pairing_exchange_rejects_expired_code() {
+        let state = test_state("pair-expired");
+        let expired_at = now_ts() - 10;
+        let conn = Connection::open(&state.db_path).unwrap();
+        conn.execute(
+            "INSERT INTO pairing_codes(code, expires_at, used_at) VALUES (?1, ?2, NULL)",
+            params!["EXPIRED1", expired_at],
+        )
+        .unwrap();
+
+        let rejected = api_pairing_exchange(
+            State(state),
+            HeaderMap::new(),
+            CookieJar::new(),
+            Json(ExchangePairingRequest {
+                code: "EXPIRED1".into(),
+                device_label: None,
+            }),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(rejected.status(), StatusCode::UNAUTHORIZED);
+    }
+}
+

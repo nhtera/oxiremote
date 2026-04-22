@@ -9,7 +9,7 @@
     "build": "bun run build:web && cargo build --manifest-path agent/Cargo.toml",
     "build:release": "bun run build:web && cargo build --release --manifest-path agent/Cargo.toml",
     "build:web": "bun --cwd apps/web build",
-    "typecheck:web": "bun --cwd apps/web run typecheck",
+    "typecheck:web": "bun --cwd apps/web typecheck",
     "lint:web": "bun --cwd apps/web lint"
   }
 }

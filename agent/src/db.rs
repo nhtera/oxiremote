@@ -19,7 +19,16 @@ pub fn init_db(db_path: &Path) -> anyhow::Result<()> {
         CREATE TABLE IF NOT EXISTS sessions (
             session_id TEXT PRIMARY KEY,
             created_at INTEGER NOT NULL,
-            last_seen_at INTEGER NOT NULL
+            last_seen_at INTEGER NOT NULL,
+            device_id TEXT
+        );
+        CREATE TABLE IF NOT EXISTS trusted_devices (
+            device_id TEXT PRIMARY KEY,
+            label TEXT NOT NULL,
+            user_agent TEXT,
+            created_at INTEGER NOT NULL,
+            last_seen_at INTEGER NOT NULL,
+            revoked_at INTEGER
         );
         CREATE TABLE IF NOT EXISTS terminal_sessions (
             terminal_session_id TEXT PRIMARY KEY,
@@ -36,5 +45,8 @@ pub fn init_db(db_path: &Path) -> anyhow::Result<()> {
         );",
     )
     .context("create tables")?;
+
+    let _ = conn.execute("ALTER TABLE sessions ADD COLUMN device_id TEXT", []);
+
     Ok(())
 }

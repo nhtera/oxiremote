@@ -3,6 +3,9 @@ import { useNavigate } from 'react-router-dom'
 
 export default function LoginPage() {
   const [code, setCode] = useState('')
+  const [deviceLabel, setDeviceLabel] = useState(
+    typeof window !== 'undefined' ? window.localStorage.getItem('oxi:device-label') ?? '' : '',
+  )
   const [error, setError] = useState('')
   const [loading, setLoading] = useState(false)
   const navigate = useNavigate()
@@ -16,9 +19,15 @@ export default function LoginPage() {
       const res = await fetch('/api/pairing/exchange', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ code: trimmed }),
+        body: JSON.stringify({
+          code: trimmed,
+          device_label: deviceLabel.trim() || undefined,
+        }),
       })
-      if (!res.ok) throw new Error('Invalid or expired code')
+      if (!res.ok) throw new Error(await res.text() || 'Invalid or expired code')
+      if (deviceLabel.trim()) {
+        window.localStorage.setItem('oxi:device-label', deviceLabel.trim())
+      }
       navigate('/')
     } catch (e: any) {
       setError(e.message || 'Pairing failed')
@@ -43,6 +52,14 @@ export default function LoginPage() {
           autoComplete="one-time-code"
           onKeyDown={(e) => e.key === 'Enter' && handlePair()}
           className="w-full px-3 py-3 text-lg bg-surface-alt border border-border rounded-lg text-text-primary text-center tracking-widest font-mono uppercase focus:outline-none focus:border-accent/50"
+        />
+
+        <input
+          value={deviceLabel}
+          onChange={(e) => setDeviceLabel(e.target.value)}
+          placeholder="This device name (optional)"
+          maxLength={80}
+          className="w-full mt-3 px-3 py-3 text-sm bg-surface-alt border border-border rounded-lg text-text-primary focus:outline-none focus:border-accent/50"
         />
 
         <button
