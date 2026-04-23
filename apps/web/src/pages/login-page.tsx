@@ -1,5 +1,6 @@
 import { useState } from 'react'
 import { useNavigate } from 'react-router-dom'
+import { useHostStore } from '../state/host-store'
 
 export default function LoginPage() {
   const [code, setCode] = useState('')
@@ -28,6 +29,9 @@ export default function LoginPage() {
       if (deviceLabel.trim()) {
         window.localStorage.setItem('oxi:device-label', deviceLabel.trim())
       }
+      // Pairing set the cookie — refresh the host store so route guards
+      // (LegacyRedirect, AppLayout sidebar) see the authenticated state.
+      await useHostStore.getState().fetchHost()
       navigate('/')
     } catch (e: any) {
       setError(e.message || 'Pairing failed')

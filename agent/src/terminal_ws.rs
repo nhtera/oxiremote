@@ -7,6 +7,7 @@ use axum::response::IntoResponse;
 use axum::Json;
 use axum_extra::extract::cookie::CookieJar;
 use rusqlite::{params, Connection};
+use tokio::sync::broadcast::error::RecvError;
 use tracing::warn;
 
 use crate::auth::require_active_auth;
@@ -70,7 +71,7 @@ async fn handle_terminal_ws(
     mut socket: WebSocket,
 ) {
     let sess = match state.terminal_sessions.get(&id) {
-        Some(s) => s,
+        Some(s) => s.clone(),
         None => {
             let _ = socket.send(Message::Close(None)).await;
             return;
@@ -83,6 +84,7 @@ async fn handle_terminal_ws(
     }
 
     let mut rx = sess.output_tx.subscribe();
+    let mut attached = false;
 
     loop {
         tokio::select! {
@@ -91,17 +93,29 @@ async fn handle_terminal_ws(
                 match msg {
                     Message::Text(text) => {
                         if text.len() > WS_MAX_TEXT_BYTES { break; }
-                        if let Ok(frame) = serde_json::from_str::<WsIn>(&text) {
-                            match frame {
-                                WsIn::Input { data } => {
-                                    if let Ok(mut w) = sess.writer.lock() {
-                                        use std::io::Write;
-                                        let _ = w.write_all(data.as_bytes());
-                                        let _ = w.flush();
-                                    }
+                        let Ok(frame) = serde_json::from_str::<WsIn>(&text) else { continue };
+                        match frame {
+                            WsIn::Attach { last_seq } => {
+                                if attached { continue; }
+                                attached = true;
+                                let snap = sess.snapshot_since(last_seq);
+                                let frame = WsOut::Snapshot {
+                                    from_seq: snap.from_seq,
+                                    to_seq: snap.to_seq,
+                                    data: snap.data,
+                                };
+                                if let Ok(text) = serde_json::to_string(&frame) {
+                                    if socket.send(Message::Text(text.into())).await.is_err() { break; }
                                 }
-                                WsIn::Ping => {}
                             }
+                            WsIn::Input { data } => {
+                                if let Ok(mut w) = sess.writer.lock() {
+                                    use std::io::Write;
+                                    let _ = w.write_all(data.as_bytes());
+                                    let _ = w.flush();
+                                }
+                            }
+                            WsIn::Ping => {}
                         }
                     }
                     Message::Close(_) => break,
@@ -109,13 +123,24 @@ async fn handle_terminal_ws(
                 }
             }
             out = rx.recv() => {
-                if let Ok(frame) = out {
-                    if let Ok(text) = serde_json::to_string(&frame) {
-                        if socket.send(Message::Text(text.into())).await.is_err() { break; }
+                match out {
+                    Ok(frame) => {
+                        // Skip live chunks until the client has attached, so replay isn't duplicated.
+                        if !attached && matches!(frame, WsOut::Chunk { .. }) { continue; }
+                        if let Ok(text) = serde_json::to_string(&frame) {
+                            if socket.send(Message::Text(text.into())).await.is_err() { break; }
+                        }
+                        if matches!(frame, WsOut::Exit { .. }) {
+                            break;
+                        }
                     }
-                    if matches!(frame, WsOut::Exit { .. }) {
+                    Err(RecvError::Lagged(_)) => {
+                        // Subscriber fell behind the 1024-slot broadcast buffer.
+                        // Drop this subscriber; PTY keeps running for others.
+                        warn!(session = %id, "ws subscriber lagged, dropping");
                         break;
                     }
+                    Err(RecvError::Closed) => break,
                 }
             }
         }

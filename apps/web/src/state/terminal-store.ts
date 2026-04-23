@@ -14,22 +14,31 @@ export type Session = {
   // legacy field from existing API; kept for compat
   status: string
   exit_code: number | null
+  // Phase 02: persistent PTY metadata
+  last_seq?: number
+  buffer_bytes?: number
+  attached?: boolean
 }
 
 type TerminalStoreState = {
   sessions: Session[]
   activeId: string | null
+  // Client-side ack of latest applied seq per session. Used on reconnect.
+  lastSeqById: Record<string, number>
   setActive: (id: string | null) => void
   upsert: (session: Session) => void
   remove: (id: string) => void
   rename: (id: string, name: string) => void
   setState: (id: string, state: SessionState) => void
   setSessions: (sessions: Session[]) => void
+  setLastSeq: (id: string, seq: number) => void
+  resetLastSeq: (id: string) => void
 }
 
 export const useTerminalStore = create<TerminalStoreState>((set) => ({
   sessions: [],
   activeId: null,
+  lastSeqById: {},
 
   setActive: (id) => set({ activeId: id }),
 
@@ -45,10 +54,15 @@ export const useTerminalStore = create<TerminalStoreState>((set) => ({
     }),
 
   remove: (id) =>
-    set((s) => ({
-      sessions: s.sessions.filter((x) => x.id !== id),
-      activeId: s.activeId === id ? null : s.activeId,
-    })),
+    set((s) => {
+      const rest = { ...s.lastSeqById }
+      delete rest[id]
+      return {
+        sessions: s.sessions.filter((x) => x.id !== id),
+        activeId: s.activeId === id ? null : s.activeId,
+        lastSeqById: rest,
+      }
+    }),
 
   rename: (id, name) =>
     set((s) => ({
@@ -61,4 +75,18 @@ export const useTerminalStore = create<TerminalStoreState>((set) => ({
     })),
 
   setSessions: (sessions) => set({ sessions }),
+
+  setLastSeq: (id, seq) =>
+    set((s) => {
+      const prev = s.lastSeqById[id] ?? 0
+      if (seq <= prev) return s
+      return { lastSeqById: { ...s.lastSeqById, [id]: seq } }
+    }),
+
+  resetLastSeq: (id) =>
+    set((s) => {
+      const rest = { ...s.lastSeqById }
+      delete rest[id]
+      return { lastSeqById: rest }
+    }),
 }))

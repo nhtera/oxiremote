@@ -78,7 +78,15 @@ export default function TerminalPage() {
     })
     const fit = new FitAddon()
     term.loadAddon(fit)
-    const handle: SessionHandle = { term, fit, ws: null, connected: false }
+    const handle: SessionHandle = {
+      term,
+      fit,
+      ws: null,
+      connected: false,
+      reconnectTimer: null,
+      reconnectAttempt: 0,
+      closedByUser: false,
+    }
     handlesRef.current.set(id, handle)
     return handle
   }
@@ -107,6 +115,11 @@ export default function TerminalPage() {
     handle.fit.fit()
     handle.term.focus()
     setIsConnected(handle.connected)
+    // The WS hook's effect runs before this one, so on first mount for a
+    // session it sees no handle and bails. Bump nonce so it re-runs now that
+    // the handle exists. No-op for already-connected sockets (connect() is
+    // idempotent against handle.ws state).
+    setReconnectNonce((n) => n + 1)
 
     const debouncedResize = debounce(() => {
       handle.fit.fit()

@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -8,12 +9,23 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 
 use crate::db::now_ts;
+use crate::terminal_buffer::{RingBuffer, Snapshot};
 
 pub const MAX_TERMINAL_SESSIONS_PER_USER: usize = 10;
 pub const WS_MAX_TEXT_BYTES: usize = 64 * 1024;
 
 /// Threshold for considering a session "active" (recently produced output).
 const ACTIVE_THRESHOLD_MS: u128 = 250;
+
+/// Default ring buffer capacity (bytes). Override via `OXI_PTY_BUFFER_BYTES`.
+const DEFAULT_BUFFER_BYTES: usize = 2 * 1024 * 1024;
+
+fn buffer_capacity_bytes() -> usize {
+    std::env::var("OXI_PTY_BUFFER_BYTES")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(DEFAULT_BUFFER_BYTES)
+}
 
 pub struct TerminalSession {
     pub owner_session_id: String,
@@ -23,6 +35,10 @@ pub struct TerminalSession {
     pub master: std::sync::Mutex<Box<dyn portable_pty::MasterPty + Send>>,
     /// Tracks the last time output was received from the PTY.
     pub last_activity: Arc<std::sync::Mutex<Instant>>,
+    /// Bounded scrollback with monotonic seq. Shared with reader thread.
+    pub buffer: Arc<std::sync::Mutex<RingBuffer>>,
+    /// Latest seq published to the buffer. Lock-free read for API.
+    pub last_seq: Arc<AtomicU64>,
 }
 
 impl TerminalSession {
@@ -42,6 +58,18 @@ impl TerminalSession {
             "idle"
         }
     }
+
+    /// Produce a replay snapshot for a (re)attaching client.
+    pub fn snapshot_since(&self, last_seq: Option<u64>) -> Snapshot {
+        self.buffer
+            .lock()
+            .map(|b| b.snapshot_since(last_seq))
+            .unwrap_or(Snapshot {
+                from_seq: 0,
+                to_seq: 0,
+                data: String::new(),
+            })
+    }
 }
 
 #[derive(Serialize)]
@@ -56,6 +84,9 @@ pub struct TerminalSessionMeta {
     pub rows: i64,
     pub status: String,
     pub exit_code: Option<i64>,
+    pub last_seq: u64,
+    pub buffer_bytes: u64,
+    pub attached: bool,
 }
 
 #[derive(Deserialize)]
@@ -66,8 +97,16 @@ pub struct RenameTerminalRequest {
 #[derive(Clone, Serialize)]
 #[serde(tag = "t")]
 pub enum WsOut {
-    #[serde(rename = "output")]
-    Output { data: String },
+    /// Live output chunk with seq number. Client stores `seq` for reattach.
+    #[serde(rename = "chunk")]
+    Chunk { seq: u64, data: String },
+    /// Replay snapshot delivered right after `attach`.
+    #[serde(rename = "snapshot")]
+    Snapshot {
+        from_seq: u64,
+        to_seq: u64,
+        data: String,
+    },
     #[serde(rename = "exit")]
     Exit { code: Option<i64> },
     #[serde(rename = "state")]
@@ -79,6 +118,9 @@ pub enum WsOut {
 #[derive(Deserialize)]
 #[serde(tag = "t")]
 pub enum WsIn {
+    /// First frame sent by client on connect. `last_seq=None` → full replay.
+    #[serde(rename = "attach")]
+    Attach { last_seq: Option<u64> },
     #[serde(rename = "input")]
     Input { data: String },
     #[serde(rename = "ping")]
@@ -161,6 +203,12 @@ pub fn spawn_terminal_session(
     let last_activity2 = last_activity.clone();
     let last_activity3 = last_activity.clone();
 
+    let buffer = Arc::new(std::sync::Mutex::new(RingBuffer::new(buffer_capacity_bytes())));
+    let buffer_reader = buffer.clone();
+
+    let last_seq = Arc::new(AtomicU64::new(0));
+    let last_seq_reader = last_seq.clone();
+
     // Shared flag so the reader thread and watchdog agree on current broadcast state.
     // Reader flips true on output; watchdog flips false when idle threshold passes.
     let is_active = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -209,16 +257,29 @@ pub fn spawn_terminal_session(
                     }
 
                     pending.extend_from_slice(&buf[..n]);
+                    let flush = |s: String| {
+                        if s.is_empty() {
+                            return;
+                        }
+                        let seq = buffer_reader
+                            .lock()
+                            .map(|mut b| b.append(s.clone()))
+                            .unwrap_or(0);
+                        if seq > 0 {
+                            last_seq_reader.store(seq, Ordering::Relaxed);
+                            let _ = output_tx2.send(WsOut::Chunk { seq, data: s });
+                        }
+                    };
                     match String::from_utf8(pending.clone()) {
                         Ok(s) => {
                             pending.clear();
-                            let _ = output_tx2.send(WsOut::Output { data: s });
+                            flush(s);
                         }
                         Err(e) => {
                             let valid_up_to = e.utf8_error().valid_up_to();
                             if valid_up_to > 0 {
                                 let s = String::from_utf8_lossy(&pending[..valid_up_to]).to_string();
-                                let _ = output_tx2.send(WsOut::Output { data: s });
+                                flush(s);
                                 pending = pending[valid_up_to..].to_vec();
                             }
                             if pending.len() > 256 * 1024 {
@@ -262,5 +323,7 @@ pub fn spawn_terminal_session(
         child,
         master: std::sync::Mutex::new(master),
         last_activity,
+        buffer,
+        last_seq,
     })
 }

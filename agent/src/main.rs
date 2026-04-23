@@ -9,6 +9,7 @@ mod preview;
 #[cfg(not(debug_assertions))]
 mod static_files;
 mod terminal_api;
+mod terminal_buffer;
 mod terminal_pty;
 mod terminal_ws;
 mod tunnel;
@@ -67,6 +68,14 @@ async fn main() -> anyhow::Result<()> {
 
     let db_path = data_dir.join("oxiremote.sqlite");
     db::init_db(&db_path).context("init db")?;
+
+    // Mark stale `running` rows as `dead` — their PTY processes died with the
+    // previous agent. Idempotent; safe on every boot.
+    match terminal_api::reconcile_orphan_sessions(&db_path) {
+        Ok(n) if n > 0 => info!(count = n, "reconciled orphan terminal sessions"),
+        Ok(_) => {}
+        Err(err) => warn!(error=%err, "orphan reconciliation failed"),
+    }
 
     let key_path = data_dir.join("signing.key");
     let signing_key = auth::load_or_create_key(&key_path).context("load signing key")?;

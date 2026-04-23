@@ -1,3 +1,5 @@
+use std::path::Path;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use axum::extract::{Path as AxumPath, State};
@@ -45,14 +47,27 @@ pub async fn api_terminal_sessions_list(
             let (id, name, created_at, last_seen_at, cols, rows_v, status, exit_code): (
                 String, Option<String>, i64, i64, i64, i64, String, Option<i64>,
             ) = r?;
+            let sess = state.terminal_sessions.get(&id);
             // Compute live state from in-memory session if available, else derive from DB status.
-            let state_str = state
-                .terminal_sessions
-                .get(&id)
+            let state_str = sess
+                .as_ref()
                 .map(|s| s.state(&status).to_string())
                 .unwrap_or_else(|| {
                     if status == "running" { "idle".into() } else { "exited".into() }
                 });
+            let (last_seq, buffer_bytes, attached) = match sess.as_ref() {
+                Some(s) => {
+                    let seq = s.last_seq.load(Ordering::Relaxed);
+                    let bytes = s
+                        .buffer
+                        .lock()
+                        .map(|b| b.byte_len() as u64)
+                        .unwrap_or(0);
+                    let atk = s.output_tx.receiver_count() > 0;
+                    (seq, bytes, atk)
+                }
+                None => (0, 0, false),
+            };
             out.push(TerminalSessionMeta {
                 id,
                 name,
@@ -64,6 +79,9 @@ pub async fn api_terminal_sessions_list(
                 rows: rows_v,
                 status,
                 exit_code,
+                last_seq,
+                buffer_bytes,
+                attached,
             });
         }
         Ok(out)
@@ -367,4 +385,17 @@ pub async fn api_terminal_session_rename(
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }
+}
+
+/// On agent boot, any DB row still marked `running` must be orphaned — the PTY
+/// process died with the previous agent. Mark them `dead` so the list endpoint
+/// and WS handler stay consistent without waiting for a subscriber to notice.
+pub fn reconcile_orphan_sessions(db_path: &Path) -> anyhow::Result<usize> {
+    let conn = Connection::open(db_path)?;
+    let now = now_ts();
+    let n = conn.execute(
+        "UPDATE terminal_sessions SET status='dead', last_seen_at=?1 WHERE status='running'",
+        params![now],
+    )?;
+    Ok(n)
 }
