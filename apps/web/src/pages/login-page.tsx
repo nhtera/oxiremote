@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { useHostStore } from '../state/host-store'
 
@@ -9,7 +9,30 @@ export default function LoginPage() {
   )
   const [error, setError] = useState('')
   const [loading, setLoading] = useState(false)
+  const [checkingAuth, setCheckingAuth] = useState(true)
   const navigate = useNavigate()
+
+  // If the session cookie is already valid, skip the pairing form entirely.
+  // Avoids the user getting stuck here after opening the app from a bookmark.
+  useEffect(() => {
+    let cancelled = false
+    fetch('/api/me', { credentials: 'include' })
+      .then(async (res) => {
+        if (cancelled) return
+        if (res.ok) {
+          await useHostStore.getState().fetchHost()
+          navigate('/', { replace: true })
+        } else {
+          setCheckingAuth(false)
+        }
+      })
+      .catch(() => {
+        if (!cancelled) setCheckingAuth(false)
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [navigate])
 
   const handlePair = async () => {
     const trimmed = code.trim()
@@ -38,6 +61,14 @@ export default function LoginPage() {
     } finally {
       setLoading(false)
     }
+  }
+
+  if (checkingAuth) {
+    return (
+      <div className="min-h-dvh flex items-center justify-center text-text-muted text-sm">
+        Loading…
+      </div>
+    )
   }
 
   return (
