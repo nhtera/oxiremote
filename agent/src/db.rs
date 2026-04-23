@@ -57,7 +57,18 @@ pub fn init_db(db_path: &Path) -> anyhow::Result<()> {
             auth TEXT NOT NULL,
             created_at INTEGER NOT NULL,
             PRIMARY KEY (host_id, device_id)
-        );",
+        );
+        CREATE TABLE IF NOT EXISTS workspaces (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            host_id TEXT NOT NULL,
+            path TEXT NOT NULL,
+            label TEXT NOT NULL,
+            last_used_at INTEGER NOT NULL,
+            pinned INTEGER NOT NULL DEFAULT 0,
+            UNIQUE(host_id, path)
+        );
+        CREATE INDEX IF NOT EXISTS idx_workspaces_host_last
+            ON workspaces(host_id, last_used_at DESC);",
     )
     .context("create tables")?;
 

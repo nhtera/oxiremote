@@ -1,6 +1,7 @@
 mod auth;
 mod db;
 mod files;
+mod files_upload;
 mod git;
 mod host;
 mod host_api;
@@ -16,6 +17,7 @@ mod terminal_buffer;
 mod terminal_pty;
 mod terminal_ws;
 mod tunnel;
+mod workspaces;
 
 use std::{
     net::SocketAddr,
@@ -25,6 +27,7 @@ use std::{
 
 use anyhow::Context;
 use axum::{
+    extract::DefaultBodyLimit,
     routing::{get, post},
     Router,
 };
@@ -108,7 +111,9 @@ async fn run_server() -> anyhow::Result<()> {
     // Derive + persist stable host identity (hostname + install salt → blake3 hash).
     let host_info = {
         let conn = rusqlite::Connection::open(&db_path).context("open db for host init")?;
-        host::ensure_host(&data_dir, &conn).context("ensure host")?
+        let info = host::ensure_host(&data_dir, &conn).context("ensure host")?;
+        workspaces::seed_defaults(&conn, &info.host_id).context("seed workspaces")?;
+        info
     };
 
     let secure_cookies = std::env::var("OXI_SECURE_COOKIES")
@@ -168,8 +173,31 @@ async fn run_server() -> anyhow::Result<()> {
         .route("/api/git/commit", post(git::api_git_commit))
         // files
         .route("/api/files/list", get(files::api_files_list))
+        .route("/api/files/stat", get(files::api_files_stat))
         .route("/api/files/read", get(files::api_files_read))
         .route("/api/files/write", post(files::api_files_write))
+        .route("/api/files/create", post(files::api_files_create))
+        .route("/api/files/rename", post(files::api_files_rename))
+        .route("/api/files/delete", post(files::api_files_delete))
+        .route("/api/files/download", get(files::api_files_download))
+        .route(
+            "/api/files/upload",
+            post(files_upload::api_files_upload)
+                .layer(DefaultBodyLimit::max(files_upload::MAX_UPLOAD_BYTES as usize)),
+        )
+        // workspaces
+        .route(
+            "/api/workspaces",
+            get(workspaces::api_workspaces_list).post(workspaces::api_workspaces_create),
+        )
+        .route(
+            "/api/workspaces/{id}",
+            axum::routing::delete(workspaces::api_workspaces_delete),
+        )
+        .route(
+            "/api/workspaces/{id}/touch",
+            post(workspaces::api_workspaces_touch),
+        )
         // preview proxy
         .route("/api/previews", get(preview::api_previews_list).post(preview::api_previews_create))
         .route("/api/previews/{id}", axum::routing::delete(preview::api_previews_delete))

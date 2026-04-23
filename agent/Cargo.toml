@@ -5,7 +5,7 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1.0"
-axum = { version = "0.8", features = ["macros", "ws"] }
+axum = { version = "0.8", features = ["macros", "ws", "multipart"] }
 axum-extra = { version = "0.10", features = ["cookie"] }
 base64 = "0.22"
 bytes = "1.10"
@@ -23,7 +23,8 @@ sha2 = "0.10"
 tar = "0.4"
 flate2 = "1.1"
 time = "0.3"
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "process", "fs"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "process", "fs", "io-util"] }
+tokio-util = { version = "0.7", features = ["io"] }
 tower = "0.5"
 tower-http = { version = "0.6", features = ["trace"] }
 tracing = "0.1"
