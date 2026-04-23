@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Instant;
 
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 use rusqlite::{params, Connection};
@@ -11,24 +12,55 @@ use crate::db::now_ts;
 pub const MAX_TERMINAL_SESSIONS_PER_USER: usize = 10;
 pub const WS_MAX_TEXT_BYTES: usize = 64 * 1024;
 
+/// Threshold for considering a session "active" (recently produced output).
+const ACTIVE_THRESHOLD_MS: u128 = 250;
+
 pub struct TerminalSession {
     pub owner_session_id: String,
     pub writer: std::sync::Mutex<Box<dyn std::io::Write + Send>>,
     pub output_tx: broadcast::Sender<WsOut>,
     pub child: Arc<std::sync::Mutex<Box<dyn portable_pty::Child + Send + Sync>>>,
     pub master: std::sync::Mutex<Box<dyn portable_pty::MasterPty + Send>>,
+    /// Tracks the last time output was received from the PTY.
+    pub last_activity: Arc<std::sync::Mutex<Instant>>,
+}
+
+impl TerminalSession {
+    /// Returns "exited" | "active" | "idle" based on DB status and recent activity.
+    pub fn state(&self, db_status: &str) -> &'static str {
+        if db_status == "exited" || db_status == "closed" || db_status == "dead" {
+            return "exited";
+        }
+        let elapsed = self
+            .last_activity
+            .lock()
+            .map(|t| t.elapsed().as_millis())
+            .unwrap_or(u128::MAX);
+        if elapsed <= ACTIVE_THRESHOLD_MS {
+            "active"
+        } else {
+            "idle"
+        }
+    }
 }
 
 #[derive(Serialize)]
 pub struct TerminalSessionMeta {
     pub id: String,
     pub name: Option<String>,
+    pub host_id: String,
+    pub state: String,
     pub created_at: i64,
     pub last_seen_at: i64,
     pub cols: i64,
     pub rows: i64,
     pub status: String,
     pub exit_code: Option<i64>,
+}
+
+#[derive(Deserialize)]
+pub struct RenameTerminalRequest {
+    pub name: String,
 }
 
 #[derive(Clone, Serialize)]
@@ -38,6 +70,10 @@ pub enum WsOut {
     Output { data: String },
     #[serde(rename = "exit")]
     Exit { code: Option<i64> },
+    #[serde(rename = "state")]
+    State { state: String },
+    #[serde(rename = "renamed")]
+    Renamed { name: String },
 }
 
 #[derive(Deserialize)]
@@ -121,8 +157,44 @@ pub fn spawn_terminal_session(
     let db_path = db_path.clone();
     let id = id.to_string();
 
+    let last_activity = Arc::new(std::sync::Mutex::new(Instant::now()));
+    let last_activity2 = last_activity.clone();
+    let last_activity3 = last_activity.clone();
+
+    // Shared flag so the reader thread and watchdog agree on current broadcast state.
+    // Reader flips true on output; watchdog flips false when idle threshold passes.
+    let is_active = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let is_active_reader = is_active.clone();
+    let is_active_watch = is_active.clone();
+    let output_tx_watch = output_tx.clone();
+
+    // Idle watchdog: emit State{idle} once output has been quiet for > ACTIVE_THRESHOLD.
+    std::thread::spawn(move || {
+        use std::sync::atomic::Ordering;
+        loop {
+            std::thread::sleep(std::time::Duration::from_millis(150));
+            // Stop when no subscribers AND no recent activity updates — the channel closes
+            // when the session is dropped, which is our exit signal.
+            if output_tx_watch.receiver_count() == 0 && Arc::strong_count(&last_activity3) <= 2 {
+                break;
+            }
+            if !is_active_watch.load(Ordering::Relaxed) {
+                continue;
+            }
+            let elapsed = last_activity3
+                .lock()
+                .map(|t| t.elapsed())
+                .unwrap_or_default();
+            if elapsed.as_millis() >= ACTIVE_THRESHOLD_MS {
+                is_active_watch.store(false, Ordering::Relaxed);
+                let _ = output_tx_watch.send(WsOut::State { state: "idle".into() });
+            }
+        }
+    });
+
     std::thread::spawn(move || {
         use std::io::Read;
+        use std::sync::atomic::Ordering;
         let mut r = reader;
         let mut buf = [0u8; 8192];
         let mut pending = Vec::<u8>::new();
@@ -131,6 +203,11 @@ pub fn spawn_terminal_session(
             match r.read(&mut buf) {
                 Ok(0) => break,
                 Ok(n) => {
+                    // Update activity timestamp on every output chunk.
+                    if let Ok(mut t) = last_activity2.lock() {
+                        *t = Instant::now();
+                    }
+
                     pending.extend_from_slice(&buf[..n]);
                     match String::from_utf8(pending.clone()) {
                         Ok(s) => {
@@ -148,6 +225,11 @@ pub fn spawn_terminal_session(
                                 pending.clear();
                             }
                         }
+                    }
+
+                    // Broadcast state transition idle → active.
+                    if !is_active_reader.swap(true, Ordering::Relaxed) {
+                        let _ = output_tx2.send(WsOut::State { state: "active".into() });
                     }
                 }
                 Err(_) => break,
@@ -169,6 +251,7 @@ pub fn spawn_terminal_session(
             Ok(())
         })();
 
+        let _ = output_tx2.send(WsOut::State { state: "exited".into() });
         let _ = output_tx2.send(WsOut::Exit { code });
     });
 
@@ -178,5 +261,6 @@ pub fn spawn_terminal_session(
         output_tx,
         child,
         master: std::sync::Mutex::new(master),
+        last_activity,
     })
 }

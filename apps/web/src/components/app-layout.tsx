@@ -1,15 +1,22 @@
 import { NavLink, Outlet, useNavigate } from 'react-router-dom'
-
-const navItems = [
-  { to: '/', label: 'Home', icon: '⌂' },
-  { to: '/terminal', label: 'Terminal', icon: '▸' },
-  { to: '/git', label: 'Git', icon: '⎇' },
-  { to: '/files', label: 'Files', icon: '◫' },
-  { to: '/preview', label: 'Preview', icon: '◉' },
-]
+import { useHostStore } from '../state/host-store'
 
 export default function AppLayout() {
   const navigate = useNavigate()
+  const { currentHostId, label } = useHostStore()
+
+  // Display label or first 8 chars of host_id as fallback
+  const hostChip = label ?? (currentHostId ? currentHostId.slice(0, 8) : null)
+
+  // Nav items: use host-scoped paths when host is known, else legacy (which redirect)
+  const base = currentHostId ? `/h/${currentHostId}` : ''
+  const navItems = [
+    { to: '/', label: 'Home', icon: '⌂', exact: true },
+    { to: `${base}/terminal`, label: 'Terminal', icon: '▸', exact: false },
+    { to: `${base}/git`, label: 'Git', icon: '⎇', exact: false },
+    { to: `${base}/files`, label: 'Files', icon: '◫', exact: false },
+    { to: `${base}/preview`, label: 'Preview', icon: '◉', exact: false },
+  ]
 
   const handleLogout = async () => {
     await fetch('/api/auth/logout', { method: 'POST' })
@@ -23,11 +30,17 @@ export default function AppLayout() {
         <div className="px-4 py-3 text-sm font-semibold text-accent tracking-wide">
           OxiRemote
         </div>
+        {/* Host chip */}
+        {hostChip && (
+          <div className="mx-3 mb-1 px-2 py-1 rounded-md bg-surface border border-border text-[11px] text-text-muted truncate" title={currentHostId ?? ''}>
+            {hostChip}
+          </div>
+        )}
         {navItems.map((item) => (
           <NavLink
             key={item.to}
             to={item.to}
-            end={item.to === '/'}
+            end={item.exact}
             className={({ isActive }) =>
               `px-4 py-2.5 text-sm flex items-center gap-2 transition-colors ${
                 isActive
@@ -61,7 +74,7 @@ export default function AppLayout() {
           <NavLink
             key={item.to}
             to={item.to}
-            end={item.to === '/'}
+            end={item.exact}
             className={({ isActive }) =>
               `flex-1 flex flex-col items-center py-2 text-xs transition-colors ${
                 isActive ? 'text-accent' : 'text-text-muted'

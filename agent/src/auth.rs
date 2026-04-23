@@ -302,6 +302,11 @@ mod tests {
             preview_targets: DashMap::new(),
             pairing_attempts: DashMap::new(),
             workspace_root: PathBuf::from("."),
+            host_info: crate::host::HostInfo {
+                host_id: "test-host-id".to_string(),
+                label: "test-host".to_string(),
+                platform: "test".to_string(),
+            },
         }
     }
 

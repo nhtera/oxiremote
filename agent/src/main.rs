@@ -2,6 +2,8 @@ mod auth;
 mod db;
 mod files;
 mod git;
+mod host;
+mod host_api;
 mod http_pages;
 mod preview;
 #[cfg(not(debug_assertions))]
@@ -26,6 +28,7 @@ use dashmap::DashMap;
 use tower_http::trace::TraceLayer;
 use tracing::{info, warn};
 
+use crate::host::HostInfo;
 use crate::terminal_pty::TerminalSession;
 use crate::preview::PreviewTarget;
 
@@ -40,6 +43,7 @@ pub struct AppState {
     pub preview_targets: DashMap<String, PreviewTarget>,
     pub pairing_attempts: DashMap<String, i64>,
     pub workspace_root: PathBuf,
+    pub host_info: HostInfo,
 }
 
 fn default_data_dir() -> anyhow::Result<PathBuf> {
@@ -67,6 +71,12 @@ async fn main() -> anyhow::Result<()> {
     let key_path = data_dir.join("signing.key");
     let signing_key = auth::load_or_create_key(&key_path).context("load signing key")?;
 
+    // Derive + persist stable host identity (hostname + install salt → blake3 hash).
+    let host_info = {
+        let conn = rusqlite::Connection::open(&db_path).context("open db for host init")?;
+        host::ensure_host(&data_dir, &conn).context("ensure host")?
+    };
+
     let secure_cookies = std::env::var("OXI_SECURE_COOKIES")
         .ok()
         .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
@@ -83,6 +93,7 @@ async fn main() -> anyhow::Result<()> {
         preview_targets: DashMap::new(),
         pairing_attempts: DashMap::new(),
         workspace_root,
+        host_info,
     });
 
     let app = Router::new()
@@ -92,6 +103,8 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/auth/logout", post(http_pages::api_logout))
         .route("/api/devices", get(http_pages::api_devices_list))
         .route("/api/devices/{id}/revoke", post(http_pages::api_device_revoke))
+        // host
+        .merge(host_api::router())
         // terminal
         .route(
             "/api/terminal/sessions",
@@ -100,6 +113,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/terminal/sessions/{id}/ws", get(terminal_ws::api_terminal_session_ws))
         .route("/api/terminal/sessions/{id}/resize", post(terminal_api::api_terminal_session_resize))
         .route("/api/terminal/sessions/{id}/close", post(terminal_api::api_terminal_session_close))
+        .route("/api/terminal/sessions/{id}", axum::routing::patch(terminal_api::api_terminal_session_rename))
         // git
         .route("/api/git/status", get(git::api_git_status))
         .route("/api/git/diff", get(git::api_git_diff))

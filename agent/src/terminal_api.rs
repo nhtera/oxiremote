@@ -14,8 +14,8 @@ use crate::auth::require_active_auth;
 use crate::db::now_ts;
 use crate::terminal_pty::{
     build_default_command, spawn_terminal_session, CreateTerminalSessionRequest,
-    CreateTerminalSessionResponse, ResizeTerminalRequest, TerminalSessionMeta,
-    MAX_TERMINAL_SESSIONS_PER_USER,
+    CreateTerminalSessionResponse, RenameTerminalRequest, ResizeTerminalRequest, TerminalSessionMeta,
+    WsOut, MAX_TERMINAL_SESSIONS_PER_USER,
 };
 use crate::AppState;
 
@@ -27,6 +27,8 @@ pub async fn api_terminal_sessions_list(
         return StatusCode::UNAUTHORIZED.into_response();
     };
 
+    let host_id = state.host_info.host_id.clone();
+
     let res: anyhow::Result<Vec<TerminalSessionMeta>> = (|| {
         let conn = Connection::open(&state.db_path)?;
         let mut stmt = conn.prepare(
@@ -34,20 +36,35 @@ pub async fn api_terminal_sessions_list(
              FROM terminal_sessions WHERE owner_session_id=?1 ORDER BY created_at DESC",
         )?;
         let rows = stmt.query_map(params![owner_session_id], |row| {
-            Ok(TerminalSessionMeta {
-                id: row.get(0)?,
-                name: row.get(1)?,
-                created_at: row.get(2)?,
-                last_seen_at: row.get(3)?,
-                cols: row.get(4)?,
-                rows: row.get(5)?,
-                status: row.get(6)?,
-                exit_code: row.get(7)?,
-            })
+            let id: String = row.get(0)?;
+            let status: String = row.get(6)?;
+            Ok((id, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, status, row.get(7)?))
         })?;
         let mut out = Vec::new();
         for r in rows {
-            out.push(r?);
+            let (id, name, created_at, last_seen_at, cols, rows_v, status, exit_code): (
+                String, Option<String>, i64, i64, i64, i64, String, Option<i64>,
+            ) = r?;
+            // Compute live state from in-memory session if available, else derive from DB status.
+            let state_str = state
+                .terminal_sessions
+                .get(&id)
+                .map(|s| s.state(&status).to_string())
+                .unwrap_or_else(|| {
+                    if status == "running" { "idle".into() } else { "exited".into() }
+                });
+            out.push(TerminalSessionMeta {
+                id,
+                name,
+                host_id: host_id.clone(),
+                state: state_str,
+                created_at,
+                last_seen_at,
+                cols,
+                rows: rows_v,
+                status,
+                exit_code,
+            });
         }
         Ok(out)
     })();
@@ -305,4 +322,49 @@ pub async fn api_terminal_session_close(
     }
 
     StatusCode::OK.into_response()
+}
+
+pub async fn api_terminal_session_rename(
+    State(state): State<Arc<AppState>>,
+    jar: CookieJar,
+    AxumPath(id): AxumPath<String>,
+    Json(req): Json<RenameTerminalRequest>,
+) -> impl IntoResponse {
+    let Some(owner_session_id) = require_active_auth(&state.db_path, &state.signing_key, &jar) else {
+        return StatusCode::UNAUTHORIZED.into_response();
+    };
+
+    // Validate name: non-empty, max 64 chars.
+    let name = req.name.trim().to_string();
+    if name.is_empty() || name.len() > 64 {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({ "error": "name must be 1–64 characters" })),
+        )
+            .into_response();
+    }
+
+    let updated: anyhow::Result<bool> = (|| {
+        let conn = Connection::open(&state.db_path)?;
+        let n = conn.execute(
+            "UPDATE terminal_sessions SET name=?3 WHERE terminal_session_id=?1 AND owner_session_id=?2",
+            params![id, owner_session_id, name],
+        )?;
+        Ok(n > 0)
+    })();
+
+    match updated {
+        Ok(true) => {
+            // Broadcast rename event to all WS subscribers of this session.
+            if let Some(sess) = state.terminal_sessions.get(&id) {
+                let _ = sess.output_tx.send(WsOut::Renamed { name });
+            }
+            StatusCode::OK.into_response()
+        }
+        Ok(false) => StatusCode::FORBIDDEN.into_response(),
+        Err(err) => {
+            warn!(error=%err, "rename terminal session failed");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
 }

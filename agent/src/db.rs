@@ -42,6 +42,12 @@ pub fn init_db(db_path: &Path) -> anyhow::Result<()> {
             rows INTEGER NOT NULL DEFAULT 24,
             status TEXT NOT NULL DEFAULT 'running',
             exit_code INTEGER
+        );
+        CREATE TABLE IF NOT EXISTS hosts (
+            host_id TEXT PRIMARY KEY,
+            label TEXT NOT NULL,
+            platform TEXT NOT NULL,
+            created_at INTEGER NOT NULL
         );",
     )
     .context("create tables")?;

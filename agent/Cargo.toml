@@ -30,6 +30,8 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 
+blake3 = "1"
+gethostname = "0.4"
 portable-pty = "0.9"
 dashmap = "6"
 tokio-tungstenite = { version = "0.26", features = ["connect"] }

@@ -4,71 +4,53 @@ import { Terminal } from 'xterm'
 import { FitAddon } from 'xterm-addon-fit'
 import 'xterm/css/xterm.css'
 
-function debounce<F extends (...args: any[]) => void>(fn: F, waitMs: number) {
+import { useTerminalStore, type Session } from '../state/terminal-store'
+import { terminalThemes, loadTheme, saveTheme } from '../lib/terminal-themes'
+import { useTerminalWs, destroyHandle, type SessionHandle } from '../lib/terminal-ws-hook'
+import TerminalTabBar from '../components/terminal-tab-bar'
+import TerminalKeybar from '../components/terminal-keybar'
+import TerminalSendComposer from '../components/terminal-send-composer'
+
+function debounce<F extends (...args: unknown[]) => void>(fn: F, ms: number) {
   let t: number | undefined
   return (...args: Parameters<F>) => {
     if (t) window.clearTimeout(t)
-    t = window.setTimeout(() => fn(...args), waitMs)
+    t = window.setTimeout(() => fn(...args), ms)
   }
 }
 
-type TerminalSessionMeta = {
-  id: string
-  name: string | null
-  created_at: number
-  last_seen_at: number
-  cols: number
-  rows: number
-  status: string
-  exit_code: number | null
-}
+type CreateSessionReq = { cols: number; rows: number }
+type CreateSessionRes = { id: string }
 
-type WsOut = { t: 'output'; data: string } | { t: 'exit'; code: number | null }
-type CreateTerminalSessionResponse = { id: string }
-type CreateTerminalSessionRequest = {
-  name?: string
-  cwd?: string
-  command?: string[]
-  cols: number
-  rows: number
-}
-
-type SessionHandle = {
-  term: Terminal
-  fit: FitAddon
-  ws: WebSocket | null
-  connected: boolean
-}
-
-const TERM_THEME = {
-  background: '#16171d',
-  foreground: '#f3f4f6',
-  cursor: '#6cb4ff',
-  selectionBackground: '#2a2b3580',
-}
-
-const CONTROL_KEYS = [
-  { label: 'Ctrl+C', value: '' },
-  { label: 'Esc', value: '' },
-  { label: 'Tab', value: '\t' },
-  { label: '↑', value: '[A' },
-  { label: '↓', value: '[B' },
-  { label: '←', value: '[D' },
-  { label: '→', value: '[C' },
-]
-
-function wsUrl(path: string) {
-  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:'
-  return `${proto}//${location.host}${path}`
+// Settings popover — minimal theme picker
+function ThemeSettings({ onClose }: { onClose: () => void }) {
+  const [current, setCurrent] = useState(loadTheme())
+  return (
+    <div className="absolute top-10 right-0 z-50 bg-surface-alt border border-border rounded-lg shadow-lg p-3 min-w-45">
+      <div className="text-xs font-medium text-text-secondary mb-2">Theme</div>
+      {Object.keys(terminalThemes).map((key) => (
+        <button
+          key={key}
+          onClick={() => { saveTheme(key); setCurrent(key); onClose() }}
+          className={`w-full text-left text-xs px-2 py-1.5 rounded transition-colors ${
+            current === key ? 'bg-accent/15 text-accent' : 'text-text-secondary hover:bg-surface-hover'
+          }`}
+        >
+          {key}
+        </button>
+      ))}
+    </div>
+  )
 }
 
 export default function TerminalPage() {
   const [searchParams, setSearchParams] = useSearchParams()
-  const [sessions, setSessions] = useState<TerminalSessionMeta[]>([])
-  const [activeId, setActiveId] = useState<string | null>(searchParams.get('session'))
+  const { sessions, activeId, setActive, setSessions, rename, setState } = useTerminalStore()
   const [err, setErr] = useState<string | null>(null)
   const [isConnected, setIsConnected] = useState(false)
   const [reconnectNonce, setReconnectNonce] = useState(0)
+  const [showSettings, setShowSettings] = useState(false)
+  const [themeKey, setThemeKey] = useState(loadTheme)
 
   const containerRef = useRef<HTMLDivElement | null>(null)
   const handlesRef = useRef<Map<string, SessionHandle>>(new Map())
@@ -85,93 +67,109 @@ export default function TerminalPage() {
     }
   }, [activeId, searchParams, setSearchParams])
 
-  function setSelectedSession(id: string) {
-    setActiveId(id)
-    window.localStorage.setItem('oxi:last-terminal-session', id)
-  }
-
-  function reconnectSession() {
-    if (!activeId) return
-    const handle = handlesRef.current.get(activeId)
-    if (handle?.ws) {
-      handle.ws.close()
-      handle.ws = null
-    }
-    setReconnectNonce((n) => n + 1)
-  }
-
   function getOrCreateHandle(id: string): SessionHandle {
     const existing = handlesRef.current.get(id)
     if (existing) return existing
-
+    const theme = terminalThemes[themeKey] ?? terminalThemes.default
     const term = new Terminal({
-      cursorBlink: true,
-      fontSize: 14,
+      cursorBlink: true, fontSize: 14,
       fontFamily: 'ui-monospace, Consolas, monospace',
-      theme: TERM_THEME,
+      theme,
     })
     const fit = new FitAddon()
     term.loadAddon(fit)
-
     const handle: SessionHandle = { term, fit, ws: null, connected: false }
     handlesRef.current.set(id, handle)
     return handle
   }
 
-  function destroyHandle(id: string) {
-    const handle = handlesRef.current.get(id)
-    if (!handle) return
-    handle.ws?.close()
-    handle.term.dispose()
-    handlesRef.current.delete(id)
-  }
+  const { refreshSessions } = useTerminalWs(handlesRef, {
+    activeId,
+    reconnectNonce,
+    onConnected: setIsConnected,
+    onError: setErr,
+  })
 
-  async function refreshSessions() {
-    setErr(null)
-    const res = await fetch('/api/terminal/sessions', { credentials: 'include' })
-    if (!res.ok) {
-      setErr('Not authorized. Pair first at /login.')
-      return
+  // Apply theme change to existing terminals
+  useEffect(() => {
+    const theme = terminalThemes[themeKey] ?? terminalThemes.default
+    for (const handle of handlesRef.current.values()) {
+      handle.term.options.theme = theme
     }
-    const data = (await res.json()) as TerminalSessionMeta[]
-    setSessions(data)
+  }, [themeKey])
 
-    const remembered = searchParams.get('session') || window.localStorage.getItem('oxi:last-terminal-session')
-    const rememberedSession = remembered ? data.find((s) => s.id === remembered) ?? null : null
-    const bestId = rememberedSession?.status === 'running'
-      ? rememberedSession.id
-      : data.find((s) => s.status === 'running')?.id ?? rememberedSession?.id ?? data[0]?.id ?? null
+  useEffect(() => {
+    const el = containerRef.current
+    if (!el || !activeId) return
+    const handle = getOrCreateHandle(activeId)
+    el.replaceChildren()
+    handle.term.open(el)
+    handle.fit.fit()
+    handle.term.focus()
+    setIsConnected(handle.connected)
 
-    if (bestId !== activeIdRef.current) {
-      setActiveId(bestId)
-      if (bestId) window.localStorage.setItem('oxi:last-terminal-session', bestId)
-    }
+    const debouncedResize = debounce(() => {
+      handle.fit.fit()
+      if (activeIdRef.current === activeId) {
+        fetch(`/api/terminal/sessions/${activeId}/resize`, {
+          method: 'POST', credentials: 'include',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ cols: handle.term.cols, rows: handle.term.rows }),
+        })
+      }
+    }, 200)
+    const ro = new ResizeObserver(() => debouncedResize())
+    ro.observe(el)
+    return () => { ro.disconnect() }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeId])
 
-    const ids = new Set(data.map((s) => s.id))
-    for (const id of handlesRef.current.keys()) {
-      if (!ids.has(id)) destroyHandle(id)
-    }
-  }
+  useEffect(() => {
+    const remembered = searchParams.get('session') || localStorage.getItem('oxi:last-terminal-session')
+    refreshSessions().then((data?: Session[]) => {
+      if (!data) return
+      const found = remembered ? data.find((s) => s.id === remembered) ?? null : null
+      const bestId = (found?.state !== 'exited' ? found?.id : null)
+        ?? data.find((s) => s.state === 'active' || s.state === 'idle')?.id
+        ?? data[0]?.id ?? null
+      if (bestId) { setActive(bestId); localStorage.setItem('oxi:last-terminal-session', bestId) }
+    })
+    return () => { for (const id of handlesRef.current.keys()) destroyHandle(handlesRef, id) }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
 
   async function createSession() {
     setErr(null)
-    const activeHandle = activeId ? handlesRef.current.get(activeId) : null
-    const cols = activeHandle?.term.cols ?? 80
-    const rows = activeHandle?.term.rows ?? 24
-    const body: CreateTerminalSessionRequest = { cols, rows }
+    const h = activeId ? handlesRef.current.get(activeId) : null
+    const body: CreateSessionReq = { cols: h?.term.cols ?? 80, rows: h?.term.rows ?? 24 }
     const res = await fetch('/api/terminal/sessions', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      credentials: 'include',
-      body: JSON.stringify(body),
+      method: 'POST', credentials: 'include',
+      headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+    })
+    if (!res.ok) { setErr(await res.text()); return }
+    const data = (await res.json()) as CreateSessionRes
+    await refreshSessions()
+    setActive(data.id)
+    localStorage.setItem('oxi:last-terminal-session', data.id)
+  }
+
+  async function closeSession(id: string) {
+    const res = await fetch(`/api/terminal/sessions/${id}/close`, { method: 'POST', credentials: 'include' })
+    if (!res.ok) { setErr('Failed to close session'); return }
+    destroyHandle(handlesRef, id)
+    await refreshSessions()
+  }
+
+  async function handleRename(id: string, name: string) {
+    rename(id, name) // optimistic
+    const res = await fetch(`/api/terminal/sessions/${id}`, {
+      method: 'PATCH', credentials: 'include',
+      headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name }),
     })
     if (!res.ok) {
-      setErr(await res.text())
-      return
+      // Revert on failure by refreshing
+      await refreshSessions()
     }
-    const data = (await res.json()) as CreateTerminalSessionResponse
-    await refreshSessions()
-    setSelectedSession(data.id)
   }
 
   function sendInput(data: string) {
@@ -183,183 +181,62 @@ export default function TerminalPage() {
     }
   }
 
-  async function closeActiveSession() {
-    if (!activeId) return
-    const res = await fetch(`/api/terminal/sessions/${activeId}/close`, {
-      method: 'POST',
-      credentials: 'include',
-    })
-    if (!res.ok) {
-      setErr('Failed to close session')
-      return
-    }
-    await refreshSessions()
+  function handleSettingsClose() {
+    setShowSettings(false)
+    setThemeKey(loadTheme()) // pick up saved theme
   }
 
-  useEffect(() => {
-    refreshSessions()
-    return () => {
-      for (const id of handlesRef.current.keys()) destroyHandle(id)
-    }
-  }, [])
-
-  useEffect(() => {
-    const el = containerRef.current
-    if (!el || !activeId) return
-
-    const handle = getOrCreateHandle(activeId)
-    el.replaceChildren()
-    handle.term.open(el)
-    handle.fit.fit()
-    handle.term.focus()
-
-    setIsConnected(handle.connected)
-
-    const debouncedResize = debounce(() => {
-      handle.fit.fit()
-      if (activeIdRef.current === activeId) {
-        fetch(`/api/terminal/sessions/${activeId}/resize`, {
-          method: 'POST',
-          credentials: 'include',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ cols: handle.term.cols, rows: handle.term.rows }),
-        })
-      }
-    }, 200)
-
-    const ro = new ResizeObserver(() => debouncedResize())
-    ro.observe(el)
-
-    return () => {
-      ro.disconnect()
-    }
-  }, [activeId])
-
-  useEffect(() => {
-    if (!activeId) return
-    const handle = handlesRef.current.get(activeId)
-    if (!handle) return
-
-    const sessionId = activeId
-
-    if (!handle.ws || handle.ws.readyState > WebSocket.OPEN) {
-      if (handle.ws) {
-        handle.ws.close()
-        handle.ws = null
-      }
-
-      const url = wsUrl(`/api/terminal/sessions/${sessionId}/ws`)
-      const ws = new WebSocket(url)
-      handle.ws = ws
-
-      ws.onopen = () => {
-        handle.connected = true
-        if (activeIdRef.current === sessionId) setIsConnected(true)
-      }
-      ws.onclose = () => {
-        handle.connected = false
-        if (activeIdRef.current === sessionId) {
-          setIsConnected(false)
-          handle.term.writeln('\r\n\x1b[33m[disconnected]\x1b[0m')
-        }
-      }
-      ws.onmessage = (ev) => {
-        try {
-          const msg = JSON.parse(ev.data) as WsOut
-          if (msg.t === 'output') handle.term.write(msg.data)
-          else if (msg.t === 'exit') {
-            handle.term.writeln(`\r\n\x1b[90m[process exited: ${msg.code ?? '?'}]\x1b[0m`)
-            refreshSessions()
-          }
-        } catch {}
-      }
-    } else {
-      setIsConnected(handle.connected)
-    }
-
-    const onData = handle.term.onData((data) => {
-      if (handle.ws?.readyState === WebSocket.OPEN) {
-        handle.ws.send(JSON.stringify({ t: 'input', data }))
-      }
-    })
-
-    return () => {
-      onData.dispose()
-    }
-  }, [activeId, reconnectNonce])
+  // Keep setState/rename in scope for the WS hook (accessed via store directly)
+  void setState; void rename; void setSessions
 
   return (
-    <div className="flex flex-col h-full p-3 md:p-4 gap-3">
-      <div className="flex flex-wrap items-center gap-2 shrink-0 sticky top-0 z-10 bg-surface/95 backdrop-blur py-1">
-        <h2 className="text-base font-semibold m-0 mr-auto">Terminal</h2>
-        <span className={`text-[11px] px-2 py-1 rounded-full border ${isConnected ? 'text-success border-success/30 bg-success/10' : 'text-warning border-warning/30 bg-warning/10'}`}>
+    <div className="flex flex-col h-full min-h-0">
+      {/* Tab bar */}
+      <div className="relative">
+        <TerminalTabBar
+          sessions={sessions}
+          activeId={activeId}
+          onSelect={(id) => { setActive(id); localStorage.setItem('oxi:last-terminal-session', id) }}
+          onClose={closeSession}
+          onNew={createSession}
+          onRename={handleRename}
+          onOpenSettings={() => setShowSettings((v) => !v)}
+        />
+        {showSettings && <ThemeSettings onClose={handleSettingsClose} />}
+      </div>
+
+      {/* Status bar */}
+      <div className="flex items-center gap-2 px-3 py-1 shrink-0 border-b border-border bg-surface/95 backdrop-blur">
+        <span className={`text-[11px] px-2 py-0.5 rounded-full border ${isConnected ? 'text-success border-success/30 bg-success/10' : 'text-warning border-warning/30 bg-warning/10'}`}>
           {activeId ? (isConnected ? 'Connected' : 'Disconnected') : 'No session'}
         </span>
-        <button onClick={createSession} className="btn-primary text-xs min-h-10">+ New</button>
-        <button onClick={refreshSessions} className="btn-secondary text-xs min-h-10">Refresh</button>
         {!isConnected && activeId && (
-          <button onClick={reconnectSession} className="btn-secondary text-xs min-h-10 text-warning">Reconnect</button>
+          <button onClick={() => setReconnectNonce((n) => n + 1)} className="btn-secondary text-xs py-0.5 px-2 text-warning">
+            Reconnect
+          </button>
         )}
-        {activeId && (
-          <button onClick={closeActiveSession} className="btn-danger text-xs min-h-10">Close</button>
+        {active && (
+          <span className="text-xs text-text-muted ml-auto">
+            {active.id.slice(0, 8)} · {active.cols}×{active.rows}
+          </span>
         )}
-        {err && <span className="text-danger text-xs basis-full">{err}</span>}
+        {err && <span className="text-danger text-xs ml-auto truncate max-w-50">{err}</span>}
       </div>
 
-      <div className="flex flex-col md:flex-row gap-3 flex-1 min-h-0">
-        <aside className="w-full md:w-56 shrink-0 overflow-hidden">
-          <div className="text-xs text-text-muted mb-2">Sessions</div>
-          <div className="flex md:grid overflow-x-auto gap-1.5 pb-1">
-            {sessions.map((s) => (
-              <button
-                key={s.id}
-                onClick={() => setSelectedSession(s.id)}
-                className={`text-left px-2.5 py-2 rounded-md border text-xs transition-colors min-w-[120px] md:min-w-0 ${
-                  s.id === activeId
-                    ? 'bg-surface-hover border-accent/40 text-text-primary'
-                    : 'bg-surface-alt border-border text-text-secondary hover:bg-surface-hover'
-                }`}
-              >
-                <div className="font-medium truncate">{s.name ?? s.id.slice(0, 8)}</div>
-                <div className="text-text-muted mt-0.5 truncate">{s.status}</div>
-              </button>
-            ))}
-            {sessions.length === 0 && <div className="text-xs text-text-muted">No sessions</div>}
-          </div>
-        </aside>
+      {/* Terminal canvas */}
+      <div
+        ref={containerRef}
+        onClick={() => handlesRef.current.get(activeId ?? '')?.term.focus()}
+        className="flex-1 min-h-0 overflow-hidden"
+      />
 
-        <div className="flex-1 flex flex-col min-w-0 gap-2">
-          <div
-            ref={containerRef}
-            onClick={() => handlesRef.current.get(activeId ?? '')?.term.focus()}
-            className="flex-1 border border-border rounded-lg overflow-hidden min-h-[50dvh] md:min-h-[300px]"
-          />
-
-          <div className="flex flex-wrap gap-1.5">
-            {CONTROL_KEYS.map((key) => (
-              <button
-                key={key.label}
-                onClick={() => sendInput(key.value)}
-                className="btn-secondary text-xs py-1 px-2"
-              >
-                {key.label}
-              </button>
-            ))}
-            <button onClick={() => navigator.clipboard.readText().then(sendInput).catch(() => setErr('Paste unavailable'))} className="btn-secondary text-xs py-1 px-2">
-              Paste
-            </button>
-            <button onClick={() => sendInput('clear\n')} className="btn-secondary text-xs py-1 px-2">
-              Clear
-            </button>
-          </div>
-
-          {active && (
-            <div className="text-xs text-text-muted">
-              {active.id.slice(0, 8)} · {active.cols}x{active.rows} · {active.status}
-            </div>
-          )}
-        </div>
+      {/* Virtual keybar */}
+      <div className="px-2 py-1.5 border-t border-border bg-surface-alt shrink-0">
+        <TerminalKeybar onSend={sendInput} />
       </div>
+
+      {/* Mobile send composer */}
+      <TerminalSendComposer onSend={sendInput} />
     </div>
   )
 }
