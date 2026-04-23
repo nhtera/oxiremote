@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
-import { useSearchParams } from 'react-router-dom'
+import { useParams, useSearchParams } from 'react-router-dom'
 import { Terminal } from 'xterm'
 import { FitAddon } from 'xterm-addon-fit'
 import 'xterm/css/xterm.css'
@@ -45,6 +45,7 @@ function ThemeSettings({ onClose }: { onClose: () => void }) {
 
 export default function TerminalPage() {
   const [searchParams, setSearchParams] = useSearchParams()
+  const { sessionId: sessionIdParam } = useParams<{ sessionId?: string }>()
   const { sessions, activeId, setActive, setSessions, rename, setState } = useTerminalStore()
   const [err, setErr] = useState<string | null>(null)
   const [isConnected, setIsConnected] = useState(false)
@@ -138,7 +139,8 @@ export default function TerminalPage() {
   }, [activeId])
 
   useEffect(() => {
-    const remembered = searchParams.get('session') || localStorage.getItem('oxi:last-terminal-session')
+    // Precedence: path param (:sessionId, from deep links) > ?session= query > last-used localStorage.
+    const remembered = sessionIdParam || searchParams.get('session') || localStorage.getItem('oxi:last-terminal-session')
     refreshSessions().then((data?: Session[]) => {
       if (!data) return
       const found = remembered ? data.find((s) => s.id === remembered) ?? null : null
@@ -149,7 +151,7 @@ export default function TerminalPage() {
     })
     return () => { for (const id of handlesRef.current.keys()) destroyHandle(handlesRef, id) }
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [])
+  }, [sessionIdParam])
 
   async function createSession() {
     setErr(null)

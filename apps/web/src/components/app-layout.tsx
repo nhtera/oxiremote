@@ -1,5 +1,7 @@
 import { NavLink, Outlet, useNavigate } from 'react-router-dom'
 import { useHostStore } from '../state/host-store'
+import PushPermissionBanner from './push-permission-banner'
+import InstallPwaBanner from './install-pwa-banner'
 
 export default function AppLayout() {
   const navigate = useNavigate()
@@ -65,6 +67,8 @@ export default function AppLayout() {
 
       {/* Main content */}
       <main className="flex-1 min-h-0 overflow-auto pb-20 md:pb-0">
+        <InstallPwaBanner />
+        <PushPermissionBanner />
         <Outlet />
       </main>
 
