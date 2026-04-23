@@ -6,6 +6,7 @@ import LoginPage from './pages/login-page'
 import TerminalPage from './pages/terminal-page'
 import GitPage from './pages/git-page'
 import FilesPage from './pages/files-page'
+import WorkspacePickerPage from './pages/workspace-picker-page'
 import PreviewPage from './pages/preview-page'
 import { useHostStore } from './state/host-store'
 import { registerServiceWorker } from './lib/push-client'
@@ -102,6 +103,7 @@ function App() {
         <Route path="/h/:hostId/terminal/:sessionId" element={<HostRoute><TerminalPage /></HostRoute>} />
         <Route path="/h/:hostId/git" element={<HostRoute><GitPage /></HostRoute>} />
         <Route path="/h/:hostId/git/diff/:filePath" element={<HostRoute><GitPage /></HostRoute>} />
+        <Route path="/h/:hostId/workspaces" element={<HostRoute><WorkspacePickerPage /></HostRoute>} />
         <Route path="/h/:hostId/files" element={<HostRoute><FilesPage /></HostRoute>} />
         <Route path="/h/:hostId/preview" element={<HostRoute><PreviewPage /></HostRoute>} />
 
