@@ -178,6 +178,14 @@ pub async fn api_device_revoke(
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
 
+    // Drop the revoked device's push subs — no point keeping them alive.
+    if let Ok(conn) = Connection::open(&state.db_path) {
+        let _ = conn.execute(
+            "DELETE FROM push_subscriptions WHERE device_id = ?1",
+            rusqlite::params![id],
+        );
+    }
+
     let current_device: anyhow::Result<Option<String>> = (|| {
         let conn = Connection::open(&state.db_path)?;
         conn.query_row(
@@ -385,6 +393,9 @@ mod tests {
         let _ = std::fs::remove_file(&db_path);
         init_db(&db_path).unwrap();
 
+        let data_dir = db_path.parent().unwrap().join(format!("oxi-http-{name}"));
+        std::fs::create_dir_all(&data_dir).unwrap();
+
         Arc::new(AppState {
             db_path,
             signing_key: b"01234567890123456789012345678901".to_vec(),
@@ -398,6 +409,9 @@ mod tests {
                 label: "test".into(),
                 platform: "test".into(),
             },
+            vapid_keys: Arc::new(crate::push::load_or_create_vapid(&data_dir).unwrap()),
+            notify_token: "test-token".to_string(),
+            http_client: reqwest::Client::new(),
         })
     }
 

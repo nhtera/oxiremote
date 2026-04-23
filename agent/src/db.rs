@@ -48,6 +48,15 @@ pub fn init_db(db_path: &Path) -> anyhow::Result<()> {
             label TEXT NOT NULL,
             platform TEXT NOT NULL,
             created_at INTEGER NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS push_subscriptions (
+            host_id TEXT NOT NULL,
+            device_id TEXT NOT NULL,
+            endpoint TEXT NOT NULL,
+            p256dh TEXT NOT NULL,
+            auth TEXT NOT NULL,
+            created_at INTEGER NOT NULL,
+            PRIMARY KEY (host_id, device_id)
         );",
     )
     .context("create tables")?;

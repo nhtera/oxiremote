@@ -5,7 +5,10 @@ mod git;
 mod host;
 mod host_api;
 mod http_pages;
+mod notify_cli;
 mod preview;
+mod push;
+mod push_api;
 #[cfg(not(debug_assertions))]
 mod static_files;
 mod terminal_api;
@@ -30,10 +33,11 @@ use tower_http::trace::TraceLayer;
 use tracing::{info, warn};
 
 use crate::host::HostInfo;
+use crate::push::VapidKeys;
 use crate::terminal_pty::TerminalSession;
 use crate::preview::PreviewTarget;
 
-const AGENT_PORT: u16 = 8787;
+pub const AGENT_PORT: u16 = 8787;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -45,6 +49,9 @@ pub struct AppState {
     pub pairing_attempts: DashMap<String, i64>,
     pub workspace_root: PathBuf,
     pub host_info: HostInfo,
+    pub vapid_keys: Arc<VapidKeys>,
+    pub notify_token: String,
+    pub http_client: reqwest::Client,
 }
 
 fn default_data_dir() -> anyhow::Result<PathBuf> {
@@ -52,8 +59,26 @@ fn default_data_dir() -> anyhow::Result<PathBuf> {
     Ok(PathBuf::from(home).join(".oxiremote"))
 }
 
+fn main() -> anyhow::Result<()> {
+    // Subcommand dispatch BEFORE the tokio runtime so `notify` runs on a tiny
+    // single-threaded runtime and the long-lived server uses the full one.
+    let argv: Vec<String> = std::env::args().collect();
+    if let Some(sub) = argv.get(1) {
+        if sub == "notify" {
+            let rest = argv.into_iter().skip(2).collect::<Vec<_>>();
+            return notify_cli::run(rest);
+        }
+        if sub == "--help" || sub == "-h" {
+            println!("Usage:\n  oxiremote                 Run the agent server\n  oxiremote notify --title <text> [--body <text>] [--deep-link </h/...>]  Send a push");
+            return Ok(());
+        }
+    }
+
+    run_server()
+}
+
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
+async fn run_server() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
@@ -94,6 +119,13 @@ async fn main() -> anyhow::Result<()> {
         .map(PathBuf::from)
         .unwrap_or_else(|_| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
 
+    let vapid_keys = Arc::new(push::load_or_create_vapid(&data_dir).context("init vapid")?);
+    let notify_token = push::load_or_create_notify_token(&data_dir).context("init notify token")?;
+    let http_client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .build()
+        .context("http client")?;
+
     let state = Arc::new(AppState {
         db_path,
         signing_key,
@@ -103,6 +135,9 @@ async fn main() -> anyhow::Result<()> {
         pairing_attempts: DashMap::new(),
         workspace_root,
         host_info,
+        vapid_keys,
+        notify_token,
+        http_client,
     });
 
     let app = Router::new()
@@ -114,6 +149,8 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/devices/{id}/revoke", post(http_pages::api_device_revoke))
         // host
         .merge(host_api::router())
+        // push + notify
+        .merge(push_api::router())
         // terminal
         .route(
             "/api/terminal/sessions",

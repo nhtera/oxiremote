@@ -38,3 +38,9 @@ tokio-tungstenite = { version = "0.26", features = ["connect"] }
 futures-util = "0.3"
 rust-embed = { version = "8", features = ["compression"] }
 mime_guess = "2"
+
+# Web Push (RFC 8291) — VAPID JWT (ES256) + aes128gcm payload encryption
+p256 = { version = "0.13", features = ["ecdh", "ecdsa", "arithmetic"] }
+aes-gcm = "0.10"
+hkdf = "0.12"
+subtle = "2"

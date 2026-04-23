@@ -294,6 +294,9 @@ mod tests {
         let _ = std::fs::remove_file(&db_path);
         init_db(&db_path).unwrap();
 
+        let data_dir = db_path.parent().unwrap().join(format!("oxi-data-{name}"));
+        std::fs::create_dir_all(&data_dir).unwrap();
+
         AppState {
             db_path,
             signing_key: b"01234567890123456789012345678901".to_vec(),
@@ -307,6 +310,11 @@ mod tests {
                 label: "test-host".to_string(),
                 platform: "test".to_string(),
             },
+            vapid_keys: std::sync::Arc::new(
+                crate::push::load_or_create_vapid(&data_dir).unwrap(),
+            ),
+            notify_token: "test-token".to_string(),
+            http_client: reqwest::Client::new(),
         }
     }
 
