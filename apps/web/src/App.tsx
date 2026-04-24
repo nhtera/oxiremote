@@ -4,6 +4,7 @@ import AppLayout from './components/app-layout'
 import AgentLayout from './components/agent-layout'
 import HomePage from './pages/home-page'
 import LoginPage from './pages/login-page'
+import ApprovalWaitingPage from './pages/approval-waiting-page'
 import TerminalPage from './pages/terminal-page'
 import GitPage from './pages/git-page'
 import FilesPage from './pages/files-page'
@@ -108,6 +109,7 @@ function App() {
   return (
     <Routes>
       <Route path="/login" element={<LoginPage />} />
+      <Route path="/approval-waiting" element={<ApprovalWaitingPage />} />
 
       {/* Host-local dashboard — localhost-only (enforced by agent route_scope) */}
       <Route element={<AgentLayout />}>

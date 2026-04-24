@@ -55,6 +55,21 @@ pub enum AgentEvent {
     DeviceDisconnected {
         device_id: String,
     },
+    OtkIssued {
+        token_prefix: String,
+    },
+    OtkUsed {
+        token_prefix: String,
+    },
+    OtkExpired {
+        token_prefix: String,
+    },
+    DeviceApproved {
+        device_id: String,
+    },
+    DeviceRejected {
+        device_id: String,
+    },
 }
 
 #[derive(Debug)]

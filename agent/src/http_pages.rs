@@ -17,10 +17,12 @@ use uuid::Uuid;
 use crate::auth::{
     bind_session_to_device, clear_stale_pairing_attempts, client_ip_key, insert_or_update_device,
     is_valid_pairing_attempt, issue_api_key, list_trusted_devices, random_device_id, rate_limit_key,
-    require_active_auth, revoke_device, sanitize_device_label, should_allow_pairing_attempt,
-    sign_session, touch_session_and_device, new_pairing_code, PAIRING_TTL_SECS, SESSION_TTL_SECS,
+    require_active_auth, require_auth, revoke_device, sanitize_device_label,
+    should_allow_pairing_attempt, sign_session, touch_session_and_device, new_pairing_code,
+    PAIRING_TTL_SECS, SESSION_TTL_SECS,
 };
 use crate::db::now_ts;
+use crate::{approval, one_time_keys};
 use crate::AppState;
 
 #[derive(Serialize)]
@@ -254,6 +256,158 @@ pub async fn api_me(State(state): State<Arc<AppState>>, jar: CookieJar) -> impl 
     }
 
     (StatusCode::OK, Json(MeResponse { session_id })).into_response()
+}
+
+// ─── One-Time Key login (tunnel-accessible) ────────────────────────────────
+
+#[derive(Deserialize)]
+pub struct OtkLoginRequest {
+    token: String,
+}
+
+/// POST /api/login/one-time — consumes an OTK, creates a session + trusted_device.
+/// Returns 200 `{ status: 'approved' }` when auto_approve is enabled, or
+/// 202 `{ session_id, status: 'pending' }` and emits DevicePending SSE event.
+pub async fn api_login_one_time(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    jar: CookieJar,
+    Json(req): Json<OtkLoginRequest>,
+) -> impl IntoResponse {
+    let token = req.token.trim().to_lowercase();
+    if token.len() != 16 {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "invalid token"}))).into_response();
+    }
+
+    // Consume OTK atomically — returns error if not found, used, or expired.
+    match one_time_keys::consume_otk(&state.db_path, &token) {
+        Err(err) => {
+            warn!(error=%err, "OTK consume failed");
+            return (
+                StatusCode::GONE,
+                Json(serde_json::json!({"error": "token invalid, expired, or already used"})),
+            )
+                .into_response();
+        }
+        Ok(rec) => {
+            let prefix: String = rec.token.chars().take(4).collect();
+            state.event_bus.send(crate::events::AgentEvent::OtkUsed { token_prefix: prefix });
+        }
+    }
+
+    let user_agent = headers.get("user-agent").and_then(|v| v.to_str().ok());
+    let ip = client_ip_key(&headers);
+    let ua_str = user_agent.unwrap_or("").to_string();
+    let label = sanitize_device_label(None, user_agent);
+
+    let device_id = random_device_id();
+    let auto_approve = approval::get_auto_approve(&state.db_path);
+    let approval_status = if auto_approve { "approved" } else { "pending" };
+
+    if let Err(err) = approval::insert_device_with_approval(
+        &state.db_path,
+        &device_id,
+        &label,
+        user_agent,
+        &ip,
+        approval_status,
+    ) {
+        warn!(error=%err, "OTK device insert failed");
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
+
+    // Create session and bind to device.
+    let session_id = uuid::Uuid::new_v4().to_string();
+    let res: anyhow::Result<()> = (|| {
+        let conn = Connection::open(&state.db_path)?;
+        let now = now_ts();
+        conn.execute(
+            "INSERT INTO sessions(session_id, created_at, last_seen_at, device_id) VALUES (?1, ?2, ?2, ?3)",
+            params![session_id, now, device_id],
+        )?;
+        Ok(())
+    })();
+    if let Err(err) = res {
+        warn!(error=%err, "OTK session insert failed");
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
+
+    if let Err(err) = bind_session_to_device(&state.db_path, &session_id, &device_id) {
+        warn!(error=%err, "OTK bind session failed");
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
+
+    let cookie_value = sign_session(&state.signing_key, &session_id);
+    let cookie = Cookie::build(("oxiremote_session", cookie_value))
+        .http_only(true)
+        .secure(state.secure_cookies)
+        .same_site(SameSite::Lax)
+        .path("/")
+        .max_age(TimeDuration::seconds(SESSION_TTL_SECS))
+        .build();
+
+    if auto_approve {
+        return (
+            StatusCode::OK,
+            jar.add(cookie),
+            Json(serde_json::json!({ "status": "approved" })),
+        )
+            .into_response();
+    }
+
+    // Emit DevicePending so TUI takeover and dashboard modal fire.
+    let first_seen = now_ts();
+    state.event_bus.send(crate::events::AgentEvent::DevicePending {
+        device_id: device_id.clone(),
+        ip: ip.clone(),
+        ua_parsed: ua_str.clone(),
+        first_seen,
+    });
+
+    (
+        StatusCode::ACCEPTED,
+        jar.add(cookie),
+        Json(serde_json::json!({
+            "session_id": session_id,
+            "device_id": device_id,
+            "status": "pending",
+        })),
+    )
+        .into_response()
+}
+
+// ─── Approval status poll (tunnel-accessible) ──────────────────────────────
+
+/// GET /api/auth/approval-status — returns the approval_status for the session's device.
+/// Uses require_auth (session validity only) so pending clients can still poll.
+pub async fn api_auth_approval_status(
+    State(state): State<Arc<AppState>>,
+    jar: CookieJar,
+) -> impl IntoResponse {
+    let Some(session_id) = require_auth(&state.signing_key, &jar) else {
+        return StatusCode::UNAUTHORIZED.into_response();
+    };
+
+    let result: anyhow::Result<String> = (|| {
+        let conn = Connection::open(&state.db_path)?;
+        let status: String = conn.query_row(
+            "SELECT COALESCE(d.approval_status, 'approved')
+             FROM sessions s
+             LEFT JOIN trusted_devices d ON d.device_id = s.device_id
+             WHERE s.session_id = ?1",
+            params![session_id],
+            |row| row.get(0),
+        )?;
+        Ok(status)
+    })();
+
+    match result {
+        Ok(status) => (StatusCode::OK, Json(serde_json::json!({ "status": status }))).into_response(),
+        Err(err) => {
+            warn!(error=%err, "approval-status lookup failed");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
 }
 
 #[cfg(debug_assertions)]

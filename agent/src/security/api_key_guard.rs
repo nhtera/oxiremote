@@ -29,6 +29,8 @@ use super::route_scope::is_tunnel_request;
 const EXEMPT_PREFIXES: &[&str] = &[
     "/api/health",
     "/api/pairing/exchange",
+    "/api/login/one-time",       // OTK login issues the session; no key yet
+    "/api/auth/approval-status", // pending-device polling; uses cookie auth in handler
     "/api/push/vapid-public",
     "/preview/",
     "/assets/", // hashed static assets; /api/ namespace not allowed here
@@ -98,6 +100,8 @@ mod tests {
     fn exempt_paths_pass() {
         assert!(is_exempt("/api/health"));
         assert!(is_exempt("/api/pairing/exchange"));
+        assert!(is_exempt("/api/login/one-time"));
+        assert!(is_exempt("/api/auth/approval-status"));
         assert!(is_exempt("/api/push/vapid-public"));
         assert!(is_exempt("/preview/abc"));
         assert!(is_exempt("/assets/index-abc.js"));

@@ -89,5 +89,51 @@ pub fn init_db(db_path: &Path) -> anyhow::Result<()> {
     let _ = conn.execute("ALTER TABLE trusted_devices ADD COLUMN api_key_hash TEXT", []);
     let _ = conn.execute("ALTER TABLE trusted_devices ADD COLUMN api_key_last4 TEXT", []);
 
+    // Migration 003: approval state on trusted_devices.
+    // Default 'approved' so existing paired devices are unaffected.
+    let _ = conn.execute(
+        "ALTER TABLE trusted_devices ADD COLUMN approval_status TEXT NOT NULL DEFAULT 'approved'",
+        [],
+    );
+    let _ = conn.execute("ALTER TABLE trusted_devices ADD COLUMN first_seen_ip TEXT", []);
+    let _ = conn.execute("ALTER TABLE trusted_devices ADD COLUMN first_seen_ua TEXT", []);
+    let _ = conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_devices_approval ON trusted_devices(approval_status)",
+        [],
+    );
+
+    // Migration 004: one-time keys table.
+    let _ = conn.execute(
+        "CREATE TABLE IF NOT EXISTS one_time_keys (
+            token TEXT PRIMARY KEY,
+            created_at INTEGER NOT NULL,
+            expires_at INTEGER NOT NULL,
+            used_at INTEGER,
+            issued_by_session TEXT
+        )",
+        [],
+    );
+
+    // Migration 005: settings table + seed rows.
+    let _ = conn.execute(
+        "CREATE TABLE IF NOT EXISTS settings (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        )",
+        [],
+    );
+    let _ = conn.execute(
+        "INSERT OR IGNORE INTO settings(key, value) VALUES ('auto_approve', 'false')",
+        [],
+    );
+    let _ = conn.execute(
+        "INSERT OR IGNORE INTO settings(key, value) VALUES ('desktop_quality', 'med')",
+        [],
+    );
+    let _ = conn.execute(
+        "INSERT OR IGNORE INTO settings(key, value) VALUES ('tunnel_mode', 'quick')",
+        [],
+    );
+
     Ok(())
 }

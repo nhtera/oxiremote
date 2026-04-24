@@ -1,10 +1,11 @@
 import { useEffect, useState } from 'react'
-import { useNavigate } from 'react-router-dom'
+import { useNavigate, useSearchParams } from 'react-router-dom'
 import { useHostStore } from '../state/host-store'
 import { storeApiKey } from '../lib/api-client'
 
 export default function LoginPage() {
   const [code, setCode] = useState('')
+  const [otkToken, setOtkToken] = useState('')
   const [deviceLabel, setDeviceLabel] = useState(
     typeof window !== 'undefined' ? window.localStorage.getItem('oxi:device-label') ?? '' : '',
   )
@@ -12,6 +13,11 @@ export default function LoginPage() {
   const [loading, setLoading] = useState(false)
   const [checkingAuth, setCheckingAuth] = useState(true)
   const navigate = useNavigate()
+  const [searchParams] = useSearchParams()
+
+  // Show rejection banner when redirected back with ?error=rejected
+  const rejectedError =
+    searchParams.get('error') === 'rejected' ? 'Device rejected by host.' : null
 
   // If the session cookie is already valid, skip the pairing form entirely.
   // Avoids the user getting stuck here after opening the app from a bookmark.
@@ -34,6 +40,12 @@ export default function LoginPage() {
       cancelled = true
     }
   }, [navigate])
+
+  // Pre-fill OTK input if URL contains ?k=<token>
+  useEffect(() => {
+    const k = searchParams.get('k')
+    if (k) setOtkToken(k)
+  }, [searchParams])
 
   const handlePair = async () => {
     const trimmed = code.trim()
@@ -73,6 +85,41 @@ export default function LoginPage() {
     }
   }
 
+  // One-time key login flow
+  const handleOtkLogin = async () => {
+    const trimmed = otkToken.trim()
+    if (!trimmed) return
+    setError('')
+    setLoading(true)
+    try {
+      const res = await fetch('/api/login/one-time', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        credentials: 'include',
+        body: JSON.stringify({ token: trimmed }),
+      })
+      if (res.status === 202) {
+        // Pending approval — navigate to waiting screen
+        const body = await res.json()
+        navigate('/approval-waiting', { state: { session_id: body.session_id } })
+        return
+      }
+      if (res.status === 200) {
+        // Auto-approved — go straight home
+        await useHostStore.getState().fetchHost()
+        navigate('/')
+        return
+      }
+      const text = await res.text()
+      throw new Error(text || 'Invalid or expired one-time key')
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : 'OTK login failed'
+      setError(msg)
+    } finally {
+      setLoading(false)
+    }
+  }
+
   if (checkingAuth) {
     return (
       <div className="min-h-dvh flex items-center justify-center text-text-muted text-sm">
@@ -85,7 +132,16 @@ export default function LoginPage() {
     <div className="min-h-dvh flex items-center justify-center p-6">
       <div className="w-full max-w-sm">
         <h1 className="text-xl font-semibold mb-1">OxiRemote</h1>
-        <p className="text-text-secondary text-sm mb-6">
+
+        {/* Rejection banner — shown when redirected back with ?error=rejected */}
+        {rejectedError && (
+          <div className="mb-4 px-3 py-2 rounded-md bg-danger/10 border border-danger/30 text-danger text-sm">
+            {rejectedError}
+          </div>
+        )}
+
+        {/* Pairing code section */}
+        <p className="text-text-secondary text-sm mb-4">
           Enter the pairing code shown in your terminal.
         </p>
 
@@ -113,6 +169,32 @@ export default function LoginPage() {
           className="w-full mt-3 py-3 text-sm font-medium bg-accent/15 text-accent border border-accent/30 rounded-lg hover:bg-accent/25 transition-colors disabled:opacity-40"
         >
           {loading ? 'Pairing…' : 'Pair'}
+        </button>
+
+        {/* Divider */}
+        <div className="flex items-center gap-3 my-5">
+          <div className="flex-1 h-px bg-border" />
+          <span className="text-xs text-text-muted">or use one-time key</span>
+          <div className="flex-1 h-px bg-border" />
+        </div>
+
+        {/* One-time key section */}
+        <input
+          value={otkToken}
+          onChange={(e) => setOtkToken(e.target.value)}
+          placeholder="16-character one-time key"
+          maxLength={20}
+          autoComplete="off"
+          onKeyDown={(e) => e.key === 'Enter' && handleOtkLogin()}
+          className="w-full px-3 py-3 text-sm bg-surface-alt border border-border rounded-lg text-text-primary font-mono focus:outline-none focus:border-warning/50"
+        />
+
+        <button
+          onClick={handleOtkLogin}
+          disabled={loading || !otkToken.trim()}
+          className="w-full mt-3 py-3 text-sm font-medium bg-warning/15 text-warning border border-warning/30 rounded-lg hover:bg-warning/25 transition-colors disabled:opacity-40"
+        >
+          {loading ? 'Connecting…' : 'Connect with Key'}
         </button>
 
         {error && (

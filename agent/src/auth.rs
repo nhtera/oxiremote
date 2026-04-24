@@ -86,19 +86,27 @@ pub fn require_active_auth(
     let session_id = require_auth(signing_key, jar)?;
     let conn = Connection::open(db_path).ok()?;
 
-    let row: Option<(Option<String>, Option<i64>)> = conn
+    // Include approval_status so we can gate pending devices.
+    // Rows without a device (NULL join) or with revoked/pending/rejected status
+    // are all rejected — callers treat None as 401/403.
+    let row: Option<(Option<String>, Option<i64>, Option<String>)> = conn
         .query_row(
-            "SELECT s.device_id, d.revoked_at
+            "SELECT s.device_id, d.revoked_at, d.approval_status
              FROM sessions s
              LEFT JOIN trusted_devices d ON d.device_id = s.device_id
              WHERE s.session_id = ?1",
             params![session_id],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .ok();
 
     match row {
-        Some((Some(_device_id), revoked_at)) if revoked_at.is_none() => Some(session_id),
+        Some((Some(_device_id), revoked_at, approval_status))
+            if revoked_at.is_none()
+                && approval_status.as_deref().unwrap_or("approved") == "approved" =>
+        {
+            Some(session_id)
+        }
         _ => None,
     }
 }
@@ -266,10 +274,14 @@ pub fn verify_api_key(db_path: &PathBuf, presented: &str) -> Option<String> {
     let conn = Connection::open(db_path).ok()?;
     let mut stmt = conn
         .prepare(
+            // Defensive: enforce the approval gate for Bearer auth too, matching
+            // the cookie path in `require_active_auth`. NULL is treated as approved
+            // so pre-migration rows keep working.
             "SELECT device_id, api_key_hash FROM trusted_devices
              WHERE api_key_hash IS NOT NULL
                AND revoked_at IS NULL
-               AND api_key_last4 = ?1",
+               AND api_key_last4 = ?1
+               AND (approval_status IS NULL OR approval_status = 'approved')",
         )
         .ok()?;
     let rows = stmt

@@ -1,4 +1,5 @@
 mod agent_api;
+mod approval;
 mod auth;
 mod db;
 mod events;
@@ -10,6 +11,7 @@ mod host_api;
 mod http_pages;
 mod local_sites;
 mod notify_cli;
+mod one_time_keys;
 mod preview;
 mod preview_token;
 mod push;
@@ -261,6 +263,8 @@ async fn server_main(event_bus: Arc<EventBus>) -> anyhow::Result<()> {
         .route("/api/health", get(api_health))
         .route("/api/me", get(http_pages::api_me))
         .route("/api/pairing/exchange", post(http_pages::api_pairing_exchange))
+        .route("/api/login/one-time", post(http_pages::api_login_one_time))
+        .route("/api/auth/approval-status", get(http_pages::api_auth_approval_status))
         .route("/api/auth/logout", post(http_pages::api_logout))
         .route("/api/devices", get(http_pages::api_devices_list))
         .route("/api/devices/{id}/revoke", post(http_pages::api_device_revoke))

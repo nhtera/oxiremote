@@ -6,26 +6,32 @@ use std::{convert::Infallible, sync::Arc, time::Duration};
 
 use axum::{
     Json, Router,
-    extract::State,
-    response::{
-        Sse,
-        sse::{Event, KeepAlive},
-    },
-    routing::get,
+    extract::{Path, State},
+    http::StatusCode,
+    response::{IntoResponse, Sse, sse::{Event, KeepAlive}},
+    routing::{get, post},
 };
 use futures_util::stream::Stream;
 use qrcode::{QrCode, render::svg};
+use serde::Deserialize;
 use serde_json::json;
 use tokio_stream::{StreamExt, wrappers::BroadcastStream};
+use tracing::{info, warn};
 
 use crate::AppState;
 use crate::events::AgentEvent;
+use crate::{approval, one_time_keys};
 
 pub fn router() -> Router<Arc<AppState>> {
     Router::new()
         .route("/api/agent/events", get(api_agent_events))
         .route("/api/agent/state", get(api_agent_state))
         .route("/api/agent/qr", get(api_agent_qr))
+        .route("/api/agent/keys/one-time", post(api_agent_keys_one_time))
+        .route("/api/agent/approvals/pending", get(api_agent_approvals_pending))
+        .route("/api/agent/approvals/{id}/approve", post(api_agent_approve))
+        .route("/api/agent/approvals/{id}/reject", post(api_agent_reject))
+        .route("/api/agent/settings/auto-approve", post(api_agent_settings_auto_approve))
 }
 
 async fn api_agent_state(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
@@ -72,8 +78,7 @@ struct QrQuery {
 async fn api_agent_qr(
     axum::extract::Query(q): axum::extract::Query<QrQuery>,
 ) -> axum::response::Response {
-    use axum::http::{StatusCode, header};
-    use axum::response::IntoResponse;
+    use axum::http::header;
     match QrCode::new(q.url.as_bytes()) {
         Ok(code) => {
             let svg_string = code
@@ -85,5 +90,109 @@ async fn api_agent_qr(
             ([(header::CONTENT_TYPE, "image/svg+xml")], svg_string).into_response()
         }
         Err(_) => StatusCode::BAD_REQUEST.into_response(),
+    }
+}
+
+/// POST /api/agent/keys/one-time — generate a new OTK (invalidates prior live token).
+async fn api_agent_keys_one_time(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    match one_time_keys::generate_otk(&state.db_path, None) {
+        Ok(rec) => {
+            let prefix: String = rec.token.chars().take(4).collect();
+            info!(token_prefix = %prefix, "OTK issued");
+            state.event_bus.send(AgentEvent::OtkIssued { token_prefix: prefix });
+
+            let tunnel_url = state.tunnel_url.read().ok().and_then(|g| g.clone());
+            let qr_url = match tunnel_url {
+                Some(ref host) => format!("https://{host}/login?k={}", rec.token),
+                None => format!("http://localhost:8787/login?k={}", rec.token),
+            };
+
+            (
+                StatusCode::OK,
+                Json(json!({
+                    "token": rec.token,
+                    "expires_at": rec.expires_at,
+                    "qr_url": qr_url,
+                })),
+            )
+                .into_response()
+        }
+        Err(err) => {
+            warn!(error=%err, "OTK generation failed");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+/// GET /api/agent/approvals/pending — list devices awaiting approval.
+async fn api_agent_approvals_pending(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    match approval::list_pending(&state.db_path) {
+        Ok(devices) => (StatusCode::OK, Json(devices)).into_response(),
+        Err(err) => {
+            warn!(error=%err, "list pending approvals failed");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+/// POST /api/agent/approvals/{id}/approve
+async fn api_agent_approve(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    match approval::approve_device(&state.db_path, &id) {
+        Ok(()) => {
+            info!(device_id = %id, "device approved");
+            state
+                .event_bus
+                .send(AgentEvent::DeviceApproved { device_id: id });
+            (StatusCode::OK, Json(json!({ "ok": true }))).into_response()
+        }
+        Err(err) => {
+            warn!(error=%err, device_id=%id, "approve device failed");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+/// POST /api/agent/approvals/{id}/reject
+async fn api_agent_reject(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    match approval::reject_device(&state.db_path, &id) {
+        Ok(()) => {
+            info!(device_id = %id, "device rejected");
+            state
+                .event_bus
+                .send(AgentEvent::DeviceRejected { device_id: id });
+            (StatusCode::OK, Json(json!({ "ok": true }))).into_response()
+        }
+        Err(err) => {
+            warn!(error=%err, device_id=%id, "reject device failed");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct AutoApproveBody {
+    enabled: bool,
+}
+
+/// POST /api/agent/settings/auto-approve — upsert the auto_approve setting.
+async fn api_agent_settings_auto_approve(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<AutoApproveBody>,
+) -> impl IntoResponse {
+    match approval::set_auto_approve(&state.db_path, body.enabled) {
+        Ok(()) => {
+            info!(enabled = body.enabled, "auto_approve setting updated");
+            (StatusCode::OK, Json(json!({ "ok": true, "enabled": body.enabled }))).into_response()
+        }
+        Err(err) => {
+            warn!(error=%err, "set auto_approve failed");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
     }
 }
