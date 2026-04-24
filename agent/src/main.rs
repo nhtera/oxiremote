@@ -74,6 +74,9 @@ pub struct AppState {
     pub rate_limiter: Arc<RateLimiter>,
     pub event_bus: Arc<EventBus>,
     pub tunnel_url: Arc<std::sync::RwLock<Option<String>>>,
+    /// Whether desktop capture is available and permitted on this machine.
+    /// Probed once at boot via `desktop::desktop_available()`.
+    pub desktop_available: bool,
 }
 
 fn default_data_dir() -> anyhow::Result<PathBuf> {
@@ -235,6 +238,21 @@ async fn server_main(event_bus: Arc<EventBus>) -> anyhow::Result<()> {
 
     let local_sites_cache = local_sites::new_cache();
 
+    // Probe desktop availability once at boot. On macOS this triggers the TCC
+    // Screen Recording prompt on first run — expected behaviour. The probe runs
+    // on a blocking thread so the Linux PipeWire D-Bus handshake (up to 3s,
+    // internally timeout-capped) cannot stall the axum serve loop.
+    #[cfg(feature = "desktop")]
+    let desktop_avail = {
+        let avail = tokio::task::spawn_blocking(desktop::desktop_available)
+            .await
+            .unwrap_or(false);
+        info!(available = avail, "desktop capture probe");
+        avail
+    };
+    #[cfg(not(feature = "desktop"))]
+    let desktop_avail = false;
+
     let state = Arc::new(AppState {
         db_path,
         signing_key,
@@ -253,6 +271,7 @@ async fn server_main(event_bus: Arc<EventBus>) -> anyhow::Result<()> {
         rate_limiter: Arc::new(RateLimiter::new()),
         event_bus,
         tunnel_url: Arc::new(std::sync::RwLock::new(None)),
+        desktop_available: desktop_avail,
     });
 
     // Background: periodic listening-port discovery + preview health checks.

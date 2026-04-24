@@ -1,3 +1,6 @@
+[workspace]
+members = [".", "crates/desktop"]
+
 [package]
 name = "agent"
 version = "0.1.0"
@@ -60,3 +63,10 @@ tray-icon = "0.19"
 notify-rust = "4"
 image = { version = "0.25", default-features = false, features = ["png"] }
 open = "5"
+
+# Phase 03: remote desktop capture + encode (optional, enabled by default).
+desktop = { path = "crates/desktop", optional = true }
+
+[features]
+default = ["desktop"]
+desktop = ["dep:desktop"]
