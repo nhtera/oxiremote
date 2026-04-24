@@ -35,8 +35,8 @@ pub fn run_approval(term: &mut Term, event: &AgentEvent) -> Result<()> {
 
     loop {
         term.draw(|f| draw(f, device_id, ip, ua_parsed))?;
-        if event::poll(Duration::from_millis(200))? {
-            if let Event::Key(key) = event::read()? {
+        if event::poll(Duration::from_millis(200))?
+            && let Event::Key(key) = event::read()? {
                 if key.kind != KeyEventKind::Press {
                     continue;
                 }
@@ -52,7 +52,6 @@ pub fn run_approval(term: &mut Term, event: &AgentEvent) -> Result<()> {
                     _ => {}
                 }
             }
-        }
     }
 }
 

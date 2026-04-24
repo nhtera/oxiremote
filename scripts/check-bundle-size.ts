@@ -11,10 +11,13 @@
  * on first paint, so they don't count against the budget.
  */
 import { gzipSync } from 'node:zlib'
-import { readFileSync } from 'node:fs'
+import { readdirSync, readFileSync } from 'node:fs'
 import { join } from 'node:path'
 
 const MAX_GZIP_BYTES = 250 * 1024
+// Lazy-loaded desktop page chunk must stay small — it's what phones fetch
+// when they open /h/{host}/desktop. Includes canvas decoder + WebRTC glue.
+const MAX_DESKTOP_CHUNK_GZIP_BYTES = 60 * 1024
 
 const here = new URL('.', import.meta.url).pathname
 const distDir = join(here, '..', 'apps', 'web', 'dist')
@@ -66,3 +69,26 @@ if (total > MAX_GZIP_BYTES) {
 }
 
 console.log('✓ bundle-size within budget')
+
+// Secondary gate: lazy desktop chunk (Phase 04) must stay under 60 KB gz.
+const assetsDir = join(distDir, 'assets')
+const desktopChunks = readdirSync(assetsDir).filter(
+  (f) => /^desktop(-page)?-.*\.js$/.test(f),
+)
+if (desktopChunks.length === 0) {
+  console.warn('desktop-chunk: no desktop-*.js found in assets/ (skipping gate)')
+} else {
+  const chunk = desktopChunks[0]
+  const raw = readFileSync(join(assetsDir, chunk))
+  const gz = gzipSync(raw).byteLength
+  console.log(
+    `\ndesktop-chunk: ${chunk} ${gz} B / limit ${MAX_DESKTOP_CHUNK_GZIP_BYTES} B`,
+  )
+  if (gz > MAX_DESKTOP_CHUNK_GZIP_BYTES) {
+    console.error(
+      `✖ desktop-chunk: exceeds budget by ${gz - MAX_DESKTOP_CHUNK_GZIP_BYTES} bytes.`,
+    )
+    process.exit(1)
+  }
+  console.log('✓ desktop-chunk within budget')
+}

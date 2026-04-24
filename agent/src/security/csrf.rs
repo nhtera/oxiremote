@@ -53,7 +53,7 @@ fn header_value<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
 
 fn subtle_eq(a: &str, b: &str) -> bool {
     use subtle::ConstantTimeEq;
-    a.as_bytes().len() == b.as_bytes().len() && a.as_bytes().ct_eq(b.as_bytes()).into()
+    a.len() == b.len() && a.as_bytes().ct_eq(b.as_bytes()).into()
 }
 
 pub async fn csrf_guard(

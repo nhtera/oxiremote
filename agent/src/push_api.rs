@@ -191,11 +191,10 @@ async fn notify(
     if body.title.is_empty() {
         return (StatusCode::BAD_REQUEST, "title required").into_response();
     }
-    if let Some(link) = body.deep_link.as_deref() {
-        if !link.starts_with('/') || link.starts_with("//") {
+    if let Some(link) = body.deep_link.as_deref()
+        && (!link.starts_with('/') || link.starts_with("//")) {
             return (StatusCode::BAD_REQUEST, "deep_link must be own-origin absolute path").into_response();
         }
-    }
     // RFC 8030 §5.3: urgency must be one of four fixed values.
     let urgency = match body.urgency.as_deref().unwrap_or("normal") {
         v @ ("very-low" | "low" | "normal" | "high") => v.to_string(),

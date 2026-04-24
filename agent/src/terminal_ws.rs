@@ -104,9 +104,8 @@ async fn handle_terminal_ws(
                                     to_seq: snap.to_seq,
                                     data: snap.data,
                                 };
-                                if let Ok(text) = serde_json::to_string(&frame) {
-                                    if socket.send(Message::Text(text.into())).await.is_err() { break; }
-                                }
+                                if let Ok(text) = serde_json::to_string(&frame)
+                                    && socket.send(Message::Text(text.into())).await.is_err() { break; }
                             }
                             WsIn::Input { data } => {
                                 if let Ok(mut w) = sess.writer.lock() {
@@ -127,9 +126,8 @@ async fn handle_terminal_ws(
                     Ok(frame) => {
                         // Skip live chunks until the client has attached, so replay isn't duplicated.
                         if !attached && matches!(frame, WsOut::Chunk { .. }) { continue; }
-                        if let Ok(text) = serde_json::to_string(&frame) {
-                            if socket.send(Message::Text(text.into())).await.is_err() { break; }
-                        }
+                        if let Ok(text) = serde_json::to_string(&frame)
+                            && socket.send(Message::Text(text.into())).await.is_err() { break; }
                         if matches!(frame, WsOut::Exit { .. }) {
                             break;
                         }

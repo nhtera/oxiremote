@@ -148,11 +148,10 @@ pub struct ResizeTerminalRequest {
 }
 
 pub fn build_default_command(command: Option<&[String]>) -> Vec<String> {
-    if let Some(cmd) = command {
-        if !cmd.is_empty() {
+    if let Some(cmd) = command
+        && !cmd.is_empty() {
             return cmd.to_vec();
         }
-    }
     if std::env::consts::OS == "macos" {
         vec!["/bin/zsh".into(), "-l".into()]
     } else {

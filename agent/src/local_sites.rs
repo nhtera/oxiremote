@@ -81,11 +81,10 @@ pub fn parse_lsof_output(text: &str) -> Vec<u16> {
         let endpoint = rest.split_whitespace().next().unwrap_or(rest);
         if let Some(idx) = endpoint.rfind(':') {
             let port_str = &endpoint[idx + 1..];
-            if let Ok(port) = port_str.parse::<u16>() {
-                if port > 0 {
+            if let Ok(port) = port_str.parse::<u16>()
+                && port > 0 {
                     out.push(port);
                 }
-            }
         }
     }
     out

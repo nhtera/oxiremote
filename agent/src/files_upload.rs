@@ -179,7 +179,7 @@ pub async fn api_files_upload(
 /// Keep the basename only and strip characters that would be unsafe on any filesystem.
 fn sanitize_upload_name(raw: &str) -> String {
     let base = raw
-        .rsplit(|c: char| c == '/' || c == '\\')
+        .rsplit(['/', '\\'])
         .next()
         .unwrap_or("");
     base.chars()

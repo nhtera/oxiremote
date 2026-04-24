@@ -298,11 +298,10 @@ pub fn verify_api_key(db_path: &PathBuf, presented: &str) -> Option<String> {
 
     for row in rows.flatten() {
         let (device_id, hash) = row;
-        if let Ok(parsed) = PasswordHash::new(&hash) {
-            if Argon2::default().verify_password(presented.as_bytes(), &parsed).is_ok() {
+        if let Ok(parsed) = PasswordHash::new(&hash)
+            && Argon2::default().verify_password(presented.as_bytes(), &parsed).is_ok() {
                 return Some(device_id);
             }
-        }
     }
     None
 }

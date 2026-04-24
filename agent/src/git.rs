@@ -109,7 +109,7 @@ pub async fn api_git_diff(
 
     let path_str;
     if let Some(ref p) = q.path {
-        if sanitize_paths(&[p.clone()], root).is_err() {
+        if sanitize_paths(std::slice::from_ref(p), root).is_err() {
             return (StatusCode::BAD_REQUEST, "invalid path").into_response();
         }
         args.push("--");

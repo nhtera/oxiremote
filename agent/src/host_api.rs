@@ -62,7 +62,7 @@ pub async fn api_desktop_capabilities(
             "quality_tiers": ["low", "med", "high"],
             "monitors": monitors,
         });
-        return (StatusCode::OK, Json(body)).into_response();
+        (StatusCode::OK, Json(body)).into_response()
     }
 
     #[cfg(not(feature = "desktop"))]

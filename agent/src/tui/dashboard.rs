@@ -103,8 +103,8 @@ pub fn run_dashboard(term: &mut Term, event_bus: Arc<EventBus>) -> Result<()> {
             state.apply(&event);
         }
 
-        if event::poll(Duration::from_millis(200))? {
-            if let Event::Key(key) = event::read()? {
+        if event::poll(Duration::from_millis(200))?
+            && let Event::Key(key) = event::read()? {
                 if key.kind != KeyEventKind::Press {
                     continue;
                 }
@@ -121,7 +121,6 @@ pub fn run_dashboard(term: &mut Term, event_bus: Arc<EventBus>) -> Result<()> {
                     _ => {}
                 }
             }
-        }
     }
 }
 

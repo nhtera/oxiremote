@@ -52,7 +52,7 @@ pub(crate) fn validate_rel_path(rel: &str) -> Result<(), &'static str> {
     if rel.starts_with('/') || rel.starts_with('\\') {
         return Err("absolute path not allowed");
     }
-    for seg in rel.split(|c: char| c == '/' || c == '\\') {
+    for seg in rel.split(['/', '\\']) {
         if seg == ".." {
             return Err("parent traversal not allowed");
         }

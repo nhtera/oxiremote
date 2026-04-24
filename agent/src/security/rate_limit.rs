@@ -117,11 +117,10 @@ fn caller_key(req: &Request) -> String {
     if let Some(raw) = headers.get(axum::http::header::COOKIE).and_then(|v| v.to_str().ok()) {
         for part in raw.split(';') {
             let part = part.trim();
-            if let Some(rest) = part.strip_prefix("oxiremote_session=") {
-                if let Some(sid) = rest.split('.').next() {
+            if let Some(rest) = part.strip_prefix("oxiremote_session=")
+                && let Some(sid) = rest.split('.').next() {
                     return format!("sess:{sid}");
                 }
-            }
         }
     }
     if let Some(ip) = headers

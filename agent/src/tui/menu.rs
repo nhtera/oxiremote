@@ -33,8 +33,8 @@ pub fn run_menu(term: &mut Term) -> Result<MenuChoice> {
     let mut selected: usize = 1; // default to Terminal UI
     loop {
         term.draw(|f| draw(f, selected))?;
-        if event::poll(Duration::from_millis(250))? {
-            if let Event::Key(key) = event::read()? {
+        if event::poll(Duration::from_millis(250))?
+            && let Event::Key(key) = event::read()? {
                 if key.kind != KeyEventKind::Press {
                     continue;
                 }
@@ -52,7 +52,6 @@ pub fn run_menu(term: &mut Term) -> Result<MenuChoice> {
                     _ => {}
                 }
             }
-        }
     }
 }
 
