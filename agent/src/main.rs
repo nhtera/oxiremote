@@ -19,6 +19,12 @@ mod push_api;
 mod security;
 #[cfg(not(debug_assertions))]
 mod static_files;
+#[cfg(feature = "desktop")]
+mod desktop_service;
+#[cfg(feature = "desktop")]
+mod desktop_ws;
+#[cfg(feature = "desktop")]
+mod desktop_ws_capture;
 mod terminal_api;
 mod terminal_buffer;
 mod terminal_pty;
@@ -53,6 +59,9 @@ use crate::push::VapidKeys;
 use crate::security::rate_limit::RateLimiter;
 use crate::terminal_pty::TerminalSession;
 
+#[cfg(feature = "desktop")]
+use crate::desktop_service::DesktopService;
+
 pub const AGENT_PORT: u16 = 8787;
 
 #[derive(Clone)]
@@ -77,6 +86,13 @@ pub struct AppState {
     /// Whether desktop capture is available and permitted on this machine.
     /// Probed once at boot via `desktop::desktop_available()`.
     pub desktop_available: bool,
+    /// Active desktop session registry. `None` when `desktop_available` is false
+    /// or the `desktop` feature is disabled.
+    #[cfg(feature = "desktop")]
+    pub desktop_service: Option<Arc<DesktopService>>,
+    /// Stub field so non-desktop builds compile without the feature flag.
+    #[cfg(not(feature = "desktop"))]
+    pub desktop_service: Option<()>,
 }
 
 fn default_data_dir() -> anyhow::Result<PathBuf> {
@@ -253,6 +269,17 @@ async fn server_main(event_bus: Arc<EventBus>) -> anyhow::Result<()> {
     #[cfg(not(feature = "desktop"))]
     let desktop_avail = false;
 
+    // Build desktop service if capture is available. This is a lightweight
+    // DashMap registry — no background tasks are spawned here.
+    #[cfg(feature = "desktop")]
+    let desktop_svc: Option<Arc<DesktopService>> = if desktop_avail {
+        Some(Arc::new(DesktopService::new()))
+    } else {
+        None
+    };
+    #[cfg(not(feature = "desktop"))]
+    let desktop_svc: Option<()> = None;
+
     let state = Arc::new(AppState {
         db_path,
         signing_key,
@@ -272,6 +299,7 @@ async fn server_main(event_bus: Arc<EventBus>) -> anyhow::Result<()> {
         event_bus,
         tunnel_url: Arc::new(std::sync::RwLock::new(None)),
         desktop_available: desktop_avail,
+        desktop_service: desktop_svc,
     });
 
     // Background: periodic listening-port discovery + preview health checks.
@@ -300,6 +328,13 @@ async fn server_main(event_bus: Arc<EventBus>) -> anyhow::Result<()> {
         )
         .route("/api/terminal/sessions/{id}/ws", get(terminal_ws::api_terminal_session_ws))
         .route("/api/terminal/sessions/{id}/resize", post(terminal_api::api_terminal_session_resize))
+        // desktop WebRTC + WS fallback (feature-gated; 503 when unavailable)
+        .route("/ws/desktop/{device_id}", get({
+            #[cfg(feature = "desktop")]
+            { desktop_ws::api_desktop_ws }
+            #[cfg(not(feature = "desktop"))]
+            { || async { axum::http::StatusCode::SERVICE_UNAVAILABLE } }
+        }))
         .route("/api/terminal/sessions/{id}/close", post(terminal_api::api_terminal_session_close))
         .route("/api/terminal/sessions/{id}", axum::routing::patch(terminal_api::api_terminal_session_rename))
         // git

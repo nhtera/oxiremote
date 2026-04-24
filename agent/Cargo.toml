@@ -67,6 +67,9 @@ open = "5"
 # Phase 03: remote desktop capture + encode (optional, enabled by default).
 desktop = { path = "crates/desktop", optional = true }
 
+# Phase 04: WebRTC DataChannel transport for remote desktop streaming.
+webrtc = { version = "0.11", optional = true }
+
 [features]
 default = ["desktop"]
-desktop = ["dep:desktop"]
+desktop = ["dep:desktop", "dep:webrtc"]

@@ -83,12 +83,20 @@ pub fn require_active_auth(
     signing_key: &[u8],
     jar: &axum_extra::extract::cookie::CookieJar,
 ) -> Option<String> {
+    require_active_auth_with_device(db_path, signing_key, jar).map(|(s, _)| s)
+}
+
+/// Like `require_active_auth` but also returns the session's bound `device_id`.
+/// Callers that authorise per-device resources (e.g. `/ws/desktop/{device_id}`)
+/// must compare this against the caller-supplied identifier.
+pub fn require_active_auth_with_device(
+    db_path: &PathBuf,
+    signing_key: &[u8],
+    jar: &axum_extra::extract::cookie::CookieJar,
+) -> Option<(String, String)> {
     let session_id = require_auth(signing_key, jar)?;
     let conn = Connection::open(db_path).ok()?;
 
-    // Include approval_status so we can gate pending devices.
-    // Rows without a device (NULL join) or with revoked/pending/rejected status
-    // are all rejected — callers treat None as 401/403.
     let row: Option<(Option<String>, Option<i64>, Option<String>)> = conn
         .query_row(
             "SELECT s.device_id, d.revoked_at, d.approval_status
@@ -101,11 +109,11 @@ pub fn require_active_auth(
         .ok();
 
     match row {
-        Some((Some(_device_id), revoked_at, approval_status))
+        Some((Some(device_id), revoked_at, approval_status))
             if revoked_at.is_none()
                 && approval_status.as_deref().unwrap_or("approved") == "approved" =>
         {
-            Some(session_id)
+            Some((session_id, device_id))
         }
         _ => None,
     }
@@ -415,6 +423,7 @@ mod tests {
             event_bus: crate::events::EventBus::new(),
             tunnel_url: std::sync::Arc::new(std::sync::RwLock::new(None)),
             desktop_available: false,
+            desktop_service: None,
         }
     }
 

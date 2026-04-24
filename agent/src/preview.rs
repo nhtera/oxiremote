@@ -518,6 +518,7 @@ mod tests {
             event_bus: crate::events::EventBus::new(),
             tunnel_url: Arc::new(std::sync::RwLock::new(None)),
             desktop_available: false,
+            desktop_service: None,
         })
     }
 

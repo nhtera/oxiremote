@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useState } from 'react'
 import { Link, Navigate, useLocation } from 'react-router-dom'
+import { useHostStore } from '../state/host-store'
 
 type TerminalSession = { id: string; status: string }
 type SessionSummary = { total: number; running: number; latestId?: string | null }
@@ -9,9 +10,11 @@ type Device = {
   label: string
   last_seen_at: number
 }
+type DesktopCaps = { available: boolean }
 
 export default function HomePage() {
   const location = useLocation()
+  const { currentHostId } = useHostStore()
   const [sessions, setSessions] = useState<SessionSummary>({ total: 0, running: 0, latestId: null })
   const [git, setGit] = useState<GitSummary>({ staged: 0, changed: 0 })
   const [previews, setPreviews] = useState(0)
@@ -19,6 +22,7 @@ export default function HomePage() {
   const [authed, setAuthed] = useState(true)
   const [busyDeviceId, setBusyDeviceId] = useState<string | null>(null)
   const [deviceError, setDeviceError] = useState('')
+  const [desktopCaps, setDesktopCaps] = useState<DesktopCaps | null>(null)
 
   const refreshDevices = useCallback(async () => {
     const res = await fetch('/api/devices', { credentials: 'include' })
@@ -68,6 +72,15 @@ export default function HomePage() {
     loadDashboard()
   }, [loadDashboard, location.search])
 
+  // Fetch desktop capabilities separately — non-critical, best-effort.
+  useEffect(() => {
+    if (!currentHostId) return
+    fetch(`/api/hosts/${currentHostId}/desktop/capabilities`, { credentials: 'include' })
+      .then((r) => (r.ok ? (r.json() as Promise<DesktopCaps>) : null))
+      .then((d) => d && setDesktopCaps(d))
+      .catch(() => {})
+  }, [currentHostId])
+
   async function revokeDevice(deviceId: string) {
     setBusyDeviceId(deviceId)
     setDeviceError('')
@@ -115,6 +128,7 @@ export default function HomePage() {
         <QuickAction to="/git" label="View changes" />
         <QuickAction to="/files" label="Browse files" />
         <QuickAction to="/preview" label="Add preview" />
+        <DesktopQuickAction hostId={currentHostId} caps={desktopCaps} />
       </div>
 
       <div className="border border-border rounded-lg bg-surface-alt p-3">
@@ -168,6 +182,39 @@ function QuickAction({ to, label }: { to: string; label: string }) {
       className="px-3 py-1.5 text-sm bg-surface-alt border border-border rounded-md text-text-secondary hover:text-text-primary hover:bg-surface-hover transition-colors"
     >
       {label}
+    </Link>
+  )
+}
+
+function DesktopQuickAction({
+  hostId,
+  caps,
+}: {
+  hostId: string | null
+  caps: DesktopCaps | null
+}) {
+  // Not yet loaded or no host — render nothing
+  if (!hostId) return null
+
+  const available = caps === null || caps.available // optimistic until loaded
+
+  if (!available) {
+    return (
+      <span
+        title="Screen Recording permission required — open Host Dashboard"
+        className="px-3 py-1.5 text-sm bg-surface-alt border border-border rounded-md text-text-muted opacity-50 cursor-not-allowed select-none"
+      >
+        Remote Desktop
+      </span>
+    )
+  }
+
+  return (
+    <Link
+      to={`/h/${hostId}/desktop`}
+      className="px-3 py-1.5 text-sm bg-surface-alt border border-border rounded-md text-text-secondary hover:text-text-primary hover:bg-surface-hover transition-colors"
+    >
+      Remote Desktop
     </Link>
   )
 }

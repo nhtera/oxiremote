@@ -19,6 +19,9 @@ const AgentHomePage = lazy(() => import('./pages/agent/agent-home-page'))
 const AgentDevicesPage = lazy(() => import('./pages/agent/agent-devices-page'))
 const AgentSettingsPage = lazy(() => import('./pages/agent/agent-settings-page'))
 
+// Lazy-loaded remote desktop page — heavy canvas worker kept in its own chunk.
+const DesktopPage = lazy(() => import('./pages/desktop-page'))
+
 function AgentFallback() {
   return (
     <div className="flex items-center justify-center h-full text-text-muted text-sm p-6">
@@ -151,6 +154,16 @@ function App() {
         <Route path="/h/:hostId/workspaces" element={<HostRoute><WorkspacePickerPage /></HostRoute>} />
         <Route path="/h/:hostId/files" element={<HostRoute><FilesPage /></HostRoute>} />
         <Route path="/h/:hostId/preview" element={<HostRoute><PreviewPage /></HostRoute>} />
+        <Route
+          path="/h/:hostId/desktop"
+          element={
+            <HostRoute>
+              <Suspense fallback={<AgentFallback />}>
+                <DesktopPage />
+              </Suspense>
+            </HostRoute>
+          }
+        />
 
         {/* Legacy redirects */}
         <Route path="/terminal" element={<LegacyRedirect page="terminal" />} />

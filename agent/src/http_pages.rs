@@ -244,10 +244,13 @@ pub async fn api_logout(State(state): State<Arc<AppState>>, jar: CookieJar) -> i
 #[derive(Serialize)]
 struct MeResponse {
     session_id: String,
+    device_id: String,
 }
 
 pub async fn api_me(State(state): State<Arc<AppState>>, jar: CookieJar) -> impl IntoResponse {
-    let Some(session_id) = require_active_auth(&state.db_path, &state.signing_key, &jar) else {
+    let Some((session_id, device_id)) =
+        crate::auth::require_active_auth_with_device(&state.db_path, &state.signing_key, &jar)
+    else {
         return StatusCode::UNAUTHORIZED.into_response();
     };
 
@@ -255,7 +258,11 @@ pub async fn api_me(State(state): State<Arc<AppState>>, jar: CookieJar) -> impl 
         warn!(error=%err, "failed to update last_seen_at");
     }
 
-    (StatusCode::OK, Json(MeResponse { session_id })).into_response()
+    (
+        StatusCode::OK,
+        Json(MeResponse { session_id, device_id }),
+    )
+        .into_response()
 }
 
 // ─── One-Time Key login (tunnel-accessible) ────────────────────────────────
@@ -586,6 +593,7 @@ mod tests {
             event_bus: crate::events::EventBus::new(),
             tunnel_url: Arc::new(std::sync::RwLock::new(None)),
             desktop_available: false,
+            desktop_service: None,
         })
     }
 
