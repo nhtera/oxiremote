@@ -2,6 +2,7 @@ import { NavLink, Outlet, useNavigate } from 'react-router-dom'
 import { useHostStore } from '../state/host-store'
 import PushPermissionBanner from './push-permission-banner'
 import InstallPwaBanner from './install-pwa-banner'
+import { clearApiKey } from '../lib/api-client'
 
 export default function AppLayout() {
   const navigate = useNavigate()
@@ -22,6 +23,7 @@ export default function AppLayout() {
 
   const handleLogout = async () => {
     await fetch('/api/auth/logout', { method: 'POST' })
+    clearApiKey()
     navigate('/login')
   }
 

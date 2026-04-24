@@ -50,8 +50,24 @@ In dev mode, the agent serves API endpoints and the Vite dev server handles the 
 
 ### Agent notes
 - On startup, the agent ensures `cloudflared` is available.
-  - If not found in the agent data dir, it auto-downloads the latest **macOS** `cloudflared` release from GitHub and verifies its SHA-256 against Cloudflare’s published checksums.
-  - Non-macOS platforms currently error if `cloudflared` is missing (auto-download is macOS-only).
+  - Auto-downloads the latest release from GitHub and verifies its SHA-256 against Cloudflare’s published checksums.
+  - Supported hosts: macOS (arm64/x64), Linux (x64/arm64), Windows (x64).
+
+### Named tunnels (production)
+
+For a stable hostname, configure a Cloudflare Named Tunnel:
+
+```bash
+# 1. Write the config scaffold
+oxiremote tunnel use my-tunnel-name
+
+# 2. Create the tunnel and route DNS (standard cloudflared commands)
+cloudflared tunnel login
+cloudflared tunnel create my-tunnel-name
+cloudflared tunnel route dns my-tunnel-name oxi.example.com
+```
+
+When `~/.config/oxiremote/tunnel.toml` is present, the agent skips Quick Tunnel and runs your named tunnel. Edit the file to point at a specific `credentials_file` if cloudflared can't auto-discover it.
 
 Run only web UI:
 

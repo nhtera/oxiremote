@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { useHostStore } from '../state/host-store'
+import { storeApiKey } from '../lib/api-client'
 
 export default function LoginPage() {
   const [code, setCode] = useState('')
@@ -52,9 +53,18 @@ export default function LoginPage() {
       if (deviceLabel.trim()) {
         window.localStorage.setItem('oxi:device-label', deviceLabel.trim())
       }
-      // Pairing set the cookie — refresh the host store so route guards
-      // (LegacyRedirect, AppLayout sidebar) see the authenticated state.
-      await useHostStore.getState().fetchHost()
+      // Persist the API key tied to this host so subsequent tunnel requests
+      // can attach `Authorization: Bearer …`.
+      try {
+        const body = await res.clone().json()
+        await useHostStore.getState().fetchHost()
+        const hostId = useHostStore.getState().currentHostId
+        if (body.api_key && hostId) {
+          storeApiKey(hostId, body.api_key)
+        }
+      } catch {
+        await useHostStore.getState().fetchHost()
+      }
       navigate('/')
     } catch (e: any) {
       setError(e.message || 'Pairing failed')

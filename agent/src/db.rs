@@ -83,6 +83,11 @@ pub fn init_db(db_path: &Path) -> anyhow::Result<()> {
     .context("create tables")?;
 
     let _ = conn.execute("ALTER TABLE sessions ADD COLUMN device_id TEXT", []);
+    // Per-device API key for tunnel-side Bearer auth. Issued at pairing,
+    // rotatable. `last4` is cosmetic — lets the UI show "••••abcd" to the
+    // user without ever reading the hash.
+    let _ = conn.execute("ALTER TABLE trusted_devices ADD COLUMN api_key_hash TEXT", []);
+    let _ = conn.execute("ALTER TABLE trusted_devices ADD COLUMN api_key_last4 TEXT", []);
 
     Ok(())
 }

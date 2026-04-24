@@ -10,6 +10,11 @@
     "build:release": "bun run build:web && cargo build --release --manifest-path agent/Cargo.toml",
     "build:web": "bun --cwd apps/web build",
     "typecheck:web": "bun --cwd apps/web typecheck",
-    "lint:web": "bun --cwd apps/web lint"
+    "lint:web": "bun --cwd apps/web lint",
+    "e2e": "playwright test --config=tests/e2e/playwright.config.ts",
+    "check:bundle": "bun run scripts/check-bundle-size.ts"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.48.0"
   }
 }

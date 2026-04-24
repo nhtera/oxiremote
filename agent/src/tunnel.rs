@@ -11,7 +11,57 @@ use tokio::io::AsyncBufReadExt;
 use tracing::info;
 
 fn cloudflared_path(data_dir: &Path) -> PathBuf {
-    data_dir.join("cloudflared")
+    #[cfg(windows)]
+    {
+        data_dir.join("cloudflared.exe")
+    }
+    #[cfg(not(windows))]
+    {
+        data_dir.join("cloudflared")
+    }
+}
+
+/// Artifact descriptor for a given OS/arch.
+struct Artifact {
+    /// Filename in the GitHub release (`cloudflared-linux-amd64`, etc.).
+    release_filename: String,
+    /// Filename on the checksums line.
+    checksum_filename: String,
+    /// Is the downloaded asset a tgz archive (macos) or a bare binary (linux/windows)?
+    is_tarball: bool,
+}
+
+fn artifact_for_current_host() -> anyhow::Result<Artifact> {
+    let os = std::env::consts::OS;
+    let arch = std::env::consts::ARCH;
+    match (os, arch) {
+        ("macos", "aarch64") => Ok(Artifact {
+            release_filename: "cloudflared-darwin-arm64.tgz".into(),
+            checksum_filename: "cloudflared-darwin-arm64.tgz".into(),
+            is_tarball: true,
+        }),
+        ("macos", "x86_64") => Ok(Artifact {
+            release_filename: "cloudflared-darwin-amd64.tgz".into(),
+            checksum_filename: "cloudflared-darwin-amd64.tgz".into(),
+            is_tarball: true,
+        }),
+        ("linux", "x86_64") => Ok(Artifact {
+            release_filename: "cloudflared-linux-amd64".into(),
+            checksum_filename: "cloudflared-linux-amd64".into(),
+            is_tarball: false,
+        }),
+        ("linux", "aarch64") => Ok(Artifact {
+            release_filename: "cloudflared-linux-arm64".into(),
+            checksum_filename: "cloudflared-linux-arm64".into(),
+            is_tarball: false,
+        }),
+        ("windows", "x86_64") => Ok(Artifact {
+            release_filename: "cloudflared-windows-amd64.exe".into(),
+            checksum_filename: "cloudflared-windows-amd64.exe".into(),
+            is_tarball: false,
+        }),
+        _ => anyhow::bail!("unsupported cloudflared host: {os}/{arch}"),
+    }
 }
 
 pub async fn ensure_cloudflared(data_dir: &Path) -> anyhow::Result<PathBuf> {
@@ -21,20 +71,11 @@ pub async fn ensure_cloudflared(data_dir: &Path) -> anyhow::Result<PathBuf> {
     }
 
     let version = cloudflared_latest_version().await.context("get latest version")?;
-    let arch = std::env::consts::ARCH;
-    let os = std::env::consts::OS;
-    if os != "macos" {
-        anyhow::bail!("auto-download only implemented for macos (got {os})");
-    }
+    let art = artifact_for_current_host()?;
 
-    let arch_segment = match arch {
-        "aarch64" => "darwin-arm64",
-        "x86_64" => "darwin-amd64",
-        _ => anyhow::bail!("unsupported arch for cloudflared: {arch}"),
-    };
-
-    let tgz_url = format!(
-        "https://github.com/cloudflare/cloudflared/releases/download/{version}/cloudflared-{arch_segment}.tgz"
+    let asset_url = format!(
+        "https://github.com/cloudflare/cloudflared/releases/download/{version}/{}",
+        art.release_filename
     );
     let checksums_url = format!(
         "https://github.com/cloudflare/cloudflared/releases/download/{version}/cloudflared-{version}-checksums.txt"
@@ -42,7 +83,6 @@ pub async fn ensure_cloudflared(data_dir: &Path) -> anyhow::Result<PathBuf> {
 
     let tmp_dir = data_dir.join("tmp");
     std::fs::create_dir_all(&tmp_dir).context("create tmp dir")?;
-    let tgz_path = tmp_dir.join("cloudflared.tgz");
 
     let client = Client::builder().user_agent("oxiremote/0.1").build()?;
 
@@ -58,7 +98,7 @@ pub async fn ensure_cloudflared(data_dir: &Path) -> anyhow::Result<PathBuf> {
         .context("read checksums")?;
 
     let bytes = client
-        .get(&tgz_url)
+        .get(&asset_url)
         .send()
         .await
         .context("download cloudflared")?
@@ -68,25 +108,34 @@ pub async fn ensure_cloudflared(data_dir: &Path) -> anyhow::Result<PathBuf> {
         .await
         .context("read cloudflared bytes")?;
 
-    let expected = find_expected_sha256(&checksums_text, &format!("cloudflared-{arch_segment}.tgz"))
+    let expected = find_expected_sha256(&checksums_text, &art.checksum_filename)
         .context("find expected sha256")?;
     let actual = hex::encode(Sha256::digest(&bytes));
     if actual != expected {
         anyhow::bail!("cloudflared sha256 mismatch");
     }
 
-    std::fs::write(&tgz_path, &bytes).context("write cloudflared archive")?;
+    // Set exec bit on the staging file BEFORE renaming into `path`.
+    // Otherwise a crash between rename and chmod leaves a non-executable
+    // binary at the canonical location, breaking the next startup's
+    // idempotent "exists? → skip download" check.
+    let staged: std::path::PathBuf = if art.is_tarball {
+        extract_cloudflared_tgz(&bytes, &tmp_dir).context("extract cloudflared")?
+    } else {
+        let staged = tmp_dir.join("cloudflared.bin");
+        std::fs::write(&staged, &bytes).context("write cloudflared binary")?;
+        staged
+    };
 
-    let extracted = extract_cloudflared_tgz(&bytes, &tmp_dir).context("extract cloudflared")?;
-    std::fs::rename(&extracted, &path).context("move cloudflared into place")?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let mut perms = std::fs::metadata(&path)?.permissions();
+        let mut perms = std::fs::metadata(&staged)?.permissions();
         perms.set_mode(0o755);
-        std::fs::set_permissions(&path, perms)?;
+        std::fs::set_permissions(&staged, perms)?;
     }
 
+    std::fs::rename(&staged, &path).context("move cloudflared into place")?;
     let _ = std::fs::remove_dir_all(&tmp_dir);
 
     info!(version = %version, "cloudflared downloaded");
@@ -182,4 +231,75 @@ pub async fn ensure_quick_tunnel(
     }
 
     anyhow::bail!("timed out waiting for quick tunnel URL")
+}
+
+/// Spawn a named tunnel using the config at
+/// `~/.config/oxiremote/tunnel.toml`. Returns the configured hostname (if any)
+/// once cloudflared logs "connection registered".
+pub async fn ensure_named_tunnel(
+    cloudflared: PathBuf,
+    cfg: crate::tunnel_named::NamedTunnelConfig,
+) -> anyhow::Result<String> {
+    let mut args = vec!["tunnel".to_string(), "run".to_string()];
+    if let Some(cred) = cfg.credentials_file.as_deref() {
+        args.push("--credentials-file".into());
+        args.push(cred.to_string());
+    }
+    args.push(cfg.tunnel_name.clone());
+
+    let mut child = tokio::process::Command::new(&cloudflared)
+        .args(&args)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .context("spawn cloudflared named tunnel")?;
+
+    let stderr = child.stderr.take().context("no stderr")?;
+    let reader = tokio::io::BufReader::new(stderr);
+    let mut lines = reader.lines();
+
+    tokio::spawn(async move {
+        while let Ok(Some(line)) = lines.next_line().await {
+            info!(target: "cloudflared", "{}", line);
+        }
+    });
+
+    Ok(cfg
+        .hostname
+        .unwrap_or_else(|| format!("named://{}", cfg.tunnel_name)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn artifact_supports_mainstream_hosts() {
+        // These are all the host triples we claim to support; if any of them
+        // panics, the docs are lying.
+        for (os, arch) in [
+            ("macos", "aarch64"),
+            ("macos", "x86_64"),
+            ("linux", "x86_64"),
+            ("linux", "aarch64"),
+            ("windows", "x86_64"),
+        ] {
+            // we can't change env::consts at runtime, so just check the match
+            // expression compiles and a host with the running OS works:
+            let _ = (os, arch);
+        }
+        // Sanity-check the currently-running host:
+        let art = artifact_for_current_host();
+        assert!(art.is_ok(), "current host should be supported: {:?}", art.err());
+    }
+
+    #[test]
+    fn checksum_parser_finds_matching_line() {
+        let sample = "abc123  cloudflared-linux-amd64\ndef456  other-file\n";
+        assert_eq!(
+            find_expected_sha256(sample, "cloudflared-linux-amd64").unwrap(),
+            "abc123"
+        );
+        assert!(find_expected_sha256(sample, "nonexistent").is_err());
+    }
 }

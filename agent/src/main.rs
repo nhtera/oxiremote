@@ -12,6 +12,7 @@ mod preview;
 mod preview_token;
 mod push;
 mod push_api;
+mod security;
 #[cfg(not(debug_assertions))]
 mod static_files;
 mod terminal_api;
@@ -19,6 +20,7 @@ mod terminal_buffer;
 mod terminal_pty;
 mod terminal_ws;
 mod tunnel;
+mod tunnel_named;
 mod workspaces;
 
 use std::{
@@ -41,6 +43,7 @@ use crate::host::HostInfo;
 use crate::local_sites::LocalSitesCache;
 use crate::preview::{PreviewHealth, PreviewTarget};
 use crate::push::VapidKeys;
+use crate::security::rate_limit::RateLimiter;
 use crate::terminal_pty::TerminalSession;
 
 pub const AGENT_PORT: u16 = 8787;
@@ -61,6 +64,7 @@ pub struct AppState {
     pub notify_token: String,
     pub http_client: reqwest::Client,
     pub preview_client: reqwest::Client,
+    pub rate_limiter: Arc<RateLimiter>,
 }
 
 fn default_data_dir() -> anyhow::Result<PathBuf> {
@@ -77,8 +81,20 @@ fn main() -> anyhow::Result<()> {
             let rest = argv.into_iter().skip(2).collect::<Vec<_>>();
             return notify_cli::run(rest);
         }
+        if sub == "tunnel" {
+            // `oxiremote tunnel use <name>`
+            let action = argv.get(2).map(String::as_str).unwrap_or("");
+            if action == "use" {
+                let rest = argv.into_iter().skip(3).collect::<Vec<_>>();
+                return tunnel_named::cli_use(rest);
+            }
+            eprintln!("Usage: oxiremote tunnel use <name>");
+            std::process::exit(2);
+        }
         if sub == "--help" || sub == "-h" {
-            println!("Usage:\n  oxiremote                 Run the agent server\n  oxiremote notify --title <text> [--body <text>] [--deep-link </h/...>]  Send a push");
+            println!(
+                "Usage:\n  oxiremote                 Run the agent server\n  oxiremote notify --title <text> [--body <text>] [--deep-link </h/...>]\n  oxiremote tunnel use <name>   Write ~/.config/oxiremote/tunnel.toml"
+            );
             return Ok(());
         }
     }
@@ -175,6 +191,7 @@ async fn run_server() -> anyhow::Result<()> {
         notify_token,
         http_client,
         preview_client,
+        rate_limiter: Arc::new(RateLimiter::new()),
     });
 
     // Background: periodic listening-port discovery + preview health checks.
@@ -252,7 +269,28 @@ async fn run_server() -> anyhow::Result<()> {
     #[cfg(not(debug_assertions))]
     let app = app.fallback(static_files::spa_handler);
 
+    // Middleware order matters: from outermost → innermost request:
+    //   1. tunnel_guard rejects Localhost-only routes over the tunnel (403)
+    //   2. rate_limit throttles tunnel callers per (session, route_class)
+    //   3. csrf_guard validates header/cookie on state-changing tunnel POSTs
+    //   4. api_key_guard requires Bearer on non-exempt tunnel routes
+    // Axum's `.layer()` applies in REVERSE order of declaration, so we reverse
+    // the list visually here.
+    let rate_limiter = state.rate_limiter.clone();
     let app = app
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            security::api_key_guard::api_key_guard,
+        ))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            security::csrf::csrf_guard,
+        ))
+        .layer(axum::middleware::from_fn_with_state(
+            rate_limiter,
+            security::rate_limit::rate_limit,
+        ))
+        .layer(axum::middleware::from_fn(security::tunnel_guard))
         .with_state(state.clone())
         .layer(TraceLayer::new_for_http());
 
@@ -264,11 +302,20 @@ async fn run_server() -> anyhow::Result<()> {
     let pairing = http_pages::create_pairing_code(&state).context("create pairing code")?;
     info!(pairing_code = %pairing.code, "pair to continue");
 
-    // Start tunnel in background — don't block the HTTP server
+    // Start tunnel in background — don't block the HTTP server.
+    // If `~/.config/oxiremote/tunnel.toml` exists, run a named tunnel; else
+    // fall back to a Quick Tunnel for the dev/first-run experience.
+    let named_cfg = tunnel_named::load().unwrap_or(None);
     tokio::spawn(async move {
-        match tunnel::ensure_quick_tunnel(addr, cloudflared).await {
-            Ok(url) => info!(%url, "quick tunnel ready"),
-            Err(err) => warn!(error=%err, "quick tunnel failed"),
+        match named_cfg {
+            Some(cfg) => match tunnel::ensure_named_tunnel(cloudflared, cfg).await {
+                Ok(target) => info!(%target, "named tunnel ready"),
+                Err(err) => warn!(error=%err, "named tunnel failed"),
+            },
+            None => match tunnel::ensure_quick_tunnel(addr, cloudflared).await {
+                Ok(url) => info!(%url, "quick tunnel ready"),
+                Err(err) => warn!(error=%err, "quick tunnel failed"),
+            },
         }
     });
 

@@ -45,3 +45,7 @@ p256 = { version = "0.13", features = ["ecdh", "ecdsa", "arithmetic"] }
 aes-gcm = "0.10"
 hkdf = "0.12"
 subtle = "2"
+
+# Per-device API key hashing for tunnel-side Bearer auth.
+argon2 = "0.5"
+toml = "0.8"

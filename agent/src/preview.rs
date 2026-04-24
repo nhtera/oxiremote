@@ -514,6 +514,7 @@ mod tests {
             notify_token: "test-token".to_string(),
             http_client: reqwest::Client::new(),
             preview_client: reqwest::Client::new(),
+            rate_limiter: Arc::new(crate::security::rate_limit::RateLimiter::new()),
         })
     }
 

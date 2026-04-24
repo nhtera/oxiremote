@@ -1,5 +1,12 @@
 use std::path::PathBuf;
 
+use argon2::{
+    password_hash::{
+        rand_core::{OsRng, RngCore},
+        PasswordHash, PasswordHasher, PasswordVerifier, SaltString,
+    },
+    Argon2,
+};
 use hmac::{Hmac, Mac};
 use rusqlite::{params, Connection};
 use sha2::Sha256;
@@ -215,6 +222,80 @@ pub fn sanitize_device_label(label: Option<&str>, fallback_user_agent: Option<&s
     device_label_from_user_agent(fallback_user_agent)
 }
 
+/// Generate + store a fresh API key for this device.
+/// Returns the plaintext key (only time the caller sees it) + last4.
+pub fn issue_api_key(db_path: &PathBuf, device_id: &str) -> anyhow::Result<(String, String)> {
+    use base64::Engine as _;
+    let mut raw = [0u8; 32];
+    OsRng.fill_bytes(&mut raw);
+    // URL-safe base64 without padding — short, pasteable, header-friendly.
+    let key = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(raw);
+    let last4: String = key.chars().rev().take(4).collect::<Vec<_>>().into_iter().rev().collect();
+
+    let salt = SaltString::generate(&mut OsRng);
+    let hash = Argon2::default()
+        .hash_password(key.as_bytes(), &salt)
+        .map_err(|e| anyhow::anyhow!("argon2 hash: {e}"))?
+        .to_string();
+
+    let conn = Connection::open(db_path)?;
+    conn.execute(
+        "UPDATE trusted_devices SET api_key_hash=?2, api_key_last4=?3 WHERE device_id=?1",
+        params![device_id, hash, last4],
+    )?;
+    Ok((key, last4))
+}
+
+/// Return `Some(device_id)` if the presented key matches some device's hash.
+/// Pre-filters by `api_key_last4` so the expensive Argon2 verify runs at most
+/// once per request. Blocking; call from `spawn_blocking` in async contexts
+/// (see `verify_api_key_async`).
+pub fn verify_api_key(db_path: &PathBuf, presented: &str) -> Option<String> {
+    if presented.len() < 4 {
+        return None;
+    }
+    let last4: String = presented
+        .chars()
+        .rev()
+        .take(4)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+
+    let conn = Connection::open(db_path).ok()?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT device_id, api_key_hash FROM trusted_devices
+             WHERE api_key_hash IS NOT NULL
+               AND revoked_at IS NULL
+               AND api_key_last4 = ?1",
+        )
+        .ok()?;
+    let rows = stmt
+        .query_map(params![last4], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+        .ok()?;
+
+    for row in rows.flatten() {
+        let (device_id, hash) = row;
+        if let Ok(parsed) = PasswordHash::new(&hash) {
+            if Argon2::default().verify_password(presented.as_bytes(), &parsed).is_ok() {
+                return Some(device_id);
+            }
+        }
+    }
+    None
+}
+
+/// Async wrapper: runs the Argon2 verify on the blocking thread pool so it
+/// doesn't stall the Tokio runtime.
+pub async fn verify_api_key_async(db_path: PathBuf, presented: String) -> Option<String> {
+    tokio::task::spawn_blocking(move || verify_api_key(&db_path, &presented))
+        .await
+        .ok()
+        .flatten()
+}
+
 pub fn is_valid_pairing_attempt(code: &str) -> bool {
     let trimmed = code.trim();
     trimmed.len() >= 6 && trimmed.len() <= 16
@@ -318,6 +399,7 @@ mod tests {
             notify_token: "test-token".to_string(),
             http_client: reqwest::Client::new(),
             preview_client: reqwest::Client::new(),
+            rate_limiter: std::sync::Arc::new(crate::security::rate_limit::RateLimiter::new()),
         }
     }
 

@@ -16,9 +16,9 @@ use uuid::Uuid;
 
 use crate::auth::{
     bind_session_to_device, clear_stale_pairing_attempts, client_ip_key, insert_or_update_device,
-    is_valid_pairing_attempt, list_trusted_devices, random_device_id, rate_limit_key, require_active_auth,
-    revoke_device, sanitize_device_label, should_allow_pairing_attempt, sign_session,
-    touch_session_and_device, new_pairing_code, PAIRING_TTL_SECS, SESSION_TTL_SECS,
+    is_valid_pairing_attempt, issue_api_key, list_trusted_devices, random_device_id, rate_limit_key,
+    require_active_auth, revoke_device, sanitize_device_label, should_allow_pairing_attempt,
+    sign_session, touch_session_and_device, new_pairing_code, PAIRING_TTL_SECS, SESSION_TTL_SECS,
 };
 use crate::db::now_ts;
 use crate::AppState;
@@ -122,6 +122,14 @@ pub async fn api_pairing_exchange(
                 return StatusCode::INTERNAL_SERVER_ERROR.into_response();
             }
 
+            let api_key_pair = match issue_api_key(&state.db_path, &device_id) {
+                Ok(pair) => pair,
+                Err(err) => {
+                    warn!(error=%err, "api key issuance failed");
+                    return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                }
+            };
+
             let cookie_value = sign_session(&state.signing_key, &session_id);
             let cookie = Cookie::build(("oxiremote_session", cookie_value))
                 .http_only(true)
@@ -134,7 +142,12 @@ pub async fn api_pairing_exchange(
             (
                 StatusCode::OK,
                 jar.add(cookie),
-                Json(serde_json::json!({"ok": true, "device_id": device_id})),
+                Json(serde_json::json!({
+                    "ok": true,
+                    "device_id": device_id,
+                    "api_key": api_key_pair.0,
+                    "api_key_last4": api_key_pair.1,
+                })),
             )
                 .into_response()
         }
@@ -415,6 +428,7 @@ mod tests {
             notify_token: "test-token".to_string(),
             http_client: reqwest::Client::new(),
             preview_client: reqwest::Client::new(),
+            rate_limiter: Arc::new(crate::security::rate_limit::RateLimiter::new()),
         })
     }
 
