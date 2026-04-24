@@ -18,6 +18,7 @@ import { registerServiceWorker } from './lib/push-client'
 const AgentHomePage = lazy(() => import('./pages/agent/agent-home-page'))
 const AgentDevicesPage = lazy(() => import('./pages/agent/agent-devices-page'))
 const AgentSettingsPage = lazy(() => import('./pages/agent/agent-settings-page'))
+const AgentLogsPage = lazy(() => import('./pages/agent/agent-logs-page'))
 
 // Lazy-loaded remote desktop page — heavy canvas worker kept in its own chunk.
 const DesktopPage = lazy(() => import('./pages/desktop-page'))
@@ -137,6 +138,14 @@ function App() {
           element={
             <Suspense fallback={<AgentFallback />}>
               <AgentSettingsPage />
+            </Suspense>
+          }
+        />
+        <Route
+          path="/agent/logs"
+          element={
+            <Suspense fallback={<AgentFallback />}>
+              <AgentLogsPage />
             </Suspense>
           }
         />

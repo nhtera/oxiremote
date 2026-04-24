@@ -50,12 +50,27 @@ async fn api_agent_state(State(state): State<Arc<AppState>>) -> Json<serde_json:
     }))
 }
 
+#[derive(Deserialize)]
+struct EventsQuery {
+    #[serde(default)]
+    filter: Option<String>,
+}
+
 async fn api_agent_events(
     State(state): State<Arc<AppState>>,
+    axum::extract::Query(q): axum::extract::Query<EventsQuery>,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
     let rx = state.event_bus.subscribe();
-    let stream = BroadcastStream::new(rx).filter_map(|msg| match msg {
-        Ok(event) => Some(Ok(event_to_sse(&event))),
+    // `?filter=log` → only stream `LogEntry` events. Used by /agent/logs.
+    let log_only = matches!(q.filter.as_deref(), Some("log"));
+    let stream = BroadcastStream::new(rx).filter_map(move |msg| match msg {
+        Ok(event) => {
+            if log_only && !matches!(event, AgentEvent::LogEntry { .. }) {
+                None
+            } else {
+                Some(Ok(event_to_sse(&event)))
+            }
+        }
         Err(_) => None, // drop lagged frames; client may GET /api/agent/state to resync
     });
     Sse::new(stream).keep_alive(

@@ -1,4 +1,5 @@
 import { useState } from 'react'
+import TerminalKeybarExpanded from './terminal-keybar-expanded'
 
 type Props = {
   onSend: (bytes: string) => void
@@ -6,31 +7,24 @@ type Props = {
 
 type Key = { label: string; value: string; isCtrlTarget?: boolean }
 
-const ROW1: Key[] = [
+// Primary strip — keys users reach for most. The `...` button toggles the
+// tier-2 drawer (nav / ctrl-chords / F-keys).
+const PRIMARY: Key[] = [
   { label: 'Esc', value: '\x1b' },
   { label: 'Tab', value: '\t' },
   { label: 'Ctrl', value: '' }, // modifier toggle — handled separately
+  { label: '^C', value: '\x03' },
   { label: '↑', value: '\x1b[A' },
   { label: '↓', value: '\x1b[B' },
-  { label: '←', value: '\x1b[D' },
-  { label: '→', value: '\x1b[C' },
+  { label: '↵', value: '\r' },
   { label: '|', value: '|', isCtrlTarget: true },
   { label: '/', value: '/', isCtrlTarget: true },
-]
-
-const ROW2: Key[] = [
   { label: '~', value: '~', isCtrlTarget: true },
-  { label: '`', value: '`', isCtrlTarget: true },
-  { label: 'PgUp', value: '\x1b[5~' },
-  { label: 'PgDn', value: '\x1b[6~' },
-  { label: 'Home', value: '\x1b[H' },
-  { label: 'End', value: '\x1b[F' },
-  { label: '\\', value: '\\', isCtrlTarget: true },
 ]
 
 export default function TerminalKeybar({ onSend }: Props) {
   const [ctrlActive, setCtrlActive] = useState(false)
-  const [showRow2, setShowRow2] = useState(false)
+  const [expanded, setExpanded] = useState(false)
 
   function handleKey(key: Key) {
     if (key.label === 'Ctrl') {
@@ -58,30 +52,28 @@ export default function TerminalKeybar({ onSend }: Props) {
 
   return (
     <div className="flex flex-col gap-1 shrink-0">
+      <TerminalKeybarExpanded visible={expanded} onSend={onSend} />
+
       <div className="flex flex-wrap gap-1">
-        {ROW1.map((key) => (
+        {PRIMARY.map((key) => (
           <button key={key.label} className={btnClass(key)} onClick={() => handleKey(key)}>
             {key.label}
           </button>
         ))}
         <button
-          className="btn-secondary text-xs py-1 px-2 min-w-9 text-center"
-          onClick={() => setShowRow2((v) => !v)}
+          className={
+            expanded
+              ? 'btn-secondary text-xs py-1 px-2 min-w-9 text-center !bg-accent/20 !text-accent !border-accent/40'
+              : 'btn-secondary text-xs py-1 px-2 min-w-9 text-center'
+          }
+          onClick={() => setExpanded((v) => !v)}
           title="More keys"
+          aria-expanded={expanded}
+          aria-label="Toggle more keys"
         >
           …
         </button>
       </div>
-
-      {showRow2 && (
-        <div className="flex flex-wrap gap-1">
-          {ROW2.map((key) => (
-            <button key={key.label} className={btnClass(key)} onClick={() => handleKey(key)}>
-              {key.label}
-            </button>
-          ))}
-        </div>
-      )}
     </div>
   )
 }

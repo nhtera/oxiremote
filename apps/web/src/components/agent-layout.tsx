@@ -8,6 +8,7 @@ export default function AgentLayout() {
   const navItems = [
     { to: '/agent', label: 'Home', icon: '⌂', exact: true },
     { to: '/agent/devices', label: 'Devices', icon: '◉', exact: false },
+    { to: '/agent/logs', label: 'Logs', icon: '≣', exact: false },
     { to: '/agent/settings', label: 'Settings', icon: '⚙', exact: false },
   ]
 
