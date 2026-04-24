@@ -68,7 +68,17 @@ pub fn init_db(db_path: &Path) -> anyhow::Result<()> {
             UNIQUE(host_id, path)
         );
         CREATE INDEX IF NOT EXISTS idx_workspaces_host_last
-            ON workspaces(host_id, last_used_at DESC);",
+            ON workspaces(host_id, last_used_at DESC);
+        CREATE TABLE IF NOT EXISTS previews (
+            id TEXT PRIMARY KEY,
+            host_id TEXT NOT NULL,
+            port INTEGER NOT NULL,
+            label TEXT NOT NULL,
+            created_at INTEGER NOT NULL,
+            UNIQUE(host_id, port)
+        );
+        CREATE INDEX IF NOT EXISTS idx_previews_host
+            ON previews(host_id, created_at DESC);",
     )
     .context("create tables")?;
 

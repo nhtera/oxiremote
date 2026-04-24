@@ -6,8 +6,10 @@ mod git;
 mod host;
 mod host_api;
 mod http_pages;
+mod local_sites;
 mod notify_cli;
 mod preview;
+mod preview_token;
 mod push;
 mod push_api;
 #[cfg(not(debug_assertions))]
@@ -36,9 +38,10 @@ use tower_http::trace::TraceLayer;
 use tracing::{info, warn};
 
 use crate::host::HostInfo;
+use crate::local_sites::LocalSitesCache;
+use crate::preview::{PreviewHealth, PreviewTarget};
 use crate::push::VapidKeys;
 use crate::terminal_pty::TerminalSession;
-use crate::preview::PreviewTarget;
 
 pub const AGENT_PORT: u16 = 8787;
 
@@ -49,12 +52,15 @@ pub struct AppState {
     pub secure_cookies: bool,
     pub terminal_sessions: DashMap<String, Arc<TerminalSession>>,
     pub preview_targets: DashMap<String, PreviewTarget>,
+    pub preview_health: DashMap<String, PreviewHealth>,
+    pub local_sites: LocalSitesCache,
     pub pairing_attempts: DashMap<String, i64>,
     pub workspace_root: PathBuf,
     pub host_info: HostInfo,
     pub vapid_keys: Arc<VapidKeys>,
     pub notify_token: String,
     pub http_client: reqwest::Client,
+    pub preview_client: reqwest::Client,
 }
 
 fn default_data_dir() -> anyhow::Result<PathBuf> {
@@ -131,19 +137,49 @@ async fn run_server() -> anyhow::Result<()> {
         .build()
         .context("http client")?;
 
+    // Reused by the /preview proxy — redirects stay client-side, bypass any
+    // system proxy, pool connections across requests.
+    let preview_client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .no_proxy()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .context("preview http client")?;
+
+    // Restore persisted previews into the in-memory cache (lookup is hot path).
+    let preview_targets: DashMap<String, PreviewTarget> = DashMap::new();
+    match preview::load_all_previews(&db_path, &host_info.host_id) {
+        Ok(rows) => {
+            for t in rows {
+                preview_targets.insert(t.id.clone(), t);
+            }
+            info!(count = preview_targets.len(), "previews restored");
+        }
+        Err(err) => warn!(error=%err, "preview restore failed; starting empty"),
+    }
+
+    let local_sites_cache = local_sites::new_cache();
+
     let state = Arc::new(AppState {
         db_path,
         signing_key,
         secure_cookies,
         terminal_sessions: DashMap::new(),
-        preview_targets: DashMap::new(),
+        preview_targets,
+        preview_health: DashMap::new(),
+        local_sites: local_sites_cache.clone(),
         pairing_attempts: DashMap::new(),
         workspace_root,
         host_info,
         vapid_keys,
         notify_token,
         http_client,
+        preview_client,
     });
+
+    // Background: periodic listening-port discovery + preview health checks.
+    local_sites::spawn_discovery_loop(local_sites_cache);
+    preview::spawn_health_loop(state.clone());
 
     let app = Router::new()
         .route("/api/health", get(api_health))
@@ -201,6 +237,9 @@ async fn run_server() -> anyhow::Result<()> {
         // preview proxy
         .route("/api/previews", get(preview::api_previews_list).post(preview::api_previews_create))
         .route("/api/previews/{id}", axum::routing::delete(preview::api_previews_delete))
+        .route("/api/previews/{id}/share", post(preview::api_previews_share))
+        .route("/api/local-sites", get(local_sites::api_local_sites))
+        .route("/preview/{id}", axum::routing::any(preview::preview_proxy_root_handler))
         .route("/preview/{id}/{*rest}", axum::routing::any(preview::preview_proxy_handler));
 
     // Dev: serve server-rendered pages, Vite dev server handles the SPA

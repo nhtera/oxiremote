@@ -382,7 +382,7 @@ mod tests {
     use dashmap::DashMap;
 
     use super::*;
-    use crate::{db::init_db, preview::PreviewTarget, terminal_pty::TerminalSession};
+    use crate::{db::init_db, local_sites, preview::PreviewTarget, terminal_pty::TerminalSession};
 
     fn test_state(name: &str) -> Arc<AppState> {
         let db_path = std::env::temp_dir().join(format!(
@@ -402,6 +402,8 @@ mod tests {
             secure_cookies: false,
             terminal_sessions: DashMap::<String, Arc<TerminalSession>>::new(),
             preview_targets: DashMap::<String, PreviewTarget>::new(),
+            preview_health: DashMap::new(),
+            local_sites: local_sites::new_cache(),
             pairing_attempts: DashMap::new(),
             workspace_root: PathBuf::from("."),
             host_info: crate::host::HostInfo {
@@ -412,6 +414,7 @@ mod tests {
             vapid_keys: Arc::new(crate::push::load_or_create_vapid(&data_dir).unwrap()),
             notify_token: "test-token".to_string(),
             http_client: reqwest::Client::new(),
+            preview_client: reqwest::Client::new(),
         })
     }
 

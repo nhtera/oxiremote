@@ -283,7 +283,7 @@ mod tests {
     use rusqlite::{params, Connection};
 
     use super::*;
-    use crate::{db::init_db, AppState};
+    use crate::{db::init_db, local_sites, AppState};
 
     fn test_state(name: &str) -> AppState {
         let db_path = std::env::temp_dir().join(format!(
@@ -303,6 +303,8 @@ mod tests {
             secure_cookies: false,
             terminal_sessions: DashMap::new(),
             preview_targets: DashMap::new(),
+            preview_health: DashMap::new(),
+            local_sites: local_sites::new_cache(),
             pairing_attempts: DashMap::new(),
             workspace_root: PathBuf::from("."),
             host_info: crate::host::HostInfo {
@@ -315,6 +317,7 @@ mod tests {
             ),
             notify_token: "test-token".to_string(),
             http_client: reqwest::Client::new(),
+            preview_client: reqwest::Client::new(),
         }
     }
 
