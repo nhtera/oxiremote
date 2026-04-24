@@ -99,15 +99,25 @@ export function useDesktopSession(
     const pc = new RTCPeerConnection(STUN_CONFIG)
     pcRef.current = pc
 
-    // Desktop DC: unreliable, ordered=false — latency > reliability for frames
+    // Desktop DC: unreliable, ordered=false — latency > reliability for frames.
+    // `negotiated: true` with a matching id pins the SCTP stream so the server's
+    // identically-configured DC receives what we send (and vice versa). Without
+    // this, each side creates a fresh in-band stream and frames flow into a
+    // one-way void (server sees its DC open; client's never receives bytes).
     const desktopDc = pc.createDataChannel('desktop', {
       ordered: false,
       maxRetransmits: 0,
+      negotiated: true,
+      id: 1,
     })
     desktopDcRef.current = desktopDc
 
     // Ctrl DC: reliable ordered — input events must not be reordered/dropped
-    const ctrlDc = pc.createDataChannel('ctrl', { ordered: true })
+    const ctrlDc = pc.createDataChannel('ctrl', {
+      ordered: true,
+      negotiated: true,
+      id: 2,
+    })
     ctrlDcRef.current = ctrlDc
 
     // ICE candidates → forward over WS

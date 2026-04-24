@@ -232,6 +232,12 @@ mod inner {
         );
 
         // ── DataChannels ──────────────────────────────────────────────────────
+        // Both channels are externally negotiated: the client creates identical
+        // DCs with the same stream ids, which pins the SCTP stream so send()
+        // from either side reaches the other. Without `negotiated=Some(id)`
+        // each side opens a fresh in-band stream and frames are sent into a
+        // one-way void even though both peers report "DC open".
+        //
         // "desktop": unordered + no retransmits — lowest latency for video tiles.
         let desktop_dc = pc
             .create_data_channel(
@@ -239,6 +245,7 @@ mod inner {
                 Some(RTCDataChannelInit {
                     ordered: Some(false),
                     max_retransmits: Some(0),
+                    negotiated: Some(1),
                     ..Default::default()
                 }),
             )
@@ -250,6 +257,7 @@ mod inner {
                 "ctrl",
                 Some(RTCDataChannelInit {
                     ordered: Some(true),
+                    negotiated: Some(2),
                     ..Default::default()
                 }),
             )

@@ -114,10 +114,11 @@ export default function DesktopPage() {
       ctx2dRef.current = canvasRef.current.getContext('2d')
     }
 
-    return () => {
-      workerRef.current?.terminate()
-      workerRef.current = null
-    }
+    // No cleanup: `transferControlToOffscreen` is a one-shot per canvas and
+    // React 19 StrictMode double-invokes effects in dev — terminating here
+    // kills the worker that owns the (already-transferred) canvas, and the
+    // re-run can't rebuild it (second transfer throws). Leaving the worker
+    // alive is safe: it becomes unreachable on real unmount and is GC'd.
   }, [caps])
 
   // ── Quality change propagates to session ────────────────────────────────
