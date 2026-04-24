@@ -55,6 +55,15 @@ mod inner {
         Ice { candidate: RTCIceCandidateInit },
         /// Sent once, before first binary frame, when 5-s DC-open timeout fires.
         Fallback,
+        /// Runtime capture-output dimensions. Clients size their canvas from
+        /// these values (not the logical-dimension HTTP capabilities probe);
+        /// re-emitted on every tier change so the grid stays aligned.
+        Capabilities {
+            width: u32,
+            height: u32,
+            scale_factor: f32,
+            tile_size: u32,
+        },
     }
 
     /// Input events the client sends on the "ctrl" DataChannel (or WS in fallback).
@@ -283,7 +292,10 @@ mod inner {
         }));
 
         // ── Quality watch channel ─────────────────────────────────────────────
-        let (quality_tx, quality_rx) = watch::channel(QualityTier::High);
+        // Default to Med to match the web client's default dropdown value —
+        // if the client's `quality` ctrl message is delayed we don't waste
+        // cycles encoding native-retina frames no one asked for.
+        let (quality_tx, quality_rx) = watch::channel(QualityTier::Med);
 
         // ── InputInjector ─────────────────────────────────────────────────────
         // Wrapped in Mutex because InputInjector is !Sync.
@@ -297,20 +309,38 @@ mod inner {
 
         // Screen dimensions for normalised-coordinate → pixel mapping.
         let (screen_w, screen_h) = primary_screen_dimensions();
+        // xcap's physical/logical ratio — used by the capture pipeline to
+        // downscale retina frames to logical before tiling, and by us here
+        // to pre-compute per-tier output dimensions for `Capabilities`.
+        let scale_factor = desktop::primary_scale_factor();
 
         // ── Ctrl DC: parse and dispatch input events ──────────────────────────
+        // The dispatch closure also needs to re-emit `Capabilities` over the
+        // WS text channel whenever the tier changes so clients resize their
+        // canvas to match the new encoder output grid.
         {
             let inj = injector.clone();
             let qtx = quality_tx.clone();
+            let caps_ws_tx = ws_out_tx.clone();
             ctrl_dc.on_message(Box::new(move |msg| {
                 let inj = inj.clone();
                 let qtx = qtx.clone();
+                let caps_tx = caps_ws_tx.clone();
                 Box::pin(async move {
                     let text = match std::str::from_utf8(&msg.data) {
                         Ok(t) => t,
                         Err(_) => return,
                     };
-                    dispatch_input(text, &inj, screen_w, screen_h, &qtx).await;
+                    dispatch_input(
+                        text,
+                        &inj,
+                        screen_w,
+                        screen_h,
+                        &qtx,
+                        scale_factor,
+                        Some(&caps_tx),
+                    )
+                    .await;
                 })
             }));
         }
@@ -397,7 +427,21 @@ mod inner {
         let (cap_shutdown_tx, cap_shutdown_rx) = tokio::sync::oneshot::channel::<()>();
         // Read initial tier before moving quality_rx into the pipeline.
         let initial_tier = *quality_rx.borrow();
-        spawn_capture_pipeline(initial_tier, sink, quality_rx, cap_shutdown_rx);
+
+        // Emit Capabilities once, before the first binary tile leaves, so the
+        // client can size its canvas from real encoder-output dimensions —
+        // not from the HTTP `/desktop/capabilities` "is enabled" probe.
+        let (out_w, out_h) = desktop::resize_dims(screen_w, screen_h, initial_tier);
+        if let Ok(msg) = serde_json::to_string(&SignalOut::Capabilities {
+            width: out_w,
+            height: out_h,
+            scale_factor,
+            tile_size: desktop::TILE_SIZE,
+        }) {
+            let _ = ws_out_tx.send(msg).await;
+        }
+
+        spawn_capture_pipeline(initial_tier, sink, quality_rx, cap_shutdown_rx, scale_factor);
 
         // ── Main WS event loop ────────────────────────────────────────────────
         ws_loop(
@@ -410,6 +454,8 @@ mod inner {
             screen_h,
             &quality_tx,
             &mut close_rx,
+            scale_factor,
+            &ws_out_tx,
         )
         .await;
 
@@ -479,6 +525,8 @@ mod inner {
         screen_h: u32,
         quality_tx: &watch::Sender<QualityTier>,
         close_rx: &mut tokio::sync::oneshot::Receiver<()>,
+        scale_factor: f32,
+        ws_out_tx: &mpsc::Sender<String>,
     ) {
         loop {
             tokio::select! {
@@ -504,7 +552,17 @@ mod inner {
                 msg = socket.recv() => {
                     match msg {
                         Some(Ok(Message::Text(text))) => {
-                            on_incoming_text(&text, pc, injector, screen_w, screen_h, quality_tx).await;
+                            on_incoming_text(
+                                &text,
+                                pc,
+                                injector,
+                                screen_w,
+                                screen_h,
+                                quality_tx,
+                                scale_factor,
+                                ws_out_tx,
+                            )
+                            .await;
                         }
                         Some(Ok(Message::Close(_))) | None => return,
                         _ => {}
@@ -518,6 +576,7 @@ mod inner {
     ///
     /// Could be a late ICE candidate or a ctrl event arriving over WS
     /// in fallback mode (when the DataChannel never opened).
+    #[allow(clippy::too_many_arguments)]
     async fn on_incoming_text(
         text: &str,
         pc: &RTCPeerConnection,
@@ -525,6 +584,8 @@ mod inner {
         screen_w: u32,
         screen_h: u32,
         quality_tx: &watch::Sender<QualityTier>,
+        scale_factor: f32,
+        ws_out_tx: &mpsc::Sender<String>,
     ) {
         // ICE candidate?
         if let Ok(SignalIn::Ice { candidate }) = serde_json::from_str(text) {
@@ -537,16 +598,32 @@ mod inner {
         // Ctrl / input event (fallback mode — DC never opened)?
         // dispatch_input parses internally; only call it when the text is not
         // a signaling message (ICE already handled above).
-        dispatch_input(text, injector, screen_w, screen_h, quality_tx).await;
+        dispatch_input(
+            text,
+            injector,
+            screen_w,
+            screen_h,
+            quality_tx,
+            scale_factor,
+            Some(ws_out_tx),
+        )
+        .await;
     }
 
     /// Parse a ctrl-channel message and dispatch to InputInjector or quality_tx.
+    ///
+    /// When `caps_tx` is `Some`, a tier change also re-emits `Capabilities`
+    /// over the WS text channel so the client can resize its canvas to the
+    /// new encoder output grid.
+    #[allow(clippy::too_many_arguments)]
     async fn dispatch_input(
         text: &str,
         injector: &Option<Arc<Mutex<InputInjector>>>,
         screen_w: u32,
         screen_h: u32,
         quality_tx: &watch::Sender<QualityTier>,
+        scale_factor: f32,
+        caps_tx: Option<&mpsc::Sender<String>>,
     ) {
         let wire: WireInput = match serde_json::from_str(text) {
             Ok(w) => w,
@@ -562,6 +639,17 @@ mod inner {
         {
             info!(tier = ?t, "quality change requested");
             let _ = quality_tx.send(t);
+            if let Some(tx) = caps_tx {
+                let (w, h) = desktop::resize_dims(screen_w, screen_h, t);
+                if let Ok(msg) = serde_json::to_string(&SignalOut::Capabilities {
+                    width: w,
+                    height: h,
+                    scale_factor,
+                    tile_size: desktop::TILE_SIZE,
+                }) {
+                    let _ = tx.send(msg).await;
+                }
+            }
             return;
         }
 

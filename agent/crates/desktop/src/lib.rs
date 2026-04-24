@@ -11,6 +11,7 @@ pub mod input;
 pub mod permissions;
 
 // Flat re-exports used by the agent crate and Phase 04 transport layer.
-pub use encode::{EncodedTile, FrameOutput, QualityTier};
+pub use capture::primary_scale_factor;
+pub use encode::{resize_dims, EncodedTile, FrameOutput, QualityTier, TILE_SIZE};
 pub use input::InputEvent;
 pub use permissions::{desktop_available, list_monitors, MonitorInfo};

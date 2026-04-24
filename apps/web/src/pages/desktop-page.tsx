@@ -88,19 +88,20 @@ export default function DesktopPage() {
     }
   }, [])
 
-  const { status, sendInput, setQuality: setSessionQuality, disconnect, attempt } =
-    useDesktopSession(hostId, deviceId ?? '', onTile)
+  const { status, sendInput, setQuality: setSessionQuality, disconnect, attempt, screenDims } =
+    useDesktopSession(hostId, deviceId ?? '', onTile, quality)
 
   // ── Init canvas worker once caps are available ──────────────────────────
   useEffect(() => {
     if (!caps?.available || workerInitialized.current || !canvasRef.current) return
     workerInitialized.current = true
 
+    // Initial canvas size is a placeholder — the agent's `capabilities` WS
+    // message arrives with the real encoder-output dims shortly after DC
+    // open, and the effect below resizes the canvas / worker accordingly.
     const monitor = caps.monitors[0]
-    const w = monitor?.width ?? 1920
-    const h = monitor?.height ?? 1080
-    canvasRef.current.width = w
-    canvasRef.current.height = h
+    canvasRef.current.width = monitor?.width ?? 1920
+    canvasRef.current.height = monitor?.height ?? 1080
 
     if (supportsOffscreen) {
       const worker = new Worker(
@@ -120,6 +121,20 @@ export default function DesktopPage() {
     // re-run can't rebuild it (second transfer throws). Leaving the worker
     // alive is safe: it becomes unreachable on real unmount and is GC'd.
   }, [caps])
+
+  // ── Resize canvas to real encoder output on capabilities / tier change ──
+  // Server emits `capabilities` once on connect and again on every tier
+  // change, so the grid stays aligned with `tileX*128` / `tileY*128` writes.
+  useEffect(() => {
+    if (!screenDims) return
+    const { width, height } = screenDims
+    if (supportsOffscreen && workerRef.current) {
+      workerRef.current.postMessage({ type: 'resize', width, height })
+    } else if (canvasRef.current) {
+      canvasRef.current.width = width
+      canvasRef.current.height = height
+    }
+  }, [screenDims])
 
   // ── Quality change propagates to session ────────────────────────────────
   function handleQualityChange(tier: QualityTier) {

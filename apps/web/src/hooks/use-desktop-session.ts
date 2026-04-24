@@ -53,6 +53,7 @@ export function useDesktopSession(
   hostId: string,
   deviceId: string,
   onTile: TileCallback,
+  tier: QualityTier = 'med',
 ): SessionApi {
   const [status, setStatus] = useState<DesktopStatus>('idle')
   const [attempt, setAttempt] = useState(0)
@@ -68,6 +69,13 @@ export function useDesktopSession(
   const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const attemptRef = useRef(0)
   const destroyedRef = useRef(false)
+  // Latest UI-selected tier — read from `ctrlDc.onopen` to tell the agent
+  // which tier to encode at before any frame leaves. Kept in a ref (not in
+  // the effect's dep list) so tier changes don't tear down the session.
+  const tierRef = useRef<QualityTier>(tier)
+  useEffect(() => {
+    tierRef.current = tier
+  }, [tier])
 
   const teardown = useCallback(() => {
     if (dcOpenTimerRef.current) clearTimeout(dcOpenTimerRef.current)
@@ -145,6 +153,17 @@ export function useDesktopSession(
     desktopDc.onclose = () => {
       if (!fallbackRef.current && !destroyedRef.current) {
         handleDisconnect()
+      }
+    }
+
+    ctrlDc.onopen = () => {
+      // Tell the agent the current UI tier **before** any input/frame —
+      // otherwise the server defaults and we burn cycles encoding at the
+      // wrong quality until the user next touches the dropdown.
+      try {
+        ctrlDc.send(JSON.stringify({ t: 'quality', tier: tierRef.current }))
+      } catch {
+        // ctrlDc could have closed between onopen and send; ignore.
       }
     }
 

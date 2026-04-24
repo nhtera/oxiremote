@@ -7,6 +7,8 @@
 /// - Route encoded frames to either an `RTCDataChannel` or a WS binary sink.
 /// - Support quality changes by dropping the current capture task and spawning
 ///   a fresh one on a `watch` channel notification.
+/// - Fire an I-frame (full tile set) on every fresh capture task so new
+///   viewers never see deltas against state they never held.
 #[cfg(feature = "desktop")]
 pub mod inner {
     use std::sync::Arc;
@@ -14,7 +16,7 @@ pub mod inner {
     use bytes::{BufMut, Bytes, BytesMut};
     use desktop::capture::CaptureLoop;
     use desktop::{FrameOutput, QualityTier};
-    use tokio::sync::{mpsc, watch};
+    use tokio::sync::{mpsc, oneshot, watch};
     use tracing::{info, warn};
     use webrtc::data_channel::RTCDataChannel;
 
@@ -43,7 +45,15 @@ pub mod inner {
     ///
     /// Listens on `quality_rx` for quality-change notifications. On change,
     /// the current `CaptureLoop` blocking task is killed (by dropping its
-    /// channel receiver) and a fresh one is spawned at the new tier.
+    /// channel receiver) and a fresh one is spawned at the new tier — the
+    /// fresh loop's first emitted frame is forced to be a full I-frame.
+    ///
+    /// `scale_factor` is the display's physical/logical ratio; the loop
+    /// composes it with `tier` in `quality_resize` to ship logical pixels.
+    ///
+    /// Channel capacity is deliberately **2** (one in-flight, one queued).
+    /// Combined with `CaptureLoop::run`'s `try_send` drop-newest policy, this
+    /// keeps glass-to-glass latency low under encoder/network pressure.
     ///
     /// The whole capture pipeline stops when `shutdown_rx` fires or when the
     /// `Sink` send fails (WS/DC closed).
@@ -52,21 +62,30 @@ pub mod inner {
         sink: Sink,
         mut quality_rx: watch::Receiver<QualityTier>,
         mut shutdown_rx: tokio::sync::oneshot::Receiver<()>,
+        scale_factor: f32,
     ) {
         tokio::spawn(async move {
             let sink = Arc::new(sink);
             let mut current_tier = initial_tier;
 
             loop {
-                // Channel pair: blocking CaptureLoop → async drain task.
-                let (frame_tx, mut frame_rx) = mpsc::channel::<FrameOutput>(8);
+                // Small channel so capture thread's drop-newest kicks in
+                // before stale frames accumulate behind slow consumers.
+                let (frame_tx, mut frame_rx) = mpsc::channel::<FrameOutput>(2);
                 let tier = current_tier;
 
-                // Spawn the blocking capture loop.
-                let _capture_handle =
-                    tokio::task::spawn_blocking(move || CaptureLoop::run(tier, frame_tx));
+                // Force the next emitted frame to be a full I-frame so the
+                // viewer sees something complete immediately after connect
+                // (or after tier restart).
+                let (iframe_tx, iframe_rx) = oneshot::channel::<()>();
+                let _ = iframe_tx.send(());
 
-                info!(tier = ?tier, "capture pipeline started");
+                // Spawn the blocking capture loop.
+                let _capture_handle = tokio::task::spawn_blocking(move || {
+                    CaptureLoop::run(tier, frame_tx, scale_factor, Some(iframe_rx))
+                });
+
+                info!(tier = ?tier, scale_factor, "capture pipeline started");
 
                 // Drain frames until quality changes or shutdown fires.
                 loop {
