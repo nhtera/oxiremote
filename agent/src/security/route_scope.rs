@@ -31,6 +31,8 @@ pub enum RouteScope {
 const LOCALHOST_PREFIXES: &[&str] = &[
     "/api/notify",       // CLI-driven push fan-out (shared-secret bearer)
     "/api/local-sites",  // leaks listening-port enumeration on the host
+    "/api/agent",        // agent dashboard API — host-only (events SSE, state)
+    "/agent",            // agent dashboard SPA pages — host-only
 ];
 
 pub fn scope_for_path(path: &str) -> RouteScope {
@@ -85,6 +87,11 @@ mod tests {
         assert_eq!(scope_for_path("/api/notify"), RouteScope::Localhost);
         assert_eq!(scope_for_path("/api/notify/extra"), RouteScope::Localhost);
         assert_eq!(scope_for_path("/api/local-sites"), RouteScope::Localhost);
+        assert_eq!(scope_for_path("/api/agent"), RouteScope::Localhost);
+        assert_eq!(scope_for_path("/api/agent/events"), RouteScope::Localhost);
+        assert_eq!(scope_for_path("/api/agent/state"), RouteScope::Localhost);
+        assert_eq!(scope_for_path("/agent"), RouteScope::Localhost);
+        assert_eq!(scope_for_path("/agent/devices"), RouteScope::Localhost);
     }
 
     #[test]
@@ -93,6 +100,8 @@ mod tests {
         // match has to respect segment boundaries.
         assert_eq!(scope_for_path("/api/notifycheater"), RouteScope::Public);
         assert_eq!(scope_for_path("/api/local-sites-public"), RouteScope::Public);
+        assert_eq!(scope_for_path("/api/agentless"), RouteScope::Public);
+        assert_eq!(scope_for_path("/agent-about"), RouteScope::Public);
     }
 
     #[test]

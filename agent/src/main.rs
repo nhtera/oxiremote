@@ -1,5 +1,7 @@
+mod agent_api;
 mod auth;
 mod db;
+mod events;
 mod files;
 mod files_upload;
 mod git;
@@ -19,6 +21,8 @@ mod terminal_api;
 mod terminal_buffer;
 mod terminal_pty;
 mod terminal_ws;
+mod tray;
+mod tui;
 mod tunnel;
 mod tunnel_named;
 mod workspaces;
@@ -39,6 +43,7 @@ use dashmap::DashMap;
 use tower_http::trace::TraceLayer;
 use tracing::{info, warn};
 
+use crate::events::EventBus;
 use crate::host::HostInfo;
 use crate::local_sites::LocalSitesCache;
 use crate::preview::{PreviewHealth, PreviewTarget};
@@ -65,6 +70,8 @@ pub struct AppState {
     pub http_client: reqwest::Client,
     pub preview_client: reqwest::Client,
     pub rate_limiter: Arc<RateLimiter>,
+    pub event_bus: Arc<EventBus>,
+    pub tunnel_url: Arc<std::sync::RwLock<Option<String>>>,
 }
 
 fn default_data_dir() -> anyhow::Result<PathBuf> {
@@ -91,19 +98,69 @@ fn main() -> anyhow::Result<()> {
             eprintln!("Usage: oxiremote tunnel use <name>");
             std::process::exit(2);
         }
+        if sub == "serve" || sub == "--headless" {
+            return run_server_headless();
+        }
+        if sub == "tui" {
+            return run_with_tui();
+        }
         if sub == "--help" || sub == "-h" {
             println!(
-                "Usage:\n  oxiremote                 Run the agent server\n  oxiremote notify --title <text> [--body <text>] [--deep-link </h/...>]\n  oxiremote tunnel use <name>   Write ~/.config/oxiremote/tunnel.toml"
+                "Usage:\n  oxiremote                     Run agent + TUI (if TTY) or headless server\n  oxiremote tui                 Force TUI mode (server in background)\n  oxiremote serve               Force headless server mode\n  oxiremote notify --title <text> [--body <text>] [--deep-link </h/...>]\n  oxiremote tunnel use <name>   Write ~/.config/oxiremote/tunnel.toml"
             );
             return Ok(());
         }
     }
 
-    run_server()
+    // Bare invocation: pick TUI if attached to a terminal, else headless.
+    use std::io::IsTerminal;
+    if std::io::stdout().is_terminal() && std::env::var("OXI_HEADLESS").is_err() {
+        run_with_tui()
+    } else {
+        run_server_headless()
+    }
 }
 
-#[tokio::main]
-async fn run_server() -> anyhow::Result<()> {
+/// Headless path: single tokio runtime on the current (main) thread.
+fn run_server_headless() -> anyhow::Result<()> {
+    let bus = EventBus::new();
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("build tokio runtime")?;
+    rt.block_on(async move { server_main(bus).await })
+}
+
+/// TUI path: tokio runtime on a sibling thread, TUI event loop on main.
+/// The event bus is shared so tunnel/device events drive the TUI live.
+fn run_with_tui() -> anyhow::Result<()> {
+    let bus = EventBus::new();
+    let bus_for_server = bus.clone();
+    std::thread::Builder::new()
+        .name("oxiremote-server".into())
+        .spawn(move || {
+            let rt = match tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(rt) => rt,
+                Err(err) => {
+                    eprintln!("failed to build tokio runtime: {err}");
+                    return;
+                }
+            };
+            if let Err(err) = rt.block_on(server_main(bus_for_server)) {
+                eprintln!("server exited: {err:#}");
+            }
+        })
+        .context("spawn server thread")?;
+
+    tui::run_tui(bus)?;
+    // TUI exit → terminate the process so the server thread tears down too.
+    std::process::exit(0);
+}
+
+async fn server_main(event_bus: Arc<EventBus>) -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
@@ -192,6 +249,8 @@ async fn run_server() -> anyhow::Result<()> {
         http_client,
         preview_client,
         rate_limiter: Arc::new(RateLimiter::new()),
+        event_bus,
+        tunnel_url: Arc::new(std::sync::RwLock::new(None)),
     });
 
     // Background: periodic listening-port discovery + preview health checks.
@@ -207,6 +266,8 @@ async fn run_server() -> anyhow::Result<()> {
         .route("/api/devices/{id}/revoke", post(http_pages::api_device_revoke))
         // host
         .merge(host_api::router())
+        // agent-local dashboard + event bus (localhost only, enforced by route_scope)
+        .merge(agent_api::router())
         // push + notify
         .merge(push_api::router())
         // terminal
@@ -306,16 +367,37 @@ async fn run_server() -> anyhow::Result<()> {
     // If `~/.config/oxiremote/tunnel.toml` exists, run a named tunnel; else
     // fall back to a Quick Tunnel for the dev/first-run experience.
     let named_cfg = tunnel_named::load().unwrap_or(None);
+    let tunnel_state = state.clone();
     tokio::spawn(async move {
-        match named_cfg {
+        let url = match named_cfg {
             Some(cfg) => match tunnel::ensure_named_tunnel(cloudflared, cfg).await {
-                Ok(target) => info!(%target, "named tunnel ready"),
-                Err(err) => warn!(error=%err, "named tunnel failed"),
+                Ok(target) => {
+                    info!(%target, "named tunnel ready");
+                    Some(target)
+                }
+                Err(err) => {
+                    warn!(error=%err, "named tunnel failed");
+                    None
+                }
             },
             None => match tunnel::ensure_quick_tunnel(addr, cloudflared).await {
-                Ok(url) => info!(%url, "quick tunnel ready"),
-                Err(err) => warn!(error=%err, "quick tunnel failed"),
+                Ok(url) => {
+                    info!(%url, "quick tunnel ready");
+                    Some(url)
+                }
+                Err(err) => {
+                    warn!(error=%err, "quick tunnel failed");
+                    None
+                }
             },
+        };
+        if let Some(u) = url {
+            if let Ok(mut guard) = tunnel_state.tunnel_url.write() {
+                *guard = Some(u.clone());
+            }
+            tunnel_state
+                .event_bus
+                .send(events::AgentEvent::TunnelUrlChanged { url: u });
         }
     });
 

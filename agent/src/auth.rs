@@ -400,6 +400,8 @@ mod tests {
             http_client: reqwest::Client::new(),
             preview_client: reqwest::Client::new(),
             rate_limiter: std::sync::Arc::new(crate::security::rate_limit::RateLimiter::new()),
+            event_bus: crate::events::EventBus::new(),
+            tunnel_url: std::sync::Arc::new(std::sync::RwLock::new(None)),
         }
     }
 

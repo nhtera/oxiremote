@@ -1,6 +1,7 @@
-import { useEffect } from 'react'
+import { lazy, Suspense, useEffect } from 'react'
 import { Navigate, Route, Routes, useNavigate, useParams } from 'react-router-dom'
 import AppLayout from './components/app-layout'
+import AgentLayout from './components/agent-layout'
 import HomePage from './pages/home-page'
 import LoginPage from './pages/login-page'
 import TerminalPage from './pages/terminal-page'
@@ -10,6 +11,20 @@ import WorkspacePickerPage from './pages/workspace-picker-page'
 import PreviewPage from './pages/preview-page'
 import { useHostStore } from './state/host-store'
 import { registerServiceWorker } from './lib/push-client'
+
+// Agent dashboard is localhost-only. Lazy-loaded so it never enters the
+// tunnel-facing bundle for devices that can't reach these routes anyway.
+const AgentHomePage = lazy(() => import('./pages/agent/agent-home-page'))
+const AgentDevicesPage = lazy(() => import('./pages/agent/agent-devices-page'))
+const AgentSettingsPage = lazy(() => import('./pages/agent/agent-settings-page'))
+
+function AgentFallback() {
+  return (
+    <div className="flex items-center justify-center h-full text-text-muted text-sm p-6">
+      Loading…
+    </div>
+  )
+}
 
 // Redirects legacy paths (no hostId) to /h/:currentHostId/<page>
 function LegacyRedirect({ page }: { page: string }) {
@@ -93,6 +108,34 @@ function App() {
   return (
     <Routes>
       <Route path="/login" element={<LoginPage />} />
+
+      {/* Host-local dashboard — localhost-only (enforced by agent route_scope) */}
+      <Route element={<AgentLayout />}>
+        <Route
+          path="/agent"
+          element={
+            <Suspense fallback={<AgentFallback />}>
+              <AgentHomePage />
+            </Suspense>
+          }
+        />
+        <Route
+          path="/agent/devices"
+          element={
+            <Suspense fallback={<AgentFallback />}>
+              <AgentDevicesPage />
+            </Suspense>
+          }
+        />
+        <Route
+          path="/agent/settings"
+          element={
+            <Suspense fallback={<AgentFallback />}>
+              <AgentSettingsPage />
+            </Suspense>
+          }
+        />
+      </Route>
 
       {/* Host-scoped routes */}
       <Route element={<AppLayout />}>

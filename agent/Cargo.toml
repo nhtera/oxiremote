@@ -18,12 +18,13 @@ rusqlite = { version = "0.37", features = ["bundled"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 regex = "1.11"
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "http2", "charset", "gzip", "stream"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "http2", "charset", "gzip", "stream", "blocking"] }
 sha2 = "0.10"
 tar = "0.4"
 flate2 = "1.1"
 time = "0.3"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "process", "fs", "io-util"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
 tokio-util = { version = "0.7", features = ["io"] }
 tower = "0.5"
 tower-http = { version = "0.6", features = ["trace"] }
@@ -49,3 +50,12 @@ subtle = "2"
 # Per-device API key hashing for tunnel-side Bearer auth.
 argon2 = "0.5"
 toml = "0.8"
+
+# Phase 01: interactive TUI + system tray + QR codes.
+ratatui = "0.29"
+crossterm = "0.28"
+qrcode = { version = "0.14", default-features = false, features = ["svg"] }
+tray-icon = "0.19"
+notify-rust = "4"
+image = { version = "0.25", default-features = false, features = ["png"] }
+open = "5"
