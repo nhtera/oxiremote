@@ -3,6 +3,21 @@ name = "desktop"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+default = []
+# H.264 pipeline (Phase 03). VideoToolbox on macOS, openh264 as cross-platform
+# fallback. Gated so the JPEG-only build keeps working during rollout and so CI
+# can compile without the openh264 C++ toolchain. The objc2-* deps resolve to
+# nothing on non-macOS targets via their target cfg.
+h264 = [
+    "dep:openh264",
+    "dep:yuvutils-rs",
+    "dep:objc2-video-toolbox",
+    "dep:objc2-core-video",
+    "dep:objc2-core-media",
+    "dep:objc2-core-foundation",
+]
+
 [dependencies]
 xcap = "0.9"
 mozjpeg = "0.10"
@@ -14,6 +29,23 @@ bytes = "1"
 tracing = "0.1"
 tokio = { version = "1", features = ["rt", "sync", "time"] }
 rayon = "1"
+
+# Phase 03 SW fallback encoder. `source` feature statically compiles Cisco's
+# OpenH264 into the binary — no dlopen, no separate dylib. MPEG LA legal review
+# required before public release (see phase-03 memo).
+openh264 = { version = "0.9", features = ["source"], optional = true }
+# BGRA→I420 conversion for the OpenH264 input path (NEON on Apple Silicon,
+# AVX2 on x86). Pure Rust; no C toolchain dependency unlike libyuv-sys.
+yuvutils-rs = { version = "0.8", optional = true }
+
+# Phase 03 macOS hardware encoder. Raw FFI to VideoToolbox/CoreMedia via the
+# madsmtm/objc2 ecosystem — auto-generated from Apple SDK headers. All four
+# objc2-* crates must stay on the same minor version (they version-lock).
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2-video-toolbox = { version = "0.3", optional = true }
+objc2-core-video = { version = "0.3", optional = true }
+objc2-core-media = { version = "0.3", optional = true }
+objc2-core-foundation = { version = "0.3", optional = true }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

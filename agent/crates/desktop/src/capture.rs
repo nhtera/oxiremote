@@ -8,7 +8,7 @@ use tokio::sync::oneshot;
 use tracing::{info, warn};
 use xcap::Monitor;
 
-use crate::encode::{FrameOutput, QualityTier, TileDiff, TileEncoder};
+use crate::encode::{quality_resize, FrameOutput, QualityTier, TileDiff, TileEncoder};
 
 /// Wraps a single monitor handle for frame-by-frame capture.
 pub struct ScreenCapture {
@@ -182,5 +182,145 @@ impl CaptureLoop {
             frames_dropped = dropped_count,
             "CaptureLoop stopped"
         );
+    }
+
+    /// Raw-BGRA variant for the Phase 03 H.264 pipeline. Shares the capture
+    /// clock + force-iframe signal with `run`, but skips tile diff + JPEG
+    /// encode and instead emits resized BGRA bytes for the `H264Encoder` to
+    /// consume. The H.264 encoder handles its own keyframe logic, so we do
+    /// not clear any diff state here — we just forward `force_iframe` as a
+    /// flag on the next emitted frame.
+    pub fn run_bgra(
+        tier: QualityTier,
+        tx: Sender<RawBgraFrame>,
+        scale_factor: f32,
+        mut force_iframe_rx: Option<oneshot::Receiver<()>>,
+    ) {
+        let capture = match ScreenCapture::primary() {
+            Ok(c) => c,
+            Err(err) => {
+                warn!(error = %err, "CaptureLoop::run_bgra: failed to open primary monitor");
+                return;
+            }
+        };
+        info!(tier = ?tier, scale_factor, "CaptureLoop::run_bgra started");
+
+        let interval = frame_interval(tier);
+        let mut frame_count: u64 = 0;
+        let mut dropped_count: u64 = 0;
+
+        loop {
+            let frame_start = Instant::now();
+
+            // Force-IDR flag for the NEXT emitted frame. One-shot; consumed
+            // in the emit block below.
+            let mut force_idr = false;
+            if let Some(mut rx) = force_iframe_rx.take() {
+                match rx.try_recv() {
+                    Ok(()) => {
+                        force_idr = true;
+                        info!("CaptureLoop::run_bgra: force-iframe received");
+                    }
+                    Err(oneshot::error::TryRecvError::Empty) => force_iframe_rx = Some(rx),
+                    Err(oneshot::error::TryRecvError::Closed) => {}
+                }
+            }
+
+            let raw = match capture.next_frame() {
+                Ok(img) => img,
+                Err(err) => {
+                    warn!(error = %err, "CaptureLoop::run_bgra: capture error");
+                    std::thread::sleep(interval);
+                    continue;
+                }
+            };
+
+            let resized = quality_resize(raw, tier, scale_factor);
+            let (width, height) = (resized.width(), resized.height());
+            let bytes = rgba_to_bgra(resized.as_raw());
+
+            match tx.try_send(RawBgraFrame {
+                bytes,
+                width,
+                height,
+                force_idr,
+            }) {
+                Ok(()) => frame_count += 1,
+                Err(TrySendError::Full(_)) => {
+                    dropped_count += 1;
+                    tracing::debug!(dropped = dropped_count, "run_bgra: backpressure drop");
+                }
+                Err(TrySendError::Closed(_)) => {
+                    info!("CaptureLoop::run_bgra: channel closed, stopping");
+                    break;
+                }
+            }
+
+            let elapsed = frame_start.elapsed();
+            if let Some(remaining) = interval.checked_sub(elapsed) {
+                std::thread::sleep(remaining);
+            }
+        }
+
+        info!(
+            frames_sent = frame_count,
+            frames_dropped = dropped_count,
+            "CaptureLoop::run_bgra stopped"
+        );
+    }
+}
+
+/// One captured frame already resized to the logical/tier dimensions, ready
+/// for H.264 encode. Byte order is BGRA (matches `kCVPixelFormatType_32BGRA`
+/// and the `yuvutils-rs` BGRA→I420 path used by OpenH264).
+#[derive(Debug)]
+pub struct RawBgraFrame {
+    pub bytes: Vec<u8>,
+    pub width: u32,
+    pub height: u32,
+    /// Set when the pipeline must mark the next encoded frame as an IDR.
+    /// Driven by client PLI over RTCP or by session-open cold-start.
+    pub force_idr: bool,
+}
+
+/// Convert an RGBA8 byte slice in-place-style to a BGRA8 Vec. xcap delivers
+/// RGBA; both our H.264 encoder backends (VT's `kCVPixelFormatType_32BGRA`
+/// and OpenH264's `yuvutils-rs::bgra_to_yuv420`) take BGRA.
+///
+/// Per-pixel swap of R↔B. Could be SIMD-accelerated later; at typical tier
+/// resolutions (≤ 1512×982 logical) this is ~1.5 M pixels ≈ < 3 ms on an
+/// M-series core — well under the 33 ms frame budget.
+fn rgba_to_bgra(rgba: &[u8]) -> Vec<u8> {
+    debug_assert!(rgba.len() % 4 == 0);
+    let mut out = Vec::with_capacity(rgba.len());
+    for p in rgba.chunks_exact(4) {
+        out.push(p[2]); // B
+        out.push(p[1]); // G
+        out.push(p[0]); // R
+        out.push(p[3]); // A
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rgba_to_bgra_swaps_r_and_b() {
+        let rgba = [
+            0x11, 0x22, 0x33, 0xFF, // R, G, B, A
+            0xAA, 0xBB, 0xCC, 0x80,
+        ];
+        let bgra = rgba_to_bgra(&rgba);
+        assert_eq!(
+            &bgra[..],
+            &[0x33, 0x22, 0x11, 0xFF, 0xCC, 0xBB, 0xAA, 0x80]
+        );
+    }
+
+    #[test]
+    fn rgba_to_bgra_empty_input() {
+        assert!(rgba_to_bgra(&[]).is_empty());
     }
 }

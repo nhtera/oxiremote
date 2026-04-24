@@ -69,7 +69,14 @@ desktop = { path = "crates/desktop", optional = true }
 
 # Phase 04: WebRTC DataChannel transport for remote desktop streaming.
 webrtc = { version = "0.11", optional = true }
+# Phase 03 RTCP feedback parsing (PLI, REMB) — webrtc-rs pulls rtcp 0.11
+# transitively but doesn't re-export the packet types we need to downcast to.
+rtcp = { version = "0.11", optional = true }
 
 [features]
 default = ["desktop"]
 desktop = ["dep:desktop", "dep:webrtc"]
+# Phase 03 H.264 pipeline (VT on macOS, OpenH264 fallback). Adds WebRTC
+# video track + capabilities exchange. Gated so the default JPEG build stays
+# compile-clean while H.264 is under active development.
+h264 = ["desktop", "desktop/h264", "dep:rtcp"]

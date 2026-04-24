@@ -1,0 +1,316 @@
+// WebRTC session hook for the Phase 03 H.264 video-track pipeline.
+//
+// Sibling to `use-desktop-session.ts` (JPEG-over-DataChannel). The server
+// announces its chosen pipeline via the `pipeline` signaling message; the
+// main page mounts whichever hook matches.
+//
+// Architecture (research memo option 1 — native decoder path):
+// - Client's first SDP offer adds a `recvonly` video transceiver so the
+//   server can attach its `TrackLocalStaticSample` without renegotiation.
+// - Ctrl DC stays text-only (same as JPEG path) for input events + tier.
+// - Incoming video arrives as a standard `MediaStreamTrack`; we pipe it to
+//   a hidden `<video>` element and use `requestVideoFrameCallback` to blit
+//   each decoded frame to the on-screen canvas.
+//
+// Upgrade path (future): swap the `<video>` + rVFC hop for
+// `RTCRtpScriptTransform` + WebCodecs `VideoDecoder` if benchmarking shows
+// the compositor hop costs > 5 ms. See phase-03-h264 plan.
+
+import { useCallback, useEffect, useRef, useState } from 'react'
+
+import type { DesktopInputEvent, DesktopStatus, QualityTier } from './use-desktop-session'
+
+interface VideoSessionApi {
+  status: DesktopStatus
+  sendInput: (ev: DesktopInputEvent) => void
+  setQuality: (tier: QualityTier) => void
+  disconnect: () => void
+  attempt: number
+  /** Set once the agent announces the stream dimensions via `capabilities`. */
+  screenDims?: { width: number; height: number }
+}
+
+/** Callback invoked once per decoded video frame. Caller draws to canvas. */
+type FrameCallback = (bitmap: VideoFrame | HTMLVideoElement, video: HTMLVideoElement) => void
+
+const STUN_CONFIG: RTCConfiguration = {
+  iceServers: [{ urls: 'stun:stun.l.google.com:19302' }],
+}
+const RECONNECT_DELAY_MS = 1500
+const MAX_ATTEMPTS = 3
+
+function wsUrl(deviceId: string): string {
+  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:'
+  return `${proto}//${location.host}/ws/desktop/${encodeURIComponent(deviceId)}`
+}
+
+/** Feature-detection: phase-03 needs WebRTC + H.264 receive support. All
+ * evergreen browsers (Chrome 2013+, Safari 14+, Firefox 2017+) satisfy this. */
+export function supportsH264Video(): boolean {
+  return typeof RTCPeerConnection !== 'undefined' && typeof MediaStream !== 'undefined'
+}
+
+export function useDesktopVideoSession(
+  hostId: string,
+  deviceId: string,
+  onFrame: FrameCallback,
+  tier: QualityTier = 'med',
+): VideoSessionApi {
+  const [status, setStatus] = useState<DesktopStatus>('idle')
+  const [attempt, setAttempt] = useState(0)
+  const [screenDims, setScreenDims] = useState<{ width: number; height: number } | undefined>()
+
+  const wsRef = useRef<WebSocket | null>(null)
+  const pcRef = useRef<RTCPeerConnection | null>(null)
+  const ctrlDcRef = useRef<RTCDataChannel | null>(null)
+  const videoRef = useRef<HTMLVideoElement | null>(null)
+  const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const attemptRef = useRef(0)
+  const destroyedRef = useRef(false)
+  const rvfcHandleRef = useRef<number | null>(null)
+
+  // Latest UI tier — pushed into ctrl DC on open so the agent encodes at the
+  // right bitrate from the first frame rather than falling back to default.
+  const tierRef = useRef<QualityTier>(tier)
+  useEffect(() => {
+    tierRef.current = tier
+  }, [tier])
+
+  // ── Hidden <video> element lifecycle ────────────────────────────────────
+  //
+  // Created once per hook; reused across reconnects. We never append it to
+  // the DOM — assigning `srcObject` + calling `play()` is enough for the
+  // decoder to run, and `requestVideoFrameCallback` still fires.
+  useEffect(() => {
+    const v = document.createElement('video')
+    v.autoplay = true
+    v.playsInline = true
+    v.muted = true
+    videoRef.current = v
+    return () => {
+      v.srcObject = null
+      videoRef.current = null
+    }
+  }, [])
+
+  // ── rVFC draw loop ──────────────────────────────────────────────────────
+  //
+  // `requestVideoFrameCallback` fires only when a new decoded frame is
+  // available — no redraws on idle. Self-reschedules each call.
+  const startFrameLoop = useCallback(() => {
+    const video = videoRef.current
+    if (!video) return
+    // Some older browsers lack rVFC; gracefully fall back to rAF.
+    if (typeof video.requestVideoFrameCallback !== 'function') {
+      const loop = () => {
+        if (destroyedRef.current) return
+        onFrame(video, video)
+        rvfcHandleRef.current = requestAnimationFrame(loop) as unknown as number
+      }
+      rvfcHandleRef.current = requestAnimationFrame(loop) as unknown as number
+      return
+    }
+    const step = () => {
+      if (destroyedRef.current) return
+      onFrame(video, video)
+      rvfcHandleRef.current = video.requestVideoFrameCallback(step) as unknown as number
+    }
+    rvfcHandleRef.current = video.requestVideoFrameCallback(step) as unknown as number
+  }, [onFrame])
+
+  const stopFrameLoop = useCallback(() => {
+    const video = videoRef.current
+    const handle = rvfcHandleRef.current
+    if (handle === null) return
+    if (video && typeof video.cancelVideoFrameCallback === 'function') {
+      try {
+        video.cancelVideoFrameCallback(handle)
+      } catch {
+        /* best effort */
+      }
+    } else {
+      cancelAnimationFrame(handle)
+    }
+    rvfcHandleRef.current = null
+  }, [])
+
+  // ── Teardown / reconnect ────────────────────────────────────────────────
+  const teardown = useCallback(() => {
+    if (reconnectTimerRef.current) clearTimeout(reconnectTimerRef.current)
+    stopFrameLoop()
+    ctrlDcRef.current?.close()
+    pcRef.current?.close()
+    if (wsRef.current && wsRef.current.readyState < WebSocket.CLOSING) {
+      wsRef.current.close()
+    }
+    ctrlDcRef.current = null
+    pcRef.current = null
+    wsRef.current = null
+    if (videoRef.current) videoRef.current.srcObject = null
+  }, [stopFrameLoop])
+
+  // ── Ctrl DC helper ──────────────────────────────────────────────────────
+  function sendCtrl(ev: DesktopInputEvent) {
+    const payload = JSON.stringify(ev)
+    if (ctrlDcRef.current?.readyState === 'open') {
+      ctrlDcRef.current.send(payload)
+    } else if (wsRef.current?.readyState === WebSocket.OPEN) {
+      wsRef.current.send(payload)
+    }
+  }
+
+  // ── Connect ─────────────────────────────────────────────────────────────
+  const connect = useCallback(() => {
+    if (destroyedRef.current) return
+    teardown()
+
+    setStatus('connecting')
+    const ws = new WebSocket(wsUrl(deviceId))
+    ws.binaryType = 'arraybuffer'
+    wsRef.current = ws
+
+    const pc = new RTCPeerConnection(STUN_CONFIG)
+    pcRef.current = pc
+
+    // Recvonly video transceiver — phase 03 server expects this in the first
+    // offer so it can add its TrackLocalStaticSample without renegotiation.
+    pc.addTransceiver('video', { direction: 'recvonly' })
+
+    // Ctrl DC: reliable ordered (same as JPEG path — input events must not be
+    // reordered). Externally-negotiated with id=2 so the server's peer
+    // creates a matching DC.
+    const ctrlDc = pc.createDataChannel('ctrl', {
+      ordered: true,
+      negotiated: true,
+      id: 2,
+    })
+    ctrlDcRef.current = ctrlDc
+
+    pc.onicecandidate = (e) => {
+      if (e.candidate && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ type: 'ice', candidate: e.candidate.toJSON() }))
+      }
+    }
+
+    // Incoming video track — attach to the hidden video element and start
+    // the draw loop.
+    pc.ontrack = (e) => {
+      if (e.track.kind !== 'video') return
+      const video = videoRef.current
+      if (!video) return
+      const stream = e.streams[0] ?? new MediaStream([e.track])
+      video.srcObject = stream
+      // `play()` may reject on autoplay restrictions; we catch because the
+      // track still dispatches frames for rVFC regardless.
+      video.play().catch(() => {})
+      setStatus('streaming')
+      attemptRef.current = 0
+      setAttempt(0)
+      startFrameLoop()
+    }
+
+    ctrlDc.onopen = () => {
+      try {
+        ctrlDc.send(JSON.stringify({ t: 'quality', tier: tierRef.current }))
+      } catch {
+        /* DC could close between open and send */
+      }
+    }
+
+    ws.onopen = () => {
+      setStatus('signaling')
+      // Announce decoder capabilities BEFORE sending the offer so the server
+      // can decide H.264 vs JPEG before the first ICE candidate arrives.
+      ws.send(
+        JSON.stringify({ type: 'capabilitiesClient', codecs: ['h264-baseline-3.1'], webcodecs: false }),
+      )
+      pc.createOffer()
+        .then((offer) => pc.setLocalDescription(offer))
+        .then(() => {
+          if (ws.readyState === WebSocket.OPEN && pc.localDescription) {
+            ws.send(JSON.stringify({ type: 'offer', sdp: pc.localDescription.sdp }))
+          }
+        })
+        .catch(() => handleDisconnect())
+    }
+
+    ws.onmessage = (e: MessageEvent) => {
+      if (typeof e.data !== 'string') return
+      let msg: Record<string, unknown>
+      try {
+        msg = JSON.parse(e.data) as Record<string, unknown>
+      } catch {
+        return
+      }
+      switch (msg.type) {
+        case 'answer':
+          pc.setRemoteDescription(
+            new RTCSessionDescription({ type: 'answer', sdp: msg.sdp as string }),
+          ).catch(() => handleDisconnect())
+          break
+        case 'ice':
+          pc.addIceCandidate(
+            new RTCIceCandidate(msg.candidate as RTCIceCandidateInit),
+          ).catch(() => {})
+          break
+        case 'capabilities':
+          if (msg.width && msg.height) {
+            setScreenDims({ width: msg.width as number, height: msg.height as number })
+          }
+          break
+        case 'pipeline':
+          // Server confirmed pipeline choice. If it's "jpeg", the host should
+          // have mounted the JPEG hook instead — log and close as protocol
+          // mismatch rather than silently streaming via the wrong path.
+          if (msg.mode !== 'h264') {
+            // eslint-disable-next-line no-console
+            console.warn('video-session: server selected non-H.264 pipeline', msg.mode)
+          }
+          break
+      }
+    }
+
+    ws.onerror = () => handleDisconnect()
+    ws.onclose = () => {
+      if (!destroyedRef.current) handleDisconnect()
+    }
+  }, [deviceId, teardown, startFrameLoop]) // eslint-disable-line react-hooks/exhaustive-deps
+
+  function handleDisconnect() {
+    if (destroyedRef.current) return
+    const next = attemptRef.current + 1
+    attemptRef.current = next
+    setAttempt(next)
+    if (next >= MAX_ATTEMPTS) {
+      teardown()
+      setStatus('disconnected')
+      return
+    }
+    setStatus('reconnecting')
+    teardown()
+    reconnectTimerRef.current = setTimeout(() => {
+      if (!destroyedRef.current) connect()
+    }, RECONNECT_DELAY_MS)
+  }
+
+  const sendInput = useCallback((ev: DesktopInputEvent) => sendCtrl(ev), []) // eslint-disable-line
+  const setQuality = useCallback((q: QualityTier) => sendCtrl({ t: 'quality', tier: q }), []) // eslint-disable-line
+
+  const disconnect = useCallback(() => {
+    destroyedRef.current = true
+    teardown()
+    setStatus('disconnected')
+  }, [teardown])
+
+  useEffect(() => {
+    if (!deviceId) return
+    destroyedRef.current = false
+    connect()
+    return () => {
+      destroyedRef.current = true
+      teardown()
+    }
+  }, [hostId, deviceId]) // eslint-disable-line react-hooks/exhaustive-deps
+
+  return { status, sendInput, setQuality, disconnect, attempt, screenDims }
+}

@@ -25,6 +25,13 @@ mod desktop_service;
 mod desktop_ws;
 #[cfg(feature = "desktop")]
 mod desktop_ws_capture;
+// Phase 03 pipeline selection — operator env flag + client capability AND.
+#[cfg(feature = "desktop")]
+mod pipeline_selection;
+// Phase 03 H.264 pipeline — gated so the JPEG default build doesn't depend
+// on the VT/OpenH264 toolchain.
+#[cfg(feature = "h264")]
+mod video_pipeline;
 mod terminal_api;
 mod terminal_buffer;
 mod terminal_pty;

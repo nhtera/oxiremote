@@ -57,10 +57,16 @@ pub async fn api_desktop_capabilities(
             vec![]
         };
 
+        // Surface the operator's pipeline preference so the SPA can mount the
+        // correct hook (JPEG vs H.264) before opening the WS — spares a
+        // doomed H.264 handshake when the server will choose JPEG anyway.
+        let preferred_pipeline = crate::pipeline_selection::operator_preference().wire_name();
+
         let body = json!({
             "available": available,
             "quality_tiers": ["low", "med", "high"],
             "monitors": monitors,
+            "preferred_pipeline": preferred_pipeline,
         });
         (StatusCode::OK, Json(body)).into_response()
     }
@@ -71,6 +77,7 @@ pub async fn api_desktop_capabilities(
             "available": false,
             "quality_tiers": ["low", "med", "high"],
             "monitors": [],
+            "preferred_pipeline": "jpeg",
         });
         (StatusCode::OK, Json(body)).into_response()
     }
