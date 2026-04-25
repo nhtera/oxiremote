@@ -63,7 +63,11 @@ const FPS_HIGH_MS: u64 = 33; // ~30 FPS
 const FPS_MED_MS: u64 = 66; // ~15 FPS
 const FPS_LOW_MS: u64 = 125; // ~8 FPS
 
-fn frame_interval(tier: QualityTier) -> Duration {
+/// Wall-clock interval between captured frames at a given tier. Public so
+/// the H.264 video pipeline's writer task can pace `track.write_sample`
+/// to the same cadence — SCK can deliver in bursts, and a constant-rate
+/// writer keeps Chrome's jitter buffer minimal.
+pub fn frame_interval(tier: QualityTier) -> Duration {
     match tier {
         QualityTier::High => Duration::from_millis(FPS_HIGH_MS),
         QualityTier::Med => Duration::from_millis(FPS_MED_MS),

@@ -648,6 +648,10 @@ mod inner {
             track,
             bgra_rx,
             bitrate_rx,
+            // Same watch source as the capture loop — writer paces RTP
+            // sends to the user's selected fps so the burst-y SCK arrival
+            // pattern doesn't fatten Chrome's jitter buffer.
+            fps_rx: quality_tx.subscribe(),
             shutdown_rx: vp_shutdown_rx,
             pli_rx,
             params_tx,

@@ -22,7 +22,7 @@ use std::time::{Duration, SystemTime};
 
 use anyhow::Result;
 use desktop::encoders::{BitrateBps, EncodedFrame, H264Encoder, ParameterSets};
-use desktop::RawBgraFrame;
+use desktop::{QualityTier, RawBgraFrame};
 use tokio::sync::{mpsc, oneshot, watch};
 use tracing::{debug, info, warn};
 use webrtc::api::media_engine::MIME_TYPE_H264;
@@ -49,6 +49,10 @@ pub struct VideoPipelineConfig {
     pub track: Arc<TrackLocalStaticSample>,
     pub bgra_rx: mpsc::Receiver<BgraFrame>,
     pub bitrate_rx: watch::Receiver<BitrateBps>,
+    /// Live tier signal — drives the writer's send-pacing cadence so RTP
+    /// arrival at the browser is steady at the user's selected fps. Without
+    /// this the burst-y SCK arrival pattern fattens Chrome's jitter buffer.
+    pub fps_rx: watch::Receiver<QualityTier>,
     pub shutdown_rx: oneshot::Receiver<()>,
     /// PLI arrivals from the RTCP read loop. Each received `()` forces the
     /// *next* encoded frame to be an IDR so the client can recover from a
@@ -123,7 +127,8 @@ pub fn spawn_video_pipeline(mut cfg: VideoPipelineConfig) {
 
     // Writer task — async, owns the track Arc.
     let track = cfg.track.clone();
-    tokio::spawn(writer_task(track, sample_rx));
+    let writer_fps_rx = cfg.fps_rx.clone();
+    tokio::spawn(writer_task(track, sample_rx, writer_fps_rx));
 
     // Encoder task — blocking, owns the encoder + params_tx oneshot.
     std::thread::spawn(move || {
@@ -223,34 +228,49 @@ pub fn spawn_video_pipeline(mut cfg: VideoPipelineConfig) {
 async fn writer_task(
     track: Arc<TrackLocalStaticSample>,
     mut sample_rx: mpsc::Receiver<EncodedFrame>,
+    fps_rx: watch::Receiver<QualityTier>,
 ) {
     use std::time::Instant;
     let mut last_send: Option<Instant> = None;
     while let Some(mut frame) = sample_rx.recv().await {
-        // Drain any encoded samples queued during the last write. Keeping
-        // only the freshest frame is "drop-oldest" semantics on top of a
-        // bounded mpsc — write_sample on a stale frame would add latency
-        // without benefit. Non-IDR frames depend on prior frames so dropping
-        // them risks decoder corruption — a full IDR keyframe arrives at
-        // least every `MaxKeyFrameInterval` (2 s) and PLI on loss, so the
-        // decoder resyncs quickly.
+        // Drain any encoded samples queued behind this one — drop-oldest
+        // semantics on top of a bounded mpsc. write_sample on a stale frame
+        // adds latency without benefit; the decoder resyncs on the next
+        // keyframe (≤ 2 s by `MaxKeyFrameInterval`, sooner on PLI).
         while let Ok(newer) = sample_rx.try_recv() {
             frame = newer;
         }
-        // Measure ACTUAL wall-clock interval since the previous sample. The
-        // packetizer uses `duration` to advance the RTP timestamp by
-        // `duration * 90 kHz`; lying about it (the previous static 17 ms)
-        // makes the RTP clock drift from real time and Chrome's jitter
-        // buffer balloons (we observed ~1.6 s buffering with the static
-        // value when SCK delivered at 15–30 fps wall cadence). Clamp to
-        // [1 ms, 200 ms] so a stalled capture loop doesn't emit a duration
-        // that confuses the receiver.
+
+        // PACED SEND: hold the sample until at least `target_interval` has
+        // elapsed since the previous write. SCK can deliver frames in bursts
+        // (4 frames in 50 ms then idle for 200 ms is normal for a static
+        // screen); shipping them as they arrive fattens Chrome's jitter
+        // buffer to absorb the unevenness. Forcing a steady cadence at the
+        // user's tier rate lets the browser play with near-zero buffering.
+        let target_interval = desktop::frame_interval(*fps_rx.borrow());
+        if let Some(prev) = last_send {
+            let elapsed = prev.elapsed();
+            if elapsed < target_interval {
+                tokio::time::sleep(target_interval - elapsed).await;
+            }
+        }
+        // Re-drain after the pacing sleep — a fresher frame may have arrived
+        // while we waited; sending it instead of the now-stale one shaves
+        // up to one tier-interval of latency.
+        while let Ok(newer) = sample_rx.try_recv() {
+            frame = newer;
+        }
+
+        // Measure ACTUAL wall-clock interval since the previous sample for
+        // the RTP timestamp delta. The packetizer multiplies this by the
+        // 90 kHz clock rate, so a lying duration drifts the receiver clock
+        // and balloons the jitter buffer. Clamp [1 ms, 200 ms] so a stalled
+        // capture loop can't emit a duration that confuses the receiver.
         let now = Instant::now();
         let duration = match last_send {
-            Some(prev) => {
-                let d = now.duration_since(prev);
-                d.clamp(Duration::from_millis(1), Duration::from_millis(200))
-            }
+            Some(prev) => now
+                .duration_since(prev)
+                .clamp(Duration::from_millis(1), Duration::from_millis(200)),
             None => Duration::from_millis(FIRST_FRAME_DURATION_MS),
         };
         last_send = Some(now);
