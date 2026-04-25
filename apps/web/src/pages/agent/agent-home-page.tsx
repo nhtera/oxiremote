@@ -9,6 +9,8 @@ import HealthCheckConsole, {
 import RecentLogsCard, { type LogEntry } from '../../components/recent-logs-card'
 import PermissionsWidget from '../../components/permissions-widget'
 import DevicesPanel from '../../components/devices-panel'
+import TunnelStatusCard from '../../components/tunnel-status-card'
+import { Button, SkeletonCard, StateView } from '../../components/ui'
 
 // Host-dashboard home. Live-updates via the `/api/agent/events` SSE stream;
 // initial snapshot from `/api/agent/state`. Both endpoints are localhost-only
@@ -59,6 +61,8 @@ type AgentEvent =
 const PROBE_BUFFER = 20
 const LOG_BUFFER = 50
 
+type FetchStatus = 'loading' | 'ready' | 'error'
+
 export default function AgentHomePage() {
   const [state, setState] = useState<AgentState | null>(null)
   const [otk, setOtk] = useState<OtkState | null>(null)
@@ -67,23 +71,37 @@ export default function AgentHomePage() {
   const [probeLog, setProbeLog] = useState<ProbeEntry[]>([])
   const [tunnelHealthy, setTunnelHealthy] = useState(false)
   const [recentLogs, setRecentLogs] = useState<LogEntry[]>([])
+  const [fetchStatus, setFetchStatus] = useState<FetchStatus>('loading')
+  const [retryNonce, setRetryNonce] = useState(0)
 
-  // Fetch initial state (includes otk if present)
+  // Fetch initial state (includes otk if present). Surface fetch failures so
+  // the user gets a "couldn't reach agent" panel instead of an empty page.
+  // Retry button bumps retryNonce → re-runs this effect.
   useEffect(() => {
     let cancelled = false
     fetch('/api/agent/state')
-      .then((r) => r.json())
-      .then((data: AgentState) => {
-        if (!cancelled) {
-          setState(data)
-          setOtk(data.otk ?? null)
-        }
+      .then((r) => {
+        if (!r.ok) throw new Error(`HTTP ${r.status}`)
+        return r.json()
       })
-      .catch(() => {})
+      .then((data: AgentState) => {
+        if (cancelled) return
+        setState(data)
+        setOtk(data.otk ?? null)
+        setFetchStatus('ready')
+      })
+      .catch(() => {
+        if (!cancelled) setFetchStatus('error')
+      })
     return () => {
       cancelled = true
     }
-  }, [])
+  }, [retryNonce])
+
+  function retry() {
+    setFetchStatus('loading')
+    setRetryNonce((n) => n + 1)
+  }
 
   // Subscribe to SSE events
   useEffect(() => {
@@ -177,12 +195,32 @@ export default function AgentHomePage() {
 
   const tunnelUrl = state?.tunnel_url ?? null
 
+  if (fetchStatus === 'error') {
+    return (
+      <div className="p-6 max-w-4xl mx-auto">
+        <StateView
+          tone="error"
+          icon={
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="h-full w-full" aria-hidden="true">
+              <circle cx="12" cy="12" r="10" />
+              <line x1="12" y1="8" x2="12" y2="12" />
+              <line x1="12" y1="16" x2="12.01" y2="16" />
+            </svg>
+          }
+          title="Couldn't reach the agent"
+          body="The local oxiremote process isn't responding. Make sure it's running, then retry."
+          action={<Button variant="primary" onClick={retry}>Retry</Button>}
+        />
+      </div>
+    )
+  }
+
   return (
     <div className="p-6 max-w-4xl mx-auto space-y-6">
       <header className="flex items-start justify-between gap-4">
         <div>
-          <h1 className="text-2xl font-semibold tracking-tight text-text-primary">Host Dashboard</h1>
-          <p className="text-sm text-text-muted mt-1">
+          <h1 className="text-[length:var(--text-h1)] font-semibold tracking-tight text-text-primary">Host Dashboard</h1>
+          <p className="text-[length:var(--text-meta)] text-text-muted mt-1">
             {state ? `${state.label} · ${state.platform}` : 'Loading…'}
           </p>
         </div>
@@ -196,7 +234,15 @@ export default function AgentHomePage() {
         )}
       </header>
 
-      {/* Hero: pairing card combines QR + OTK + URL + countdown. */}
+      {/* Tunnel status banner — second-most-prominent element after pairing.
+          Hidden while the very first /api/agent/state response is in flight
+          to avoid a flash of "tunnel unreachable" copy. */}
+      {fetchStatus === 'ready' && (
+        <TunnelStatusCard tunnelUrl={tunnelUrl} healthy={tunnelHealthy} />
+      )}
+
+      {/* Hero: pairing card combines QR + OTK + URL + countdown. PairingCard
+          carries its own loading-state for the OTK so we render it eagerly. */}
       <PairingCard
         tunnelUrl={tunnelUrl}
         otkToken={otk?.token ?? null}
@@ -212,30 +258,39 @@ export default function AgentHomePage() {
           <HealthCheckConsole entries={probeLog} reachable={tunnelHealthy} />
         </Card>
       )}
-      {!tunnelUrl && (
+      {!tunnelUrl && fetchStatus === 'ready' && (
         <Card title="Tunnel health">
           <HealthCheckConsole entries={probeLog} reachable={false} />
         </Card>
       )}
 
       <section className="grid grid-cols-1 md:grid-cols-2 gap-4">
-        <Card title="Host">
-          <Row k="Host ID" v={state?.host_id ?? '—'} />
-          <Row k="Label" v={state?.label ?? '—'} />
-          <Row k="Platform" v={state?.platform ?? '—'} />
-        </Card>
+        {fetchStatus === 'loading' ? (
+          <>
+            <SkeletonCard lines={3} />
+            <SkeletonCard lines={3} />
+          </>
+        ) : (
+          <>
+            <Card title="Host">
+              <Row k="Host ID" v={state?.host_id ?? '—'} />
+              <Row k="Label" v={state?.label ?? '—'} />
+              <Row k="Platform" v={state?.platform ?? '—'} />
+            </Card>
 
-        <Card title="Connected Devices">
-          <div className="flex items-baseline gap-2 mb-3">
-            <div className="text-[length:var(--text-display)] font-semibold text-text-primary leading-none">
-              {state?.connected_devices ?? '—'}
-            </div>
-            <div className="text-xs text-text-muted">
-              active terminal/preview sessions
-            </div>
-          </div>
-          <DevicesPanel />
-        </Card>
+            <Card title="Connected Devices">
+              <div className="flex items-baseline gap-2 mb-3">
+                <div className="text-[length:var(--text-display)] font-semibold text-text-primary leading-none">
+                  {state?.connected_devices ?? '—'}
+                </div>
+                <div className="text-[length:var(--text-meta)] text-text-muted">
+                  active terminal/preview sessions
+                </div>
+              </div>
+              <DevicesPanel />
+            </Card>
+          </>
+        )}
       </section>
 
       <section>

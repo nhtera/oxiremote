@@ -1,9 +1,12 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { List, type RowComponentProps } from 'react-window'
+import { useToast } from '../../components/ui'
+import StatusChip from '../../components/ui/status-chip'
 
 // Localhost-only log viewer. Streams `LogEntry` events over SSE filtered by
 // `?filter=log` (see agent_api.rs). Hard-capped at 5000 entries so long-running
-// sessions don't leak memory.
+// sessions don't leak memory. Pause buffers incoming entries client-side so the
+// list stays steady while the operator reads.
 
 type Level = 'info' | 'warn' | 'error'
 
@@ -25,6 +28,18 @@ export default function AgentLogsPage() {
   const [modFilter, setModFilter] = useState<string>('all')
   const [query, setQuery] = useState('')
   const [connected, setConnected] = useState(false)
+  const [paused, setPaused] = useState(false)
+  const [pendingCount, setPendingCount] = useState(0)
+  const toast = useToast()
+
+  // While paused, incoming entries land in bufferRef instead of state, so the
+  // visible list stays steady while the operator reads. resume() drains it.
+  const pausedRef = useRef(false)
+  const bufferRef = useRef<LogEntry[]>([])
+
+  useEffect(() => {
+    pausedRef.current = paused
+  }, [paused])
 
   useEffect(() => {
     const es = new EventSource('/api/agent/events?filter=log')
@@ -40,16 +55,37 @@ export default function AgentLogsPage() {
           ts: Number(ev.ts ?? 0),
           msg: ev.msg ?? '',
         }
-        setEntries((prev) => {
-          const next = prev.length >= MAX_BUFFER ? prev.slice(-(MAX_BUFFER - 1)) : prev
-          return [...next, entry]
-        })
+        if (pausedRef.current) {
+          bufferRef.current.push(entry)
+          if (bufferRef.current.length > MAX_BUFFER) {
+            bufferRef.current = bufferRef.current.slice(-MAX_BUFFER)
+          }
+          setPendingCount(bufferRef.current.length)
+        } else {
+          setEntries((prev) => {
+            const next = prev.length >= MAX_BUFFER ? prev.slice(-(MAX_BUFFER - 1)) : prev
+            return [...next, entry]
+          })
+        }
       } catch {
         // drop malformed frames
       }
     }
     return () => es.close()
   }, [])
+
+  function resume() {
+    if (bufferRef.current.length > 0) {
+      const drained = bufferRef.current
+      bufferRef.current = []
+      setEntries((prev) => {
+        const merged = [...prev, ...drained]
+        return merged.length > MAX_BUFFER ? merged.slice(-MAX_BUFFER) : merged
+      })
+    }
+    setPendingCount(0)
+    setPaused(false)
+  }
 
   const filtered = useMemo(() => {
     const q = query.trim().toLowerCase()
@@ -70,7 +106,16 @@ export default function AgentLogsPage() {
     })
   }
 
-  const rowProps = useMemo(() => ({ rows: filtered }), [filtered])
+  async function copyRow(e: LogEntry) {
+    const line = `${fmtTsFull(e.ts)} ${e.level.toUpperCase()} ${e.module} ${e.msg}`
+    try {
+      await navigator.clipboard.writeText(line)
+      toast.show({ kind: 'success', title: 'Copied log line' })
+    } catch {
+      toast.show({ kind: 'warning', title: 'Clipboard unavailable' })
+    }
+  }
+
   const containerRef = useRef<HTMLDivElement>(null)
   const [height, setHeight] = useState(0)
 
@@ -83,41 +128,50 @@ export default function AgentLogsPage() {
     return () => ro.disconnect()
   }, [])
 
+  const rowProps = useMemo(
+    () => ({ rows: filtered, onCopy: copyRow }),
+    // copyRow closes over toast which is stable; depending on filtered alone is enough.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [filtered],
+  )
+
   return (
     <div className="flex flex-col h-dvh p-4 gap-3">
       <header className="shrink-0">
         <div className="flex items-center gap-3">
-          <h1 className="text-xl font-semibold text-text-primary">Logs</h1>
-          <span
-            className={`text-[11px] px-2 py-0.5 rounded-full border ${
-              connected
-                ? 'text-success border-success/30 bg-success/10'
-                : 'text-warning border-warning/30 bg-warning/10'
-            }`}
-          >
+          <h1 className="text-[length:var(--text-h1)] font-semibold text-text-primary">
+            Logs
+          </h1>
+          <StatusChip variant={connected ? 'online' : 'warning'}>
             {connected ? 'streaming' : 'disconnected'}
-          </span>
-          <span className="text-xs text-text-muted ml-auto">
+          </StatusChip>
+          <span className="text-[length:var(--text-meta)] text-text-muted ml-auto">
             {filtered.length} / {entries.length}
           </span>
         </div>
       </header>
 
       <div className="flex flex-wrap gap-2 items-center shrink-0">
-        {(['info', 'warn', 'error'] as Level[]).map((l) => (
-          <label key={l} className="flex items-center gap-1 text-xs text-text-secondary">
-            <input
-              type="checkbox"
-              checked={levels.has(l)}
-              onChange={() => toggleLevel(l)}
-            />
-            <span className={badgeClass(l)}>{l}</span>
-          </label>
-        ))}
+        {(['info', 'warn', 'error'] as Level[]).map((l) => {
+          const active = levels.has(l)
+          return (
+            <button
+              key={l}
+              onClick={() => toggleLevel(l)}
+              aria-pressed={active}
+              className={[
+                'px-2.5 py-1 rounded-full border text-[length:var(--text-meta)] font-medium leading-none transition-colors',
+                active ? levelActiveClass(l) : 'bg-surface-alt text-text-muted border-border hover:bg-surface-hover',
+              ].join(' ')}
+            >
+              {l}
+            </button>
+          )
+        })}
         <select
           value={modFilter}
           onChange={(e) => setModFilter(e.target.value)}
-          className="bg-surface border border-border rounded px-2 py-1 text-xs text-text-primary"
+          className="bg-surface border border-border rounded-md px-2 py-1 text-[length:var(--text-meta)] text-text-primary"
         >
           {MODULES.map((m) => (
             <option key={m} value={m}>
@@ -129,11 +183,28 @@ export default function AgentLogsPage() {
           value={query}
           onChange={(e) => setQuery(e.target.value)}
           placeholder="search…"
-          className="flex-1 min-w-40 bg-surface border border-border rounded px-2 py-1 text-xs text-text-primary placeholder:text-text-muted"
+          className="flex-1 min-w-40 bg-surface border border-border rounded-md px-2 py-1 text-[length:var(--text-meta)] text-text-primary placeholder:text-text-muted"
         />
+
+        {paused ? (
+          <button
+            onClick={resume}
+            className="text-[length:var(--text-meta)] py-1 px-2.5 rounded-md border border-accent/30 bg-accent/15 text-accent hover:bg-accent/25 transition-colors"
+          >
+            Resume{pendingCount > 0 ? ` (+${pendingCount})` : ''}
+          </button>
+        ) : (
+          <button
+            onClick={() => setPaused(true)}
+            className="btn-secondary text-[length:var(--text-meta)] py-1 px-2.5"
+          >
+            Pause
+          </button>
+        )}
+
         <button
           onClick={() => setEntries([])}
-          className="btn-secondary text-xs py-1 px-2"
+          className="btn-secondary text-[length:var(--text-meta)] py-1 px-2.5"
         >
           Clear
         </button>
@@ -141,7 +212,7 @@ export default function AgentLogsPage() {
 
       <div
         ref={containerRef}
-        className="flex-1 min-h-0 border border-border rounded-md bg-surface font-mono text-xs"
+        className="flex-1 min-h-0 border border-border rounded-md bg-surface font-mono text-[length:var(--text-mono)]"
       >
         {height > 0 && (
           <List
@@ -158,15 +229,17 @@ export default function AgentLogsPage() {
   )
 }
 
-type RowProps = { rows: LogEntry[] }
+type RowProps = { rows: LogEntry[]; onCopy: (e: LogEntry) => void }
 
-function LogRow({ index, style, rows }: RowComponentProps<RowProps>) {
+function LogRow({ index, style, rows, onCopy }: RowComponentProps<RowProps>) {
   const e = rows[index]
   if (!e) return null
   return (
     <div
       style={style}
-      className="flex items-center gap-2 px-2 border-b border-border/30 text-xs"
+      onClick={() => onCopy(e)}
+      title="Click to copy"
+      className="flex items-center gap-2 px-2 border-b border-border/30 cursor-pointer hover:bg-surface-alt transition-colors"
     >
       <span className="text-text-muted shrink-0 w-20">{fmtTs(e.ts)}</span>
       <span className={`shrink-0 w-12 font-semibold ${badgeClass(e.level)}`}>
@@ -184,9 +257,20 @@ function badgeClass(l: Level): string {
   return 'text-text-muted'
 }
 
+function levelActiveClass(l: Level): string {
+  if (l === 'error') return 'bg-danger/10 text-danger border-danger/30'
+  if (l === 'warn') return 'bg-warning/10 text-warning border-warning/30'
+  return 'bg-accent/10 text-accent border-accent/30'
+}
+
 function fmtTs(tsSec: number): string {
   if (!tsSec) return '--:--:--'
   const d = new Date(tsSec * 1000)
   const pad = (n: number) => String(n).padStart(2, '0')
   return `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`
+}
+
+function fmtTsFull(tsSec: number): string {
+  if (!tsSec) return ''
+  return new Date(tsSec * 1000).toISOString()
 }
