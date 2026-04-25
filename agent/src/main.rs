@@ -12,6 +12,7 @@ mod host_api;
 mod http_pages;
 mod instance_lock;
 mod local_sites;
+mod notifier;
 mod notify_cli;
 mod one_time_keys;
 mod preview;
@@ -431,6 +432,11 @@ async fn server_main(event_bus: Arc<EventBus>) -> anyhow::Result<()> {
     local_sites::spawn_discovery_loop(local_sites_cache);
     preview::spawn_health_loop(state.clone());
 
+    // Desktop notifications (no-op when no notification daemon — headless,
+    // sandboxed, Codespaces). Tray runtime is dead code until Phase 06; this
+    // keeps device-pending toasts working in TUI/headless modes today.
+    notifier::spawn_event_notifier(state.event_bus.clone());
+
     let app = Router::new()
         .route("/api/health", get(api_health))
         .route("/api/me", get(http_pages::api_me))
@@ -548,6 +554,7 @@ async fn server_main(event_bus: Arc<EventBus>) -> anyhow::Result<()> {
     info!(%addr, "starting agent server");
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
+    notifier::show_startup(addr);
 
     let pairing = http_pages::create_pairing_code(&state).context("create pairing code")?;
     info!(pairing_code = %pairing.code, "pair to continue");

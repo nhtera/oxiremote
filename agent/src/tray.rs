@@ -20,7 +20,7 @@ use tray_icon::{
     menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem},
 };
 
-use crate::events::{AgentEvent, EventBus};
+use crate::events::EventBus;
 
 /// Programmatically paint a 32×32 icon. Two tones so it matches the
 /// idle/active visual without shipping binary PNG assets in the repo.
@@ -93,30 +93,18 @@ pub fn build_tray() -> Result<TrayHandle> {
 }
 
 /// Blocks the caller (typically the main thread on macOS/Windows) and
-/// dispatches menu clicks + tunnel URL state until the "Shutdown" item is
-/// chosen. Bus events only drive icon state + notifications here; the UI
-/// copy refreshes via the polling loop.
+/// dispatches menu clicks until the "Shutdown" item is chosen. Bus events
+/// only drive icon state here; desktop notifications are owned by
+/// `crate::notifier` and fire regardless of whether the tray is wired.
 pub fn run_event_loop(handle: &TrayHandle, event_bus: Arc<EventBus>) {
     let menu_rx = MenuEvent::receiver();
     let mut bus_rx = event_bus.subscribe();
 
     loop {
-        // Drain bus events (non-blocking).
-        while let Ok(event) = bus_rx.try_recv() {
-            if let AgentEvent::DevicePending {
-                device_id, ip, ..
-            } = &event
-            {
-                let _ = notify_rust::Notification::new()
-                    .summary("OxiRemote — device pending")
-                    .body(&format!(
-                        "Device {}… from {} is waiting for approval",
-                        device_id.chars().take(10).collect::<String>(),
-                        ip
-                    ))
-                    .show();
-            }
-        }
+        // Drain bus events (non-blocking) so the channel doesn't lag the
+        // notifier and other subscribers. Currently no per-event behaviour;
+        // future icon-tone changes (idle/active) hook in here.
+        while let Ok(_event) = bus_rx.try_recv() {}
 
         if let Ok(evt) = menu_rx.try_recv() {
             let id = evt.id.0;
