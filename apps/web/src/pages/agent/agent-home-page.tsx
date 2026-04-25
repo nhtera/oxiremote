@@ -176,6 +176,15 @@ export default function AgentHomePage() {
   }
 
   const tunnelUrl = state?.tunnel_url ?? null
+  const otkActive =
+    !!otk?.token && otk.expires_at > Math.floor(Date.now() / 1000)
+  // Encode the deep-link form (`<tunnel>/login?k=<otk>`) when a fresh OTK
+  // is available — phone scans the QR and lands on auto-submit instead of
+  // having to type the key. Falls back to the bare tunnel URL otherwise.
+  const qrPayload =
+    tunnelUrl && otkActive
+      ? `${tunnelUrl.replace(/\/$/, '')}/login?k=${otk!.token}`
+      : tunnelUrl ?? ''
 
   return (
     <div className="p-6 max-w-4xl mx-auto space-y-6">
@@ -201,10 +210,21 @@ export default function AgentHomePage() {
           {tunnelUrl ? (
             <div className="flex flex-col gap-3 items-start w-full">
               <img
-                src={`/api/agent/qr?url=${encodeURIComponent(tunnelUrl)}`}
+                src={`/api/agent/qr?url=${encodeURIComponent(qrPayload)}`}
                 alt="Tunnel QR code"
                 className="w-48 h-48 rounded-md bg-white p-2 border border-border"
               />
+              {otkActive ? (
+                <p className="text-xs text-text-muted">
+                  Scan to land on{' '}
+                  <code className="text-accent">/login</code> with the
+                  one-time key auto-applied.
+                </p>
+              ) : (
+                <p className="text-xs text-text-muted">
+                  Generate a one-time key for a one-tap pairing scan.
+                </p>
+              )}
               <a
                 className="text-xs text-accent break-all hover:underline"
                 href={tunnelUrl}

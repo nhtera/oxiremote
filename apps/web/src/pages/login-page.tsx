@@ -41,11 +41,26 @@ export default function LoginPage() {
     }
   }, [navigate])
 
-  // Pre-fill OTK input if URL contains ?k=<token>
+  // Pre-fill OTK input if URL contains ?k=<token>. Auto-submit when the
+  // token is present and the user isn't already authed — this is the
+  // QR-deep-link flow ("scan QR → land here → enter OTK is automatic").
+  // Scrub the token from the visible URL after consumption so it doesn't
+  // sit in the address bar / browser history.
   useEffect(() => {
+    if (checkingAuth) return
     const k = searchParams.get('k')
-    if (k) setOtkToken(k)
-  }, [searchParams])
+    if (!k) return
+    setOtkToken(k)
+    // OTKs are 16 chars in our generator; loose-match here so a future
+    // length tweak doesn't silently break the auto-submit.
+    if (k.length >= 12 && k.length <= 32 && !loading) {
+      window.history.replaceState({}, '', '/login')
+      void handleOtkLogin(k)
+    }
+    // We deliberately don't depend on `handleOtkLogin` (stable) or `loading`
+    // (would re-fire on flip). Auto-submit happens once per page load.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [searchParams, checkingAuth])
 
   const handlePair = async () => {
     const trimmed = code.trim()
@@ -85,9 +100,11 @@ export default function LoginPage() {
     }
   }
 
-  // One-time key login flow
-  const handleOtkLogin = async () => {
-    const trimmed = otkToken.trim()
+  // One-time key login flow. Accepts an optional override so the
+  // deep-link auto-submit doesn't have to wait for a re-render after
+  // `setOtkToken`.
+  const handleOtkLogin = async (override?: string) => {
+    const trimmed = (override ?? otkToken).trim()
     if (!trimmed) return
     setError('')
     setLoading(true)
@@ -185,12 +202,12 @@ export default function LoginPage() {
           placeholder="16-character one-time key"
           maxLength={20}
           autoComplete="off"
-          onKeyDown={(e) => e.key === 'Enter' && handleOtkLogin()}
+          onKeyDown={(e) => e.key === 'Enter' && handleOtkLogin(undefined)}
           className="w-full px-3 py-3 text-sm bg-surface-alt border border-border rounded-lg text-text-primary font-mono focus:outline-none focus:border-warning/50"
         />
 
         <button
-          onClick={handleOtkLogin}
+          onClick={() => handleOtkLogin()}
           disabled={loading || !otkToken.trim()}
           className="w-full mt-3 py-3 text-sm font-medium bg-warning/15 text-warning border border-warning/30 rounded-lg hover:bg-warning/25 transition-colors disabled:opacity-40"
         >
