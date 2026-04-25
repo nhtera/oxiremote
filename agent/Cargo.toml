@@ -64,6 +64,10 @@ notify-rust = "4"
 image = { version = "0.25", default-features = false, features = ["png"] }
 open = "5"
 
+# Detach child from controlling TTY in `oxiremote ui` (setsid).
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 # Phase 03: remote desktop capture + encode (optional, enabled by default).
 desktop = { path = "crates/desktop", optional = true }
 

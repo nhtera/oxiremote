@@ -28,7 +28,20 @@ struct State {
     steps: Vec<super::step_progress::Step>,
     connected_devices: usize,
     last_log: Option<String>,
+    /// Last few HEAD-probe attempts; rendered as a tiny streaming console
+    /// while the tunnel is up but health-check hasn't passed yet.
+    probe_log: Vec<ProbeEntry>,
 }
+
+#[derive(Clone)]
+struct ProbeEntry {
+    attempt: u32,
+    status: String,
+    ok: bool,
+    elapsed_ms: u64,
+}
+
+const PROBE_LOG_MAX: usize = 6;
 
 impl State {
     fn new() -> Self {
@@ -54,7 +67,16 @@ impl State {
             ],
             connected_devices: 0,
             last_log: None,
+            probe_log: Vec::new(),
         }
+    }
+
+    fn ready_verifying(&self) -> bool {
+        self.steps
+            .iter()
+            .find(|s| s.name == "Ready")
+            .map(|s| matches!(s.status, StepStatus::Active))
+            .unwrap_or(false)
     }
 
     fn apply(&mut self, event: &AgentEvent) {
@@ -65,9 +87,30 @@ impl State {
                     s.status = StepStatus::Done;
                     s.sub = Some(url.clone());
                 }
+                // Tunnel resolved → start the verification phase. Health-check
+                // promotes Ready to Done once a HEAD probe returns 200.
                 if let Some(s) = self.steps.iter_mut().find(|s| s.name == "Ready") {
-                    s.status = StepStatus::Done;
-                    s.sub = Some("waiting for devices".into());
+                    s.status = StepStatus::Active;
+                    s.sub = Some("verifying…".into());
+                }
+            }
+            AgentEvent::HealthProbe { attempt, status, ok, elapsed_ms } => {
+                self.probe_log.push(ProbeEntry {
+                    attempt: *attempt,
+                    status: status.clone(),
+                    ok: *ok,
+                    elapsed_ms: *elapsed_ms,
+                });
+                while self.probe_log.len() > PROBE_LOG_MAX {
+                    self.probe_log.remove(0);
+                }
+                if let Some(s) = self.steps.iter_mut().find(|s| s.name == "Ready") {
+                    if *ok {
+                        s.status = StepStatus::Done;
+                        s.sub = Some("waiting for devices".into());
+                    } else {
+                        s.sub = Some(format!("#{attempt} → {status}"));
+                    }
                 }
             }
             AgentEvent::DeviceConnected { .. } => {
@@ -212,10 +255,36 @@ fn render_info_panel(f: &mut ratatui::Frame<'_>, area: Rect, state: &State) {
         .clone()
         .unwrap_or_else(|| "—".to_string());
     let devices_str = state.connected_devices.to_string();
-    let lines = vec![
+    let mut lines = vec![
         kv("App URL", &url),
         kv("One-Time Key", "— (Phase 02)"),
         kv("Connected Devices", &devices_str),
+    ];
+
+    // Streaming probe log — only shown while we're verifying tunnel reachability.
+    if state.ready_verifying() && !state.probe_log.is_empty() {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "Verifying tunnel…",
+            Style::default()
+                .fg(Color::Rgb(255, 140, 0))
+                .add_modifier(Modifier::BOLD),
+        )));
+        for entry in &state.probe_log {
+            let mark = if entry.ok { "✓" } else { " " };
+            let color = if entry.ok { Color::Green } else { Color::DarkGray };
+            lines.push(Line::from(vec![
+                Span::styled(format!("  {mark} #{:<3}", entry.attempt),
+                    Style::default().fg(color)),
+                Span::styled(format!("→ {} ", entry.status),
+                    Style::default().fg(Color::White)),
+                Span::styled(format!("({}ms)", entry.elapsed_ms),
+                    Style::default().fg(Color::DarkGray)),
+            ]));
+        }
+    }
+
+    lines.extend(vec![
         Line::from(""),
         Line::from(Span::styled(
             "Actions",
@@ -235,7 +304,7 @@ fn render_info_panel(f: &mut ratatui::Frame<'_>, area: Rect, state: &State) {
             "  q  Exit TUI",
             Style::default().fg(Color::White),
         )),
-    ];
+    ]);
     f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), inner);
 }
 

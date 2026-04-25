@@ -70,6 +70,15 @@ pub enum AgentEvent {
     DeviceRejected {
         device_id: String,
     },
+    /// Per-attempt result from `health_check::run_health_check`. Streams to TUI
+    /// + web UI so the user sees DNS/health probes ticking through during the
+    /// "tunnel up but not yet reachable" window.
+    HealthProbe {
+        attempt: u32,
+        status: String,
+        elapsed_ms: u64,
+        ok: bool,
+    },
 }
 
 #[derive(Debug)]

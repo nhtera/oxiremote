@@ -7,6 +7,7 @@ mod files;
 mod files_upload;
 mod git;
 mod host;
+mod health_check;
 mod host_api;
 mod http_pages;
 mod instance_lock;
@@ -128,15 +129,23 @@ fn main() -> anyhow::Result<()> {
             eprintln!("Usage: oxiremote tunnel use <name>");
             std::process::exit(2);
         }
-        if sub == "serve" || sub == "--headless" {
+        if sub == "serve" || sub == "--headless" || sub == "--auto" {
             return run_server_headless();
         }
         if sub == "tui" {
             return run_with_tui();
         }
+        if sub == "ui" {
+            return run_ui_command();
+        }
+        if sub == "--tray" || sub == "--background" {
+            // Re-entry from `oxiremote ui` after detached spawn — same as headless,
+            // but no log output to stderr (parent already detached our stdio).
+            return run_server_headless();
+        }
         if sub == "--help" || sub == "-h" {
             println!(
-                "Usage:\n  oxiremote                     Run agent + TUI (if TTY) or headless server\n  oxiremote tui                 Force TUI mode (server in background)\n  oxiremote serve               Force headless server mode\n  oxiremote notify --title <text> [--body <text>] [--deep-link </h/...>]\n  oxiremote tunnel use <name>   Write ~/.config/oxiremote/tunnel.toml"
+                "Usage:\n  oxiremote                     Run agent + TUI (if TTY) or headless server\n  oxiremote tui                 Force TUI mode (server in background)\n  oxiremote ui                  Spawn agent in background, open browser to dashboard\n  oxiremote serve               Force headless server mode\n  oxiremote --auto              Headless start (alias of `serve`, useful for Codespaces postStartCommand)\n  oxiremote notify --title <text> [--body <text>] [--deep-link </h/...>]\n  oxiremote tunnel use <name>   Write ~/.config/oxiremote/tunnel.toml"
             );
             return Ok(());
         }
@@ -149,6 +158,72 @@ fn main() -> anyhow::Result<()> {
     } else {
         run_server_headless()
     }
+}
+
+/// `oxiremote ui` — spawn the agent detached, wait for /api/health, open
+/// browser to `/agent`. If a server is already running on the port, just
+/// open the browser.
+fn run_ui_command() -> anyhow::Result<()> {
+    use std::net::{SocketAddr, TcpStream};
+    use std::process::Stdio;
+    use std::time::{Duration, Instant};
+
+    let addr = SocketAddr::from(([127, 0, 0, 1], AGENT_PORT));
+    let already_running =
+        TcpStream::connect_timeout(&addr, Duration::from_millis(500)).is_ok();
+
+    if !already_running {
+        let exe = std::env::current_exe().context("current_exe")?;
+        let mut cmd = std::process::Command::new(&exe);
+        cmd.arg("--tray")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+
+        #[cfg(unix)]
+        {
+            // setsid() detaches from the controlling TTY so the child survives
+            // the parent shell exiting and doesn't share signals.
+            use std::os::unix::process::CommandExt;
+            unsafe {
+                cmd.pre_exec(|| {
+                    if libc::setsid() == -1 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            const DETACHED_PROCESS: u32 = 0x00000008;
+            const CREATE_NO_WINDOW: u32 = 0x08000000;
+            cmd.creation_flags(DETACHED_PROCESS | CREATE_NO_WINDOW);
+        }
+
+        let child = cmd.spawn().context("spawn detached agent")?;
+        // We deliberately don't wait/reap — child runs independently.
+        let pid = child.id();
+
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while Instant::now() < deadline {
+            if TcpStream::connect_timeout(&addr, Duration::from_millis(500)).is_ok() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(300));
+        }
+        if TcpStream::connect_timeout(&addr, Duration::from_millis(500)).is_err() {
+            anyhow::bail!(
+                "background agent did not start within 15s (PID {pid}). Check ~/.oxiremote/."
+            );
+        }
+    }
+
+    let agent_root = format!("http://127.0.0.1:{AGENT_PORT}/agent");
+    let _ = open::that(&agent_root);
+    println!("OxiRemote running at {agent_root}");
+    Ok(())
 }
 
 /// Headless path: single tokio runtime on the current (main) thread.
@@ -489,7 +564,19 @@ async fn server_main(event_bus: Arc<EventBus>) -> anyhow::Result<()> {
             }
             tunnel_state
                 .event_bus
-                .send(events::AgentEvent::TunnelUrlChanged { url: u });
+                .send(events::AgentEvent::TunnelUrlChanged { url: u.clone() });
+
+            // Verify reachability — emits HealthProbe events per attempt so the
+            // TUI/dashboard can show "DNS not propagated yet" instead of going silent.
+            let healthy = health_check::run_health_check(
+                u,
+                tunnel_state.event_bus.clone(),
+                tunnel_state.http_client.clone(),
+            )
+            .await;
+            if !healthy {
+                warn!("tunnel URL did not pass health check within timeout");
+            }
         }
     });
 

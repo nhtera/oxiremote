@@ -74,6 +74,7 @@ dependencies = [
  "hmac",
  "http",
  "image",
+ "libc",
  "mime_guess",
  "notify-rust",
  "open",
