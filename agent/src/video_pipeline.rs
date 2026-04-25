@@ -31,9 +31,10 @@ use webrtc::rtp_transceiver::rtp_codec::RTCRtpCodecCapability;
 use webrtc::rtp_transceiver::rtp_sender::RTCRtpSender;
 use webrtc::track::track_local::track_local_static_sample::TrackLocalStaticSample;
 
-/// Default FPS assumption for PTS/duration. Real cadence is sent per-frame
-/// via `Sample.duration` so rate control adapts — this is only the seed.
-const DEFAULT_FRAME_DURATION_MS: u64 = 17;
+/// Default duration for the very first sample (no prior frame to measure
+/// from). 33 ms ≈ 30 fps — a reasonable seed at any tier; subsequent
+/// samples carry the true elapsed wall-clock interval.
+const FIRST_FRAME_DURATION_MS: u64 = 33;
 
 /// Alias for the canonical capture-layer type. Kept as a re-export so the
 /// transport-layer API (`VideoPipelineConfig`) stays self-contained.
@@ -223,6 +224,8 @@ async fn writer_task(
     track: Arc<TrackLocalStaticSample>,
     mut sample_rx: mpsc::Receiver<EncodedFrame>,
 ) {
+    use std::time::Instant;
+    let mut last_send: Option<Instant> = None;
     while let Some(mut frame) = sample_rx.recv().await {
         // Drain any encoded samples queued during the last write. Keeping
         // only the freshest frame is "drop-oldest" semantics on top of a
@@ -234,10 +237,27 @@ async fn writer_task(
         while let Ok(newer) = sample_rx.try_recv() {
             frame = newer;
         }
+        // Measure ACTUAL wall-clock interval since the previous sample. The
+        // packetizer uses `duration` to advance the RTP timestamp by
+        // `duration * 90 kHz`; lying about it (the previous static 17 ms)
+        // makes the RTP clock drift from real time and Chrome's jitter
+        // buffer balloons (we observed ~1.6 s buffering with the static
+        // value when SCK delivered at 15–30 fps wall cadence). Clamp to
+        // [1 ms, 200 ms] so a stalled capture loop doesn't emit a duration
+        // that confuses the receiver.
+        let now = Instant::now();
+        let duration = match last_send {
+            Some(prev) => {
+                let d = now.duration_since(prev);
+                d.clamp(Duration::from_millis(1), Duration::from_millis(200))
+            }
+            None => Duration::from_millis(FIRST_FRAME_DURATION_MS),
+        };
+        last_send = Some(now);
         let sample = Sample {
             data: frame.annexb,
             timestamp: SystemTime::now(),
-            duration: Duration::from_millis(DEFAULT_FRAME_DURATION_MS),
+            duration,
             packet_timestamp: 0,
             prev_dropped_packets: 0,
             prev_padding_packets: 0,

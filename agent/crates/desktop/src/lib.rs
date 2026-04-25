@@ -12,6 +12,8 @@ pub mod encoders;
 pub mod h264_format;
 pub mod input;
 pub mod permissions;
+#[cfg(target_os = "macos")]
+pub mod sck;
 
 // Flat re-exports used by the agent crate and Phase 04 transport layer.
 pub use capture::{primary_scale_factor, RawBgraFrame};

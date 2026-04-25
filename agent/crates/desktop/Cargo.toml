@@ -45,11 +45,20 @@ yuvutils-rs = { version = "0.8", optional = true }
 # Phase 03 macOS hardware encoder. Raw FFI to VideoToolbox/CoreMedia via the
 # madsmtm/objc2 ecosystem — auto-generated from Apple SDK headers. All four
 # objc2-* crates must stay on the same minor version (they version-lock).
+#
+# `screencapturekit` is the high-level wrapper around Apple's
+# ScreenCaptureKit framework (macOS 12.3+). Replaces xcap's
+# CGWindowListCreateImage hot path — SCK delivers pre-resized BGRA frames
+# at native frame cadence via GPU IOSurface, lifting capture from ~28 ms
+# to ~3–5 ms / frame. xcap stays as fallback for pre-12.3 hosts and for
+# the JPEG-pipeline diff path. Mandatory on macOS — ifeel of the agent
+# binary on this platform pulls it in unconditionally.
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2-video-toolbox = { version = "0.3", optional = true }
 objc2-core-video = { version = "0.3", optional = true }
 objc2-core-media = { version = "0.3", optional = true }
 objc2-core-foundation = { version = "0.3", optional = true }
+screencapturekit = "1.5"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
