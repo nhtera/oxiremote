@@ -1,0 +1,22 @@
+{
+  "name": "OxiRemote Codespace",
+  "image": "mcr.microsoft.com/devcontainers/base:ubuntu-22.04",
+  "features": {
+    "ghcr.io/devcontainers/features/node:1": {
+      "version": "20"
+    }
+  },
+  "postCreateCommand": "curl -fsSL https://raw.githubusercontent.com/nhtera/oxiremote/main/scripts/install.sh | bash",
+  "postStartCommand": "$HOME/.local/bin/oxiremote --auto",
+  "forwardPorts": [8787],
+  "portsAttributes": {
+    "8787": {
+      "label": "OxiRemote agent",
+      "onAutoForward": "silent"
+    }
+  },
+  "remoteEnv": {
+    "PATH": "${containerEnv:HOME}/.local/bin:${containerEnv:PATH}",
+    "OXI_HEADLESS": "1"
+  }
+}

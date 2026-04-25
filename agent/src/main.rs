@@ -22,6 +22,7 @@ mod push;
 mod push_api;
 mod security;
 mod tracing_setup;
+mod update;
 #[cfg(not(debug_assertions))]
 mod static_files;
 #[cfg(feature = "desktop")]
@@ -126,6 +127,13 @@ fn main() -> anyhow::Result<()> {
             let rest = argv.into_iter().skip(2).collect::<Vec<_>>();
             return notify_cli::run(rest);
         }
+        if sub == "update" {
+            return update::run();
+        }
+        if sub == "--version" || sub == "-V" {
+            println!("oxiremote {}", env!("CARGO_PKG_VERSION"));
+            return Ok(());
+        }
         if sub == "tunnel" {
             // `oxiremote tunnel use <name>`
             let action = argv.get(2).map(String::as_str).unwrap_or("");
@@ -152,7 +160,7 @@ fn main() -> anyhow::Result<()> {
         }
         if sub == "--help" || sub == "-h" {
             println!(
-                "Usage:\n  oxiremote                     Run agent + TUI (if TTY) or headless server\n  oxiremote tui                 Force TUI mode (server in background)\n  oxiremote ui                  Spawn agent in background, open browser to dashboard\n  oxiremote serve               Force headless server mode\n  oxiremote --auto              Headless start (alias of `serve`, useful for Codespaces postStartCommand)\n  oxiremote notify --title <text> [--body <text>] [--deep-link </h/...>]\n  oxiremote tunnel use <name>   Write ~/.config/oxiremote/tunnel.toml"
+                "Usage:\n  oxiremote                     Run agent + TUI (if TTY) or headless server\n  oxiremote tui                 Force TUI mode (server in background)\n  oxiremote ui                  Spawn agent in background, open browser to dashboard\n  oxiremote serve               Force headless server mode\n  oxiremote --auto              Headless start (alias of `serve`, useful for Codespaces postStartCommand)\n  oxiremote update              Self-update from the latest GitHub release\n  oxiremote --version           Print version and exit\n  oxiremote notify --title <text> [--body <text>] [--deep-link </h/...>]\n  oxiremote tunnel use <name>   Write ~/.config/oxiremote/tunnel.toml"
             );
             return Ok(());
         }

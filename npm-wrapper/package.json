@@ -1,0 +1,46 @@
+{
+  "name": "oxiremote",
+  "version": "0.1.0",
+  "description": "Self-hosted remote-access agent — terminal, files, preview, remote desktop over a Cloudflare tunnel.",
+  "bin": {
+    "oxiremote": "bin/oxiremote.js"
+  },
+  "scripts": {
+    "postinstall": "node scripts/install.js"
+  },
+  "files": [
+    "bin/",
+    "scripts/",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "keywords": [
+    "remote",
+    "terminal",
+    "tunnel",
+    "self-hosted",
+    "cloudflared",
+    "developer-tools"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/nhtera/oxiremote.git"
+  },
+  "homepage": "https://github.com/nhtera/oxiremote#readme",
+  "bugs": {
+    "url": "https://github.com/nhtera/oxiremote/issues"
+  },
+  "os": [
+    "darwin",
+    "linux",
+    "win32"
+  ],
+  "cpu": [
+    "x64",
+    "arm64"
+  ]
+}

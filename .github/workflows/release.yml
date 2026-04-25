@@ -1,0 +1,179 @@
+name: release
+
+# Triggered by `git tag vX.Y.Z && git push --tags`. Builds the agent binary
+# on a native runner per target, uploads each artifact + a SHA256 manifest
+# to a GitHub Release named `vX.Y.Z`. The manifest is what `oxiremote update`
+# verifies downloads against — keep its filename in sync with `update.rs`.
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to (re)build"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: build (${{ matrix.target }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            runner: macos-14
+            archive_ext: tar.gz
+            bin: oxiremote
+          - target: x86_64-apple-darwin
+            runner: macos-13
+            archive_ext: tar.gz
+            bin: oxiremote
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
+            archive_ext: tar.gz
+            bin: oxiremote
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-latest-arm64
+            archive_ext: tar.gz
+            bin: oxiremote
+          - target: x86_64-pc-windows-msvc
+            runner: windows-latest
+            archive_ext: zip
+            bin: oxiremote.exe
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve version
+        id: version
+        shell: bash
+        run: |
+          # Workflow may be triggered by tag push or manual dispatch.
+          if [ -n "${{ inputs.tag }}" ]; then
+            tag="${{ inputs.tag }}"
+          else
+            tag="${GITHUB_REF#refs/tags/}"
+          fi
+          version="${tag#v}"
+          echo "tag=$tag"         >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - uses: oven-sh/setup-bun@v1
+        with:
+          bun-version: latest
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: agent -> target
+
+      # Linux: pull X11/wayland dev headers needed by the desktop crate.
+      - name: Install Linux build deps
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libx11-dev libxcb-randr0-dev libxcb-xtest0-dev libxcb-xinerama0-dev libxcb-shape0-dev libxcb-xkb-dev libxkbcommon-dev libxcb-cursor-dev pkg-config
+
+      - name: Install JS deps + build web assets
+        run: |
+          bun install --frozen-lockfile
+          bun run build:web
+
+      - name: Build release binary
+        shell: bash
+        run: |
+          cargo build --release --manifest-path agent/Cargo.toml --target ${{ matrix.target }}
+
+      - name: Stage artifact
+        id: stage
+        shell: bash
+        run: |
+          version="${{ steps.version.outputs.version }}"
+          target="${{ matrix.target }}"
+          stem="oxiremote-${version}-${target}"
+          mkdir -p dist/$stem
+          src="agent/target/${target}/release/${{ matrix.bin }}"
+          cp "$src" "dist/$stem/${{ matrix.bin }}"
+          cp README.md LICENSE "dist/$stem/" 2>/dev/null || true
+          cd dist
+          if [ "${{ matrix.archive_ext }}" = "zip" ]; then
+            7z a "$stem.zip" "$stem"
+          else
+            tar -czf "$stem.tar.gz" "$stem"
+          fi
+          asset="$stem.${{ matrix.archive_ext }}"
+          # SHA256 — Linux + macOS shasum, Windows certutil. Output `<sha>  <name>`.
+          if command -v shasum >/dev/null 2>&1; then
+            shasum -a 256 "$asset" > "$asset.sha256"
+          else
+            certutil -hashfile "$asset" SHA256 | sed -n 2p | tr -d '\r ' | awk -v f="$asset" '{print $1"  "f}' > "$asset.sha256"
+          fi
+          echo "asset=dist/$asset"      >> "$GITHUB_OUTPUT"
+          echo "sha256=dist/$asset.sha256" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: oxiremote-${{ matrix.target }}
+          path: |
+            ${{ steps.stage.outputs.asset }}
+            ${{ steps.stage.outputs.sha256 }}
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: publish release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve version
+        id: version
+        shell: bash
+        run: |
+          if [ -n "${{ inputs.tag }}" ]; then tag="${{ inputs.tag }}"; else tag="${GITHUB_REF#refs/tags/}"; fi
+          echo "tag=$tag"            >> "$GITHUB_OUTPUT"
+          echo "version=${tag#v}"    >> "$GITHUB_OUTPUT"
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Combine SHA256 manifest
+        id: manifest
+        shell: bash
+        run: |
+          version="${{ steps.version.outputs.version }}"
+          mkdir -p release
+          # Copy each archive next to a single combined SHA manifest.
+          find artifacts -type f \( -name '*.tar.gz' -o -name '*.zip' \) -exec cp {} release/ \;
+          manifest="release/oxiremote-${version}-sha256.txt"
+          : > "$manifest"
+          # Concatenate per-asset .sha256 lines into one file. Filenames
+          # already match the asset basenames thanks to the build step.
+          find artifacts -type f -name '*.sha256' -print0 | sort -z | while IFS= read -r -d '' f; do
+            cat "$f" >> "$manifest"
+          done
+          echo "Manifest:"; cat "$manifest"
+
+      - name: Create / update release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          tag="${{ steps.version.outputs.tag }}"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" release/* --clobber
+          else
+            gh release create "$tag" release/* \
+              --title "$tag" \
+              --notes "Automated release. Verify downloads with \`oxiremote-${tag#v}-sha256.txt\`."
+          fi

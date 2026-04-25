@@ -18,7 +18,7 @@ export type DesktopStatus =
 export type QualityTier = 'low' | 'med' | 'high'
 
 export interface DesktopInputEvent {
-  t: 'mouse' | 'wheel' | 'key' | 'quality' | 'monitor'
+  t: 'mouse' | 'wheel' | 'key' | 'quality' | 'monitor' | 'settings'
   [key: string]: unknown
 }
 
