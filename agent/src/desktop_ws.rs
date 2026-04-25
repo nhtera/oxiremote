@@ -25,6 +25,7 @@ mod inner {
     use tokio::sync::{mpsc, watch, Mutex};
     use tracing::{info, warn};
     use webrtc::api::APIBuilder;
+    use webrtc::api::media_engine::MediaEngine;
     use webrtc::data_channel::data_channel_init::RTCDataChannelInit;
     use webrtc::ice_transport::ice_candidate::RTCIceCandidateInit;
     use webrtc::ice_transport::ice_server::RTCIceServer;
@@ -32,6 +33,8 @@ mod inner {
     use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
     use webrtc::peer_connection::RTCPeerConnection;
     use webrtc::rtp_transceiver::rtp_sender::RTCRtpSender;
+    use webrtc::rtp_transceiver::rtp_transceiver_direction::RTCRtpTransceiverDirection;
+    use webrtc::rtp_transceiver::RTCRtpTransceiverInit;
     use webrtc::track::track_local::TrackLocal;
 
     use crate::auth::require_active_auth_with_device;
@@ -255,7 +258,14 @@ mod inner {
         mut close_rx: tokio::sync::oneshot::Receiver<()>,
     ) -> anyhow::Result<()> {
         // ── Peer connection ───────────────────────────────────────────────────
-        let api = APIBuilder::new().build();
+        // Register the default codec set so the H.264 track the server adds
+        // matches a payload type in the client's offer. Without this, the
+        // MediaEngine is empty and the answer rejects the video m-line with
+        // `m=video 0 ... 0` (port 0 = disabled); the client's `ontrack`
+        // never fires and the canvas stays black.
+        let mut media_engine = MediaEngine::default();
+        media_engine.register_default_codecs()?;
+        let api = APIBuilder::new().with_media_engine(media_engine).build();
         let pc = Arc::new(
             api.new_peer_connection(RTCConfiguration {
                 ice_servers: vec![RTCIceServer {
@@ -268,26 +278,16 @@ mod inner {
         );
 
         // ── DataChannels ──────────────────────────────────────────────────────
-        // Both channels are externally negotiated: the client creates identical
-        // DCs with the same stream ids, which pins the SCTP stream so send()
-        // from either side reaches the other. Without `negotiated=Some(id)`
-        // each side opens a fresh in-band stream and frames are sent into a
-        // one-way void even though both peers report "DC open".
+        // Externally negotiated: each peer pre-binds a stream id so no DCEP
+        // OPEN handshake is exchanged. Asymmetry is fatal here — if the
+        // server pre-binds a stream id the client never creates, the
+        // browser's SCTP receives chunks on an unassigned stream and answers
+        // with ERROR, collapsing the whole association ~5 s in.
         //
-        // "desktop": unordered + no retransmits — lowest latency for video tiles.
-        let desktop_dc = pc
-            .create_data_channel(
-                "desktop",
-                Some(RTCDataChannelInit {
-                    ordered: Some(false),
-                    max_retransmits: Some(0),
-                    negotiated: Some(1),
-                    ..Default::default()
-                }),
-            )
-            .await?;
-
-        // "ctrl": ordered — input events must not arrive out-of-order.
+        // "ctrl" (id=2) is created in BOTH modes and is safe to build now —
+        // the client creates it from both JPEG and H.264 hooks. "desktop"
+        // (id=1) is JPEG-only and is deferred until `Pipeline::Jpeg` is
+        // confirmed by `await_offer_with_caps` below.
         let ctrl_dc = pc
             .create_data_channel(
                 "ctrl",
@@ -373,23 +373,6 @@ mod inner {
             }));
         }
 
-        // ── DC-open signal (plain oneshot<()>) ────────────────────────────────
-        // The on_open callback cannot pass the DC Arc; the session loop holds it.
-        let (dc_open_tx, mut dc_open_rx) = tokio::sync::oneshot::channel::<()>();
-        {
-            let tx = Arc::new(std::sync::Mutex::new(Some(dc_open_tx)));
-            desktop_dc.on_open(Box::new(move || {
-                let tx = Arc::clone(&tx);
-                Box::pin(async move {
-                    if let Ok(mut guard) = tx.lock()
-                        && let Some(s) = guard.take()
-                    {
-                        let _ = s.send(());
-                    }
-                })
-            }));
-        }
-
         // ── Offer / answer exchange ───────────────────────────────────────────
         // Split in two: read the offer + capabilities first, then complete
         // the SDP exchange. Between the two, when Pipeline::H264 we attach
@@ -446,7 +429,43 @@ mod inner {
             return result;
         }
 
-        // ── JPEG path: 5-second fallback race ─────────────────────────────────
+        // ── JPEG path: desktop DC + 5-second fallback race ────────────────────
+        //
+        // Create the "desktop" DC (stream id=1) NOW — not at the top of the
+        // session — because it is JPEG-only. Creating it unconditionally
+        // pre-binds an SCTP stream the H.264 client never reserves, which
+        // triggers a browser SCTP ERROR chunk and tears down the PC.
+        //
+        // Unordered + no retransmits — lowest latency for video tiles.
+        let desktop_dc = pc
+            .create_data_channel(
+                "desktop",
+                Some(RTCDataChannelInit {
+                    ordered: Some(false),
+                    max_retransmits: Some(0),
+                    negotiated: Some(1),
+                    ..Default::default()
+                }),
+            )
+            .await?;
+
+        // DC-open signal for the 5-s fallback race below. The on_open callback
+        // can't pass the DC Arc directly, so we gate a oneshot.
+        let (dc_open_tx, mut dc_open_rx) = tokio::sync::oneshot::channel::<()>();
+        {
+            let tx = Arc::new(std::sync::Mutex::new(Some(dc_open_tx)));
+            desktop_dc.on_open(Box::new(move || {
+                let tx = Arc::clone(&tx);
+                Box::pin(async move {
+                    if let Ok(mut guard) = tx.lock()
+                        && let Some(s) = guard.take()
+                    {
+                        let _ = s.send(());
+                    }
+                })
+            }));
+        }
+
         // Channel for capture→WS binary frames (fallback path only).
         let (ws_bin_tx, mut ws_bin_rx) = mpsc::channel::<Bytes>(64);
 
@@ -811,13 +830,30 @@ mod inner {
         ws_out_tx: &mpsc::Sender<String>,
         sending_track: Option<Arc<dyn TrackLocal + Send + Sync>>,
     ) -> anyhow::Result<Option<Arc<RTCRtpSender>>> {
-        pc.set_remote_description(RTCSessionDescription::offer(offer_sdp)?)
-            .await?;
+        // Pre-bind the sendonly transceiver BEFORE set_remote_description so
+        // `satisfy_type_and_direction` pairs it with the client's recvonly
+        // m=video. `add_track()` after set_remote_description never reuses
+        // the pending transceiver (webrtc-rs 0.11 only matches when the
+        // track id equals the sender id — never true for fresh tracks), so
+        // it spawns a second transceiver that doesn't map to any m-line and
+        // the frames we write go nowhere. This change moves the binding
+        // earlier so the single mid:0 m-line in the answer carries our RTP.
         let rtp_sender = if let Some(track) = sending_track {
-            Some(pc.add_track(track).await?)
+            let transceiver = pc
+                .add_transceiver_from_track(
+                    track,
+                    Some(RTCRtpTransceiverInit {
+                        direction: RTCRtpTransceiverDirection::Sendonly,
+                        send_encodings: vec![],
+                    }),
+                )
+                .await?;
+            Some(transceiver.sender().await)
         } else {
             None
         };
+        pc.set_remote_description(RTCSessionDescription::offer(offer_sdp)?)
+            .await?;
         let answer = pc.create_answer(None).await?;
         let sdp_out = answer.sdp.clone();
         pc.set_local_description(answer).await?;

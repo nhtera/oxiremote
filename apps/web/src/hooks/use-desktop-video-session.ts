@@ -218,6 +218,8 @@ export function useDesktopVideoSession(
     }
 
     ws.onopen = () => {
+      // If this WS is already stale (StrictMode cleanup closed our pc), skip.
+      if (wsRef.current !== ws) return
       setStatus('signaling')
       // Announce decoder capabilities BEFORE sending the offer so the server
       // can decide H.264 vs JPEG before the first ICE candidate arrives.
@@ -231,10 +233,16 @@ export function useDesktopVideoSession(
             ws.send(JSON.stringify({ type: 'offer', sdp: pc.localDescription.sdp }))
           }
         })
-        .catch(() => handleDisconnect())
+        .catch(() => {
+          // Stale PC from a previous StrictMode mount may reject after the
+          // live mount replaced our refs — don't cascade its failure.
+          if (pcRef.current !== pc) return
+          handleDisconnect()
+        })
     }
 
     ws.onmessage = (e: MessageEvent) => {
+      if (wsRef.current !== ws) return
       if (typeof e.data !== 'string') return
       let msg: Record<string, unknown>
       try {
@@ -246,7 +254,10 @@ export function useDesktopVideoSession(
         case 'answer':
           pc.setRemoteDescription(
             new RTCSessionDescription({ type: 'answer', sdp: msg.sdp as string }),
-          ).catch(() => handleDisconnect())
+          ).catch(() => {
+            if (pcRef.current !== pc) return
+            handleDisconnect()
+          })
           break
         case 'ice':
           pc.addIceCandidate(
@@ -270,8 +281,14 @@ export function useDesktopVideoSession(
       }
     }
 
-    ws.onerror = () => handleDisconnect()
+    ws.onerror = () => {
+      if (wsRef.current !== ws) return
+      handleDisconnect()
+    }
     ws.onclose = () => {
+      // StrictMode double-mount: a stale WS closing must not abort the live
+      // replacement WS (see use-desktop-session.ts for the full race).
+      if (wsRef.current !== ws) return
       if (!destroyedRef.current) handleDisconnect()
     }
   }, [deviceId, teardown, startFrameLoop]) // eslint-disable-line react-hooks/exhaustive-deps

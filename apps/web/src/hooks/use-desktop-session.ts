@@ -151,6 +151,9 @@ export function useDesktopSession(
     }
 
     desktopDc.onclose = () => {
+      // StrictMode double-mount: a stale DC belonging to a torn-down session
+      // must not trigger reconnect of the current one.
+      if (desktopDcRef.current !== desktopDc) return
       if (!fallbackRef.current && !destroyedRef.current) {
         handleDisconnect()
       }
@@ -172,6 +175,7 @@ export function useDesktopSession(
     }
 
     ws.onopen = () => {
+      if (wsRef.current !== ws) return
       setStatus('signaling')
       // Create and send offer
       pc.createOffer()
@@ -181,7 +185,12 @@ export function useDesktopSession(
             ws.send(JSON.stringify({ type: 'offer', sdp: pc.localDescription.sdp }))
           }
         })
-        .catch(() => handleDisconnect())
+        .catch(() => {
+          // Stale PC from an evicted StrictMode mount must not tear down
+          // the live replacement.
+          if (pcRef.current !== pc) return
+          handleDisconnect()
+        })
 
       // Start 5s fallback timer
       dcOpenTimerRef.current = setTimeout(() => {
@@ -193,6 +202,7 @@ export function useDesktopSession(
     }
 
     ws.onmessage = (e: MessageEvent) => {
+      if (wsRef.current !== ws) return
       if (e.data instanceof ArrayBuffer) {
         // Fallback binary tile frame
         if (fallbackRef.current) {
@@ -212,7 +222,10 @@ export function useDesktopSession(
         case 'answer':
           pc.setRemoteDescription(
             new RTCSessionDescription({ type: 'answer', sdp: msg.sdp as string }),
-          ).catch(() => handleDisconnect())
+          ).catch(() => {
+            if (pcRef.current !== pc) return
+            handleDisconnect()
+          })
           break
 
         case 'ice':
@@ -239,10 +252,17 @@ export function useDesktopSession(
     }
 
     ws.onerror = () => {
+      // Ignore errors from a stale WS — StrictMode's first-mount WS can emit
+      // `error` after mount 2 has opened a new live WS.
+      if (wsRef.current !== ws) return
       handleDisconnect()
     }
 
     ws.onclose = () => {
+      // Guard against late `close` from a superseded WS (StrictMode cleanup):
+      // without this, the first-mount WS tears down the second-mount session
+      // after it has already handshaked successfully.
+      if (wsRef.current !== ws) return
       if (!destroyedRef.current) {
         handleDisconnect()
       }
