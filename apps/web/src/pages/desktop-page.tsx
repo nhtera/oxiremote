@@ -21,6 +21,7 @@ import DesktopJpegView from '../components/desktop-jpeg-view'
 import DesktopH264View from '../components/desktop-h264-view'
 import DesktopToolbar from '../components/desktop-toolbar'
 import DesktopGestureHelp from '../components/desktop-gesture-help'
+import DesktopOnscreenKeyboard from '../components/desktop-onscreen-keyboard'
 import ReconnectModal from '../components/reconnect-modal'
 import { useConfirm } from '../components/ui'
 
@@ -80,6 +81,7 @@ export default function DesktopPage() {
   const [quality, setQuality] = useState<QualityTier>('med')
   const [inputMode, setInputMode] = useState<InputMode>('touch')
   const [showHelp, setShowHelp] = useState(false)
+  const [showKeyboard, setShowKeyboard] = useState(false)
   // Phase 04 — HiDPI + smooth-scaling toggles, persisted per-device.
   const [settings, setSettingsState] = useState<DisplaySettings>(() => loadSettings())
   useEffect(() => {
@@ -242,13 +244,20 @@ export default function DesktopPage() {
           onInputModeToggle={() => setInputMode((m) => (m === 'touch' ? 'trackpad' : 'touch'))}
           onKeyEvent={sendInput}
           onShowGestureHelp={() => setShowHelp(true)}
+          onShowOnscreenKeyboard={() => setShowKeyboard(true)}
           hidpi={settings.hidpi}
           smoothScaling={settings.smoothScaling}
           onSettingsChange={handleSettingsChange}
+          pipeline={useH264 ? 'h264' : 'jpeg'}
         />
       </div>
 
       <DesktopGestureHelp open={showHelp} onClose={() => setShowHelp(false)} />
+      <DesktopOnscreenKeyboard
+        open={showKeyboard}
+        onClose={() => setShowKeyboard(false)}
+        onKeyEvent={sendInput}
+      />
 
       <ReconnectModal
         open={showReconnect}

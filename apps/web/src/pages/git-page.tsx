@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'react'
+import { StateView } from '../components/ui'
 
 type GitStatusEntry = {
   path: string
@@ -88,6 +89,7 @@ export default function GitPage() {
 
   const staged = entries.filter((e) => e.index !== ' ' && e.index !== '?')
   const unstaged = entries.filter((e) => e.working !== ' ' || e.index === '?')
+  const cleanTree = entries.length > 0 && staged.length === 0 && unstaged.length === 0
 
   return (
     <div className="p-3 md:p-4">
@@ -99,6 +101,18 @@ export default function GitPage() {
       </div>
 
       {err && <div className="text-danger text-sm mb-3">{err}</div>}
+
+      {cleanTree ? (
+        <StateView
+          icon={
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="h-full w-full" aria-hidden="true">
+              <polyline points="20 6 9 17 4 12" />
+            </svg>
+          }
+          title="Working tree clean"
+          body="No staged or unstaged changes. Nice."
+        />
+      ) : null}
 
       <div className="flex flex-col md:flex-row gap-4 pb-4">
         {/* File lists */}

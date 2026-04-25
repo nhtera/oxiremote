@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useState } from 'react'
 
 import PreviewShareModal from '../components/preview-share-modal'
 import { apiFetch } from '../lib/transport'
+import { StateView } from '../components/ui'
 
 type Health = 'ok' | 'down' | 'unknown'
 
@@ -105,6 +106,20 @@ export default function PreviewPage() {
       </p>
 
       {error && <div className="text-danger text-sm mb-2">{error}</div>}
+
+      {discoveredNew.length === 0 && saved.length === 0 ? (
+        <StateView
+          icon={
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="h-full w-full" aria-hidden="true">
+              <circle cx="12" cy="12" r="10" />
+              <line x1="2" y1="12" x2="22" y2="12" />
+              <path d="M12 2a15 15 0 0 1 4 10 15 15 0 0 1-4 10 15 15 0 0 1-4-10 15 15 0 0 1 4-10z" />
+            </svg>
+          }
+          title="No local sites detected"
+          body="Start a dev server (e.g. vite, next dev), and its port will appear here within a few seconds."
+        />
+      ) : null}
 
       <section className="mb-6">
         <h3 className="text-xs uppercase tracking-wide text-text-muted m-0 mb-2">

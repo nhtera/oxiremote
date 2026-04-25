@@ -46,23 +46,27 @@ export default function ReconnectModal({
       open={open}
       onClose={onCancel}
       dismissable={exhausted}
+      tone={exhausted ? 'danger' : 'warning'}
       ariaLabelledBy="reconnect-title"
       ariaDescribedBy="reconnect-desc"
     >
-      <div id="reconnect-title" className="text-text-primary font-semibold text-sm">
-        {exhausted ? 'Connection failed' : 'Reconnecting…'}
+      <div id="reconnect-title" className="text-text-primary font-semibold text-[length:var(--text-h2)]">
+        {exhausted ? 'Connection failed' : 'Connection lost'}
       </div>
-      <div id="reconnect-desc" className="text-text-muted text-xs mt-2">
-        {exhausted
-          ? `Could not reconnect after ${maxAttempts} attempts.`
-          : (
-            <>
-              Attempt {attempt} of {maxAttempts}
-              {!exhausted && onRetry && (
+      <div id="reconnect-desc" className="text-text-secondary text-[length:var(--text-body)] mt-2 leading-relaxed">
+        {exhausted ? (
+          `Could not reconnect after ${maxAttempts} attempts. Your terminal session is still preserved on the host — try opening the page again to resume.`
+        ) : (
+          <>
+            Your session is preserved — we'll resume where you left off.
+            <div className="text-[length:var(--text-meta)] text-text-muted mt-2">
+              Retrying… ({attempt} of {maxAttempts})
+              {onRetry && (
                 <> — next try in <span className="font-mono">{secondsLeft}s</span></>
               )}
-            </>
-          )}
+            </div>
+          </>
+        )}
       </div>
       <div className="mt-5 flex justify-end gap-2">
         {!exhausted && onRetry && (
@@ -71,7 +75,7 @@ export default function ReconnectModal({
           </Button>
         )}
         <Button variant="ghost" size="sm" onClick={onCancel}>
-          {exhausted ? 'Exit' : 'Give up'}
+          {exhausted ? 'Exit' : 'Cancel'}
         </Button>
       </div>
     </Dialog>

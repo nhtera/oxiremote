@@ -1,4 +1,4 @@
-import { NavLink, Outlet, useNavigate } from 'react-router-dom'
+import { NavLink, Outlet, useLocation, useNavigate } from 'react-router-dom'
 import { useHostStore } from '../state/host-store'
 import PushPermissionBanner from './push-permission-banner'
 import InstallPwaBanner from './install-pwa-banner'
@@ -6,7 +6,14 @@ import { clearApiKey } from '../lib/api-client'
 
 export default function AppLayout() {
   const navigate = useNavigate()
+  const { pathname } = useLocation()
   const { currentHostId, label } = useHostStore()
+
+  // Push banner is a setup nudge, not an in-flow nag. Only show on home pages —
+  // the workspace pages (terminal/files/git/preview/desktop) are mid-task.
+  const isHomeRoute =
+    pathname === '/' ||
+    /^\/h\/[^/]+\/?$/.test(pathname)
 
   // Display label or first 8 chars of host_id as fallback
   const hostChip = label ?? (currentHostId ? currentHostId.slice(0, 8) : null)
@@ -70,7 +77,7 @@ export default function AppLayout() {
       {/* Main content */}
       <main className="flex-1 min-h-0 overflow-auto pb-20 md:pb-0">
         <InstallPwaBanner />
-        <PushPermissionBanner />
+        {isHomeRoute && <PushPermissionBanner />}
         <Outlet />
       </main>
 
