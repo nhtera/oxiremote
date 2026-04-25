@@ -25,6 +25,7 @@ interface SessionSnapshot {
 interface SessionApi {
   sendInput: (ev: DesktopInputEvent) => void
   setQuality: (tier: QualityTier) => void
+  setSettings: (next: { hidpi: boolean }) => void
   disconnect: () => void
 }
 
@@ -33,6 +34,8 @@ interface Props {
   deviceId: string
   quality: QualityTier
   inputMode: InputMode
+  hidpi: boolean
+  smoothScaling: boolean
   monitorDefault?: { width: number; height: number }
   onSessionChange: (s: SessionSnapshot) => void
   onSessionApi: (api: SessionApi) => void
@@ -43,6 +46,8 @@ export default function DesktopJpegView({
   deviceId,
   quality,
   inputMode,
+  hidpi,
+  smoothScaling,
   monitorDefault,
   onSessionChange,
   onSessionApi,
@@ -77,8 +82,8 @@ export default function DesktopJpegView({
     }
   }, [])
 
-  const { status, sendInput, setQuality, disconnect, attempt, screenDims } =
-    useDesktopSession(hostId, deviceId, onTile, quality)
+  const { status, sendInput, setQuality, setSettings, disconnect, attempt, screenDims } =
+    useDesktopSession(hostId, deviceId, onTile, quality, hidpi)
 
   // Push session state to the parent whenever it changes.
   useEffect(() => {
@@ -87,8 +92,19 @@ export default function DesktopJpegView({
 
   // Push a stable API reference whenever the callback identities change.
   useEffect(() => {
-    onSessionApi({ sendInput, setQuality, disconnect })
-  }, [sendInput, setQuality, disconnect, onSessionApi])
+    onSessionApi({ sendInput, setQuality, setSettings, disconnect })
+  }, [sendInput, setQuality, setSettings, disconnect, onSessionApi])
+
+  // Apply smoothScaling: worker postMessage in offscreen mode, ctx flag in
+  // main-thread fallback. Re-applied on every smoothScaling change AND on
+  // resize (worker handles its own re-apply on resize internally).
+  useEffect(() => {
+    if (supportsOffscreen && workerRef.current) {
+      workerRef.current.postMessage({ type: 'smoothing', enabled: smoothScaling })
+    } else if (ctx2dRef.current) {
+      ctx2dRef.current.imageSmoothingEnabled = smoothScaling
+    }
+  }, [smoothScaling])
 
   // Init canvas worker once — one-shot `transferControlToOffscreen` per canvas.
   useEffect(() => {

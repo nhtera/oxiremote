@@ -89,6 +89,8 @@ impl CaptureLoop {
     /// - `tx`: frame sink; channel **full** drops newest (never blocks the
     ///   capture thread); channel **closed** exits the loop cleanly.
     /// - `scale_factor`: xcap physical/logical ratio; `1.0` is safe on non-HiDPI.
+    /// - `hidpi_mode`: when true, `quality_resize` skips the 1/scale_factor
+    ///   normalisation step so the encoder receives native physical pixels.
     /// - `force_iframe_rx`: optional oneshot that, when fired, resets the tile
     ///   diff so the next emitted frame contains every tile (equivalent to an
     ///   H.264 IDR for a joining viewer).
@@ -100,6 +102,7 @@ impl CaptureLoop {
         tier: QualityTier,
         tx: Sender<FrameOutput>,
         scale_factor: f32,
+        hidpi_mode: bool,
         mut force_iframe_rx: Option<oneshot::Receiver<()>>,
     ) {
         let capture = match ScreenCapture::primary() {
@@ -153,7 +156,8 @@ impl CaptureLoop {
             };
 
             // Resize + diff + encode.
-            let output = TileEncoder::process_frame(raw, tier, scale_factor, &mut diff);
+            let output =
+                TileEncoder::process_frame(raw, tier, scale_factor, hidpi_mode, &mut diff);
 
             // Only emit non-idle frames. Drop-newest on backpressure so the
             // capture thread never stalls behind a slow consumer.
@@ -201,11 +205,16 @@ impl CaptureLoop {
     /// iteration so the loop's frame cadence tracks the user's tier slider
     /// in real time without restarting the capture (Low ≈ 8 fps,
     /// Med ≈ 15 fps, High ≈ 30 fps).
+    ///
+    /// `hidpi_mode` is also captured ONCE — like resolution it changes the
+    /// encoder dims and so requires a session-level restart to flip. The
+    /// caller (`desktop_ws.rs`) handles that path.
     pub fn run_bgra(
         resolution_tier: QualityTier,
         fps_rx: tokio::sync::watch::Receiver<QualityTier>,
         tx: Sender<RawBgraFrame>,
         scale_factor: f32,
+        hidpi_mode: bool,
         force_iframe_rx: Option<oneshot::Receiver<()>>,
     ) {
         // ── Pick a capture backend ────────────────────────────────────────
@@ -219,8 +228,13 @@ impl CaptureLoop {
             // xcap's `Monitor::width()` returns logical points (CGDisplayBounds),
             // matching what `desktop_ws_inner::primary_screen_dimensions()` and
             // the encoder build use. So feed it straight into resize_dims.
-            let (target_w, target_h) =
-                crate::encode::resize_dims(screen_w, screen_h, resolution_tier);
+            let (target_w, target_h) = crate::encode::resize_dims(
+                screen_w,
+                screen_h,
+                resolution_tier,
+                scale_factor,
+                hidpi_mode,
+            );
             // SCK target FPS is the ceiling; we still gate on fps_rx in the
             // hot loop. Pass the highest tier's FPS so SCK never throttles
             // below what the user might select mid-session.
@@ -230,7 +244,7 @@ impl CaptureLoop {
                     info!(
                         resolution_tier = ?resolution_tier,
                         initial_fps_tier = ?*fps_rx.borrow(),
-                        target_w, target_h, target_fps,
+                        target_w, target_h, target_fps, hidpi_mode,
                         "CaptureLoop::run_bgra started (ScreenCaptureKit)"
                     );
                     return run_bgra_sck(sck, fps_rx, tx, force_iframe_rx);
@@ -249,11 +263,19 @@ impl CaptureLoop {
         info!(
             resolution_tier = ?resolution_tier,
             initial_fps_tier = ?*fps_rx.borrow(),
-            scale_factor,
+            scale_factor, hidpi_mode,
             "CaptureLoop::run_bgra started (xcap)"
         );
 
-        run_bgra_xcap(capture, resolution_tier, fps_rx, tx, scale_factor, force_iframe_rx);
+        run_bgra_xcap(
+            capture,
+            resolution_tier,
+            fps_rx,
+            tx,
+            scale_factor,
+            hidpi_mode,
+            force_iframe_rx,
+        );
     }
 }
 
@@ -261,12 +283,14 @@ impl CaptureLoop {
 
 /// xcap-backed driver. Captures full physical RGBA, runs `quality_resize` +
 /// `rgba_to_bgra`, then forwards a `RawBgraFrame`.
+#[allow(clippy::too_many_arguments)]
 fn run_bgra_xcap(
     capture: ScreenCapture,
     resolution_tier: QualityTier,
     fps_rx: tokio::sync::watch::Receiver<QualityTier>,
     tx: Sender<RawBgraFrame>,
     scale_factor: f32,
+    hidpi_mode: bool,
     mut force_iframe_rx: Option<oneshot::Receiver<()>>,
 ) {
     let mut frame_count: u64 = 0;
@@ -297,7 +321,7 @@ fn run_bgra_xcap(
             }
         };
 
-        let resized = quality_resize(raw, resolution_tier, scale_factor);
+        let resized = quality_resize(raw, resolution_tier, scale_factor, hidpi_mode);
         let (width, height) = (resized.width(), resized.height());
         let bytes = rgba_to_bgra(resized.as_raw());
 

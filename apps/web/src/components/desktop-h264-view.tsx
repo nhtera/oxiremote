@@ -25,6 +25,7 @@ interface SessionSnapshot {
 interface SessionApi {
   sendInput: (ev: DesktopInputEvent) => void
   setQuality: (tier: QualityTier) => void
+  setSettings: (next: { hidpi: boolean }) => void
   disconnect: () => void
 }
 
@@ -33,6 +34,8 @@ interface Props {
   deviceId: string
   quality: QualityTier
   inputMode: InputMode
+  hidpi: boolean
+  smoothScaling: boolean
   monitorDefault?: { width: number; height: number }
   onSessionChange: (s: SessionSnapshot) => void
   onSessionApi: (api: SessionApi) => void
@@ -43,12 +46,23 @@ export default function DesktopH264View({
   deviceId,
   quality,
   inputMode,
+  hidpi,
+  smoothScaling,
   monitorDefault,
   onSessionChange,
   onSessionApi,
 }: Props) {
   const canvasRef = useRef<HTMLCanvasElement>(null)
   const ctx2dRef = useRef<CanvasRenderingContext2D | null>(null)
+  // Read latest smoothScaling inside the rVFC callback without recreating
+  // onFrame (which would tear down + restart the rVFC handle on each toggle).
+  const smoothRef = useRef(smoothScaling)
+  useEffect(() => {
+    smoothRef.current = smoothScaling
+    // Apply immediately to the live context so the next frame paints with
+    // the new filter — without waiting for the next canvas resize.
+    if (ctx2dRef.current) ctx2dRef.current.imageSmoothingEnabled = smoothScaling
+  }, [smoothScaling])
 
   // Draw each decoded frame to the on-screen canvas. The hook hands us the
   // hidden <video> element so we can read `videoWidth`/`videoHeight` — the
@@ -61,10 +75,10 @@ export default function DesktopH264View({
     if (!ctx) {
       ctx = canvas.getContext('2d')
       ctx2dRef.current = ctx
-      // Screen content is text-heavy — bilinear smoothing softens glyph
-      // edges. Disabling it keeps text crisp when the canvas is later
-      // CSS-scaled by `object-contain`.
-      if (ctx) ctx.imageSmoothingEnabled = false
+      // Screen content is text-heavy: default OFF keeps glyph edges crisp
+      // when CSS upscales the canvas. Users who view downscaled (e.g. mobile)
+      // can flip Smooth Scaling on to soften aliasing.
+      if (ctx) ctx.imageSmoothingEnabled = smoothRef.current
     }
     if (!ctx) return
     const w = video.videoWidth
@@ -73,23 +87,22 @@ export default function DesktopH264View({
     if (canvas.width !== w || canvas.height !== h) {
       canvas.width = w
       canvas.height = h
-      // getContext returns the same context, but resizing a canvas resets
-      // most state including imageSmoothingEnabled — re-apply.
-      ctx.imageSmoothingEnabled = false
+      // Resizing a canvas resets context state — re-apply the filter.
+      ctx.imageSmoothingEnabled = smoothRef.current
     }
     ctx.drawImage(video, 0, 0, w, h)
   }, [])
 
-  const { status, sendInput, setQuality, disconnect, attempt, screenDims } =
-    useDesktopVideoSession(hostId, deviceId, onFrame, quality)
+  const { status, sendInput, setQuality, setSettings, disconnect, attempt, screenDims } =
+    useDesktopVideoSession(hostId, deviceId, onFrame, quality, hidpi)
 
   useEffect(() => {
     onSessionChange({ status, attempt, screenDims })
   }, [status, attempt, screenDims, onSessionChange])
 
   useEffect(() => {
-    onSessionApi({ sendInput, setQuality, disconnect })
-  }, [sendInput, setQuality, disconnect, onSessionApi])
+    onSessionApi({ sendInput, setQuality, setSettings, disconnect })
+  }, [sendInput, setQuality, setSettings, disconnect, onSessionApi])
 
   // Set an initial canvas size from the monitor hint so the layout doesn't
   // pop when the first frame arrives; the onFrame loop adjusts precisely.

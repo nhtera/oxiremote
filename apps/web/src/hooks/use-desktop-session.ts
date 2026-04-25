@@ -26,6 +26,7 @@ interface SessionApi {
   status: DesktopStatus
   sendInput: (ev: DesktopInputEvent) => void
   setQuality: (tier: QualityTier) => void
+  setSettings: (next: { hidpi: boolean }) => void
   disconnect: () => void
   attempt: number
   screenDims?: { width: number; height: number }
@@ -54,6 +55,7 @@ export function useDesktopSession(
   deviceId: string,
   onTile: TileCallback,
   tier: QualityTier = 'med',
+  hidpi: boolean = false,
 ): SessionApi {
   const [status, setStatus] = useState<DesktopStatus>('idle')
   const [attempt, setAttempt] = useState(0)
@@ -76,6 +78,14 @@ export function useDesktopSession(
   useEffect(() => {
     tierRef.current = tier
   }, [tier])
+
+  // Same pattern as tier — sent BEFORE the offer so the agent picks the
+  // right encoder dims from session-start. Mid-session toggle goes via the
+  // ctrl DC's `{t:"settings", hidpi}` path (see `setSettings` below).
+  const hidpiRef = useRef<boolean>(hidpi)
+  useEffect(() => {
+    hidpiRef.current = hidpi
+  }, [hidpi])
 
   const teardown = useCallback(() => {
     if (dcOpenTimerRef.current) clearTimeout(dcOpenTimerRef.current)
@@ -177,6 +187,9 @@ export function useDesktopSession(
     ws.onopen = () => {
       if (wsRef.current !== ws) return
       setStatus('signaling')
+      // Push the persisted HiDPI preference before the offer so the agent
+      // builds the JPEG capture pipeline at the right dims from frame zero.
+      ws.send(JSON.stringify({ type: 'settings', hidpi: hidpiRef.current }))
       // Create and send offer
       pc.createOffer()
         .then((offer) => pc.setLocalDescription(offer))
@@ -304,6 +317,13 @@ export function useDesktopSession(
 
   const setQuality = useCallback((tier: QualityTier) => {
     sendCtrl({ t: 'quality', tier })
+  }, []) // eslint-disable-line
+
+  // JPEG path supports live HiDPI flips: agent's `spawn_capture_pipeline`
+  // restarts the loop on the settings watch and re-emits Capabilities so
+  // the canvas resizes itself. No reconnect needed.
+  const setSettings = useCallback((next: { hidpi: boolean }) => {
+    sendCtrl({ t: 'settings', hidpi: next.hidpi })
   }, []) // eslint-disable-line react-hooks/exhaustive-deps
 
   const disconnect = useCallback(() => {
@@ -323,5 +343,5 @@ export function useDesktopSession(
     }
   }, [hostId, deviceId]) // eslint-disable-line react-hooks/exhaustive-deps
 
-  return { status, sendInput, setQuality, disconnect, attempt, screenDims }
+  return { status, sendInput, setQuality, setSettings, disconnect, attempt, screenDims }
 }

@@ -3,9 +3,10 @@
 // the modifier is fused into the next key event then automatically cleared.
 // On viewport ≥1024px this sits in a right sidebar; below that it's fixed bottom.
 
-import { useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import type { QualityTier, DesktopInputEvent } from '../hooks/use-desktop-session'
 import type { InputMode } from '../hooks/use-desktop-input'
+import DesktopSettingsPopover from './desktop-settings-popover'
 
 interface Props {
   quality: QualityTier
@@ -14,6 +15,9 @@ interface Props {
   onInputModeToggle: () => void
   onKeyEvent: (ev: DesktopInputEvent) => void
   onShowGestureHelp: () => void
+  hidpi: boolean
+  smoothScaling: boolean
+  onSettingsChange: (next: { hidpi: boolean; smoothScaling: boolean }) => void
 }
 
 // Sticky modifier keys — toggled on tap, cleared after next key dispatch
@@ -49,8 +53,30 @@ export default function DesktopToolbar({
   onInputModeToggle,
   onKeyEvent,
   onShowGestureHelp,
+  hidpi,
+  smoothScaling,
+  onSettingsChange,
 }: Props) {
   const [activeModifiers, setActiveModifiers] = useState<Set<ModKey>>(new Set())
+  const [settingsOpen, setSettingsOpen] = useState(false)
+  // Wrap the gear button + popover so a single click-outside listener can
+  // close the popover without each child needing its own ref.
+  const settingsContainerRef = useRef<HTMLDivElement>(null)
+  useEffect(() => {
+    if (!settingsOpen) return
+    const onDown = (e: MouseEvent | TouchEvent) => {
+      const target = e.target as Node | null
+      if (target && !settingsContainerRef.current?.contains(target)) {
+        setSettingsOpen(false)
+      }
+    }
+    document.addEventListener('mousedown', onDown)
+    document.addEventListener('touchstart', onDown)
+    return () => {
+      document.removeEventListener('mousedown', onDown)
+      document.removeEventListener('touchstart', onDown)
+    }
+  }, [settingsOpen])
 
   function toggleMod(mod: ModKey) {
     setActiveModifiers((prev) => {
@@ -104,13 +130,13 @@ export default function DesktopToolbar({
 
   return (
     <div className="flex flex-col gap-2 p-2 bg-surface border-t border-border lg:border-t-0 lg:border-l lg:h-full lg:w-60 lg:p-3">
-      {/* Quality + input mode row */}
-      <div className="flex items-center gap-2">
+      {/* Quality + display settings row — both about render output */}
+      <div className="flex items-center gap-2 min-w-0">
         <label className="text-xs text-text-muted shrink-0">Quality</label>
         <select
           value={quality}
           onChange={(e) => onQualityChange(e.target.value as QualityTier)}
-          className="flex-1 text-xs bg-surface border border-border rounded-md px-2 py-1 text-text-primary outline-none focus:border-accent/50"
+          className="flex-1 min-w-0 text-xs bg-surface border border-border rounded-md px-2 py-1 text-text-primary outline-none focus:border-accent/50"
         >
           {QUALITY_OPTIONS.map((o) => (
             <option key={o.value} value={o.value}>
@@ -119,10 +145,36 @@ export default function DesktopToolbar({
           ))}
         </select>
 
+        <div className="relative shrink-0" ref={settingsContainerRef}>
+          <button
+            onClick={() => setSettingsOpen((v) => !v)}
+            title="Display settings"
+            aria-label="Display settings"
+            aria-expanded={settingsOpen}
+            className={`text-xs px-2 py-1 border border-border rounded-md transition-colors ${
+              settingsOpen
+                ? 'bg-surface-hover text-text-primary'
+                : 'bg-surface-alt text-text-muted hover:text-text-primary hover:bg-surface-hover'
+            }`}
+          >
+            ⚙
+          </button>
+          {settingsOpen && (
+            <DesktopSettingsPopover
+              hidpi={hidpi}
+              smoothScaling={smoothScaling}
+              onChange={onSettingsChange}
+            />
+          )}
+        </div>
+      </div>
+
+      {/* Input mode + gesture help row */}
+      <div className="flex items-center gap-2 min-w-0">
         <button
           onClick={onInputModeToggle}
           title={`Mode: ${inputMode}`}
-          className="text-xs px-2 py-1 border border-border rounded-md bg-surface-alt text-text-secondary hover:bg-surface-hover transition-colors"
+          className="flex-1 min-w-0 text-xs px-2 py-1 border border-border rounded-md bg-surface-alt text-text-secondary hover:bg-surface-hover transition-colors"
         >
           {inputMode === 'touch' ? 'Touch' : 'Trackpad'}
         </button>
@@ -130,7 +182,7 @@ export default function DesktopToolbar({
         <button
           onClick={onShowGestureHelp}
           title="Gesture help"
-          className="text-xs px-2 py-1 border border-border rounded-md bg-surface-alt text-text-muted hover:text-text-primary hover:bg-surface-hover transition-colors"
+          className="shrink-0 text-xs px-2 py-1 border border-border rounded-md bg-surface-alt text-text-muted hover:text-text-primary hover:bg-surface-hover transition-colors"
           aria-label="Gesture help"
         >
           ?

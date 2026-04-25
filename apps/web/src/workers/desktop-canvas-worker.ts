@@ -4,6 +4,8 @@
 
 let ctx: OffscreenCanvasRenderingContext2D | null = null
 let tileSize = 128
+// Phase 04 — persisted across resize because canvas resize resets ctx state.
+let smoothingEnabled = false
 
 interface InitMessage {
   type: 'init'
@@ -26,7 +28,12 @@ interface ResizeMessage {
   height: number
 }
 
-type WorkerMessage = InitMessage | TileMessage | ResizeMessage
+interface SmoothingMessage {
+  type: 'smoothing'
+  enabled: boolean
+}
+
+type WorkerMessage = InitMessage | TileMessage | ResizeMessage | SmoothingMessage
 
 self.onmessage = async (e: MessageEvent<WorkerMessage>) => {
   const msg = e.data
@@ -34,6 +41,7 @@ self.onmessage = async (e: MessageEvent<WorkerMessage>) => {
   if (msg.type === 'init') {
     tileSize = msg.tileSize ?? 128
     ctx = msg.canvas.getContext('2d')
+    if (ctx) ctx.imageSmoothingEnabled = smoothingEnabled
     return
   }
 
@@ -41,7 +49,15 @@ self.onmessage = async (e: MessageEvent<WorkerMessage>) => {
     if (ctx) {
       ctx.canvas.width = msg.width
       ctx.canvas.height = msg.height
+      // Resizing the canvas resets context state — reapply smoothing.
+      ctx.imageSmoothingEnabled = smoothingEnabled
     }
+    return
+  }
+
+  if (msg.type === 'smoothing') {
+    smoothingEnabled = msg.enabled
+    if (ctx) ctx.imageSmoothingEnabled = smoothingEnabled
     return
   }
 

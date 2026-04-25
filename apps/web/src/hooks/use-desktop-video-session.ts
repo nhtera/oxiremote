@@ -24,6 +24,7 @@ interface VideoSessionApi {
   status: DesktopStatus
   sendInput: (ev: DesktopInputEvent) => void
   setQuality: (tier: QualityTier) => void
+  setSettings: (next: { hidpi: boolean }) => void
   disconnect: () => void
   attempt: number
   /** Set once the agent announces the stream dimensions via `capabilities`. */
@@ -55,6 +56,7 @@ export function useDesktopVideoSession(
   deviceId: string,
   onFrame: FrameCallback,
   tier: QualityTier = 'med',
+  hidpi: boolean = false,
 ): VideoSessionApi {
   const [status, setStatus] = useState<DesktopStatus>('idle')
   const [attempt, setAttempt] = useState(0)
@@ -75,6 +77,13 @@ export function useDesktopVideoSession(
   useEffect(() => {
     tierRef.current = tier
   }, [tier])
+
+  // Latest HiDPI preference — sent BEFORE the offer (not on ctrl DC) so the
+  // agent builds the encoder at the right resolution from session-start.
+  const hidpiRef = useRef<boolean>(hidpi)
+  useEffect(() => {
+    hidpiRef.current = hidpi
+  }, [hidpi])
 
   // ── Hidden <video> element lifecycle ────────────────────────────────────
   //
@@ -233,6 +242,10 @@ export function useDesktopVideoSession(
       ws.send(
         JSON.stringify({ type: 'capabilitiesClient', codecs: ['h264-baseline-3.1'], webcodecs: false }),
       )
+      // Push the persisted HiDPI preference before the offer so the encoder
+      // is built at the right resolution from session-start. Skipping this
+      // would force a reconnect every time the user has HiDPI on.
+      ws.send(JSON.stringify({ type: 'settings', hidpi: hidpiRef.current }))
       pc.createOffer()
         .then((offer) => pc.setLocalDescription(offer))
         .then(() => {
@@ -319,6 +332,12 @@ export function useDesktopVideoSession(
 
   const sendInput = useCallback((ev: DesktopInputEvent) => sendCtrl(ev), []) // eslint-disable-line
   const setQuality = useCallback((q: QualityTier) => sendCtrl({ t: 'quality', tier: q }), []) // eslint-disable-line
+  // Mid-session HiDPI flip → server tears down the PC; the reconnect path
+  // re-runs ws.onopen which sends the new persisted hidpi before the offer.
+  const setSettings = useCallback(
+    (next: { hidpi: boolean }) => sendCtrl({ t: 'settings', hidpi: next.hidpi }),
+    [],
+  ) // eslint-disable-line
 
   const disconnect = useCallback(() => {
     destroyedRef.current = true
@@ -336,5 +355,5 @@ export function useDesktopVideoSession(
     }
   }, [hostId, deviceId]) // eslint-disable-line react-hooks/exhaustive-deps
 
-  return { status, sendInput, setQuality, disconnect, attempt, screenDims }
+  return { status, sendInput, setQuality, setSettings, disconnect, attempt, screenDims }
 }

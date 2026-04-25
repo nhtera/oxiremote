@@ -34,13 +34,41 @@ interface Capabilities {
 interface SessionApi {
   sendInput: (ev: DesktopInputEvent) => void
   setQuality: (tier: QualityTier) => void
+  setSettings: (next: { hidpi: boolean }) => void
   disconnect: () => void
 }
 
 const noopApi: SessionApi = {
   sendInput: () => {},
   setQuality: () => {},
+  setSettings: () => {},
   disconnect: () => {},
+}
+
+interface DisplaySettings {
+  hidpi: boolean
+  smoothScaling: boolean
+}
+
+const SETTINGS_KEY = 'oxi.desktop.settings'
+const DEFAULT_SETTINGS: DisplaySettings = { hidpi: false, smoothScaling: false }
+
+function loadSettings(): DisplaySettings {
+  if (typeof localStorage === 'undefined') return DEFAULT_SETTINGS
+  try {
+    const raw = localStorage.getItem(SETTINGS_KEY)
+    if (!raw) return DEFAULT_SETTINGS
+    const parsed = JSON.parse(raw) as Partial<DisplaySettings>
+    return {
+      hidpi: typeof parsed.hidpi === 'boolean' ? parsed.hidpi : DEFAULT_SETTINGS.hidpi,
+      smoothScaling:
+        typeof parsed.smoothScaling === 'boolean'
+          ? parsed.smoothScaling
+          : DEFAULT_SETTINGS.smoothScaling,
+    }
+  } catch {
+    return DEFAULT_SETTINGS
+  }
 }
 
 export default function DesktopPage() {
@@ -51,6 +79,15 @@ export default function DesktopPage() {
   const [quality, setQuality] = useState<QualityTier>('med')
   const [inputMode, setInputMode] = useState<InputMode>('touch')
   const [showHelp, setShowHelp] = useState(false)
+  // Phase 04 — HiDPI + smooth-scaling toggles, persisted per-device.
+  const [settings, setSettingsState] = useState<DisplaySettings>(() => loadSettings())
+  useEffect(() => {
+    try {
+      localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings))
+    } catch {
+      /* private mode / quota exceeded — best-effort */
+    }
+  }, [settings])
 
   // Session state pushed up from the mounted view.
   const [status, setStatus] = useState<DesktopStatus>('idle')
@@ -101,6 +138,32 @@ export default function DesktopPage() {
     sessionApiRef.current.disconnect()
   }, [])
 
+  // Settings change handler. HiDPI flips trigger a brief session reconnect on
+  // the H.264 path (encoder dims fixed at init) — confirm before sending so
+  // the user isn't surprised by a freeze. Smooth-scaling is render-only.
+  const handleSettingsChange = useCallback(
+    (next: { hidpi: boolean; smoothScaling: boolean }) => {
+      const hidpiChanged = next.hidpi !== settings.hidpi
+      if (hidpiChanged) {
+        const ok = window.confirm(
+          'Changing High-DPI mode will briefly reconnect the session. Continue?',
+        )
+        if (!ok) {
+          // Keep smoothScaling change even if user cancels HiDPI, reverting only hidpi.
+          if (next.smoothScaling !== settings.smoothScaling) {
+            setSettingsState({ hidpi: settings.hidpi, smoothScaling: next.smoothScaling })
+          }
+          return
+        }
+      }
+      setSettingsState(next)
+      if (hidpiChanged) {
+        sessionApiRef.current.setSettings({ hidpi: next.hidpi })
+      }
+    },
+    [settings.hidpi, settings.smoothScaling],
+  )
+
   // Unavailable / loading states
   if (capsError) {
     return (
@@ -146,6 +209,8 @@ export default function DesktopPage() {
             deviceId={deviceId}
             quality={quality}
             inputMode={inputMode}
+            hidpi={settings.hidpi}
+            smoothScaling={settings.smoothScaling}
             monitorDefault={monitorDefault}
             onSessionChange={onSessionChange}
             onSessionApi={onSessionApi}
@@ -156,6 +221,8 @@ export default function DesktopPage() {
             deviceId={deviceId}
             quality={quality}
             inputMode={inputMode}
+            hidpi={settings.hidpi}
+            smoothScaling={settings.smoothScaling}
             monitorDefault={monitorDefault}
             onSessionChange={onSessionChange}
             onSessionApi={onSessionApi}
@@ -171,6 +238,9 @@ export default function DesktopPage() {
           onInputModeToggle={() => setInputMode((m) => (m === 'touch' ? 'trackpad' : 'touch'))}
           onKeyEvent={sendInput}
           onShowGestureHelp={() => setShowHelp(true)}
+          hidpi={settings.hidpi}
+          smoothScaling={settings.smoothScaling}
+          onSettingsChange={handleSettingsChange}
         />
       </div>
 

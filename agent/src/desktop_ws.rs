@@ -62,6 +62,15 @@ mod inner {
             #[serde(default)]
             webcodecs: bool,
         },
+        /// Phase 04: per-session capture settings. `hidpi=true` skips logical
+        /// downscale so the encoder gets native physical pixels — costs ~4×
+        /// pixel throughput on retina, paid for by a 2× bitrate multiplier
+        /// in `tier_bitrate`. Toggling triggers a capture-pipeline restart
+        /// because encoder dims are fixed once H.264 starts.
+        Settings {
+            #[serde(default)]
+            hidpi: bool,
+        },
     }
 
     /// Signaling messages the agent sends to the client (WS text channel).
@@ -129,6 +138,12 @@ mod inner {
         Quality {
             tier: String, // "high" | "med" | "low"
         },
+        /// Phase 04: mid-session HiDPI toggle. JPEG path applies live;
+        /// H.264 path triggers full session restart (encoder dims locked).
+        Settings {
+            #[serde(default)]
+            hidpi: bool,
+        },
         /// Monitor selector — v1 no-op, kept for forward compatibility.
         Monitor {
             #[allow(dead_code)]
@@ -163,6 +178,11 @@ mod inner {
                     let t = parse_quality_tier(&tier)?;
                     Some(InputEvent::QualityChange { tier: t })
                 }
+                // Settings is intercepted before InputEvent conversion in
+                // `dispatch_input` (it routes to `settings_tx`, not the
+                // injector) — this arm is unreachable but keeps the match
+                // exhaustive.
+                WireInput::Settings { .. } => None,
                 WireInput::Monitor { .. } => None,
             }
         }
@@ -325,6 +345,14 @@ mod inner {
         #[cfg_attr(not(feature = "h264"), allow(unused_mut))]
         let (quality_tx, mut quality_rx) = watch::channel(QualityTier::Med);
 
+        // ── Settings watch channel ────────────────────────────────────────────
+        // Phase 04 HiDPI toggle. Initial value is filled in from the
+        // pre-offer `Settings` signal (persisted in client localStorage); if
+        // the client never sends one we stay in default-off (preserves
+        // pre-Phase-04 behaviour).
+        let (settings_tx, mut settings_rx) = watch::channel(false);
+        let _ = &mut settings_rx; // silence unused-mut on JPEG-only builds
+
         // ── InputInjector ─────────────────────────────────────────────────────
         // Wrapped in Mutex because InputInjector is !Sync.
         let injector: Option<Arc<Mutex<InputInjector>>> = match InputInjector::new() {
@@ -349,10 +377,12 @@ mod inner {
         {
             let inj = injector.clone();
             let qtx = quality_tx.clone();
+            let stx = settings_tx.clone();
             let caps_ws_tx = ws_out_tx.clone();
             ctrl_dc.on_message(Box::new(move |msg| {
                 let inj = inj.clone();
                 let qtx = qtx.clone();
+                let stx = stx.clone();
                 let caps_tx = caps_ws_tx.clone();
                 Box::pin(async move {
                     let text = match std::str::from_utf8(&msg.data) {
@@ -365,6 +395,7 @@ mod inner {
                         screen_w,
                         screen_h,
                         &qtx,
+                        &stx,
                         scale_factor,
                         Some(&caps_tx),
                     )
@@ -380,8 +411,12 @@ mod inner {
         // recvonly video m-line. The returned RTCRtpSender feeds
         // `spawn_rtcp_reader` for PLI + REMB feedback.
         #[cfg_attr(not(feature = "h264"), allow(unused_variables))]
-        let (pipeline, offer_sdp) =
+        let (pipeline, offer_sdp, initial_hidpi) =
             await_offer_with_caps(&mut socket, &pc, &mut close_rx).await?;
+        // Seed the settings watch with the pre-offer client preference so
+        // the encoder starts at the user's persisted HiDPI mode without a
+        // reconnect round-trip.
+        let _ = settings_tx.send(initial_hidpi);
 
         // Build the H.264 sending track iff the Pipeline chose H.264 AND the
         // feature is compiled in. For the JPEG path `sending_track` is None
@@ -420,8 +455,11 @@ mod inner {
                 screen_w,
                 screen_h,
                 scale_factor,
+                initial_hidpi,
                 &quality_tx,
                 &mut quality_rx,
+                &settings_tx,
+                &mut settings_rx,
                 &mut close_rx,
             )
             .await;
@@ -525,13 +563,21 @@ mod inner {
 
         // ── Capture pipeline ──────────────────────────────────────────────────
         let (cap_shutdown_tx, cap_shutdown_rx) = tokio::sync::oneshot::channel::<()>();
-        // Read initial tier before moving quality_rx into the pipeline.
+        // Read initial tier + hidpi before moving the watches into the pipeline.
         let initial_tier = *quality_rx.borrow();
+        let initial_hidpi_jpeg = *settings_rx.borrow();
+        let settings_rx_for_pipeline = settings_tx.subscribe();
 
         // Emit Capabilities once, before the first binary tile leaves, so the
         // client can size its canvas from real encoder-output dimensions —
         // not from the HTTP `/desktop/capabilities` "is enabled" probe.
-        let (out_w, out_h) = desktop::resize_dims(screen_w, screen_h, initial_tier);
+        let (out_w, out_h) = desktop::resize_dims(
+            screen_w,
+            screen_h,
+            initial_tier,
+            scale_factor,
+            initial_hidpi_jpeg,
+        );
         if let Ok(msg) = serde_json::to_string(&SignalOut::Capabilities {
             width: out_w,
             height: out_h,
@@ -541,7 +587,15 @@ mod inner {
             let _ = ws_out_tx.send(msg).await;
         }
 
-        spawn_capture_pipeline(initial_tier, sink, quality_rx, cap_shutdown_rx, scale_factor);
+        spawn_capture_pipeline(
+            initial_tier,
+            initial_hidpi_jpeg,
+            sink,
+            quality_rx,
+            settings_rx_for_pipeline,
+            cap_shutdown_rx,
+            scale_factor,
+        );
 
         // ── Main WS event loop ────────────────────────────────────────────────
         ws_loop(
@@ -553,6 +607,7 @@ mod inner {
             screen_w,
             screen_h,
             &quality_tx,
+            &settings_tx,
             &mut close_rx,
             scale_factor,
             &ws_out_tx,
@@ -591,8 +646,11 @@ mod inner {
         screen_w: u32,
         screen_h: u32,
         scale_factor: f32,
+        initial_hidpi: bool,
         quality_tx: &watch::Sender<QualityTier>,
         quality_rx: &mut watch::Receiver<QualityTier>,
+        settings_tx: &watch::Sender<bool>,
+        settings_rx: &mut watch::Receiver<bool>,
         close_rx: &mut tokio::sync::oneshot::Receiver<()>,
     ) -> anyhow::Result<()> {
         use base64::{engine::general_purpose::STANDARD as B64_STD, Engine as _};
@@ -601,7 +659,8 @@ mod inner {
         use desktop::resize_dims;
 
         let initial_tier = *quality_rx.borrow();
-        let (out_w, out_h) = resize_dims(screen_w, screen_h, initial_tier);
+        let hidpi = initial_hidpi;
+        let (out_w, out_h) = resize_dims(screen_w, screen_h, initial_tier, scale_factor, hidpi);
 
         // Emit Capabilities so the client can size its <video> backing canvas.
         if let Ok(msg) = serde_json::to_string(&SignalOut::Capabilities {
@@ -615,7 +674,7 @@ mod inner {
 
         // ── Channels ──────────────────────────────────────────────────────────
         let (bgra_tx, bgra_rx) = mpsc::channel::<desktop::RawBgraFrame>(2);
-        let (bitrate_tx, bitrate_rx) = watch::channel(tier_bitrate(initial_tier));
+        let (bitrate_tx, bitrate_rx) = watch::channel(tier_bitrate(initial_tier, hidpi));
         let (pli_tx, pli_rx) = mpsc::channel::<()>(4);
         let (params_tx, params_rx) = tokio::sync::oneshot::channel();
         let (vp_shutdown_tx, vp_shutdown_rx) = tokio::sync::oneshot::channel::<()>();
@@ -627,9 +686,9 @@ mod inner {
         let _ = cap_iframe_tx.send(());
 
         // ── Spawn tasks ───────────────────────────────────────────────────────
-        // Capture: resolution locked to initial tier (encoder dims are fixed
-        // at init), but FPS tracks the live tier slider via `quality_rx` so
-        // High delivers ~30 fps, Med ~15 fps, Low ~8 fps without restart.
+        // Capture: resolution + HiDPI locked at session start (encoder dims are
+        // fixed at init), but FPS tracks the live tier slider via `quality_rx`
+        // so High delivers ~30 fps, Med ~15 fps, Low ~8 fps without restart.
         let cap_fps_rx = quality_tx.subscribe();
         tokio::task::spawn_blocking(move || {
             CaptureLoop::run_bgra(
@@ -637,6 +696,7 @@ mod inner {
                 cap_fps_rx,
                 bgra_tx,
                 scale_factor,
+                hidpi,
                 Some(cap_iframe_rx),
             )
         });
@@ -644,7 +704,7 @@ mod inner {
         crate::video_pipeline::spawn_video_pipeline(crate::video_pipeline::VideoPipelineConfig {
             width: out_w,
             height: out_h,
-            initial_bitrate: tier_bitrate(initial_tier),
+            initial_bitrate: tier_bitrate(initial_tier, hidpi),
             track,
             bgra_rx,
             bitrate_rx,
@@ -668,8 +728,13 @@ mod inner {
             width = out_w,
             height = out_h,
             tier = ?initial_tier,
+            hidpi,
             "h264 pipeline spawned"
         );
+
+        // Track current HiDPI so a stray Settings echo with the same value
+        // doesn't trigger a needless reconnect.
+        let current_hidpi = hidpi;
 
         // ── Main WS loop, pumping signaling + watching for first IDR ──────────
         let mut params_rx = Some(params_rx);
@@ -711,12 +776,27 @@ mod inner {
                 // the encoder keeps its locked resolution.
                 Ok(_) = quality_rx.changed() => {
                     let new_tier = *quality_rx.borrow();
-                    let _ = bitrate_tx.send(tier_bitrate(new_tier));
-                    let (w, h) = resize_dims(screen_w, screen_h, new_tier);
+                    let _ = bitrate_tx.send(tier_bitrate(new_tier, current_hidpi));
+                    let (w, h) = resize_dims(
+                        screen_w, screen_h, new_tier, scale_factor, current_hidpi,
+                    );
                     if let Ok(msg) = serde_json::to_string(&SignalOut::Capabilities {
                         width: w, height: h, scale_factor, tile_size: desktop::TILE_SIZE,
                     }) {
                         let _ = ws_out_tx.send(msg).await;
+                    }
+                }
+
+                // HiDPI flip → encoder dims change. The encoder is locked at
+                // init, so we can't resize live. Break out and let the caller
+                // close the PC; the client's reconnect path then opens a new
+                // session with the persisted setting (sent before offer).
+                Ok(_) = settings_rx.changed() => {
+                    let new_hidpi = *settings_rx.borrow();
+                    if new_hidpi != current_hidpi {
+                        info!(old = current_hidpi, new = new_hidpi,
+                            "h264: hidpi change → session restart");
+                        break;
                     }
                 }
 
@@ -731,6 +811,7 @@ mod inner {
                                 screen_w,
                                 screen_h,
                                 quality_tx,
+                                settings_tx,
                                 scale_factor,
                                 ws_out_tx,
                             ).await;
@@ -760,16 +841,27 @@ mod inner {
         }
     }
 
-    /// Map a quality tier to its H.264 bitrate preset. Keeps the bitrate
-    /// table in one place so the `SignalOut::Pipeline` message and the
-    /// encoder never drift apart.
+    /// Map a quality tier (and HiDPI flag) to its H.264 bitrate preset. Keeps
+    /// the bitrate table in one place so the `SignalOut::Pipeline` message
+    /// and the encoder never drift apart.
+    ///
+    /// HiDPI doubles the encoder pixel count (~4× actually, but H.264
+    /// compresses near-static UI well). The 2× bitrate multiplier captures
+    /// most of the extra detail without overshooting REMB's typical ceiling.
+    /// Capped at 20 Mbps so REMB clamping doesn't hammer the encoder back to
+    /// its floor under cellular bandwidth.
     #[cfg(feature = "h264")]
-    fn tier_bitrate(tier: QualityTier) -> desktop::encoders::BitrateBps {
+    fn tier_bitrate(tier: QualityTier, hidpi: bool) -> desktop::encoders::BitrateBps {
         use desktop::encoders::BitrateBps;
-        match tier {
+        let base = match tier {
             QualityTier::High => BitrateBps::HIGH,
             QualityTier::Med => BitrateBps::MED,
             QualityTier::Low => BitrateBps::LOW,
+        };
+        if hidpi {
+            BitrateBps((base.0.saturating_mul(2)).min(20_000_000))
+        } else {
+            base
         }
     }
 
@@ -780,16 +872,21 @@ mod inner {
     /// the Pipeline choice but before `create_answer` binds the SDP. ICE
     /// candidates that arrive before the offer are applied immediately.
     ///
+    /// Also collects any pre-offer `Settings` so the encoder gets initialised
+    /// with the user's persisted HiDPI preference on first frame — saves a
+    /// reconnect round-trip when the client has toggled HiDPI on previously.
+    ///
     /// Returns the chosen `Pipeline` (AND of operator env preference +
-    /// client-advertised decoder capability) and the offer SDP to feed into
-    /// `complete_answer`.
+    /// client-advertised decoder capability), the offer SDP to feed into
+    /// `complete_answer`, and the initial HiDPI flag (default `false`).
     async fn await_offer_with_caps(
         socket: &mut WebSocket,
         pc: &RTCPeerConnection,
         close_rx: &mut tokio::sync::oneshot::Receiver<()>,
-    ) -> anyhow::Result<(Pipeline, String)> {
+    ) -> anyhow::Result<(Pipeline, String, bool)> {
         let operator = operator_preference();
         let mut client_caps = ClientCapabilities::default();
+        let mut initial_hidpi = false;
 
         loop {
             tokio::select! {
@@ -811,9 +908,10 @@ mod inner {
                                 client_webcodecs = client_caps.webcodecs,
                                 client_codec_count = client_caps.codecs.len(),
                                 pipeline = chosen.wire_name(),
+                                initial_hidpi,
                                 "negotiation: offer received"
                             );
-                            return Ok((chosen, sdp));
+                            return Ok((chosen, sdp, initial_hidpi));
                         }
                         Ok(SignalIn::Ice { candidate }) => {
                             if let Err(e) = pc.add_ice_candidate(candidate).await {
@@ -823,6 +921,9 @@ mod inner {
                         Ok(SignalIn::CapabilitiesClient { codecs, webcodecs }) => {
                             client_caps.codecs = codecs;
                             client_caps.webcodecs = webcodecs;
+                        }
+                        Ok(SignalIn::Settings { hidpi }) => {
+                            initial_hidpi = hidpi;
                         }
                         Err(e) => warn!(error = %e, "unknown signaling message — ignored"),
                     }
@@ -888,6 +989,7 @@ mod inner {
         screen_w: u32,
         screen_h: u32,
         quality_tx: &watch::Sender<QualityTier>,
+        settings_tx: &watch::Sender<bool>,
         close_rx: &mut tokio::sync::oneshot::Receiver<()>,
         scale_factor: f32,
         ws_out_tx: &mpsc::Sender<String>,
@@ -923,6 +1025,7 @@ mod inner {
                                 screen_w,
                                 screen_h,
                                 quality_tx,
+                                settings_tx,
                                 scale_factor,
                                 ws_out_tx,
                             )
@@ -938,8 +1041,9 @@ mod inner {
 
     /// Handle a post-negotiation WS text message.
     ///
-    /// Could be a late ICE candidate or a ctrl event arriving over WS
-    /// in fallback mode (when the DataChannel never opened).
+    /// Could be a late ICE candidate, a Settings update from the persistent
+    /// client preference channel, or a ctrl event arriving over WS in
+    /// fallback mode (when the DataChannel never opened).
     #[allow(clippy::too_many_arguments)]
     async fn on_incoming_text(
         text: &str,
@@ -948,33 +1052,45 @@ mod inner {
         screen_w: u32,
         screen_h: u32,
         quality_tx: &watch::Sender<QualityTier>,
+        settings_tx: &watch::Sender<bool>,
         scale_factor: f32,
         ws_out_tx: &mpsc::Sender<String>,
     ) {
-        // ICE candidate?
-        if let Ok(SignalIn::Ice { candidate }) = serde_json::from_str(text) {
-            if let Err(e) = pc.add_ice_candidate(candidate).await {
-                warn!(error = %e, "post-offer ICE candidate rejected");
+        // ICE / Settings — handled inline. Settings on the WS text channel
+        // covers the case where the client wants to push a preference change
+        // before the ctrl DC has opened (or in WS-fallback mode).
+        match serde_json::from_str::<SignalIn>(text) {
+            Ok(SignalIn::Ice { candidate }) => {
+                if let Err(e) = pc.add_ice_candidate(candidate).await {
+                    warn!(error = %e, "post-offer ICE candidate rejected");
+                }
+                return;
             }
-            return;
+            Ok(SignalIn::Settings { hidpi }) => {
+                let _ = settings_tx.send(hidpi);
+                return;
+            }
+            _ => {}
         }
 
         // Ctrl / input event (fallback mode — DC never opened)?
         // dispatch_input parses internally; only call it when the text is not
-        // a signaling message (ICE already handled above).
+        // a signaling message (handled above).
         dispatch_input(
             text,
             injector,
             screen_w,
             screen_h,
             quality_tx,
+            settings_tx,
             scale_factor,
             Some(ws_out_tx),
         )
         .await;
     }
 
-    /// Parse a ctrl-channel message and dispatch to InputInjector or quality_tx.
+    /// Parse a ctrl-channel message and dispatch to InputInjector, quality_tx,
+    /// or settings_tx.
     ///
     /// When `caps_tx` is `Some`, a tier change also re-emits `Capabilities`
     /// over the WS text channel so the client can resize its canvas to the
@@ -986,6 +1102,7 @@ mod inner {
         screen_w: u32,
         screen_h: u32,
         quality_tx: &watch::Sender<QualityTier>,
+        settings_tx: &watch::Sender<bool>,
         scale_factor: f32,
         caps_tx: Option<&mpsc::Sender<String>>,
     ) {
@@ -997,24 +1114,48 @@ mod inner {
             }
         };
 
-        // Quality changes are handled before converting to InputEvent.
-        if let WireInput::Quality { ref tier } = wire
-            && let Some(t) = parse_quality_tier(tier)
-        {
-            info!(tier = ?t, "quality change requested");
-            let _ = quality_tx.send(t);
-            if let Some(tx) = caps_tx {
-                let (w, h) = desktop::resize_dims(screen_w, screen_h, t);
-                if let Ok(msg) = serde_json::to_string(&SignalOut::Capabilities {
-                    width: w,
-                    height: h,
-                    scale_factor,
-                    tile_size: desktop::TILE_SIZE,
-                }) {
-                    let _ = tx.send(msg).await;
+        // Quality + Settings are handled before InputEvent conversion: they
+        // route to watch channels, not the input injector.
+        match &wire {
+            WireInput::Quality { tier } => {
+                if let Some(t) = parse_quality_tier(tier) {
+                    info!(tier = ?t, "quality change requested");
+                    let _ = quality_tx.send(t);
+                    if let Some(tx) = caps_tx {
+                        let hidpi = *settings_tx.borrow();
+                        let (w, h) =
+                            desktop::resize_dims(screen_w, screen_h, t, scale_factor, hidpi);
+                        if let Ok(msg) = serde_json::to_string(&SignalOut::Capabilities {
+                            width: w,
+                            height: h,
+                            scale_factor,
+                            tile_size: desktop::TILE_SIZE,
+                        }) {
+                            let _ = tx.send(msg).await;
+                        }
+                    }
                 }
+                return;
             }
-            return;
+            WireInput::Settings { hidpi } => {
+                info!(hidpi, "settings change requested (hidpi)");
+                let _ = settings_tx.send(*hidpi);
+                if let Some(tx) = caps_tx {
+                    let tier = *quality_tx.borrow();
+                    let (w, h) =
+                        desktop::resize_dims(screen_w, screen_h, tier, scale_factor, *hidpi);
+                    if let Ok(msg) = serde_json::to_string(&SignalOut::Capabilities {
+                        width: w,
+                        height: h,
+                        scale_factor,
+                        tile_size: desktop::TILE_SIZE,
+                    }) {
+                        let _ = tx.send(msg).await;
+                    }
+                }
+                return;
+            }
+            _ => {}
         }
 
         let Some(event) = wire.into_input_event() else { return };
@@ -1038,6 +1179,35 @@ mod inner {
             .filter(|m| m.width > 0 && m.height > 0)
             .map(|m| (m.width, m.height))
             .unwrap_or((1920, 1080))
+    }
+
+    // ─── Tests ───────────────────────────────────────────────────────────────
+    #[cfg(all(test, feature = "h264"))]
+    mod tier_bitrate_tests {
+        use super::*;
+        use desktop::encoders::BitrateBps;
+
+        /// HiDPI on doubles the per-tier bitrate, capped at 20 Mbps so REMB
+        /// clamping doesn't fight us under cellular bandwidth.
+        #[test]
+        fn tier_bitrate_doubles_when_hidpi_on() {
+            // Off → matches base preset.
+            assert_eq!(tier_bitrate(QualityTier::Low, false).0, BitrateBps::LOW.0);
+            assert_eq!(tier_bitrate(QualityTier::Med, false).0, BitrateBps::MED.0);
+            assert_eq!(tier_bitrate(QualityTier::High, false).0, BitrateBps::HIGH.0);
+
+            // On → 2× until the 20 Mbps cap.
+            assert_eq!(
+                tier_bitrate(QualityTier::Low, true).0,
+                BitrateBps::LOW.0 * 2
+            );
+            assert_eq!(
+                tier_bitrate(QualityTier::Med, true).0,
+                BitrateBps::MED.0 * 2
+            );
+            // High = 12 Mbps × 2 = 24 Mbps → clamped to 20 Mbps.
+            assert_eq!(tier_bitrate(QualityTier::High, true).0, 20_000_000);
+        }
     }
 }
 

@@ -70,17 +70,28 @@ pub struct FrameOutput {
 /// Resize `img` by composing HiDPI normalisation × tier scale.
 ///
 /// xcap returns physical pixels (e.g. 3024×1964 on 2× retina), while clients
-/// expect logical coordinates. On a 2× retina MBP at High tier the naive
-/// 100% path yields a 24×16 tile grid (384 tiles); downscaling to logical
+/// expect logical coordinates by default. On a 2× retina MBP at High tier the
+/// naive 100% path yields a 24×16 tile grid (384 tiles); downscaling to logical
 /// first gives 12×8 (96 tiles — 4× fewer tiles and pixels to encode).
+///
+/// When `hidpi_mode` is `true` the logical normalisation is skipped — the
+/// encoder keeps physical-resolution input (modulated by tier only) so text
+/// glyphs are rendered from native pixels rather than a downsampled
+/// approximation. Costs ~4× encoder load on 2× retina; bitrate is bumped
+/// by the caller to compensate. Phase 04 user toggle.
 ///
 /// `scale_factor` is the display's physical-to-logical ratio from xcap
 /// (`Monitor::scale_factor()`) or the objc2 backingScaleFactor fallback.
 /// Returns the input unchanged at 1× logical + High tier (fast path).
-pub fn quality_resize(img: RgbaImage, tier: QualityTier, scale_factor: f32) -> RgbaImage {
-    let hidpi = 1.0_f32 / scale_factor.max(1.0);
+pub fn quality_resize(
+    img: RgbaImage,
+    tier: QualityTier,
+    scale_factor: f32,
+    hidpi_mode: bool,
+) -> RgbaImage {
+    let hidpi_norm = if hidpi_mode { 1.0 } else { 1.0_f32 / scale_factor.max(1.0) };
     let tier_f = tier.scale_num() as f32 / 4.0;
-    let effective = hidpi * tier_f;
+    let effective = hidpi_norm * tier_f;
 
     if (effective - 1.0).abs() < 0.01 {
         return img;
@@ -121,12 +132,32 @@ fn fir_resize_rgba8(src: &RgbaImage, dst_w: u32, dst_h: u32) -> RgbaImage {
 }
 
 /// Compute the resized output dimensions for a (logical_w, logical_h) monitor
-/// at a given tier. Mirrors `quality_resize` math without capturing a frame.
-/// Used by the session runner to pre-emit `capabilities` to clients.
-pub fn resize_dims(logical_w: u32, logical_h: u32, tier: QualityTier) -> (u32, u32) {
+/// at a given tier and HiDPI mode. Mirrors `quality_resize` math without
+/// capturing a frame. Used by the session runner to pre-emit `capabilities`
+/// and to size the SCK output stream.
+///
+/// `scale_factor` is only consulted when `hidpi_mode` is true — it's the
+/// physical/logical ratio used to expand the logical extent back to physical
+/// before applying tier reduction.
+pub fn resize_dims(
+    logical_w: u32,
+    logical_h: u32,
+    tier: QualityTier,
+    scale_factor: f32,
+    hidpi_mode: bool,
+) -> (u32, u32) {
     let num = tier.scale_num();
-    let w = (logical_w * num / 4).max(1);
-    let h = (logical_h * num / 4).max(1);
+    let (base_w, base_h) = if hidpi_mode {
+        let s = scale_factor.max(1.0);
+        (
+            ((logical_w as f32) * s).round() as u32,
+            ((logical_h as f32) * s).round() as u32,
+        )
+    } else {
+        (logical_w, logical_h)
+    };
+    let w = (base_w * num / 4).max(1);
+    let h = (base_h * num / 4).max(1);
     (w, h)
 }
 
@@ -242,6 +273,7 @@ impl TileEncoder {
         raw: RgbaImage,
         tier: QualityTier,
         scale_factor: f32,
+        hidpi_mode: bool,
         diff: &mut TileDiff,
     ) -> FrameOutput {
         let frame_ts = SystemTime::now()
@@ -249,7 +281,7 @@ impl TileEncoder {
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0);
 
-        let resized = quality_resize(raw, tier, scale_factor);
+        let resized = quality_resize(raw, tier, scale_factor, hidpi_mode);
         let changed_tiles = diff.diff(&resized);
         let tiles = TileEncoder::encode(changed_tiles, tier.jpeg_quality());
 
@@ -355,11 +387,11 @@ mod tests {
         assert_eq!(all_again.len(), 4, "reset must force every tile changed");
     }
 
-    /// `resize_dims(logical, tier)` must produce the same output size that
-    /// `quality_resize(physical_img, tier, scale_factor)` actually emits —
-    /// otherwise the `Capabilities` message disagrees with the tile grid
-    /// and the client canvas misaligns. Locks the math contract across
-    /// any future xcap or tier scale-factor changes.
+    /// `resize_dims(logical, tier, scale_factor, hidpi)` must agree with
+    /// `quality_resize(physical_img, tier, scale_factor, hidpi)` for every
+    /// (tier, hidpi) combination — otherwise the `Capabilities` message
+    /// disagrees with the encoder grid and the client canvas misaligns.
+    /// Locks the math contract across any future xcap or tier changes.
     #[test]
     fn resize_dims_agrees_with_quality_resize_on_retina() {
         // 2× retina MBP physical 3024×1964, logical 1512×982.
@@ -370,16 +402,18 @@ mod tests {
         let scale_factor = 2.0_f32;
 
         for tier in [QualityTier::High, QualityTier::Med, QualityTier::Low] {
-            let physical = solid_rgba(physical_w, physical_h, Rgba([0, 0, 0, 255]));
-            let emitted = quality_resize(physical, tier, scale_factor);
-            let predicted = resize_dims(logical_w, logical_h, tier);
-            assert_eq!(
-                (emitted.width(), emitted.height()),
-                predicted,
-                "tier {tier:?}: resize_dims predicted {predicted:?} but quality_resize emitted {}×{}",
-                emitted.width(),
-                emitted.height()
-            );
+            for hidpi in [false, true] {
+                let physical = solid_rgba(physical_w, physical_h, Rgba([0, 0, 0, 255]));
+                let emitted = quality_resize(physical, tier, scale_factor, hidpi);
+                let predicted = resize_dims(logical_w, logical_h, tier, scale_factor, hidpi);
+                assert_eq!(
+                    (emitted.width(), emitted.height()),
+                    predicted,
+                    "tier {tier:?} hidpi={hidpi}: resize_dims predicted {predicted:?} but quality_resize emitted {}×{}",
+                    emitted.width(),
+                    emitted.height()
+                );
+            }
         }
     }
 
@@ -388,18 +422,48 @@ mod tests {
     fn quality_resize_composes_hidpi_and_tier() {
         // 2× retina physical → logical at High: 200×200 → 100×100
         let img = solid_rgba(200, 200, Rgba([0, 0, 0, 255]));
-        let out = quality_resize(img.clone(), QualityTier::High, 2.0);
+        let out = quality_resize(img.clone(), QualityTier::High, 2.0, false);
         assert_eq!(out.width(), 100);
         assert_eq!(out.height(), 100);
 
         // 2× retina + Low tier (0.5): 200 × (1/2) × (2/4) = 50
-        let out_low = quality_resize(img.clone(), QualityTier::Low, 2.0);
+        let out_low = quality_resize(img.clone(), QualityTier::Low, 2.0, false);
         assert_eq!(out_low.width(), 50);
         assert_eq!(out_low.height(), 50);
 
         // 1× scale + High: no-op fast path (same width/height)
-        let out_noop = quality_resize(img, QualityTier::High, 1.0);
+        let out_noop = quality_resize(img, QualityTier::High, 1.0, false);
         assert_eq!(out_noop.width(), 200);
+    }
+
+    /// HiDPI mode skips the 1/scale_factor logical-normalisation step. On
+    /// 2× retina input the encoder receives the full physical resolution
+    /// (modulated only by tier), preserving native pixel detail for text.
+    #[test]
+    fn resize_dims_with_hidpi_skips_logical_normalization() {
+        let img = solid_rgba(200, 200, Rgba([0, 0, 0, 255]));
+
+        // hidpi=true + High: tier_f = 1.0, hidpi_norm = 1.0 → identity (200×200).
+        let out_high = quality_resize(img.clone(), QualityTier::High, 2.0, true);
+        assert_eq!(
+            (out_high.width(), out_high.height()),
+            (200, 200),
+            "HiDPI High must keep physical resolution"
+        );
+
+        // hidpi=true + Med: tier_f = 0.75, hidpi_norm = 1.0 → 150×150.
+        let out_med = quality_resize(img.clone(), QualityTier::Med, 2.0, true);
+        assert_eq!((out_med.width(), out_med.height()), (150, 150));
+
+        // hidpi=true + Low: tier_f = 0.5, hidpi_norm = 1.0 → 100×100.
+        let out_low = quality_resize(img, QualityTier::Low, 2.0, true);
+        assert_eq!((out_low.width(), out_low.height()), (100, 100));
+
+        // resize_dims must agree with the above for the same logical input.
+        // logical = physical / scale = 100. HiDPI re-expands to 200, then tier.
+        assert_eq!(resize_dims(100, 100, QualityTier::High, 2.0, true), (200, 200));
+        assert_eq!(resize_dims(100, 100, QualityTier::Med, 2.0, true), (150, 150));
+        assert_eq!(resize_dims(100, 100, QualityTier::Low, 2.0, true), (100, 100));
     }
 
     /// Parallel encode preserves input ordering (rayon docs contract).
@@ -468,7 +532,7 @@ mod tests {
             let tier = QualityTier::High;
 
             // Spawn blocking capture loop with default 1× scale (CI).
-            tokio::task::spawn_blocking(move || CaptureLoop::run(tier, tx, 1.0, None));
+            tokio::task::spawn_blocking(move || CaptureLoop::run(tier, tx, 1.0, false, None));
 
             // Collect frames for 1 second.
             let deadline = tokio::time::Instant::now() + Duration::from_millis(1000);

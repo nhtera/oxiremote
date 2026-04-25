@@ -59,20 +59,24 @@ pub mod inner {
     /// `Sink` send fails (WS/DC closed).
     pub fn spawn_capture_pipeline(
         initial_tier: QualityTier,
+        initial_hidpi: bool,
         sink: Sink,
         mut quality_rx: watch::Receiver<QualityTier>,
+        mut hidpi_rx: watch::Receiver<bool>,
         mut shutdown_rx: tokio::sync::oneshot::Receiver<()>,
         scale_factor: f32,
     ) {
         tokio::spawn(async move {
             let sink = Arc::new(sink);
             let mut current_tier = initial_tier;
+            let mut current_hidpi = initial_hidpi;
 
             loop {
                 // Small channel so capture thread's drop-newest kicks in
                 // before stale frames accumulate behind slow consumers.
                 let (frame_tx, mut frame_rx) = mpsc::channel::<FrameOutput>(2);
                 let tier = current_tier;
+                let hidpi = current_hidpi;
 
                 // Force the next emitted frame to be a full I-frame so the
                 // viewer sees something complete immediately after connect
@@ -82,12 +86,12 @@ pub mod inner {
 
                 // Spawn the blocking capture loop.
                 let _capture_handle = tokio::task::spawn_blocking(move || {
-                    CaptureLoop::run(tier, frame_tx, scale_factor, Some(iframe_rx))
+                    CaptureLoop::run(tier, frame_tx, scale_factor, hidpi, Some(iframe_rx))
                 });
 
-                info!(tier = ?tier, scale_factor, "capture pipeline started");
+                info!(tier = ?tier, scale_factor, hidpi, "capture pipeline started");
 
-                // Drain frames until quality changes or shutdown fires.
+                // Drain frames until quality/hidpi changes or shutdown fires.
                 loop {
                     tokio::select! {
                         // Prefer shutdown over quality change for clean exit.
@@ -103,9 +107,18 @@ pub mod inner {
                             if new_tier != current_tier {
                                 info!(old = ?current_tier, new = ?new_tier, "quality change → restart capture");
                                 current_tier = new_tier;
-                                // Drop frame_rx — this signals CaptureLoop to stop.
                                 drop(frame_rx);
-                                break; // Restart outer loop with new tier.
+                                break;
+                            }
+                        }
+
+                        _ = hidpi_rx.changed() => {
+                            let new_hidpi = *hidpi_rx.borrow();
+                            if new_hidpi != current_hidpi {
+                                info!(old = current_hidpi, new = new_hidpi, "hidpi change → restart capture");
+                                current_hidpi = new_hidpi;
+                                drop(frame_rx);
+                                break;
                             }
                         }
 
