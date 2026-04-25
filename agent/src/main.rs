@@ -23,7 +23,6 @@ mod push_api;
 mod security;
 mod tracing_setup;
 mod update;
-#[cfg(not(debug_assertions))]
 mod static_files;
 #[cfg(feature = "desktop")]
 mod desktop_service;
@@ -527,14 +526,17 @@ async fn server_main(event_bus: Arc<EventBus>) -> anyhow::Result<()> {
         .route("/proxy/{port}/", axum::routing::any(proxy::proxy_root_handler))
         .route("/proxy/{port}/{*rest}", axum::routing::any(proxy::proxy_handler));
 
-    // Dev: serve server-rendered pages, Vite dev server handles the SPA
+    // Dev keeps the server-rendered `/` and `/login` for the no-SPA pairing
+    // bootstrap. They take routing precedence over the SPA fallback below.
     #[cfg(debug_assertions)]
     let app = app
         .route("/", get(http_pages::app_root))
         .route("/login", get(http_pages::login_page));
 
-    // Prod: embedded web assets with SPA fallback
-    #[cfg(not(debug_assertions))]
+    // SPA fallback — serves the embedded web assets in release, and reads
+    // from `apps/web/dist/` at runtime in debug (rust-embed default). When
+    // `dist/` is missing in debug, the fallback renders a help page pointing
+    // the user at `bun run build:web` or `bun dev`.
     let app = app.fallback(static_files::spa_handler);
 
     // Middleware order matters: from outermost → innermost request:
@@ -564,6 +566,25 @@ async fn server_main(event_bus: Arc<EventBus>) -> anyhow::Result<()> {
 
     let addr: SocketAddr = SocketAddr::from(([127, 0, 0, 1], AGENT_PORT));
     info!(%addr, "starting agent server");
+
+    // Dev affordance: tell the operator which URL to open. If the SPA has
+    // been built we serve it directly from :8787; otherwise we point them at
+    // `bun dev` (Vite on :5173) or `bun run build:web` for standalone.
+    #[cfg(debug_assertions)]
+    {
+        let dist_index = std::path::Path::new("apps/web/dist/index.html");
+        let dist_index_alt = std::path::Path::new("../apps/web/dist/index.html");
+        if dist_index.exists() || dist_index_alt.exists() {
+            info!(
+                "dev: SPA built — open http://localhost:{} in your browser",
+                AGENT_PORT
+            );
+        } else {
+            info!(
+                "dev: SPA not built — run `bun run build:web` then refresh, or `bun dev` for hot-reload at http://localhost:5173"
+            );
+        }
+    }
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
     notifier::show_startup(addr);
