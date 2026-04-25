@@ -509,6 +509,10 @@ async fn server_main(event_bus: Arc<EventBus>) -> anyhow::Result<()> {
             "/api/workspaces/{id}/touch",
             post(workspaces::api_workspaces_touch),
         )
+        .route(
+            "/api/workspace/validate",
+            post(workspaces::api_workspace_validate),
+        )
         // preview proxy
         .route("/api/previews", get(preview::api_previews_list).post(preview::api_previews_create))
         .route("/api/previews/{id}", axum::routing::delete(preview::api_previews_delete))

@@ -409,7 +409,11 @@ pub async fn api_auth_approval_status(
     })();
 
     match result {
-        Ok(status) => (StatusCode::OK, Json(serde_json::json!({ "status": status }))).into_response(),
+        Ok(status) => (
+            StatusCode::OK,
+            Json(serde_json::json!({ "status": status, "session_id": session_id })),
+        )
+            .into_response(),
         Err(err) => {
             warn!(error=%err, "approval-status lookup failed");
             StatusCode::INTERNAL_SERVER_ERROR.into_response()

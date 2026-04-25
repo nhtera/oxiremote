@@ -31,10 +31,32 @@ export default function WorkspacePickerPage() {
 
   async function onAdd(e: React.FormEvent) {
     e.preventDefault()
-    if (!newPath.trim()) return
+    const path = newPath.trim()
+    if (!path) return
     setAdding(true)
     setAddError('')
-    const res = await createWorkspace(newPath.trim(), newLabel.trim() || undefined)
+
+    // Pre-flight: ask the agent if the path is a real directory before posting.
+    try {
+      const probe = await fetch('/api/workspace/validate', {
+        method: 'POST',
+        credentials: 'include',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ path }),
+      })
+      if (probe.ok) {
+        const data = (await probe.json()) as { exists: boolean; kind: string; message?: string }
+        if (!data.exists || data.kind !== 'dir') {
+          setAdding(false)
+          setAddError(data.message || 'Path is not a valid directory.')
+          return
+        }
+      }
+    } catch {
+      // Network blip — fall through to createWorkspace which has its own error path.
+    }
+
+    const res = await createWorkspace(path, newLabel.trim() || undefined)
     setAdding(false)
     if (!res.ok) {
       setAddError(res.error)

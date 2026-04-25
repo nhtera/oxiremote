@@ -13,7 +13,7 @@ export default function AgentSettingsPage() {
       <section className="mt-6 rounded-lg border border-border bg-surface p-4 text-sm text-text-secondary">
         <p>
           Auto-approve is now in the{' '}
-          <Link to="/agent/home" className="text-accent hover:text-accent-hover">
+          <Link to="/agent" className="text-accent hover:text-accent-hover">
             host dashboard header
           </Link>
           . More settings will land here as we expand the surface.

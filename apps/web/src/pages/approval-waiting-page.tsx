@@ -1,15 +1,21 @@
-import { useEffect } from 'react'
+import { useEffect, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 
 // Maximum time to poll before giving up (5 minutes)
 const MAX_POLL_MS = 5 * 60 * 1000
 const POLL_INTERVAL_MS = 2000
 
+type ApprovalStatusResponse = {
+  status: 'pending' | 'approved' | 'rejected'
+  session_id?: string
+}
+
 // "Waiting for Approval" screen shown after OTK login returns 202.
 // Polls GET /api/auth/approval-status every 2s (session cookie attached).
 // Navigates to / on approved, /login?error=rejected on rejected.
 export default function ApprovalWaitingPage() {
   const navigate = useNavigate()
+  const [sessionTag, setSessionTag] = useState<string | null>(null)
 
   useEffect(() => {
     let stopped = false
@@ -34,8 +40,10 @@ export default function ApprovalWaitingPage() {
           if (!stopped) navigate('/login', { replace: true })
           return
         }
-        const data: { status: 'pending' | 'approved' | 'rejected' } = await res.json()
+        const data: ApprovalStatusResponse = await res.json()
         if (stopped) return
+
+        if (data.session_id) setSessionTag(data.session_id.slice(-8))
 
         if (data.status === 'approved') {
           navigate('/', { replace: true })
@@ -76,6 +84,11 @@ export default function ApprovalWaitingPage() {
           <p className="mt-2 text-sm text-text-secondary leading-relaxed">
             The host needs to approve this device. Check the terminal or host dashboard.
           </p>
+          {sessionTag && (
+            <p className="mt-3 text-xs font-mono text-text-muted" aria-label="Session identifier">
+              Session: {sessionTag}
+            </p>
+          )}
         </div>
 
         <button

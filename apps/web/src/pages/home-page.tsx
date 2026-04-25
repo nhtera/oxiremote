@@ -104,9 +104,10 @@ export default function HomePage() {
     return new Date(ts * 1000).toLocaleString()
   }
 
+  const hostPrefix = currentHostId ? `/h/${currentHostId}` : ''
   const terminalLink = sessions.latestId
-    ? `/terminal?session=${encodeURIComponent(sessions.latestId)}`
-    : '/terminal'
+    ? `${hostPrefix}/terminal?session=${encodeURIComponent(sessions.latestId)}`
+    : `${hostPrefix}/terminal`
 
   if (!authed) {
     return <Navigate to="/login" replace />
@@ -118,16 +119,16 @@ export default function HomePage() {
 
       <div className="grid grid-cols-2 md:grid-cols-3 gap-3 mb-6">
         <StatCard label="Terminal" value={`${sessions.running} active`} sub={`${sessions.total} total`} to={terminalLink} />
-        <StatCard label="Git" value={`${git.staged} staged`} sub={`${git.changed} changed`} to="/git" />
-        <StatCard label="Previews" value={`${previews} active`} to="/preview" />
+        <StatCard label="Git" value={`${git.staged} staged`} sub={`${git.changed} changed`} to={`${hostPrefix}/git`} />
+        <StatCard label="Previews" value={`${previews} active`} to={`${hostPrefix}/preview`} />
       </div>
 
       <h2 className="text-sm text-text-secondary mb-3">Quick actions</h2>
       <div className="flex flex-wrap gap-2 mb-6">
         <QuickAction to={terminalLink} label={sessions.latestId ? 'Resume terminal' : 'New terminal'} />
-        <QuickAction to="/git" label="View changes" />
-        <QuickAction to="/files" label="Browse files" />
-        <QuickAction to="/preview" label="Add preview" />
+        <QuickAction to={`${hostPrefix}/git`} label="View changes" />
+        <QuickAction to={`${hostPrefix}/files`} label="Browse files" />
+        <QuickAction to={`${hostPrefix}/preview`} label="Add preview" />
         <DesktopQuickAction hostId={currentHostId} caps={desktopCaps} />
       </div>
 

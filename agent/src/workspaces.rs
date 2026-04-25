@@ -200,6 +200,77 @@ pub async fn api_workspaces_delete(
     StatusCode::OK.into_response()
 }
 
+#[derive(Deserialize)]
+pub struct ValidateWorkspace {
+    path: String,
+}
+
+#[derive(Serialize)]
+pub struct ValidateWorkspaceResponse {
+    exists: bool,
+    kind: &'static str, // "dir" | "file" | "missing"
+    #[serde(skip_serializing_if = "Option::is_none")]
+    message: Option<String>,
+}
+
+/// POST /api/workspace/validate — cheap pre-flight before workspace creation.
+/// Auth-required (loopback or Bearer + CSRF). Returns kind so the SPA can
+/// show inline errors instead of waiting for the create round-trip.
+pub async fn api_workspace_validate(
+    State(state): State<Arc<AppState>>,
+    jar: CookieJar,
+    Json(req): Json<ValidateWorkspace>,
+) -> Response {
+    if require_active_auth(&state.db_path, &state.signing_key, &jar).is_none() {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+
+    let trimmed = req.path.trim();
+    if trimmed.is_empty() || trimmed.contains('\0') {
+        return Json(ValidateWorkspaceResponse {
+            exists: false,
+            kind: "missing",
+            message: Some("Path is empty.".to_string()),
+        })
+        .into_response();
+    }
+    let path_buf = PathBuf::from(trimmed);
+    if !path_buf.is_absolute() {
+        return Json(ValidateWorkspaceResponse {
+            exists: false,
+            kind: "missing",
+            message: Some("Path must be absolute.".to_string()),
+        })
+        .into_response();
+    }
+    let canon = match path_buf.canonicalize() {
+        Ok(p) => p,
+        Err(_) => {
+            return Json(ValidateWorkspaceResponse {
+                exists: false,
+                kind: "missing",
+                message: Some("Path does not exist.".to_string()),
+            })
+            .into_response();
+        }
+    };
+    if canon.is_dir() {
+        return Json(ValidateWorkspaceResponse {
+            exists: true,
+            kind: "dir",
+            message: None,
+        })
+        .into_response();
+    }
+    let kind = if canon.is_file() { "file" } else { "missing" };
+    Json(ValidateWorkspaceResponse {
+        exists: true,
+        kind,
+        message: Some("Path is not a directory.".to_string()),
+    })
+    .into_response()
+}
+
 pub async fn api_workspaces_touch(
     State(state): State<Arc<AppState>>,
     jar: CookieJar,

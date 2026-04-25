@@ -14,6 +14,7 @@ interface TrustedDevice {
 }
 
 const POLL_MS = 10_000
+const STALE_AFTER_SEC = 300 // 5 min — treat as offline/grey
 
 function relTime(tsSec: number): string {
   if (!tsSec) return '—'
@@ -23,6 +24,13 @@ function relTime(tsSec: number): string {
   if (diff < 3600) return `${Math.floor(diff / 60)}m ago`
   if (diff < 86_400) return `${Math.floor(diff / 3600)}h ago`
   return `${Math.floor(diff / 86_400)}d ago`
+}
+
+function statusFor(d: TrustedDevice): { dotClass: string; title: string } {
+  if (d.revoked_at) return { dotClass: 'bg-danger', title: 'Revoked' }
+  const idleSec = Math.floor(Date.now() / 1000 - d.last_seen_at)
+  if (idleSec > STALE_AFTER_SEC) return { dotClass: 'bg-text-muted', title: 'Offline' }
+  return { dotClass: 'bg-success', title: 'Online' }
 }
 
 export default function DevicesPanel() {
@@ -54,23 +62,26 @@ export default function DevicesPanel() {
 
   return (
     <div className="grid gap-1">
-      {devices.map((d) => (
-        <div
-          key={d.device_id}
-          className="flex items-center gap-2 py-1.5 border-b border-border/60 last:border-0"
-        >
-          <span className="inline-block w-2 h-2 rounded-full bg-success" />
-          <span className="flex-1 truncate text-sm text-text-primary" title={d.label}>
-            {d.label}
-          </span>
-          <span
-            className="text-xs text-text-muted"
-            title={new Date(d.last_seen_at * 1000).toLocaleString()}
+      {devices.map((d) => {
+        const { dotClass, title } = statusFor(d)
+        return (
+          <div
+            key={d.device_id}
+            className="flex items-center gap-2 py-1.5 border-b border-border/60 last:border-0"
           >
-            {relTime(d.last_seen_at)}
-          </span>
-        </div>
-      ))}
+            <span className={`inline-block w-2 h-2 rounded-full ${dotClass}`} title={title} />
+            <span className="flex-1 truncate text-sm text-text-primary" title={d.label}>
+              {d.label}
+            </span>
+            <span
+              className="text-xs text-text-muted"
+              title={new Date(d.last_seen_at * 1000).toLocaleString()}
+            >
+              {relTime(d.last_seen_at)}
+            </span>
+          </div>
+        )
+      })}
     </div>
   )
 }

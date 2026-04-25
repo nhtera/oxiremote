@@ -245,8 +245,8 @@ export default function TerminalPage() {
         className="flex-1 min-h-0 overflow-hidden"
       />
 
-      {/* Virtual keybar */}
-      <div className="px-2 py-1.5 border-t border-border bg-surface-alt shrink-0">
+      {/* Virtual keybar — mobile only; desktop hides it (Phase 02 adds opt-in toggle) */}
+      <div className="md:hidden px-2 py-1.5 border-t border-border bg-surface-alt shrink-0">
         <TerminalKeybar onSend={sendInput} />
       </div>
 

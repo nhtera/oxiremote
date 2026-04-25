@@ -42,3 +42,7 @@ body {
   @apply px-3 py-1.5 bg-danger/15 text-danger border border-danger/30 rounded-md
     hover:bg-danger/25 transition-colors cursor-pointer;
 }
+
+@layer utilities {
+  .pb-safe { padding-bottom: env(safe-area-inset-bottom, 0px); }
+}
