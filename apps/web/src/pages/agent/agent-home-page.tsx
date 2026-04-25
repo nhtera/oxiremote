@@ -227,7 +227,7 @@ export default function AgentHomePage() {
 
         <Card title="Connected Devices">
           <div className="flex items-baseline gap-2 mb-3">
-            <div className="text-3xl font-semibold text-text-primary">
+            <div className="text-[length:var(--text-display)] font-semibold text-text-primary leading-none">
               {state?.connected_devices ?? '—'}
             </div>
             <div className="text-xs text-text-muted">

@@ -1,5 +1,5 @@
 // Gesture help bottom sheet — two tabs: Touch and Trackpad.
-// Dismisses on backdrop click or X button. Orange underline on active tab.
+// Dismisses on backdrop click or X button. Accent underline on active tab.
 
 import { useState } from 'react'
 

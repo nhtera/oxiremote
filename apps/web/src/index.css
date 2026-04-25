@@ -16,11 +16,14 @@
   --font-mono: ui-monospace, Consolas, "Courier New", monospace;
 }
 
-/* Phase 02 design tokens — HSL channels for opacity composition (hsl(var(--x)/0.1)).
-   --accent-primary: brand orange used by primitives + emphasis (replaces hardcoded orange-500).
-   Sizing tokens give Button a single source of truth for height/radius. */
+/* Design tokens — HSL channels for opacity composition (hsl(var(--x)/0.1)).
+   --accent-primary mirrors --color-accent (#6cb4ff) so primitives that compose
+   opacity (Button accent-primary variant, modifier highlights) stay aligned with
+   the canonical brand accent.
+   Sizing tokens give Button a single source of truth for height/radius.
+   Type scale tokens give Heading + page hero text a consistent ladder. */
 :root {
-  --accent-primary: 30 100% 50%;
+  --accent-primary: 211 100% 71%;
   --accent-danger:  0 80% 55%;
   --accent-success: 140 60% 45%;
   --accent-warning: 40 90% 55%;
@@ -29,6 +32,14 @@
   --btn-h-sm: 1.75rem;
   --btn-h-md: 2.25rem;
   --btn-h-lg: 2.75rem;
+
+  --text-display: clamp(1.75rem, 5vw, 2.5rem);
+  --text-h1: 1.5rem;
+  --text-h2: 1.25rem;
+  --text-h3: 1.0625rem;
+  --text-body: 0.9375rem;
+  --text-meta: 0.8125rem;
+  --text-mono: 0.875rem;
 }
 
 body {

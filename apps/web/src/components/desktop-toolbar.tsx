@@ -1,5 +1,5 @@
 // Remote desktop toolbar — quality selector + 8-button mobile key row.
-// Sticky modifiers (Ctrl/Alt/Shift/⌘): tap to toggle (orange highlight);
+// Sticky modifiers (Ctrl/Alt/Shift/⌘): tap to toggle (accent highlight);
 // the modifier is fused into the next key event then automatically cleared.
 // On viewport ≥1024px this sits in a right sidebar; below that it's fixed bottom.
 

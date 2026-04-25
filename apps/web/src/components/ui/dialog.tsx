@@ -1,5 +1,7 @@
 import { useEffect, useRef, type ReactNode } from 'react'
 
+export type DialogTone = 'default' | 'warning' | 'danger'
+
 interface Props {
   open: boolean
   onClose?: () => void
@@ -10,6 +12,14 @@ interface Props {
   children: ReactNode
   /** Extra classes for the panel (size, padding, etc.). */
   panelClassName?: string
+  /** Border tint conveying intent. Reserve warning/danger for irreversible actions. */
+  tone?: DialogTone
+}
+
+const TONE_BORDER: Record<DialogTone, string> = {
+  default: 'border-border',
+  warning: 'border-warning/40',
+  danger: 'border-danger/40',
 }
 
 const FOCUSABLE_SELECTOR =
@@ -26,6 +36,7 @@ export default function Dialog({
   ariaDescribedBy,
   children,
   panelClassName,
+  tone = 'default',
 }: Props) {
   const panelRef = useRef<HTMLDivElement>(null)
   const previouslyFocusedRef = useRef<HTMLElement | null>(null)
@@ -103,7 +114,7 @@ export default function Dialog({
   }
 
   const panelCls =
-    'relative z-10 w-full max-w-sm bg-surface border border-border rounded-lg shadow-xl outline-none ' +
+    `relative z-10 w-full max-w-sm bg-surface border ${TONE_BORDER[tone]} rounded-lg shadow-xl outline-none ` +
     (panelClassName ?? 'p-5')
 
   return (
