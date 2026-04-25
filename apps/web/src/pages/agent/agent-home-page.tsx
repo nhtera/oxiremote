@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react'
 import OneTimeKeyField from '../../components/one-time-key-field'
 import ApprovalModal from '../../components/approval-modal'
+import ProxyPortsCard from '../../components/proxy-ports-card'
 
 // Host-dashboard home. Live-updates via the `/api/agent/events` SSE stream;
 // initial snapshot from `/api/agent/state`. Both endpoints are localhost-only
@@ -187,6 +188,12 @@ export default function AgentHomePage() {
           <div className="text-xs text-text-muted mt-1">
             Active terminal/preview sessions
           </div>
+        </Card>
+      </section>
+
+      <section>
+        <Card title="Local Sites Proxy">
+          <ProxyPortsCard tunnelUrl={tunnelUrl} />
         </Card>
       </section>
 

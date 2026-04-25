@@ -134,6 +134,37 @@ pub fn init_db(db_path: &Path) -> anyhow::Result<()> {
         "INSERT OR IGNORE INTO settings(key, value) VALUES ('tunnel_mode', 'quick')",
         [],
     );
+    // Phase 02: per-port opt-in for the local sites reverse proxy. Empty by default.
+    let _ = conn.execute(
+        "INSERT OR IGNORE INTO settings(key, value) VALUES ('proxy_allowed_ports', '[]')",
+        [],
+    );
 
+    Ok(())
+}
+
+/// Read the persisted `/proxy/<port>/*` allowlist. Stored as a JSON array of
+/// u16. Malformed values are treated as empty so a hand-edited DB never blocks
+/// boot.
+pub fn load_proxy_allowed_ports(db_path: &Path) -> anyhow::Result<Vec<u16>> {
+    let conn = Connection::open(db_path).context("open db for proxy_allowed_ports load")?;
+    let mut stmt =
+        conn.prepare("SELECT value FROM settings WHERE key = 'proxy_allowed_ports'")?;
+    let raw: Option<String> = stmt
+        .query_row([], |row| row.get::<_, String>(0))
+        .ok();
+    let Some(text) = raw else { return Ok(Vec::new()) };
+    let parsed: Vec<u16> = serde_json::from_str(&text).unwrap_or_default();
+    Ok(parsed)
+}
+
+pub fn save_proxy_allowed_ports(db_path: &Path, ports: &[u16]) -> anyhow::Result<()> {
+    let conn = Connection::open(db_path).context("open db for proxy_allowed_ports save")?;
+    let value = serde_json::to_string(ports).context("encode ports json")?;
+    conn.execute(
+        "INSERT INTO settings(key, value) VALUES ('proxy_allowed_ports', ?1)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        rusqlite::params![value],
+    )?;
     Ok(())
 }

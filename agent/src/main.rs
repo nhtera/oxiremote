@@ -16,6 +16,7 @@ mod notify_cli;
 mod one_time_keys;
 mod preview;
 mod preview_token;
+mod proxy;
 mod push;
 mod push_api;
 mod security;
@@ -46,9 +47,10 @@ mod tunnel_named;
 mod workspaces;
 
 use std::{
+    collections::HashSet,
     net::SocketAddr,
     path::PathBuf,
-    sync::Arc,
+    sync::{Arc, RwLock as StdRwLock},
 };
 
 use anyhow::Context;
@@ -83,6 +85,10 @@ pub struct AppState {
     pub preview_targets: DashMap<String, PreviewTarget>,
     pub preview_health: DashMap<String, PreviewHealth>,
     pub local_sites: LocalSitesCache,
+    /// Phase 02 — set of localhost ports operators have opted into for the
+    /// `/proxy/<port>/*` reverse proxy. Mirrored to the `proxy_allowed_ports`
+    /// settings row so toggles survive restarts.
+    pub proxy_allowed_ports: Arc<StdRwLock<HashSet<u16>>>,
     pub pairing_attempts: DashMap<String, i64>,
     pub workspace_root: PathBuf,
     pub host_info: HostInfo,
@@ -363,6 +369,15 @@ async fn server_main(event_bus: Arc<EventBus>) -> anyhow::Result<()> {
 
     let local_sites_cache = local_sites::new_cache();
 
+    let proxy_allowed_ports: HashSet<u16> = match db::load_proxy_allowed_ports(&db_path) {
+        Ok(ports) => ports.into_iter().collect(),
+        Err(err) => {
+            warn!(error=%err, "failed to load proxy_allowed_ports; defaulting to empty");
+            HashSet::new()
+        }
+    };
+    let proxy_allowed_ports = Arc::new(StdRwLock::new(proxy_allowed_ports));
+
     // Probe desktop availability once at boot. On macOS this triggers the TCC
     // Screen Recording prompt on first run — expected behaviour. The probe runs
     // on a blocking thread so the Linux PipeWire D-Bus handshake (up to 3s,
@@ -397,6 +412,7 @@ async fn server_main(event_bus: Arc<EventBus>) -> anyhow::Result<()> {
         preview_targets,
         preview_health: DashMap::new(),
         local_sites: local_sites_cache.clone(),
+        proxy_allowed_ports,
         pairing_attempts: DashMap::new(),
         workspace_root,
         host_info,
@@ -485,7 +501,13 @@ async fn server_main(event_bus: Arc<EventBus>) -> anyhow::Result<()> {
         .route("/api/previews/{id}/share", post(preview::api_previews_share))
         .route("/api/local-sites", get(local_sites::api_local_sites))
         .route("/preview/{id}", axum::routing::any(preview::preview_proxy_root_handler))
-        .route("/preview/{id}/{*rest}", axum::routing::any(preview::preview_proxy_handler));
+        .route("/preview/{id}/{*rest}", axum::routing::any(preview::preview_proxy_handler))
+        // Local-sites reverse proxy (Phase 02). Default-deny allowlist is
+        // checked inside the handler; bare `/proxy/<port>` redirects to the
+        // trailing-slash form so relative paths in upstream HTML resolve.
+        .route("/proxy/{port}", axum::routing::any(proxy::proxy_root_redirect))
+        .route("/proxy/{port}/", axum::routing::any(proxy::proxy_root_handler))
+        .route("/proxy/{port}/{*rest}", axum::routing::any(proxy::proxy_handler));
 
     // Dev: serve server-rendered pages, Vite dev server handles the SPA
     #[cfg(debug_assertions)]

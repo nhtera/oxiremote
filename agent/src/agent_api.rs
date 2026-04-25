@@ -32,6 +32,10 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/api/agent/approvals/{id}/approve", post(api_agent_approve))
         .route("/api/agent/approvals/{id}/reject", post(api_agent_reject))
         .route("/api/agent/settings/auto-approve", post(api_agent_settings_auto_approve))
+        .route(
+            "/api/agent/proxy/ports",
+            get(api_agent_proxy_ports_list).post(api_agent_proxy_ports_set),
+        )
 }
 
 async fn api_agent_state(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
@@ -185,6 +189,51 @@ async fn api_agent_reject(
         }
         Err(err) => {
             warn!(error=%err, device_id=%id, "reject device failed");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+/// GET /api/agent/proxy/ports — surface discovered listeners alongside the
+/// persisted allowlist so the UI can render a single toggle list.
+async fn api_agent_proxy_ports_list(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let discovered = state.local_sites.read().await.clone();
+    let allowed: Vec<u16> = {
+        let guard = state.proxy_allowed_ports.read().unwrap();
+        let mut out: Vec<u16> = guard.iter().copied().collect();
+        out.sort_unstable();
+        out
+    };
+    Json(json!({
+        "discovered": discovered,
+        "allowed": allowed,
+    }))
+    .into_response()
+}
+
+#[derive(Deserialize)]
+struct ProxyPortBody {
+    port: u16,
+    enabled: bool,
+}
+
+/// POST /api/agent/proxy/ports — flip a single port on/off. Persists to the
+/// settings table and updates the in-memory DashSet so the next request
+/// observes the change without restart.
+async fn api_agent_proxy_ports_set(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<ProxyPortBody>,
+) -> impl IntoResponse {
+    if body.port == 0 {
+        return (StatusCode::BAD_REQUEST, "port required").into_response();
+    }
+    match crate::proxy::set_allowed(&state, body.port, body.enabled) {
+        Ok(allowed) => {
+            info!(port = body.port, enabled = body.enabled, "proxy port toggled");
+            (StatusCode::OK, Json(json!({ "allowed": allowed }))).into_response()
+        }
+        Err(err) => {
+            warn!(error=%err, "proxy ports persist failed");
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }

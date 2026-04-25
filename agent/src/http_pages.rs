@@ -578,6 +578,9 @@ mod tests {
             preview_targets: DashMap::<String, PreviewTarget>::new(),
             preview_health: DashMap::new(),
             local_sites: local_sites::new_cache(),
+            proxy_allowed_ports: Arc::new(std::sync::RwLock::new(
+                std::collections::HashSet::new(),
+            )),
             pairing_attempts: DashMap::new(),
             workspace_root: PathBuf::from("."),
             host_info: crate::host::HostInfo {

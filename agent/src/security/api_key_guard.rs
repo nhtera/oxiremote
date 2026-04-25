@@ -33,6 +33,7 @@ const EXEMPT_PREFIXES: &[&str] = &[
     "/api/auth/approval-status", // pending-device polling; uses cookie auth in handler
     "/api/push/vapid-public",
     "/preview/",
+    "/proxy/",  // local-sites reverse proxy; auth checked inside the handler
     "/assets/", // hashed static assets; /api/ namespace not allowed here
     "/login",
 ];
@@ -104,6 +105,7 @@ mod tests {
         assert!(is_exempt("/api/auth/approval-status"));
         assert!(is_exempt("/api/push/vapid-public"));
         assert!(is_exempt("/preview/abc"));
+        assert!(is_exempt("/proxy/3000/index.html"));
         assert!(is_exempt("/assets/index-abc.js"));
         assert!(is_exempt("/"));
         assert!(is_exempt("/manifest.webmanifest"));
