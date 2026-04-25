@@ -1,41 +1,79 @@
-// STUB — Phase 05 extracts full reconnect-modal with animation and history.
-// Presentational only: shows attempt count, Cancel/Exit button.
+// Real reconnect modal: countdown to next attempt + manual retry + give-up.
+// Built on the shared <Dialog> primitive — focus trap, Esc, backdrop, ARIA all
+// inherited. The countdown is presentational: actual reconnect cadence lives
+// in the session hook; this only paints the seconds remaining.
+
+import { useEffect, useState } from 'react'
+import Dialog from './ui/dialog'
+import Button from './ui/button'
 
 interface Props {
   open: boolean
   attempt: number
   maxAttempts: number
-  onCancel: () => void
   exhausted: boolean
+  /** Tear down the session — used as the give-up / cancel action. */
+  onCancel: () => void
+  /** Optional: trigger a manual retry now. When unset, only Cancel is shown. */
+  onRetry?: () => void
+  /** Seconds shown in the countdown. Defaults to 3. */
+  countdownSeconds?: number
 }
 
-export default function ReconnectModal({ open, attempt, maxAttempts, onCancel, exhausted }: Props) {
-  if (!open) return null
+export default function ReconnectModal({
+  open,
+  attempt,
+  maxAttempts,
+  exhausted,
+  onCancel,
+  onRetry,
+  countdownSeconds = 3,
+}: Props) {
+  const [secondsLeft, setSecondsLeft] = useState(countdownSeconds)
+
+  // Reset the visible countdown each time a new attempt begins or the modal opens.
+  useEffect(() => {
+    if (!open || exhausted) return
+    setSecondsLeft(countdownSeconds)
+    const id = window.setInterval(() => {
+      setSecondsLeft((s) => (s > 0 ? s - 1 : 0))
+    }, 1000)
+    return () => window.clearInterval(id)
+  }, [open, exhausted, attempt, countdownSeconds])
 
   return (
-    <div
-      role="dialog"
-      aria-modal="true"
-      className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4"
+    <Dialog
+      open={open}
+      onClose={onCancel}
+      dismissable={exhausted}
+      ariaLabelledBy="reconnect-title"
+      ariaDescribedBy="reconnect-desc"
     >
-      <div className="w-full max-w-sm bg-surface border border-border rounded-lg p-5 shadow-xl">
-        <div className="text-text-primary font-semibold text-sm mb-2">
-          {exhausted ? 'Connection failed' : 'Reconnecting…'}
-        </div>
-        <div className="text-text-muted text-xs mb-5">
-          {exhausted
-            ? `Could not reconnect after ${maxAttempts} attempts.`
-            : `Attempt ${attempt} of ${maxAttempts}`}
-        </div>
-        <div className="flex justify-end">
-          <button
-            onClick={onCancel}
-            className="px-4 py-2 text-sm font-medium border border-border text-text-secondary rounded-md hover:bg-surface-hover hover:text-text-primary transition-colors"
-          >
-            {exhausted ? 'Exit' : 'Cancel'}
-          </button>
-        </div>
+      <div id="reconnect-title" className="text-text-primary font-semibold text-sm">
+        {exhausted ? 'Connection failed' : 'Reconnecting…'}
       </div>
-    </div>
+      <div id="reconnect-desc" className="text-text-muted text-xs mt-2">
+        {exhausted
+          ? `Could not reconnect after ${maxAttempts} attempts.`
+          : (
+            <>
+              Attempt {attempt} of {maxAttempts}
+              {!exhausted && onRetry && (
+                <> — next try in <span className="font-mono">{secondsLeft}s</span></>
+              )}
+            </>
+          )}
+      </div>
+      <div className="mt-5 flex justify-end gap-2">
+        {!exhausted && onRetry && (
+          <Button variant="primary" size="sm" onClick={onRetry}>
+            Retry now
+          </Button>
+        )}
+        <Button variant="ghost" size="sm" onClick={onCancel}>
+          {exhausted ? 'Exit' : 'Give up'}
+        </Button>
+      </div>
+    </Dialog>
   )
 }

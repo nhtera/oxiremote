@@ -16,6 +16,21 @@
   --font-mono: ui-monospace, Consolas, "Courier New", monospace;
 }
 
+/* Phase 02 design tokens — HSL channels for opacity composition (hsl(var(--x)/0.1)).
+   --accent-primary: brand orange used by primitives + emphasis (replaces hardcoded orange-500).
+   Sizing tokens give Button a single source of truth for height/radius. */
+:root {
+  --accent-primary: 30 100% 50%;
+  --accent-danger:  0 80% 55%;
+  --accent-success: 140 60% 45%;
+  --accent-warning: 40 90% 55%;
+
+  --btn-radius: 0.5rem;
+  --btn-h-sm: 1.75rem;
+  --btn-h-md: 2.25rem;
+  --btn-h-lg: 2.75rem;
+}
+
 body {
   @apply bg-surface text-text-primary m-0;
   font-family: system-ui, -apple-system, sans-serif;
@@ -41,6 +56,11 @@ body {
 .btn-danger {
   @apply px-3 py-1.5 bg-danger/15 text-danger border border-danger/30 rounded-md
     hover:bg-danger/25 transition-colors cursor-pointer;
+}
+
+.btn-ghost {
+  @apply px-3 py-1.5 bg-transparent text-text-secondary border border-transparent rounded-md
+    hover:bg-surface-hover hover:text-text-primary transition-colors cursor-pointer;
 }
 
 @layer utilities {

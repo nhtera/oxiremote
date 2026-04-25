@@ -59,7 +59,7 @@ export default function DesktopGestureHelp({ open, onClose }: Props) {
               className={[
                 'pb-2 text-sm capitalize transition-colors',
                 tab === t
-                  ? 'text-orange-400 border-b-2 border-orange-500 -mb-px font-medium'
+                  ? 'text-[hsl(var(--accent-primary))] border-b-2 border-[hsl(var(--accent-primary))] -mb-px font-medium'
                   : 'text-text-muted hover:text-text-secondary',
               ].join(' ')}
             >

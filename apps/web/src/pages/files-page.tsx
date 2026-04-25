@@ -4,6 +4,7 @@ import { useHostStore } from '../state/host-store'
 import { useWorkspaceStore } from '../state/workspace-store'
 import FileTree, { type FileEntry } from '../components/file-tree'
 import FileActionsMenu, { type FileAction } from '../components/file-actions-menu'
+import { useConfirm, usePrompt } from '../components/ui'
 
 const CodeEditor = lazy(() => import('../components/code-editor'))
 
@@ -34,6 +35,8 @@ export default function FilesPage() {
   const [conflict, setConflict] = useState<{ mtime: number } | null>(null)
   const fileInputRef = useRef<HTMLInputElement>(null)
   const uploadTargetDirRef = useRef<string>('')
+  const confirm = useConfirm()
+  const prompt = usePrompt()
 
   const wsId = activeWs?.id
 
@@ -156,7 +159,11 @@ export default function FilesPage() {
     switch (action) {
       case 'new-file':
       case 'new-folder': {
-        const name = window.prompt(action === 'new-file' ? 'New file name' : 'New folder name')
+        const name = await prompt({
+          title: action === 'new-file' ? 'New file' : 'New folder',
+          placeholder: action === 'new-file' ? 'filename.ext' : 'folder-name',
+          confirmText: 'Create',
+        })
         if (!name) return
         const dir = entry && entry.is_dir ? joinPath(currentPath, entry.name) : currentPath
         const path = joinPath(dir, name)
@@ -173,7 +180,12 @@ export default function FilesPage() {
       case 'rename': {
         if (!entry) return
         const current = joinPath(currentPath, entry.name)
-        const next = window.prompt('Rename to', entry.name)
+        const next = await prompt({
+          title: 'Rename',
+          message: entry.name,
+          initial: entry.name,
+          confirmText: 'Rename',
+        })
         if (!next || next === entry.name) return
         const to = joinPath(currentPath, next)
         const res = await fetch('/api/files/rename', {
@@ -193,7 +205,13 @@ export default function FilesPage() {
       }
       case 'delete': {
         if (!entry) return
-        if (!window.confirm(`Delete ${entry.name}?`)) return
+        const ok = await confirm({
+          title: `Delete ${entry.name}?`,
+          message: entry.is_dir ? 'The folder and its contents will be removed.' : undefined,
+          confirmText: 'Delete',
+          danger: true,
+        })
+        if (!ok) return
         const p = joinPath(currentPath, entry.name)
         const res = await fetch('/api/files/delete', {
           method: 'POST',

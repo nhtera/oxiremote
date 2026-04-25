@@ -22,6 +22,7 @@ import DesktopH264View from '../components/desktop-h264-view'
 import DesktopToolbar from '../components/desktop-toolbar'
 import DesktopGestureHelp from '../components/desktop-gesture-help'
 import ReconnectModal from '../components/reconnect-modal'
+import { useConfirm } from '../components/ui'
 
 interface Capabilities {
   available: boolean
@@ -138,18 +139,21 @@ export default function DesktopPage() {
     sessionApiRef.current.disconnect()
   }, [])
 
+  const confirm = useConfirm()
   // Settings change handler. HiDPI flips trigger a brief session reconnect on
   // the H.264 path (encoder dims fixed at init) — confirm before sending so
   // the user isn't surprised by a freeze. Smooth-scaling is render-only.
   const handleSettingsChange = useCallback(
-    (next: { hidpi: boolean; smoothScaling: boolean }) => {
+    async (next: { hidpi: boolean; smoothScaling: boolean }) => {
       const hidpiChanged = next.hidpi !== settings.hidpi
       if (hidpiChanged) {
-        const ok = window.confirm(
-          'Changing High-DPI mode will briefly reconnect the session. Continue?',
-        )
+        const ok = await confirm({
+          title: 'Switch High-DPI mode?',
+          message: 'The session will briefly reconnect.',
+          confirmText: 'Continue',
+        })
         if (!ok) {
-          // Keep smoothScaling change even if user cancels HiDPI, reverting only hidpi.
+          // Keep smoothScaling change even if user cancels HiDPI.
           if (next.smoothScaling !== settings.smoothScaling) {
             setSettingsState({ hidpi: settings.hidpi, smoothScaling: next.smoothScaling })
           }
@@ -161,7 +165,7 @@ export default function DesktopPage() {
         sessionApiRef.current.setSettings({ hidpi: next.hidpi })
       }
     },
-    [settings.hidpi, settings.smoothScaling],
+    [confirm, settings.hidpi, settings.smoothScaling],
   )
 
   // Unavailable / loading states

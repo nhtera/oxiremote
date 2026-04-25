@@ -10,6 +10,7 @@ import GitPage from './pages/git-page'
 import FilesPage from './pages/files-page'
 import WorkspacePickerPage from './pages/workspace-picker-page'
 import PreviewPage from './pages/preview-page'
+import { ToastProvider, ConfirmProvider } from './components/ui'
 import { useHostStore } from './state/host-store'
 import { registerServiceWorker } from './lib/push-client'
 
@@ -110,6 +111,16 @@ function App() {
     return () => navigator.serviceWorker.removeEventListener('message', onMessage)
   }, [navigate])
 
+  return (
+    <ToastProvider>
+      <ConfirmProvider>
+        <AppRoutes />
+      </ConfirmProvider>
+    </ToastProvider>
+  )
+}
+
+function AppRoutes() {
   return (
     <Routes>
       <Route path="/login" element={<LoginPage />} />

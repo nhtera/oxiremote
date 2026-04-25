@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from 'react'
 import { Link, Navigate, useLocation } from 'react-router-dom'
 import { useHostStore } from '../state/host-store'
+import { Heading } from '../components/ui'
 
 type TerminalSession = { id: string; status: string }
 type SessionSummary = { total: number; running: number; latestId?: string | null }
@@ -115,7 +116,7 @@ export default function HomePage() {
 
   return (
     <div className="p-4 md:p-6 max-w-3xl">
-      <h1 className="text-lg font-semibold mb-4">Dashboard</h1>
+      <Heading level={1} className="mb-4">Dashboard</Heading>
 
       <div className="grid grid-cols-2 md:grid-cols-3 gap-3 mb-6">
         <StatCard label="Terminal" value={`${sessions.running} active`} sub={`${sessions.total} total`} to={terminalLink} />
@@ -123,7 +124,7 @@ export default function HomePage() {
         <StatCard label="Previews" value={`${previews} active`} to={`${hostPrefix}/preview`} />
       </div>
 
-      <h2 className="text-sm text-text-secondary mb-3">Quick actions</h2>
+      <Heading level={3} className="mb-3">Quick actions</Heading>
       <div className="flex flex-wrap gap-2 mb-6">
         <QuickAction to={terminalLink} label={sessions.latestId ? 'Resume terminal' : 'New terminal'} />
         <QuickAction to={`${hostPrefix}/git`} label="View changes" />

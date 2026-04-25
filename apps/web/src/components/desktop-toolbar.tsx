@@ -120,7 +120,7 @@ export default function DesktopToolbar({
     const base =
       'flex-1 min-w-0 py-2 text-xs font-medium rounded-md border border-border transition-colors select-none active:scale-95'
     if (key.mod && activeModifiers.has(key.mod)) {
-      return `${base} bg-orange-500/20 text-orange-400 border-orange-500/40`
+      return `${base} bg-[hsl(var(--accent-primary)/0.2)] text-[hsl(var(--accent-primary))] border-[hsl(var(--accent-primary)/0.4)]`
     }
     if (key.label === '✓') {
       return `${base} bg-green-600/20 text-green-400 border-green-600/40 hover:bg-green-600/30`

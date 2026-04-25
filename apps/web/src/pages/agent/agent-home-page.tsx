@@ -190,7 +190,7 @@ export default function AgentHomePage() {
     <div className="p-6 max-w-4xl mx-auto space-y-6">
       <header className="flex items-start justify-between gap-4">
         <div>
-          <h1 className="text-xl font-semibold text-text-primary">Host Dashboard</h1>
+          <h1 className="text-2xl font-semibold tracking-tight text-text-primary">Host Dashboard</h1>
           <p className="text-sm text-text-muted mt-1">
             {state ? `${state.label} · ${state.platform}` : 'Loading…'}
           </p>

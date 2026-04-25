@@ -148,7 +148,7 @@ export default function LoginPage() {
   return (
     <div className="min-h-dvh flex items-center justify-center p-6">
       <div className="w-full max-w-sm">
-        <h1 className="text-xl font-semibold mb-1">OxiRemote</h1>
+        <h1 className="text-2xl font-semibold tracking-tight text-text-primary mb-1">OxiRemote</h1>
 
         {/* Rejection banner — shown when redirected back with ?error=rejected */}
         {rejectedError && (
