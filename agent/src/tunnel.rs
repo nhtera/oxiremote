@@ -202,23 +202,35 @@ pub async fn ensure_quick_tunnel(
         .context("spawn cloudflared")?;
 
     let stderr = child.stderr.take().context("no stderr")?;
-    let reader = tokio::io::BufReader::new(stderr);
-    let mut lines = reader.lines();
+    let stdout = child.stdout.take().context("no stdout")?;
 
     let re = Regex::new(r"https://[a-z0-9\-]+\.trycloudflare\.com").unwrap();
-
     let url = Arc::new(tokio::sync::Mutex::new(None::<String>));
-    let url2 = url.clone();
 
+    // stderr carries cloudflared's INF/ERR log lines AND the tunnel URL banner.
+    let url_for_stderr = url.clone();
+    let re_stderr = re.clone();
     tokio::spawn(async move {
+        let reader = tokio::io::BufReader::new(stderr);
+        let mut lines = reader.lines();
         while let Ok(Some(line)) = lines.next_line().await {
             info!(target: "cloudflared", "{}", line);
-            if let Some(m) = re.find(&line) {
-                let mut u = url2.lock().await;
+            if let Some(m) = re_stderr.find(&line) {
+                let mut u = url_for_stderr.lock().await;
                 if u.is_none() {
                     *u = Some(m.as_str().to_string());
                 }
             }
+        }
+    });
+
+    // stdout is rarely used by cloudflared but inheriting it would corrupt the
+    // TUI alternate buffer. Forward through tracing → bus instead.
+    tokio::spawn(async move {
+        let reader = tokio::io::BufReader::new(stdout);
+        let mut lines = reader.lines();
+        while let Ok(Some(line)) = lines.next_line().await {
+            info!(target: "cloudflared", "{}", line);
         }
     });
 
@@ -255,10 +267,18 @@ pub async fn ensure_named_tunnel(
         .context("spawn cloudflared named tunnel")?;
 
     let stderr = child.stderr.take().context("no stderr")?;
-    let reader = tokio::io::BufReader::new(stderr);
-    let mut lines = reader.lines();
+    let stdout = child.stdout.take().context("no stdout")?;
 
     tokio::spawn(async move {
+        let reader = tokio::io::BufReader::new(stderr);
+        let mut lines = reader.lines();
+        while let Ok(Some(line)) = lines.next_line().await {
+            info!(target: "cloudflared", "{}", line);
+        }
+    });
+    tokio::spawn(async move {
+        let reader = tokio::io::BufReader::new(stdout);
+        let mut lines = reader.lines();
         while let Ok(Some(line)) = lines.next_line().await {
             info!(target: "cloudflared", "{}", line);
         }

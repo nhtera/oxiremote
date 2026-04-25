@@ -9,6 +9,7 @@ mod git;
 mod host;
 mod host_api;
 mod http_pages;
+mod instance_lock;
 mod local_sites;
 mod notify_cli;
 mod one_time_keys;
@@ -17,6 +18,7 @@ mod preview_token;
 mod push;
 mod push_api;
 mod security;
+mod tracing_setup;
 #[cfg(not(debug_assertions))]
 mod static_files;
 #[cfg(feature = "desktop")]
@@ -152,6 +154,12 @@ fn main() -> anyhow::Result<()> {
 /// Headless path: single tokio runtime on the current (main) thread.
 fn run_server_headless() -> anyhow::Result<()> {
     let bus = EventBus::new();
+    tracing_setup::init(tracing_setup::AgentMode::Headless, bus.clone());
+
+    let data_dir = default_data_dir()?;
+    let _lock = instance_lock::InstanceLock::acquire(&data_dir)
+        .context("acquire instance lock")?;
+
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -163,6 +171,12 @@ fn run_server_headless() -> anyhow::Result<()> {
 /// The event bus is shared so tunnel/device events drive the TUI live.
 fn run_with_tui() -> anyhow::Result<()> {
     let bus = EventBus::new();
+    tracing_setup::init(tracing_setup::AgentMode::Tui, bus.clone());
+
+    let data_dir = default_data_dir()?;
+    let lock = instance_lock::InstanceLock::acquire(&data_dir)
+        .context("acquire instance lock")?;
+
     let bus_for_server = bus.clone();
     std::thread::Builder::new()
         .name("oxiremote-server".into())
@@ -173,28 +187,41 @@ fn run_with_tui() -> anyhow::Result<()> {
             {
                 Ok(rt) => rt,
                 Err(err) => {
-                    eprintln!("failed to build tokio runtime: {err}");
+                    // No stderr in TUI mode — push to bus so log pane sees it.
+                    bus_for_server.send(crate::events::AgentEvent::LogEntry {
+                        level: crate::events::LogLevel::Error,
+                        module: "agent".into(),
+                        ts: 0,
+                        msg: format!("failed to build tokio runtime: {err}"),
+                    });
                     return;
                 }
             };
-            if let Err(err) = rt.block_on(server_main(bus_for_server)) {
-                eprintln!("server exited: {err:#}");
+            if let Err(err) = rt.block_on(server_main(bus_for_server.clone())) {
+                bus_for_server.send(crate::events::AgentEvent::LogEntry {
+                    level: crate::events::LogLevel::Error,
+                    module: "agent".into(),
+                    ts: 0,
+                    msg: format!("server exited: {err:#}"),
+                });
             }
         })
         .context("spawn server thread")?;
 
-    tui::run_tui(bus)?;
-    // TUI exit → terminate the process so the server thread tears down too.
-    std::process::exit(0);
+    let result = tui::run_tui(bus);
+    // Explicit drop — process::exit skips destructors so we'd otherwise leak
+    // the PID file and lock out the next start.
+    drop(lock);
+    match result {
+        Ok(()) => std::process::exit(0),
+        Err(err) => {
+            eprintln!("tui error: {err:#}");
+            std::process::exit(1);
+        }
+    }
 }
 
 async fn server_main(event_bus: Arc<EventBus>) -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
-        )
-        .init();
-
     let data_dir = default_data_dir()?;
     std::fs::create_dir_all(&data_dir).context("create data dir")?;
 
