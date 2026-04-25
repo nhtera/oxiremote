@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import OneTimeKeyField from '../../components/one-time-key-field'
+import PairingCard from '../../components/pairing-card'
 import ApprovalModal from '../../components/approval-modal'
 import ProxyPortsCard from '../../components/proxy-ports-card'
 import AutoApproveToggle from '../../components/auto-approve-toggle'
@@ -176,15 +176,6 @@ export default function AgentHomePage() {
   }
 
   const tunnelUrl = state?.tunnel_url ?? null
-  const otkActive =
-    !!otk?.token && otk.expires_at > Math.floor(Date.now() / 1000)
-  // Encode the deep-link form (`<tunnel>/login?k=<otk>`) when a fresh OTK
-  // is available — phone scans the QR and lands on auto-submit instead of
-  // having to type the key. Falls back to the bare tunnel URL otherwise.
-  const qrPayload =
-    tunnelUrl && otkActive
-      ? `${tunnelUrl.replace(/\/$/, '')}/login?k=${otk!.token}`
-      : tunnelUrl ?? ''
 
   return (
     <div className="p-6 max-w-4xl mx-auto space-y-6">
@@ -205,59 +196,29 @@ export default function AgentHomePage() {
         )}
       </header>
 
+      {/* Hero: pairing card combines QR + OTK + URL + countdown. */}
+      <PairingCard
+        tunnelUrl={tunnelUrl}
+        otkToken={otk?.token ?? null}
+        otkExpiresAt={otk?.expires_at ?? null}
+        onRegenerate={handleRegenOtk}
+        errorMessage={otkError}
+      />
+
+      {/* Tunnel health check is only useful while the tunnel hasn't passed
+          a probe yet — once it has, hide the noise. */}
+      {tunnelUrl && !tunnelHealthy && (
+        <Card title="Tunnel health">
+          <HealthCheckConsole entries={probeLog} reachable={tunnelHealthy} />
+        </Card>
+      )}
+      {!tunnelUrl && (
+        <Card title="Tunnel health">
+          <HealthCheckConsole entries={probeLog} reachable={false} />
+        </Card>
+      )}
+
       <section className="grid grid-cols-1 md:grid-cols-2 gap-4">
-        <Card title="Tunnel URL">
-          {tunnelUrl ? (
-            <div className="flex flex-col gap-3 items-start w-full">
-              <img
-                src={`/api/agent/qr?url=${encodeURIComponent(qrPayload)}`}
-                alt="Tunnel QR code"
-                className="w-48 h-48 rounded-md bg-white p-2 border border-border"
-              />
-              {otkActive ? (
-                <p className="text-xs text-text-muted">
-                  Scan to land on{' '}
-                  <code className="text-accent">/login</code> with the
-                  one-time key auto-applied.
-                </p>
-              ) : (
-                <p className="text-xs text-text-muted">
-                  Generate a one-time key for a one-tap pairing scan.
-                </p>
-              )}
-              <a
-                className="text-xs text-accent break-all hover:underline"
-                href={tunnelUrl}
-                target="_blank"
-                rel="noreferrer"
-              >
-                {tunnelUrl}
-              </a>
-              {!tunnelHealthy && (
-                <HealthCheckConsole
-                  entries={probeLog}
-                  reachable={tunnelHealthy}
-                />
-              )}
-            </div>
-          ) : (
-            <HealthCheckConsole entries={probeLog} reachable={false} />
-          )}
-        </Card>
-
-        <Card title="One-Time Key">
-          <OneTimeKeyField
-            token={otk?.token ?? null}
-            expiresAt={otk?.expires_at ?? 0}
-            onRegenerate={handleRegenOtk}
-          />
-          {otkError && (
-            <div className="mt-2 text-xs text-danger bg-danger/10 border border-danger/30 rounded px-2 py-1">
-              {otkError}
-            </div>
-          )}
-        </Card>
-
         <Card title="Host">
           <Row k="Host ID" v={state?.host_id ?? '—'} />
           <Row k="Label" v={state?.label ?? '—'} />

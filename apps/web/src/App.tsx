@@ -5,6 +5,7 @@ import AgentLayout from './components/agent-layout'
 import HomePage from './pages/home-page'
 import LoginPage from './pages/login-page'
 import ApprovalWaitingPage from './pages/approval-waiting-page'
+import WelcomePage from './pages/welcome-page'
 import TerminalPage from './pages/terminal-page'
 import GitPage from './pages/git-page'
 import FilesPage from './pages/files-page'
@@ -120,9 +121,24 @@ function App() {
   )
 }
 
+// Renders the welcome screen for unpaired devices and the home dashboard for
+// paired ones. Avoids a flash of "Loading…" by waiting for the host store.
+function RootRoute() {
+  const { currentHostId, loading } = useHostStore()
+  if (loading) {
+    return (
+      <div className="flex items-center justify-center h-full text-text-muted text-sm">
+        Loading…
+      </div>
+    )
+  }
+  return currentHostId ? <HomePage /> : <Navigate to="/welcome" replace />
+}
+
 function AppRoutes() {
   return (
     <Routes>
+      <Route path="/welcome" element={<WelcomePage />} />
       <Route path="/login" element={<LoginPage />} />
       <Route path="/approval-waiting" element={<ApprovalWaitingPage />} />
 
@@ -164,7 +180,7 @@ function AppRoutes() {
 
       {/* Host-scoped routes */}
       <Route element={<AppLayout />}>
-        <Route path="/" element={<HomePage />} />
+        <Route path="/" element={<RootRoute />} />
 
         <Route path="/h/:hostId" element={<HostRoute><TerminalPage /></HostRoute>} />
         <Route path="/h/:hostId/terminal" element={<HostRoute><TerminalPage /></HostRoute>} />
