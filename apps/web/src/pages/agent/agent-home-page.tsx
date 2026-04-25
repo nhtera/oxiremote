@@ -7,6 +7,8 @@ import HealthCheckConsole, {
   type ProbeEntry,
 } from '../../components/health-check-console'
 import RecentLogsCard, { type LogEntry } from '../../components/recent-logs-card'
+import PermissionsWidget from '../../components/permissions-widget'
+import DevicesPanel from '../../components/devices-panel'
 
 // Host-dashboard home. Live-updates via the `/api/agent/events` SSE stream;
 // initial snapshot from `/api/agent/state`. Both endpoints are localhost-only
@@ -243,12 +245,21 @@ export default function AgentHomePage() {
         </Card>
 
         <Card title="Connected Devices">
-          <div className="text-3xl font-semibold text-text-primary">
-            {state?.connected_devices ?? '—'}
+          <div className="flex items-baseline gap-2 mb-3">
+            <div className="text-3xl font-semibold text-text-primary">
+              {state?.connected_devices ?? '—'}
+            </div>
+            <div className="text-xs text-text-muted">
+              active terminal/preview sessions
+            </div>
           </div>
-          <div className="text-xs text-text-muted mt-1">
-            Active terminal/preview sessions
-          </div>
+          <DevicesPanel />
+        </Card>
+      </section>
+
+      <section>
+        <Card title="Remote Desktop Permissions">
+          <PermissionsWidget />
         </Card>
       </section>
 

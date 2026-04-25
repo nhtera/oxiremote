@@ -36,6 +36,9 @@ pub fn router() -> Router<Arc<AppState>> {
             "/api/agent/proxy/ports",
             get(api_agent_proxy_ports_list).post(api_agent_proxy_ports_set),
         )
+        .route("/api/agent/permissions", get(api_agent_permissions))
+        .route("/api/agent/permissions/grant", post(api_agent_permissions_grant))
+        .route("/api/agent/devices", get(api_agent_devices))
 }
 
 async fn api_agent_state(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
@@ -236,6 +239,104 @@ async fn api_agent_proxy_ports_set(
         }
         Err(err) => {
             warn!(error=%err, "proxy ports persist failed");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+/// GET /api/agent/permissions — TCC / Accessibility status for the desktop
+/// pipeline. macOS is the only OS where this matters in practice; Linux and
+/// Windows always report `true`. Returns 503 when the agent was built without
+/// the `desktop` feature so the UI can render a "not supported" badge.
+async fn api_agent_permissions() -> impl IntoResponse {
+    #[cfg(feature = "desktop")]
+    {
+        let status = tokio::task::spawn_blocking(desktop::permissions::PermissionStatus::check)
+            .await
+            .unwrap_or(desktop::permissions::PermissionStatus {
+                screen_recording: false,
+                accessibility: false,
+            });
+        return (
+            StatusCode::OK,
+            Json(json!({
+                "screen_recording": status.screen_recording,
+                "accessibility": status.accessibility,
+                "platform": std::env::consts::OS,
+                "supported": true,
+            })),
+        )
+            .into_response();
+    }
+    #[cfg(not(feature = "desktop"))]
+    {
+        (
+            StatusCode::OK,
+            Json(json!({
+                "screen_recording": false,
+                "accessibility": false,
+                "platform": std::env::consts::OS,
+                "supported": false,
+            })),
+        )
+            .into_response()
+    }
+}
+
+#[derive(Deserialize)]
+struct PermissionsGrantBody {
+    /// One of `screen_recording` or `accessibility`. Anything else is rejected.
+    kind: String,
+}
+
+/// POST /api/agent/permissions/grant — open the relevant System Settings
+/// pane. macOS only; other platforms return 501. The `open` crate handles
+/// the URL scheme; we never inject user input into the URL.
+async fn api_agent_permissions_grant(
+    Json(body): Json<PermissionsGrantBody>,
+) -> impl IntoResponse {
+    #[cfg(target_os = "macos")]
+    {
+        let url = match body.kind.as_str() {
+            "screen_recording" => {
+                "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture"
+            }
+            "accessibility" => {
+                "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility"
+            }
+            _ => {
+                return (StatusCode::BAD_REQUEST, "unknown permission kind").into_response();
+            }
+        };
+        match open::that(url) {
+            Ok(()) => (StatusCode::OK, Json(json!({ "ok": true }))).into_response(),
+            Err(err) => {
+                warn!(error=%err, "failed to open settings pane");
+                StatusCode::INTERNAL_SERVER_ERROR.into_response()
+            }
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = body; // suppress unused warning
+        (
+            StatusCode::NOT_IMPLEMENTED,
+            "permission granting only implemented on macOS",
+        )
+            .into_response()
+    }
+}
+
+/// GET /api/agent/devices — host-only device list. The user-facing
+/// `/api/devices` endpoint requires a session cookie, but the agent dashboard
+/// at `/agent` runs before any device has paired, so we expose an
+/// auth-free localhost-only mirror. `route_scope::LOCALHOST_PREFIXES`
+/// already restricts `/api/agent/*` to loopback callers.
+async fn api_agent_devices(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    match crate::auth::list_trusted_devices(&state.db_path) {
+        Ok(devices) => (StatusCode::OK, Json(devices)).into_response(),
+        Err(err) => {
+            warn!(error=%err, "list trusted devices failed");
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }
