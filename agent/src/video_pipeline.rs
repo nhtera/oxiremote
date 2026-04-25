@@ -113,7 +113,12 @@ fn build_encoder(
 /// Spawn the encode + write tasks. Returns immediately. Both tasks terminate
 /// when `shutdown_rx` fires or when the channels close.
 pub fn spawn_video_pipeline(mut cfg: VideoPipelineConfig) {
-    let (sample_tx, sample_rx) = mpsc::channel::<EncodedFrame>(2);
+    // Capacity 1 — combined with the writer's drain-to-latest below this
+    // gives drop-oldest semantics: encoder always pushes the freshest sample,
+    // writer always pulls the freshest sample, and any frame stuck queueing
+    // behind a slow `track.write_sample()` is replaced rather than aged.
+    // Lowers worst-case glass-to-glass by one frame interval.
+    let (sample_tx, sample_rx) = mpsc::channel::<EncodedFrame>(1);
 
     // Writer task — async, owns the track Arc.
     let track = cfg.track.clone();
@@ -160,12 +165,21 @@ pub fn spawn_video_pipeline(mut cfg: VideoPipelineConfig) {
                 }
             }
 
-            let Some(frame) = cfg.bgra_rx.blocking_recv() else {
+            let Some(mut frame) = cfg.bgra_rx.blocking_recv() else {
                 // bgra_rx closed — capture loop shut down.
                 break;
             };
+            // Drain any extra frames the capture loop produced while we were
+            // encoding. Keep only the freshest — encoding a stale frame just
+            // adds latency for no quality benefit. force_idr is OR-ed across
+            // all drained frames so a queued PLI-driven IDR isn't lost.
+            let mut drained_force_idr = frame.force_idr;
+            while let Ok(newer) = cfg.bgra_rx.try_recv() {
+                drained_force_idr |= newer.force_idr;
+                frame = newer;
+            }
 
-            let force_idr = frame.force_idr || pli_pending;
+            let force_idr = drained_force_idr || pli_pending;
             let encoded = match encoder.encode(
                 &frame.bytes,
                 frame.width,
@@ -209,7 +223,17 @@ async fn writer_task(
     track: Arc<TrackLocalStaticSample>,
     mut sample_rx: mpsc::Receiver<EncodedFrame>,
 ) {
-    while let Some(frame) = sample_rx.recv().await {
+    while let Some(mut frame) = sample_rx.recv().await {
+        // Drain any encoded samples queued during the last write. Keeping
+        // only the freshest frame is "drop-oldest" semantics on top of a
+        // bounded mpsc — write_sample on a stale frame would add latency
+        // without benefit. Non-IDR frames depend on prior frames so dropping
+        // them risks decoder corruption — a full IDR keyframe arrives at
+        // least every `MaxKeyFrameInterval` (2 s) and PLI on loss, so the
+        // decoder resyncs quickly.
+        while let Ok(newer) = sample_rx.try_recv() {
+            frame = newer;
+        }
         let sample = Sample {
             data: frame.annexb,
             timestamp: SystemTime::now(),

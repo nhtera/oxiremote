@@ -198,6 +198,13 @@ export function useDesktopVideoSession(
       if (e.track.kind !== 'video') return
       const video = videoRef.current
       if (!video) return
+      // Ask Chrome's WebRTC pipeline to play frames as soon as they decode,
+      // skipping the default jitter buffer (which is tuned for media playback,
+      // not interactive remote control). Chrome 92+; ignored elsewhere.
+      // Cuts ~30–80 ms off glass-to-glass on LAN — the largest single win
+      // identified in the phase-03 latency benchmark.
+      const recvr = e.receiver as RTCRtpReceiver & { playoutDelayHint?: number }
+      try { recvr.playoutDelayHint = 0 } catch { /* unsupported browser */ }
       const stream = e.streams[0] ?? new MediaStream([e.track])
       video.srcObject = stream
       // `play()` may reject on autoplay restrictions; we catch because the
