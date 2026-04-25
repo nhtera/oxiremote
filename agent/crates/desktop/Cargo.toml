@@ -24,6 +24,10 @@ mozjpeg = "0.10"
 enigo = { version = "0.6", default-features = false }
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 image = { version = "0.25", default-features = false, features = ["jpeg"] }
+# SIMD-accelerated resize — replaces image::imageops::resize for the
+# capture-pipeline downscale (CPU-bound on Apple Silicon: ~20 ms → ~4 ms
+# per frame at logical→tier dims, lifting High tier from ~22 fps to ~30+).
+fast_image_resize = { version = "6", features = ["image"] }
 anyhow = "1"
 bytes = "1"
 tracing = "0.1"

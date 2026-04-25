@@ -2,7 +2,8 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
-use image::imageops::FilterType;
+use fast_image_resize::images::Image as FirImage;
+use fast_image_resize::{FilterType as FirFilter, PixelType, ResizeAlg, ResizeOptions, Resizer};
 use image::{GenericImageView, RgbaImage};
 use rayon::prelude::*;
 use xxhash_rust::xxh3::xxh3_64;
@@ -87,7 +88,36 @@ pub fn quality_resize(img: RgbaImage, tier: QualityTier, scale_factor: f32) -> R
 
     let w = ((img.width() as f32 * effective) as u32).max(1);
     let h = ((img.height() as f32 * effective) as u32).max(1);
-    image::imageops::resize(&img, w, h, FilterType::Triangle)
+    fir_resize_rgba8(&img, w, h)
+}
+
+/// SIMD downscale via `fast_image_resize`. Roughly 4–5× faster than
+/// `image::imageops::resize(_, FilterType::Triangle)` on Apple Silicon
+/// (AArch64 NEON) and AVX2 on x86_64. Bilinear filter chosen because the
+/// frame is rarely the user's focus pixel-for-pixel — H.264 + JPEG quality
+/// dominates perceived sharpness, so paying for Lanczos here is wasted.
+/// Falls back to image::imageops on any internal error so a one-frame hiccup
+/// can't break the session.
+fn fir_resize_rgba8(src: &RgbaImage, dst_w: u32, dst_h: u32) -> RgbaImage {
+    let (sw, sh) = (src.width(), src.height());
+    let src_fir = match FirImage::from_vec_u8(sw, sh, src.as_raw().clone(), PixelType::U8x4) {
+        Ok(i) => i,
+        Err(e) => {
+            tracing::warn!(error = %e, "fir_resize: src wrap failed, falling back");
+            return image::imageops::resize(src, dst_w, dst_h, image::imageops::FilterType::Triangle);
+        }
+    };
+    let mut dst_fir = FirImage::new(dst_w, dst_h, PixelType::U8x4);
+    let opts = ResizeOptions::new().resize_alg(ResizeAlg::Convolution(FirFilter::Bilinear));
+    let mut resizer = Resizer::new();
+    if let Err(e) = resizer.resize(&src_fir, &mut dst_fir, &opts) {
+        tracing::warn!(error = %e, "fir_resize: resize failed, falling back");
+        return image::imageops::resize(src, dst_w, dst_h, image::imageops::FilterType::Triangle);
+    }
+    RgbaImage::from_raw(dst_w, dst_h, dst_fir.into_vec()).unwrap_or_else(|| {
+        // unreachable: from_vec_u8 above already validated 4 bytes/pixel
+        image::imageops::resize(src, dst_w, dst_h, image::imageops::FilterType::Triangle)
+    })
 }
 
 /// Compute the resized output dimensions for a (logical_w, logical_h) monitor
