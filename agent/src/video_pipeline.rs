@@ -350,10 +350,13 @@ async fn handle_rtcp_batch(
             .downcast_ref::<rtcp::payload_feedbacks::receiver_estimated_maximum_bitrate::ReceiverEstimatedMaximumBitrate>(
             )
         {
-            // REMB's bitrate is f32 bps. Clamp to our BitrateBps tier range
-            // (roughly 500 kbps floor, 10 Mbps ceiling) to avoid the encoder
-            // whiplashing on outliers.
-            let bps = (remb.bitrate as u32).clamp(500_000, 10_000_000);
+            // REMB's bitrate is f32 bps. Clamp to a safe range:
+            // - Floor 1.5 Mbps: a 500 Kbps floor on ~1 MP screen content
+            //   reduces to 0.6 bpp and produces unreadable text. 1.5 Mbps
+            //   keeps Low tier intact under transient congestion.
+            // - Ceiling 15 Mbps: lets High tier (12 Mbps) breathe so REMB
+            //   never artificially clips the configured target on LAN.
+            let bps = (remb.bitrate as u32).clamp(1_500_000, 15_000_000);
             let _ = remb_tx.send(BitrateBps(bps));
         }
     }

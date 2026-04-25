@@ -61,6 +61,10 @@ export default function DesktopH264View({
     if (!ctx) {
       ctx = canvas.getContext('2d')
       ctx2dRef.current = ctx
+      // Screen content is text-heavy — bilinear smoothing softens glyph
+      // edges. Disabling it keeps text crisp when the canvas is later
+      // CSS-scaled by `object-contain`.
+      if (ctx) ctx.imageSmoothingEnabled = false
     }
     if (!ctx) return
     const w = video.videoWidth
@@ -69,6 +73,9 @@ export default function DesktopH264View({
     if (canvas.width !== w || canvas.height !== h) {
       canvas.width = w
       canvas.height = h
+      // getContext returns the same context, but resizing a canvas resets
+      // most state including imageSmoothingEnabled — re-apply.
+      ctx.imageSmoothingEnabled = false
     }
     ctx.drawImage(video, 0, 0, w, h)
   }, [])

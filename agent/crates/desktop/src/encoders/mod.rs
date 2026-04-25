@@ -37,15 +37,28 @@ pub struct ParameterSets {
     pub pps: Bytes,
 }
 
-/// Bitrate targets by quality tier, in bits per second. Matches the preset
-/// table in the phase-03 plan: Low ≈ 1 Mbps, Med ≈ 3 Mbps, High ≈ 6 Mbps.
+/// Bitrate targets by quality tier, in bits per second.
+///
+/// Tuned for **screen content** (mostly UI + text), not natural video. Screen
+/// captures push H.264 outside its sweet spot: Constrained Baseline + CAVLC
+/// (no B-frames, no CABAC) costs ~25 % more bits than Main+CABAC for the same
+/// visual quality, and text edges are unforgiving — sub-3 bpp on a 1 MP frame
+/// produces visible macroblocking around glyphs and panel borders.
+///
+/// Reference points (per industry remote-desktop tools at ~1 MP):
+/// - Parsec "Conservative" preset: ~8 Mbps
+/// - Moonlight default 1080p60: ~10–15 Mbps
+/// - AnyDesk Med tier: ~6–8 Mbps
+///
+/// Picked so Med stays comfortable on broadband and High targets LAN/wifi-5
+/// without hitting the 10 Mbps ceiling that REMB defaults imply.
 #[derive(Debug, Clone, Copy)]
 pub struct BitrateBps(pub u32);
 
 impl BitrateBps {
-    pub const LOW: Self = Self(1_000_000);
-    pub const MED: Self = Self(3_000_000);
-    pub const HIGH: Self = Self(6_000_000);
+    pub const LOW: Self = Self(2_500_000);
+    pub const MED: Self = Self(6_000_000);
+    pub const HIGH: Self = Self(12_000_000);
 }
 
 /// Trait implemented by all H.264 backends.
