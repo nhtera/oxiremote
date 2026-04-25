@@ -190,8 +190,16 @@ impl CaptureLoop {
     /// consume. The H.264 encoder handles its own keyframe logic, so we do
     /// not clear any diff state here — we just forward `force_iframe` as a
     /// flag on the next emitted frame.
+    ///
+    /// `resolution_tier` is captured ONCE and controls the output dimensions
+    /// for the lifetime of the loop — H.264 encoders are built at a fixed
+    /// resolution and cannot be resized mid-stream. `fps_rx` is polled every
+    /// iteration so the loop's frame cadence tracks the user's tier slider
+    /// in real time without restarting the capture (Low ≈ 8 fps,
+    /// Med ≈ 15 fps, High ≈ 30 fps).
     pub fn run_bgra(
-        tier: QualityTier,
+        resolution_tier: QualityTier,
+        fps_rx: tokio::sync::watch::Receiver<QualityTier>,
         tx: Sender<RawBgraFrame>,
         scale_factor: f32,
         mut force_iframe_rx: Option<oneshot::Receiver<()>>,
@@ -203,14 +211,21 @@ impl CaptureLoop {
                 return;
             }
         };
-        info!(tier = ?tier, scale_factor, "CaptureLoop::run_bgra started");
+        info!(
+            resolution_tier = ?resolution_tier,
+            initial_fps_tier = ?*fps_rx.borrow(),
+            scale_factor,
+            "CaptureLoop::run_bgra started"
+        );
 
-        let interval = frame_interval(tier);
         let mut frame_count: u64 = 0;
         let mut dropped_count: u64 = 0;
 
         loop {
             let frame_start = Instant::now();
+            // Re-read fps tier each iteration so a tier change picks up the
+            // new cadence on the very next frame — no capture restart.
+            let interval = frame_interval(*fps_rx.borrow());
 
             // Force-IDR flag for the NEXT emitted frame. One-shot; consumed
             // in the emit block below.
@@ -235,7 +250,7 @@ impl CaptureLoop {
                 }
             };
 
-            let resized = quality_resize(raw, tier, scale_factor);
+            let resized = quality_resize(raw, resolution_tier, scale_factor);
             let (width, height) = (resized.width(), resized.height());
             let bytes = rgba_to_bgra(resized.as_raw());
 

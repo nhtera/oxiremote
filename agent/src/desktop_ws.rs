@@ -627,8 +627,18 @@ mod inner {
         let _ = cap_iframe_tx.send(());
 
         // ── Spawn tasks ───────────────────────────────────────────────────────
+        // Capture: resolution locked to initial tier (encoder dims are fixed
+        // at init), but FPS tracks the live tier slider via `quality_rx` so
+        // High delivers ~30 fps, Med ~15 fps, Low ~8 fps without restart.
+        let cap_fps_rx = quality_tx.subscribe();
         tokio::task::spawn_blocking(move || {
-            CaptureLoop::run_bgra(initial_tier, bgra_tx, scale_factor, Some(cap_iframe_rx))
+            CaptureLoop::run_bgra(
+                initial_tier,
+                cap_fps_rx,
+                bgra_tx,
+                scale_factor,
+                Some(cap_iframe_rx),
+            )
         });
 
         crate::video_pipeline::spawn_video_pipeline(crate::video_pipeline::VideoPipelineConfig {
