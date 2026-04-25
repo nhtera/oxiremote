@@ -45,12 +45,14 @@ async fn api_agent_state(State(state): State<Arc<AppState>>) -> Json<serde_json:
         .ok()
         .and_then(|g| g.clone());
     let connected_devices = state.terminal_sessions.len();
+    let auto_approve = approval::get_auto_approve(&state.db_path);
     Json(json!({
         "tunnel_url": tunnel_url,
         "host_id": state.host_info.host_id,
         "label": state.host_info.label,
         "platform": state.host_info.platform,
         "connected_devices": connected_devices,
+        "auto_approve": auto_approve,
     }))
 }
 

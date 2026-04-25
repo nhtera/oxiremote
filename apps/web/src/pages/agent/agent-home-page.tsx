@@ -2,6 +2,11 @@ import { useEffect, useState } from 'react'
 import OneTimeKeyField from '../../components/one-time-key-field'
 import ApprovalModal from '../../components/approval-modal'
 import ProxyPortsCard from '../../components/proxy-ports-card'
+import AutoApproveToggle from '../../components/auto-approve-toggle'
+import HealthCheckConsole, {
+  type ProbeEntry,
+} from '../../components/health-check-console'
+import RecentLogsCard, { type LogEntry } from '../../components/recent-logs-card'
 
 // Host-dashboard home. Live-updates via the `/api/agent/events` SSE stream;
 // initial snapshot from `/api/agent/state`. Both endpoints are localhost-only
@@ -18,6 +23,7 @@ type AgentState = {
   label: string
   platform: string
   connected_devices: number
+  auto_approve?: boolean
   otk?: OtkState | null
 }
 
@@ -38,14 +44,27 @@ type AgentEvent =
   | { type: 'otk_issued'; token_prefix: string }
   | { type: 'otk_used'; token_prefix: string }
   | { type: 'otk_expired'; token_prefix: string }
-  | { type: 'log_entry'; level: string; module: string; ts: number; msg: string }
+  | { type: 'log_entry'; level: 'info' | 'warn' | 'error'; module: string; ts: number; msg: string }
   | { type: 'step_change'; name: string; status: string; sub?: string }
+  | {
+      type: 'health_probe'
+      attempt: number
+      status: string
+      elapsed_ms: number
+      ok: boolean
+    }
+
+const PROBE_BUFFER = 20
+const LOG_BUFFER = 50
 
 export default function AgentHomePage() {
   const [state, setState] = useState<AgentState | null>(null)
   const [otk, setOtk] = useState<OtkState | null>(null)
   const [pendingDevice, setPendingDevice] = useState<PendingDevice | null>(null)
   const [otkError, setOtkError] = useState<string | null>(null)
+  const [probeLog, setProbeLog] = useState<ProbeEntry[]>([])
+  const [tunnelHealthy, setTunnelHealthy] = useState(false)
+  const [recentLogs, setRecentLogs] = useState<LogEntry[]>([])
 
   // Fetch initial state (includes otk if present)
   useEffect(() => {
@@ -72,6 +91,34 @@ export default function AgentHomePage() {
         const ev: AgentEvent = JSON.parse(msg.data)
         if (ev.type === 'tunnel_url_changed') {
           setState((s) => (s ? { ...s, tunnel_url: ev.url } : s))
+          // New tunnel URL → reset health-check state so the console shows
+          // probes again instead of leaving the previous "reachable" badge.
+          setTunnelHealthy(false)
+          setProbeLog([])
+        } else if (ev.type === 'health_probe') {
+          if (ev.ok) setTunnelHealthy(true)
+          setProbeLog((prev) => {
+            const next = [
+              ...prev,
+              {
+                attempt: ev.attempt,
+                status: ev.status,
+                ok: ev.ok,
+                elapsed_ms: ev.elapsed_ms,
+              },
+            ]
+            return next.length > PROBE_BUFFER
+              ? next.slice(-PROBE_BUFFER)
+              : next
+          })
+        } else if (ev.type === 'log_entry') {
+          setRecentLogs((prev) => {
+            const next = [
+              ...prev,
+              { level: ev.level, module: ev.module, ts: ev.ts, msg: ev.msg },
+            ]
+            return next.length > LOG_BUFFER ? next.slice(-LOG_BUFFER) : next
+          })
         } else if (ev.type === 'device_connected') {
           setState((s) => (s ? { ...s, connected_devices: s.connected_devices + 1 } : s))
         } else if (ev.type === 'device_disconnected') {
@@ -130,17 +177,27 @@ export default function AgentHomePage() {
 
   return (
     <div className="p-6 max-w-4xl mx-auto space-y-6">
-      <header>
-        <h1 className="text-xl font-semibold text-text-primary">Host Dashboard</h1>
-        <p className="text-sm text-text-muted mt-1">
-          {state ? `${state.label} · ${state.platform}` : 'Loading…'}
-        </p>
+      <header className="flex items-start justify-between gap-4">
+        <div>
+          <h1 className="text-xl font-semibold text-text-primary">Host Dashboard</h1>
+          <p className="text-sm text-text-muted mt-1">
+            {state ? `${state.label} · ${state.platform}` : 'Loading…'}
+          </p>
+        </div>
+        {state && (
+          <AutoApproveToggle
+            enabled={state.auto_approve ?? false}
+            onChange={(next) =>
+              setState((s) => (s ? { ...s, auto_approve: next } : s))
+            }
+          />
+        )}
       </header>
 
       <section className="grid grid-cols-1 md:grid-cols-2 gap-4">
         <Card title="Tunnel URL">
           {tunnelUrl ? (
-            <div className="flex flex-col gap-3 items-start">
+            <div className="flex flex-col gap-3 items-start w-full">
               <img
                 src={`/api/agent/qr?url=${encodeURIComponent(tunnelUrl)}`}
                 alt="Tunnel QR code"
@@ -154,11 +211,15 @@ export default function AgentHomePage() {
               >
                 {tunnelUrl}
               </a>
+              {!tunnelHealthy && (
+                <HealthCheckConsole
+                  entries={probeLog}
+                  reachable={tunnelHealthy}
+                />
+              )}
             </div>
           ) : (
-            <div className="text-sm text-text-muted">
-              Tunnel not ready yet — check agent logs.
-            </div>
+            <HealthCheckConsole entries={probeLog} reachable={false} />
           )}
         </Card>
 
@@ -194,6 +255,12 @@ export default function AgentHomePage() {
       <section>
         <Card title="Local Sites Proxy">
           <ProxyPortsCard tunnelUrl={tunnelUrl} />
+        </Card>
+      </section>
+
+      <section>
+        <Card title="Recent Logs">
+          <RecentLogsCard entries={recentLogs} />
         </Card>
       </section>
 

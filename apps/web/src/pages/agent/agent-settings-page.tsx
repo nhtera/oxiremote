@@ -1,5 +1,7 @@
-// Phase 02 wires this to `POST /api/agent/settings/auto-approve`. Phase 01
-// ships the visual stub so the nav surface is complete.
+import { Link } from 'react-router-dom'
+
+// Placeholder for future host-side toggles. The auto-approve switch lives on
+// the home dashboard now; nothing else needs configuration today.
 export default function AgentSettingsPage() {
   return (
     <div className="p-6 max-w-4xl mx-auto">
@@ -8,21 +10,14 @@ export default function AgentSettingsPage() {
         Host-side configuration. Persists to the agent's SQLite database.
       </p>
 
-      <section className="mt-6 rounded-lg border border-border bg-surface p-4">
-        <div className="flex items-start justify-between gap-4">
-          <div>
-            <div className="text-sm font-medium text-text-primary">Auto-approve new devices</div>
-            <div className="text-xs text-text-muted mt-1">
-              When on, devices that scan a valid one-time key join without a prompt.
-            </div>
-          </div>
-          <button
-            disabled
-            className="px-3 py-1.5 text-xs rounded-md border border-border text-text-muted cursor-not-allowed"
-          >
-            Phase 02
-          </button>
-        </div>
+      <section className="mt-6 rounded-lg border border-border bg-surface p-4 text-sm text-text-secondary">
+        <p>
+          Auto-approve is now in the{' '}
+          <Link to="/agent/home" className="text-accent hover:text-accent-hover">
+            host dashboard header
+          </Link>
+          . More settings will land here as we expand the surface.
+        </p>
       </section>
     </div>
   )
