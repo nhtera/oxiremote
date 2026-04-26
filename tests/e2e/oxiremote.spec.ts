@@ -1,63 +1,59 @@
 import { expect, test } from '@playwright/test'
+import { STORAGE_STATE } from './global-setup'
 
 /**
- * End-to-end smoke over the iPhone 14 profile.
+ * Hardened core API smoke (iPhone 14 profile).
  *
- * Pre-reqs (CI responsibility — this spec stays dumb):
- *   - A running agent at OXI_BASE_URL (default http://127.0.0.1:8787).
- *   - OXI_PAIRING_CODE env var containing a fresh 8-char pairing code the
- *     test can exchange. The CI job prints the code when it spawns the agent
- *     and passes it in.
+ * Auth bootstrap moved to `global-setup.ts` — it pairs once per run and
+ * stashes the `oxi_session` cookie in storageState. Tests that need auth
+ * `test.use({ storageState: STORAGE_STATE })`; tests that exercise
+ * tunnel-origin negative contracts run without it.
+ *
+ * Pre-reqs (CI responsibility):
+ *   - Agent at OXI_BASE_URL (default http://127.0.0.1:8787).
+ *   - OXI_PAIRING_CODE — fresh 8-char code; consumed once by global-setup.
  *
  * What this covers:
- *   - Pairing exchange → cookie + api_key + api_key_last4 in response.
- *   - Authenticated GET /api/me succeeds with the cookie.
- *   - A terminal session can be created and listed.
+ *   - Pair body-shape contract (asserted in global-setup; see throw on regression).
+ *   - /api/me succeeds with the shared session cookie.
+ *   - Terminal session can be created and listed.
  *   - File list endpoint returns at least one entry.
- *   - Git status endpoint responds (shape only — repo state is out of scope).
- *   - The push /notify endpoint cannot be reached from tunnel-origin traffic
- *     (403). We fake a tunnel origin by forwarding the `cf-connecting-ip`
- *     header, which is the same condition the real cloudflared proxy sets.
- *
- * iPhone 14 profile ensures the UI renders mobile-first; the API-level smoke
- * additionally protects the hardening guarantees in phase 06.
+ *   - /api/notify is 403 from tunnel-origin (push surface is localhost-only).
+ *   - /api/workspaces POST without CSRF is rejected before the handler runs.
  */
 
 const PAIRING_CODE = process.env.OXI_PAIRING_CODE
 
-test.describe('oxiremote hardened smoke', () => {
+test.describe('authed core API smoke', () => {
   test.skip(!PAIRING_CODE, 'OXI_PAIRING_CODE env var not provided')
+  test.use({ storageState: STORAGE_STATE })
 
-  test('pair → cookie + api_key, fetch /api/me, create terminal', async ({ request }) => {
-    const pairRes = await request.post('/api/pairing/exchange', {
-      data: { code: PAIRING_CODE!, device_label: 'playwright-iphone14' },
-    })
-    expect(pairRes.ok(), await pairRes.text()).toBeTruthy()
-    const body = await pairRes.json()
-    expect(body.ok).toBe(true)
-    expect(typeof body.api_key).toBe('string')
-    expect(body.api_key.length).toBeGreaterThan(16)
-    expect(body.api_key_last4).toMatch(/^[\w-]{4}$/)
-    expect(typeof body.device_id).toBe('string')
+  test('/api/me succeeds with shared session', async ({ request }) => {
+    const res = await request.get('/api/me')
+    expect(res.ok(), await res.text()).toBeTruthy()
+  })
 
-    const me = await request.get('/api/me')
-    expect(me.ok()).toBeTruthy()
-
+  test('terminal session can be created and listed', async ({ request }) => {
     const create = await request.post('/api/terminal/sessions', {
-      data: { name: 'e2e-session', cols: 80, rows: 24 },
+      data: { name: 'e2e-shared', cols: 80, rows: 24 },
     })
     expect(create.ok(), await create.text()).toBeTruthy()
 
     const list = await request.get('/api/terminal/sessions')
     expect(list.ok()).toBeTruthy()
-    const sessions = await list.json()
-    expect(Array.isArray(sessions.sessions ?? sessions)).toBeTruthy()
-
-    const files = await request.get('/api/files/list?path=.')
-    expect(files.ok()).toBeTruthy()
+    const body = (await list.json()) as unknown
+    const sessions = Array.isArray(body) ? body : (body as { sessions?: unknown[] }).sessions
+    expect(Array.isArray(sessions)).toBeTruthy()
   })
 
-  test('tunnel-origin request to /api/notify is rejected', async ({ request }) => {
+  test('files list returns successfully', async ({ request }) => {
+    const res = await request.get('/api/files/list?path=.')
+    expect(res.ok(), await res.text()).toBeTruthy()
+  })
+})
+
+test.describe('tunnel-origin negative contracts', () => {
+  test('tunnel-origin /api/notify is rejected', async ({ request }) => {
     const res = await request.post('/api/notify', {
       headers: {
         'cf-connecting-ip': '203.0.113.10',
@@ -68,7 +64,7 @@ test.describe('oxiremote hardened smoke', () => {
     expect(res.status()).toBe(403)
   })
 
-  test('tunnel-origin state-changing request without CSRF header is rejected', async ({ request }) => {
+  test('tunnel-origin state-changing request without CSRF is rejected', async ({ request }) => {
     const res = await request.post('/api/workspaces', {
       headers: { 'cf-connecting-ip': '203.0.113.10' },
       data: { path: '/tmp', label: 'x' },

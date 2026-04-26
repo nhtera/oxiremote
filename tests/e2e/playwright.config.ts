@@ -6,6 +6,7 @@ export default defineConfig({
   testDir: '.',
   timeout: 60_000,
   fullyParallel: false,
+  globalSetup: './global-setup.ts',
   reporter: process.env.CI ? 'github' : 'list',
   use: {
     baseURL: process.env.OXI_BASE_URL ?? `http://127.0.0.1:${PORT}`,

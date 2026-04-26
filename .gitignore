@@ -10,5 +10,8 @@ plans/
 # OxiRemote local state
 .oxiremote/
 
+# Playwright shared-session storageState — contains paired oxi_session cookie
+tests/e2e/.auth/
+
 docs
 .mcp.json
