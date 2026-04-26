@@ -23,13 +23,12 @@ export default function FileSearchInput({ wsId, onPick }: Props) {
   const [open, setOpen] = useState(false)
   const wrapRef = useRef<HTMLDivElement>(null)
 
+  const trimmed = q.trim()
+  const queryActive = trimmed.length >= MIN_QUERY
+
   useEffect(() => {
-    const trimmed = q.trim()
-    if (trimmed.length < MIN_QUERY) {
-      setHits([])
-      setLoading(false)
-      return
-    }
+    if (!queryActive) return
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     setLoading(true)
     const id = setTimeout(async () => {
       try {
@@ -47,7 +46,13 @@ export default function FileSearchInput({ wsId, onPick }: Props) {
       }
     }, DEBOUNCE_MS)
     return () => clearTimeout(id)
-  }, [q, wsId])
+  }, [trimmed, queryActive, wsId])
+
+  // When the query falls below the threshold we render with no hits and no
+  // spinner. Keeping these as derived values avoids a synchronous setState
+  // inside the effect body.
+  const visibleHits = queryActive ? hits : []
+  const spinning = queryActive && loading
 
   // Close dropdown on outside click — search keeps state, just hides results.
   useEffect(() => {
@@ -61,7 +66,7 @@ export default function FileSearchInput({ wsId, onPick }: Props) {
     return () => document.removeEventListener('mousedown', onDown)
   }, [open])
 
-  const showDropdown = open && q.trim().length >= MIN_QUERY
+  const showDropdown = open && queryActive
 
   return (
     <div ref={wrapRef} className="relative mb-2">
@@ -79,13 +84,13 @@ export default function FileSearchInput({ wsId, onPick }: Props) {
       />
       {showDropdown && (
         <div className="absolute z-20 left-0 right-0 mt-1 max-h-60 overflow-auto bg-surface border border-border rounded-md shadow-lg">
-          {loading ? (
+          {spinning ? (
             <div className="px-2 py-1.5 text-xs text-text-muted">Searching…</div>
-          ) : hits.length === 0 ? (
+          ) : visibleHits.length === 0 ? (
             <div className="px-2 py-1.5 text-xs text-text-muted">No matches</div>
           ) : (
             <ul>
-              {hits.map((h) => (
+              {visibleHits.map((h) => (
                 <li
                   key={h.path}
                   onClick={() => {

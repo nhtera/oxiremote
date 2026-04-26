@@ -141,7 +141,9 @@ export default function TerminalPage() {
   const handlesRef = useRef<Map<string, SessionHandle>>(new Map())
   const activeIdRef = useRef<string | null>(null)
   const prefsRef = useRef(prefs)
-  prefsRef.current = prefs
+  useEffect(() => {
+    prefsRef.current = prefs
+  }, [prefs])
 
   const active = useMemo(() => sessions.find((s) => s.id === activeId) ?? null, [sessions, activeId])
 

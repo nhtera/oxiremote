@@ -5,6 +5,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::extract::{Query, State};
 use axum::http::StatusCode;
@@ -20,6 +21,7 @@ use crate::AppState;
 const MAX_HITS: usize = 200;
 const MAX_DEPTH: usize = 20;
 const MIN_QUERY_LEN: usize = 2;
+const SEARCH_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Serialize)]
 pub struct SearchHit {
@@ -86,11 +88,15 @@ pub async fn api_files_search(
     let canon = root.canonicalize().unwrap_or(root);
 
     // Run the walk on the blocking pool — the `ignore` walker is sync and a
-    // big workspace would otherwise block the request executor.
+    // big workspace would otherwise block the request executor. Cap with a
+    // 30 s wall-clock timeout so a misclick on a deep non-git tree can't pin
+    // a blocking thread indefinitely.
     let query = q.q.clone();
-    let hits = match tokio::task::spawn_blocking(move || search(&canon, &query)).await {
-        Ok(v) => v,
-        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    let work = tokio::task::spawn_blocking(move || search(&canon, &query));
+    let hits = match tokio::time::timeout(SEARCH_TIMEOUT, work).await {
+        Ok(Ok(v)) => v,
+        Ok(Err(_)) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        Err(_) => return (StatusCode::REQUEST_TIMEOUT, "search timed out").into_response(),
     };
     (StatusCode::OK, Json(hits)).into_response()
 }

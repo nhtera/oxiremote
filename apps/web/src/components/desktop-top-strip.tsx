@@ -8,6 +8,8 @@ interface Props {
   onReload: () => void
   onFullscreen: () => void
   inFullscreen: boolean
+  /** Display scale of the canvas vs the remote's native resolution. 1.0 = 100%. */
+  zoom?: number
 }
 
 export default function DesktopTopStrip({
@@ -15,6 +17,7 @@ export default function DesktopTopStrip({
   onReload,
   onFullscreen,
   inFullscreen,
+  zoom,
 }: Props) {
   return (
     <div className="lg:hidden fixed top-0 inset-x-0 z-30 flex items-center gap-1 px-2 py-1 bg-surface/95 backdrop-blur border-b border-border">
@@ -24,6 +27,14 @@ export default function DesktopTopStrip({
           <polyline points="12 19 5 12 12 5" />
         </svg>
       </IconButton>
+      {typeof zoom === 'number' && zoom > 0 && (
+        <span
+          className="px-1.5 text-[11px] tabular-nums text-text-muted"
+          aria-label="Current zoom"
+        >
+          {Math.round(zoom * 100)}%
+        </span>
+      )}
       <div className="flex-1" />
       <IconButton onClick={onReload} aria-label="Reload session" title="Reload">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.75" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">

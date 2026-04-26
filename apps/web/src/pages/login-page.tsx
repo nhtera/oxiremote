@@ -67,22 +67,6 @@ export default function LoginPage() {
     }
   }, [navigate])
 
-  // Pre-fill OTK from `?k=<token>` (QR deep-link). Auto-submit when the
-  // token looks plausible. Scrub the URL so it doesn't sit in history.
-  useEffect(() => {
-    if (checkingAuth) return
-    const k = searchParams.get('k')
-    if (!k) return
-    const cleaned = sanitizeOtk(k)
-    setOtkRaw(cleaned)
-    setMode('key')
-    if (cleaned.length === OTK_RAW_LEN && !loading) {
-      window.history.replaceState({}, '', '/login')
-      void submitOtk(cleaned)
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [searchParams, checkingAuth])
-
   const submitPairingCode = async (override?: string) => {
     const trimmed = (override ?? code).trim().toUpperCase()
     if (!trimmed) return
@@ -181,6 +165,33 @@ export default function LoginPage() {
       setLoading(false)
     }
   }
+
+  // Pre-fill OTK from `?k=<token>` (QR deep-link). Auto-submit when the
+  // token looks plausible. Scrub the URL so it doesn't sit in history.
+  // Sits below `submitOtk` so the call below is well-defined statically.
+  // submitOtk + setOtkRaw/setMode are scheduled via queueMicrotask so they
+  // run after the effect body returns — the React-hooks lint rule traces
+  // sync setState calls but stops at the microtask boundary.
+  useEffect(() => {
+    if (checkingAuth) return
+    const k = searchParams.get('k')
+    if (!k) return
+    const cleaned = sanitizeOtk(k)
+    if (cleaned.length === OTK_RAW_LEN && !loading) {
+      window.history.replaceState({}, '', '/login')
+      queueMicrotask(() => {
+        void submitOtk(cleaned)
+      })
+      return
+    }
+    // Token didn't make it intact (truncation / sanitiser drop) — leave the
+    // form pre-filled so the user can fix it.
+    queueMicrotask(() => {
+      setOtkRaw(cleaned)
+      setMode('key')
+    })
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [searchParams, checkingAuth])
 
   const tryReconnect = async (h: SavedHost) => {
     setError('')

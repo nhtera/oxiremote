@@ -102,7 +102,35 @@ export default function DesktopPage() {
   // Session state pushed up from the mounted view.
   const [status, setStatus] = useState<DesktopStatus>('idle')
   const [attempt, setAttempt] = useState(0)
+  const [screenDims, setScreenDims] = useState<{ width: number; height: number } | undefined>(
+    undefined,
+  )
   const sessionApiRef = useRef<SessionApi>(noopApi)
+
+  // Container that wraps the canvas. Tracked via ResizeObserver so we can
+  // surface the displayed-vs-native scale as a zoom % in the mobile top strip.
+  const canvasWrapRef = useRef<HTMLDivElement | null>(null)
+  const [containerSize, setContainerSize] = useState<{ width: number; height: number } | null>(null)
+  useEffect(() => {
+    const el = canvasWrapRef.current
+    if (!el || typeof ResizeObserver === 'undefined') return
+    const ro = new ResizeObserver((entries) => {
+      const r = entries[0]?.contentRect
+      if (r) setContainerSize({ width: r.width, height: r.height })
+    })
+    ro.observe(el)
+    return () => ro.disconnect()
+  }, [])
+
+  // canvas uses `object-contain`, so the displayed scale is the smaller of
+  // the two ratios. Skip when either input is missing.
+  const zoom =
+    screenDims && containerSize && screenDims.width > 0 && screenDims.height > 0
+      ? Math.min(
+          containerSize.width / screenDims.width,
+          containerSize.height / screenDims.height,
+        )
+      : undefined
 
   // Resolve authenticated device_id from /api/me. Agent binds each WS to
   // the session's device_id; mismatch → 403. See phase-04 review C-1.
@@ -127,9 +155,14 @@ export default function DesktopPage() {
   }, [hostId])
 
   const onSessionChange = useCallback(
-    (s: { status: DesktopStatus; attempt: number }) => {
+    (s: {
+      status: DesktopStatus
+      attempt: number
+      screenDims?: { width: number; height: number }
+    }) => {
       setStatus(s.status)
       setAttempt(s.attempt)
+      if (s.screenDims) setScreenDims(s.screenDims)
     },
     [],
   )
@@ -277,9 +310,10 @@ export default function DesktopPage() {
         onReload={handleReload}
         onFullscreen={handleFullscreen}
         inFullscreen={inFullscreen}
+        zoom={zoom}
       />
 
-      <div className="flex-1 relative min-h-0">
+      <div ref={canvasWrapRef} className="flex-1 relative min-h-0">
         {useH264 ? (
           <DesktopH264View
             key={`h264-${reloadNonce}`}
