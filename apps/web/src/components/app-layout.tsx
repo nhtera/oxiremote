@@ -3,6 +3,15 @@ import { useHostStore } from '../state/host-store'
 import PushPermissionBanner from './push-permission-banner'
 import InstallPwaBanner from './install-pwa-banner'
 import { clearApiKey } from '../lib/api-client'
+import {
+  HomeIcon,
+  TerminalIcon,
+  GitIcon,
+  FilesIcon,
+  PreviewIcon,
+} from './icons'
+
+type IconCmp = (props: { size?: number }) => React.ReactNode
 
 export default function AppLayout() {
   const navigate = useNavigate()
@@ -20,12 +29,12 @@ export default function AppLayout() {
 
   // Nav items: use host-scoped paths when host is known, else legacy (which redirect)
   const base = currentHostId ? `/h/${currentHostId}` : ''
-  const navItems = [
-    { to: '/', label: 'Home', icon: '⌂', exact: true },
-    { to: `${base}/terminal`, label: 'Terminal', icon: '▸', exact: false },
-    { to: `${base}/git`, label: 'Git', icon: '⎇', exact: false },
-    { to: `${base}/files`, label: 'Files', icon: '◫', exact: false },
-    { to: `${base}/preview`, label: 'Preview', icon: '◉', exact: false },
+  const navItems: { to: string; label: string; Icon: IconCmp; exact: boolean }[] = [
+    { to: '/', label: 'Home', Icon: HomeIcon, exact: true },
+    { to: `${base}/terminal`, label: 'Terminal', Icon: TerminalIcon, exact: false },
+    { to: `${base}/git`, label: 'Git', Icon: GitIcon, exact: false },
+    { to: `${base}/files`, label: 'Files', Icon: FilesIcon, exact: false },
+    { to: `${base}/preview`, label: 'Preview', Icon: PreviewIcon, exact: false },
   ]
 
   const handleLogout = async () => {
@@ -41,10 +50,15 @@ export default function AppLayout() {
         <div className="px-4 py-3 text-sm font-semibold text-accent tracking-wide">
           OxiRemote
         </div>
-        {/* Host chip */}
+        {/* Host chip with status dot — green when a host_id is resolved (the
+            agent is reachable to this client), muted otherwise. */}
         {hostChip && (
-          <div className="mx-3 mb-1 px-2 py-1 rounded-md bg-surface border border-border text-[11px] text-text-muted truncate" title={currentHostId ?? ''}>
-            {hostChip}
+          <div
+            className="mx-3 mb-1 px-2 py-1 rounded-md bg-surface border border-border text-[11px] flex items-center gap-1.5"
+            title={currentHostId ?? ''}
+          >
+            <span className={`w-1.5 h-1.5 rounded-full ${currentHostId ? 'bg-success' : 'bg-text-muted'}`} />
+            <span className="truncate text-text-muted">{hostChip}</span>
           </div>
         )}
         {navItems.map((item) => (
@@ -60,7 +74,9 @@ export default function AppLayout() {
               }`
             }
           >
-            <span className="text-base w-5 text-center">{item.icon}</span>
+            <span className="w-5 h-5 shrink-0 flex items-center justify-center">
+              <item.Icon size={16} />
+            </span>
             {item.label}
           </NavLink>
         ))}
@@ -94,7 +110,9 @@ export default function AppLayout() {
               }`
             }
           >
-            <span className="text-lg leading-none mb-0.5">{item.icon}</span>
+            <span className="mb-0.5">
+              <item.Icon size={18} />
+            </span>
             {item.label}
           </NavLink>
         ))}

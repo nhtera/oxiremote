@@ -2,6 +2,15 @@ import { useCallback, useEffect, useState } from 'react'
 import { Link, Navigate, useLocation } from 'react-router-dom'
 import { useHostStore } from '../state/host-store'
 import { Heading } from '../components/ui'
+import {
+  TerminalIcon,
+  GitIcon,
+  FilesIcon,
+  PreviewIcon,
+  RemoteDesktopIcon,
+} from '../components/icons'
+
+type IconCmp = (props: { size?: number }) => React.ReactNode
 
 type TerminalSession = { id: string; status: string }
 type SessionSummary = { total: number; running: number; latestId?: string | null }
@@ -125,11 +134,11 @@ export default function HomePage() {
       </div>
 
       <Heading level={3} className="mb-3">Quick actions</Heading>
-      <div className="flex flex-wrap gap-2 mb-6">
-        <QuickAction to={terminalLink} label={sessions.latestId ? 'Resume terminal' : 'New terminal'} />
-        <QuickAction to={`${hostPrefix}/git`} label="View changes" />
-        <QuickAction to={`${hostPrefix}/files`} label="Browse files" />
-        <QuickAction to={`${hostPrefix}/preview`} label="Add preview" />
+      <div className="grid grid-cols-2 sm:grid-cols-5 gap-2 mb-6">
+        <QuickAction to={terminalLink} label={sessions.latestId ? 'Resume terminal' : 'New terminal'} Icon={TerminalIcon} />
+        <QuickAction to={`${hostPrefix}/git`} label="View changes" Icon={GitIcon} />
+        <QuickAction to={`${hostPrefix}/files`} label="Browse files" Icon={FilesIcon} />
+        <QuickAction to={`${hostPrefix}/preview`} label="Add preview" Icon={PreviewIcon} />
         <DesktopQuickAction hostId={currentHostId} caps={desktopCaps} />
       </div>
 
@@ -177,13 +186,14 @@ function StatCard({ label, value, sub, to }: { label: string; value: string; sub
   )
 }
 
-function QuickAction({ to, label }: { to: string; label: string }) {
+function QuickAction({ to, label, Icon }: { to: string; label: string; Icon: IconCmp }) {
   return (
     <Link
       to={to}
-      className="px-3 py-1.5 text-sm bg-surface-alt border border-border rounded-md text-text-secondary hover:text-text-primary hover:bg-surface-hover transition-colors"
+      className="flex flex-col items-center justify-center gap-1.5 p-3 bg-surface-alt border border-border rounded-lg text-text-secondary hover:text-text-primary hover:bg-surface-hover transition-colors text-center"
     >
-      {label}
+      <Icon size={20} />
+      <span className="text-xs leading-tight">{label}</span>
     </Link>
   )
 }
@@ -204,9 +214,10 @@ function DesktopQuickAction({
     return (
       <span
         title="Screen Recording permission required — open Host Dashboard"
-        className="px-3 py-1.5 text-sm bg-surface-alt border border-border rounded-md text-text-muted opacity-50 cursor-not-allowed select-none"
+        className="flex flex-col items-center justify-center gap-1.5 p-3 bg-surface-alt border border-border rounded-lg text-text-muted opacity-50 cursor-not-allowed select-none text-center"
       >
-        Remote Desktop
+        <RemoteDesktopIcon size={20} />
+        <span className="text-xs leading-tight">Remote Desktop</span>
       </span>
     )
   }
@@ -214,9 +225,10 @@ function DesktopQuickAction({
   return (
     <Link
       to={`/h/${hostId}/desktop`}
-      className="px-3 py-1.5 text-sm bg-surface-alt border border-border rounded-md text-text-secondary hover:text-text-primary hover:bg-surface-hover transition-colors"
+      className="flex flex-col items-center justify-center gap-1.5 p-3 bg-surface-alt border border-border rounded-lg text-text-secondary hover:text-text-primary hover:bg-surface-hover transition-colors text-center"
     >
-      Remote Desktop
+      <RemoteDesktopIcon size={20} />
+      <span className="text-xs leading-tight">Remote Desktop</span>
     </Link>
   )
 }
