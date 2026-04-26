@@ -19,8 +19,12 @@ pub enum StepStatus {
 
 /// Granular tunnel lifecycle step. Emitted as `AgentEvent::TunnelStepChanged`
 /// so both the TUI and the WebUI can render a live 5-step checklist.
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "snake_case", tag = "step")]
+///
+/// Unit-only on purpose — flattens to a plain string on the wire (`"ready"`,
+/// `"failed"`, …) so the SPA can pattern-match it directly. When `Failed`,
+/// the human-readable cause rides on the parent event's `reason` field.
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum TunnelStep {
     /// Locating / downloading cloudflared binary.
     Preparing,
@@ -32,10 +36,8 @@ pub enum TunnelStep {
     Verifying,
     /// Tunnel healthy and serving requests.
     Ready,
-    /// Tunnel failed — `reason` describes the root cause.
-    Failed {
-        reason: String,
-    },
+    /// Tunnel failed — see `reason` on the parent event.
+    Failed,
 }
 
 #[derive(Debug, Clone, Copy, Serialize)]
@@ -118,6 +120,11 @@ pub enum AgentEvent {
         /// probe HTTP status, error snippet).
         #[serde(skip_serializing_if = "Option::is_none")]
         info: Option<String>,
+        /// Set when `step` is `Failed` — the root cause string. Sibling field
+        /// (rather than payload on the variant) keeps the wire shape flat:
+        /// `{ step: "failed", reason: "…" }` instead of nested objects.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
     },
 }
 

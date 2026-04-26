@@ -26,6 +26,7 @@ pub fn router() -> Router<Arc<AppState>> {
     Router::new()
         .route("/api/agent/events", get(api_agent_events))
         .route("/api/agent/state", get(api_agent_state))
+        .route("/api/agent/logs/recent", get(api_agent_logs_recent))
         .route("/api/agent/qr", get(api_agent_qr))
         .route("/api/agent/keys/one-time", post(api_agent_keys_one_time))
         .route("/api/agent/approvals/pending", get(api_agent_approvals_pending))
@@ -63,14 +64,42 @@ async fn api_agent_state(State(state): State<Arc<AppState>>) -> Json<serde_json:
         .and_then(|g| g.clone());
     let connected_devices = state.terminal_sessions.len();
     let auto_approve = approval::get_auto_approve(&state.db_path);
+    // Mirror the latest TunnelStepChanged event so SSE late-joiners can
+    // hydrate the 5-step progress card. Shape matches the SSE frame so the
+    // client can apply it via the same reducer.
+    let tunnel_step = state
+        .latest_tunnel_step
+        .read()
+        .ok()
+        .and_then(|g| g.clone())
+        .map(|ev| serde_json::to_value(&ev).unwrap_or(serde_json::Value::Null));
     Json(json!({
         "tunnel_url": tunnel_url,
+        "tunnel_step": tunnel_step,
         "host_id": state.host_info.host_id,
         "label": state.host_info.label,
         "platform": state.host_info.platform,
         "connected_devices": connected_devices,
         "auto_approve": auto_approve,
     }))
+}
+
+/// GET /api/agent/logs/recent — backfill for the `/agent/logs` page when it
+/// mounts after the agent has already been running. Returns the last
+/// `LOG_RING_CAP` `LogEntry` events in chronological order. Each entry is the
+/// same shape as the SSE frame so the client can pass it through unchanged.
+async fn api_agent_logs_recent(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
+    let entries: Vec<serde_json::Value> = state
+        .recent_logs
+        .lock()
+        .ok()
+        .map(|g| {
+            g.iter()
+                .filter_map(|ev| serde_json::to_value(ev).ok())
+                .collect()
+        })
+        .unwrap_or_default();
+    Json(json!({ "entries": entries }))
 }
 
 #[derive(Deserialize)]

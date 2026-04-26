@@ -66,6 +66,9 @@ function applyStepEvent(steps: StepState[], ev: AgentEventTunnelStep): StepState
   for (let i = 0; i < next.length; i++) {
     if (i < targetIdx) {
       next[i].status = 'done'
+      // Clear stale sub-text from when this step was Active, so it doesn't
+      // linger under the green check while the spinner is on a later row.
+      next[i].info = undefined
     } else if (i === targetIdx) {
       next[i].status = stepKey === 'ready' ? 'done' : 'active'
       next[i].info = ev.info
@@ -115,6 +118,23 @@ export function TunnelProgressCard() {
   const [steps, setSteps] = useState<StepState[]>(buildInitialSteps)
 
   useEffect(() => {
+    let cancelled = false
+
+    // Hydrate from the snapshot first — the SSE stream has no replay, so a
+    // page reload mid-startup would otherwise leave us frozen at the default
+    // "Preparing" state forever. `tunnel_step` mirrors the latest event; if
+    // null the agent hasn't emitted any step yet (truly preparing).
+    fetch('/api/agent/state')
+      .then((r) => (r.ok ? r.json() : null))
+      .then((data) => {
+        if (cancelled || !data?.tunnel_step) return
+        const ev = data.tunnel_step as { type?: string }
+        if (ev.type === 'tunnel_step_changed') {
+          setSteps((prev) => applyStepEvent(prev, data.tunnel_step as AgentEventTunnelStep))
+        }
+      })
+      .catch(() => { /* SSE stream below will deliver fresh state */ })
+
     const es = new EventSource('/api/agent/events')
     es.onmessage = (msg) => {
       try {
@@ -135,7 +155,10 @@ export function TunnelProgressCard() {
         }
       } catch { /* drop malformed frames */ }
     }
-    return () => es.close()
+    return () => {
+      cancelled = true
+      es.close()
+    }
   }, [])
 
   return (
@@ -192,6 +215,13 @@ export function TunnelStatusPill() {
       .then((data) => {
         if (cancelled || !data) return
         setTunnelUrl(data.tunnel_url ?? null)
+        // Hydrate healthy from the snapshot — if the latest tunnel step is
+        // `ready`, the tunnel is up even if we open the page after the
+        // single `health_probe { ok: true }` event already fired.
+        const ts = data.tunnel_step as AgentEventTunnelStep | null | undefined
+        if (ts?.type === 'tunnel_step_changed' && ts.step === 'ready') {
+          setHealthy(true)
+        }
       })
       .catch(() => {
         // The dashboard's /api/agent/events stream will resync once it lands.
@@ -206,6 +236,13 @@ export function TunnelStatusPill() {
           setHealthy(false)
           setDown(false)
         } else if (ev.type === 'health_probe' && (ev as AgentEventHealthProbe).ok) {
+          setHealthy(true)
+        } else if (
+          ev.type === 'tunnel_step_changed'
+          && (ev as AgentEventTunnelStep).step === 'ready'
+        ) {
+          // First-client-connected wins the verify race even before the HTTP
+          // probe succeeds. Surface it on the pill too.
           setHealthy(true)
         } else if (ev.type === 'tunnel_down') {
           setDown(true)

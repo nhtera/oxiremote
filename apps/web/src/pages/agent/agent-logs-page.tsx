@@ -42,6 +42,32 @@ export default function AgentLogsPage() {
   }, [paused])
 
   useEffect(() => {
+    let cancelled = false
+
+    // Hydrate from the snapshot — without this, a fresh page mount sees only
+    // future events. After pairing the agent often goes idle for minutes, so
+    // the operator stares at "0 / 0" with no indication anything is wrong.
+    fetch('/api/agent/logs/recent')
+      .then((r) => (r.ok ? r.json() : null))
+      .then((data) => {
+        if (cancelled || !data?.entries) return
+        const seeded: LogEntry[] = (data.entries as Array<Partial<LogEntry> & { type?: string }>)
+          .filter((e) => e.type === 'log_entry')
+          .map((e) => ({
+            level: (e.level as Level) ?? 'info',
+            module: e.module ?? '',
+            ts: Number(e.ts ?? 0),
+            msg: e.msg ?? '',
+          }))
+        setEntries((prev) => {
+          // Merge seed first, then anything the SSE stream already pushed
+          // between mount and snapshot resolve.
+          const merged = [...seeded, ...prev]
+          return merged.length > MAX_BUFFER ? merged.slice(-MAX_BUFFER) : merged
+        })
+      })
+      .catch(() => { /* SSE will keep streaming; backfill is best-effort */ })
+
     const es = new EventSource('/api/agent/events?filter=log')
     es.onopen = () => setConnected(true)
     es.onerror = () => setConnected(false)
@@ -71,7 +97,10 @@ export default function AgentLogsPage() {
         // drop malformed frames
       }
     }
-    return () => es.close()
+    return () => {
+      cancelled = true
+      es.close()
+    }
   }, [])
 
   function resume() {

@@ -202,6 +202,7 @@ pub async fn ensure_quick_tunnel(
         step: TunnelStep::Preparing,
         attempt: 1,
         info: Some(format!("cloudflared at {}", cloudflared.display())),
+        reason: None,
     });
 
     let mut child = tokio::process::Command::new(&cloudflared)
@@ -219,6 +220,7 @@ pub async fn ensure_quick_tunnel(
         step: TunnelStep::Connecting,
         attempt: 1,
         info: Some(format!("waiting for tunnel URL on http://{addr}")),
+        reason: None,
     });
 
     let re = Regex::new(r"https://[a-z0-9\-]+\.trycloudflare\.com").unwrap();
@@ -261,6 +263,7 @@ pub async fn ensure_quick_tunnel(
                 step: TunnelStep::Tunneling,
                 attempt: 1,
                 info: Some(tunnel_url.clone()),
+                reason: None,
             });
 
             // Spawn a separate task that blocks until the child exits, then
@@ -278,11 +281,10 @@ pub async fn ensure_quick_tunnel(
     }
 
     bus.send(AgentEvent::TunnelStepChanged {
-        step: TunnelStep::Failed {
-            reason: "timed out waiting for tunnel URL (60 s)".into(),
-        },
+        step: TunnelStep::Failed,
         attempt: 1,
         info: None,
+        reason: Some("timed out waiting for tunnel URL (60 s)".into()),
     });
     anyhow::bail!("timed out waiting for quick tunnel URL")
 }

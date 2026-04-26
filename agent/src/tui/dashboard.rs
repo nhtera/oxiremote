@@ -145,7 +145,7 @@ impl State {
 
     fn apply(&mut self, event: &AgentEvent) {
         match event {
-            AgentEvent::TunnelStepChanged { step, info, .. } => {
+            AgentEvent::TunnelStepChanged { step, info, reason, .. } => {
                 // Map TunnelStep enum → step name in the checklist.
                 let (step_name, sub_text) = match step {
                     TunnelStep::Preparing => (
@@ -168,11 +168,14 @@ impl State {
                         "Ready",
                         info.clone().unwrap_or_else(|| "serving".into()),
                     ),
-                    TunnelStep::Failed { reason } => {
+                    TunnelStep::Failed => {
                         // Mark the currently-active step as failed by setting sub text.
+                        let why = reason
+                            .clone()
+                            .unwrap_or_else(|| "unknown error".into());
                         for s in &mut self.steps {
                             if matches!(s.status, StepStatus::Active) {
-                                s.sub = Some(format!("failed: {reason}"));
+                                s.sub = Some(format!("failed: {why}"));
                             }
                         }
                         return;
@@ -180,12 +183,15 @@ impl State {
                 };
 
                 // Mark all steps before this one as Done, this one as Active,
-                // and all after as Pending.
+                // and all after as Pending. Also clear stale sub-text on
+                // non-active rows so the previous step's "starting cloudflared…"
+                // doesn't linger after the spinner moves on.
                 let names = ["Preparing", "Connecting", "Tunneling", "Verifying", "Ready"];
                 let target_idx = names.iter().position(|&n| n == step_name).unwrap_or(0);
                 for (i, s) in self.steps.iter_mut().enumerate() {
                     if i < target_idx {
                         s.status = StepStatus::Done;
+                        s.sub = None;
                     } else if i == target_idx {
                         // Ready is the terminal state — mark Done.
                         s.status = if step_name == "Ready" {
@@ -196,6 +202,7 @@ impl State {
                         s.sub = Some(sub_text.clone());
                     } else {
                         s.status = StepStatus::Pending;
+                        s.sub = None;
                     }
                 }
             }

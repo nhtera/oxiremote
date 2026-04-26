@@ -518,6 +518,8 @@ mod tests {
             rate_limiter: Arc::new(crate::security::rate_limit::RateLimiter::new()),
             event_bus: crate::events::EventBus::new(),
             tunnel_url: Arc::new(std::sync::RwLock::new(None)),
+            latest_tunnel_step: Arc::new(std::sync::RwLock::new(None)),
+            recent_logs: Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new())),
             desktop_available: false,
             desktop_service: None,
         })

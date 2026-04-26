@@ -91,10 +91,16 @@ export default function AgentHomePage() {
         if (!r.ok) throw new Error(`HTTP ${r.status}`)
         return r.json()
       })
-      .then((data: AgentState) => {
+      .then((data: AgentState & { tunnel_step?: { type?: string; step?: string } | null }) => {
         if (cancelled) return
         setState(data)
         setOtk(data.otk ?? null)
+        // Seed `tunnelStepReady` from the snapshot so the progress card hides
+        // immediately on a page reload after the tunnel is already healthy.
+        if (data.tunnel_step?.type === 'tunnel_step_changed' && data.tunnel_step.step === 'ready') {
+          setTunnelStepReady(true)
+          setTunnelHealthy(true)
+        }
         setFetchStatus('ready')
       })
       .catch(() => {

@@ -49,10 +49,10 @@ mod tunnel_named;
 mod workspaces;
 
 use std::{
-    collections::HashSet,
+    collections::{HashSet, VecDeque},
     net::SocketAddr,
     path::PathBuf,
-    sync::{Arc, RwLock as StdRwLock},
+    sync::{Arc, Mutex as StdMutex, RwLock as StdRwLock},
 };
 
 use anyhow::Context;
@@ -65,7 +65,7 @@ use dashmap::DashMap;
 use tower_http::trace::TraceLayer;
 use tracing::{info, warn};
 
-use crate::events::EventBus;
+use crate::events::{AgentEvent, EventBus};
 use crate::host::HostInfo;
 use crate::local_sites::LocalSitesCache;
 use crate::preview::{PreviewHealth, PreviewTarget};
@@ -77,6 +77,11 @@ use crate::terminal_pty::TerminalSession;
 use crate::desktop_service::DesktopService;
 
 pub const AGENT_PORT: u16 = 8787;
+
+/// Ring-buffer cap for `AppState::recent_logs`. Lets the `/agent/logs` page
+/// hydrate with backfill instead of starting empty when the operator opens it
+/// after the agent has already been running for a while.
+pub const LOG_RING_CAP: usize = 200;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -101,6 +106,13 @@ pub struct AppState {
     pub rate_limiter: Arc<RateLimiter>,
     pub event_bus: Arc<EventBus>,
     pub tunnel_url: Arc<std::sync::RwLock<Option<String>>>,
+    /// Latest `TunnelStepChanged` event, mirrored for SSE late-joiners. The
+    /// broadcast bus has no replay; without this, a page reload mid-startup
+    /// shows a stale "Preparing" card forever.
+    pub latest_tunnel_step: Arc<StdRwLock<Option<AgentEvent>>>,
+    /// Bounded ring buffer of `LogEntry` events. Same rationale — `/agent/logs`
+    /// hydrates from this on mount, then streams new entries via SSE.
+    pub recent_logs: Arc<StdMutex<VecDeque<AgentEvent>>>,
     /// Whether desktop capture is available and permitted on this machine.
     /// Probed once at boot via `desktop::desktop_available()`.
     pub desktop_available: bool,
@@ -439,6 +451,8 @@ async fn server_main(event_bus: Arc<EventBus>) -> anyhow::Result<()> {
         rate_limiter: Arc::new(RateLimiter::new()),
         event_bus,
         tunnel_url: Arc::new(std::sync::RwLock::new(None)),
+        latest_tunnel_step: Arc::new(StdRwLock::new(None)),
+        recent_logs: Arc::new(StdMutex::new(VecDeque::with_capacity(LOG_RING_CAP))),
         desktop_available: desktop_avail,
         desktop_service: desktop_svc,
     });
@@ -446,6 +460,44 @@ async fn server_main(event_bus: Arc<EventBus>) -> anyhow::Result<()> {
     // Background: periodic listening-port discovery + preview health checks.
     local_sites::spawn_discovery_loop(local_sites_cache);
     preview::spawn_health_loop(state.clone());
+
+    // Snapshot maintainer — single bus subscriber that mirrors the latest
+    // `TunnelStepChanged` and the last `LOG_RING_CAP` `LogEntry` events into
+    // AppState. SSE late-joiners hydrate from `/api/agent/state` and
+    // `/api/agent/logs/recent` instead of starting empty.
+    {
+        let snap_state = state.clone();
+        let mut rx = state.event_bus.subscribe();
+        tokio::spawn(async move {
+            loop {
+                match rx.recv().await {
+                    Ok(ev) => match &ev {
+                        AgentEvent::TunnelStepChanged { .. } => {
+                            if let Ok(mut g) = snap_state.latest_tunnel_step.write() {
+                                *g = Some(ev.clone());
+                            }
+                        }
+                        AgentEvent::LogEntry { .. } => {
+                            if let Ok(mut g) = snap_state.recent_logs.lock() {
+                                if g.len() >= LOG_RING_CAP {
+                                    g.pop_front();
+                                }
+                                g.push_back(ev.clone());
+                            }
+                        }
+                        _ => {}
+                    },
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                        // Slow consumer fell behind — keep going. Tunnel step
+                        // emits at most ~10 events per session so this is
+                        // dominated by log spikes; missing a few logs is OK.
+                        continue;
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        });
+    }
 
     // Desktop notifications (no-op when no notification daemon — headless,
     // sandboxed, Codespaces). Tray runtime is dead code until Phase 06; this
@@ -645,25 +697,60 @@ async fn server_main(event_bus: Arc<EventBus>) -> anyhow::Result<()> {
                 step: events::TunnelStep::Verifying,
                 attempt: 1,
                 info: Some("running HTTP health probes…".into()),
+                reason: None,
             });
 
-            // Verify reachability — emits HealthProbe events per attempt so the
-            // TUI/dashboard can show "DNS not propagated yet" instead of going silent.
-            let healthy = health_check::run_health_check(
-                u.clone(),
-                tunnel_state.event_bus.clone(),
-                tunnel_state.http_client.clone(),
-            )
-            .await;
+            // Race the active probe loop against the first real client event.
+            // The probe uses the system DNS resolver, which can lag for a
+            // freshly-issued `*.trycloudflare.com` subdomain. Real clients
+            // resolve via Cloudflare's edge and may succeed long before the
+            // local resolver catches up — when that happens, treating "client
+            // got through" as Ready avoids a spurious 3-minute timeout.
+            let probe_bus = tunnel_state.event_bus.clone();
+            let probe_url = u.clone();
+            let probe_client = tunnel_state.http_client.clone();
+            let probe_fut = async move {
+                health_check::run_health_check(probe_url, probe_bus, probe_client).await
+            };
+
+            let mut client_rx = tunnel_state.event_bus.subscribe();
+            let first_client_fut = async move {
+                loop {
+                    match client_rx.recv().await {
+                        Ok(events::AgentEvent::OtkUsed { .. })
+                        | Ok(events::AgentEvent::DevicePending { .. })
+                        | Ok(events::AgentEvent::DeviceApproved { .. })
+                        | Ok(events::AgentEvent::DeviceConnected { .. }) => return true,
+                        Ok(_) => continue,
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                        Err(_) => return false,
+                    }
+                }
+            };
+
+            let healthy = tokio::select! {
+                h = probe_fut => h,
+                c = first_client_fut => c,
+            };
+
             if healthy {
-                // Step 5 — all probes passed.
+                // Step 5 — probe passed OR a real client connected.
                 tunnel_state.event_bus.send(events::AgentEvent::TunnelStepChanged {
                     step: events::TunnelStep::Ready,
                     attempt: 1,
                     info: Some(u),
+                    reason: None,
                 });
             } else {
                 warn!("tunnel URL did not pass health check within timeout");
+                tunnel_state.event_bus.send(events::AgentEvent::TunnelStepChanged {
+                    step: events::TunnelStep::Failed,
+                    attempt: 0,
+                    info: None,
+                    reason: Some(
+                        "health probe timeout (180s); DNS may not have propagated".into(),
+                    ),
+                });
             }
         }
     });
