@@ -11,10 +11,18 @@ type Props = {
   onOpenSettings: () => void
 }
 
-function statusDot(state: Session['state']) {
-  if (state === 'active') return 'bg-warning'
-  if (state === 'exited') return 'bg-text-muted'
-  return 'bg-success' // idle
+function statusDot(state: Session['state']): string {
+  // Conventional traffic-light mapping: active=green (running), exited=red
+  // (process gone), idle=muted (alive but not currently focused).
+  if (state === 'active') return 'bg-success'
+  if (state === 'exited') return 'bg-danger'
+  return 'bg-text-muted'
+}
+
+function statusLabel(state: Session['state']): string {
+  if (state === 'active') return 'Running'
+  if (state === 'exited') return 'Exited'
+  return 'Idle'
 }
 
 export default function TerminalTabBar({
@@ -56,7 +64,11 @@ export default function TerminalTabBar({
           }`}
         >
           {/* Status dot */}
-          <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${statusDot(s.state)}`} />
+          <span
+            className={`w-1.5 h-1.5 rounded-full shrink-0 ${statusDot(s.state)}`}
+            title={statusLabel(s.state)}
+            aria-label={statusLabel(s.state)}
+          />
 
           {/* Tab name or inline rename input */}
           {editingId === s.id ? (
