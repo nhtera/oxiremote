@@ -20,9 +20,12 @@ pub struct Step {
     pub sub: Option<String>,
 }
 
+/// Braille spinner frames — 10 characters, cycled via `frame % 10`.
+const SPINNER_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
 /// Same as `render_steps` but accepts a slice of references — used by the
 /// narrow-terminal compact path in `dashboard.rs` which filters a subset.
-pub fn render_steps_refs(f: &mut Frame<'_>, area: Rect, steps: &[&Step]) {
+pub fn render_steps_refs(f: &mut Frame<'_>, area: Rect, steps: &[&Step], frame: u8) {
     let owned: Vec<_> = steps
         .iter()
         .map(|s| Step {
@@ -31,28 +34,24 @@ pub fn render_steps_refs(f: &mut Frame<'_>, area: Rect, steps: &[&Step]) {
             sub: s.sub.clone(),
         })
         .collect();
-    render_steps(f, area, &owned);
+    render_steps(f, area, &owned, frame);
 }
 
-pub fn render_steps(f: &mut Frame<'_>, area: Rect, steps: &[Step]) {
-    let total_w = area.width as usize;
+pub fn render_steps(f: &mut Frame<'_>, area: Rect, steps: &[Step], frame: u8) {
     let mut lines: Vec<Line> = Vec::with_capacity(steps.len());
     for step in steps {
-        let (icon, name_style, badge) = match step.status {
+        let (icon, name_style) = match step.status {
             StepStatus::Done => (
-                "●",
+                "✓",
                 Style::default().fg(Color::Rgb(74, 222, 128)).add_modifier(Modifier::BOLD),
-                Some(("Done", Style::default().fg(Color::Rgb(74, 222, 128)))),
             ),
             StepStatus::Active => (
-                "●",
+                SPINNER_FRAMES[frame as usize % 10],
                 Style::default().fg(BRAND).add_modifier(Modifier::BOLD),
-                Some(("Running", Style::default().fg(BRAND).add_modifier(Modifier::BOLD))),
             ),
             StepStatus::Pending => (
                 "○",
                 Style::default().fg(Color::DarkGray),
-                None,
             ),
         };
 
@@ -63,19 +62,8 @@ pub fn render_steps(f: &mut Frame<'_>, area: Rect, steps: &[Step]) {
             Style::default().fg(Color::Gray),
         ));
 
-        let used_left = 1 + 2 + step.name.len()
-            + step.sub.as_ref().map(|s| s.len() + 2).unwrap_or(0);
-        let badge_label_w = badge.map(|(t, _)| t.len()).unwrap_or(0);
-        let pad = total_w
-            .saturating_sub(used_left)
-            .saturating_sub(badge_label_w);
-
         let mut spans = vec![icon_span, Span::raw("  "), name_span];
         if let Some(s) = sub_span { spans.push(s); }
-        if let Some((label, style)) = badge {
-            spans.push(Span::raw(" ".repeat(pad)));
-            spans.push(Span::styled(label, style));
-        }
         lines.push(Line::from(spans));
     }
     f.render_widget(Paragraph::new(lines), area);

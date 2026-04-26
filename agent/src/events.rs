@@ -93,6 +93,11 @@ pub enum AgentEvent {
     DeviceRejected {
         device_id: String,
     },
+    /// Permanent dashboard API key was rotated. Broadcasts `last4` so other
+    /// dashboard tabs can refresh their metadata without revealing the plaintext.
+    PermanentKeyRotated {
+        last4: String,
+    },
     /// Per-attempt result from `health_check::run_health_check`. Streams to
     /// TUI and the web UI so the user sees DNS/health probes ticking through
     /// during the "tunnel up but not yet reachable" window.

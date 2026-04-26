@@ -145,6 +145,26 @@ pub fn init_db(db_path: &Path) -> anyhow::Result<()> {
         [],
     );
 
+    // Migration 006: permanent dashboard API key stored in the settings table.
+    // Three settings rows:
+    //   permanent_key_hash       — Argon2id PHC string, NULL until first generation
+    //   permanent_key_last4      — cosmetic last-4 chars; lets the UI show "••••abcd"
+    //   permanent_key_created_at — Unix timestamp of last rotation
+    // These are seeded as empty strings so the row always exists; callers treat
+    // an empty hash as "not yet generated".
+    let _ = conn.execute(
+        "INSERT OR IGNORE INTO settings(key, value) VALUES ('permanent_key_hash', '')",
+        [],
+    );
+    let _ = conn.execute(
+        "INSERT OR IGNORE INTO settings(key, value) VALUES ('permanent_key_last4', '')",
+        [],
+    );
+    let _ = conn.execute(
+        "INSERT OR IGNORE INTO settings(key, value) VALUES ('permanent_key_created_at', '0')",
+        [],
+    );
+
     Ok(())
 }
 

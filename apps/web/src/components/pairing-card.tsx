@@ -5,12 +5,21 @@ import { useEffect, useMemo, useState } from 'react'
 // into a single presentation. Replaces the separate `Tunnel URL` and
 // `One-Time Key` cards from the previous layout.
 
+interface PermanentKeyMeta {
+  last4: string
+  created_at: number
+}
+
 interface PairingCardProps {
   tunnelUrl: string | null
   otkToken: string | null
   otkExpiresAt: number | null // Unix seconds
-  onRegenerate: () => Promise<void>
+  onRegenerate: () => void
   errorMessage: string | null
+  permanentKey: PermanentKeyMeta | null
+  revealedPlaintext: string | null
+  onRegeneratePermanent: () => Promise<void>
+  onDismissReveal: () => void
 }
 
 export default function PairingCard({
@@ -19,9 +28,12 @@ export default function PairingCard({
   otkExpiresAt,
   onRegenerate,
   errorMessage,
+  permanentKey,
+  revealedPlaintext,
+  onRegeneratePermanent,
+  onDismissReveal,
 }: PairingCardProps) {
   const [now, setNow] = useState(() => Math.floor(Date.now() / 1000))
-  const [regenerating, setRegenerating] = useState(false)
   const [copied, setCopied] = useState<'key' | 'url' | null>(null)
 
   // 1 s tick keeps the countdown accurate. The card is small and re-renders
@@ -50,13 +62,8 @@ export default function PairingCard({
       ? `${tunnelUrl.replace(/\/$/, '')}/login?k=${otkToken!}`
       : tunnelUrl ?? ''
 
-  const handleRegenerate = async () => {
-    setRegenerating(true)
-    try {
-      await onRegenerate()
-    } finally {
-      setRegenerating(false)
-    }
+  const handleRegenerate = () => {
+    onRegenerate()
   }
 
   const copyToClipboard = async (
@@ -77,64 +84,70 @@ export default function PairingCard({
 
   return (
     <section className="rounded-2xl border border-border bg-surface p-5 md:p-6 shadow-[0_8px_28px_-12px_rgba(0,0,0,0.55)]">
-      <header className="flex items-start justify-between gap-3 mb-5">
-        <div>
+      {/* Header + QR share a row so the QR doesn't push the text fields below
+          a tall block. Text fields below get the full inner card width — no
+          more squeezing OTK/URL/permanent-key into a 190px column. */}
+      <div className="flex flex-col sm:flex-row gap-5 mb-5">
+        <div className="flex-1 min-w-0">
           <div className="text-[11px] uppercase tracking-[0.18em] text-text-muted font-medium">
             Pairing
           </div>
           <h2 className="text-lg font-semibold text-text-primary mt-1 tracking-tight">
             Connect a phone or tablet
           </h2>
-          <p className="text-xs text-text-secondary mt-1.5 max-w-md leading-relaxed">
-            Scan the QR with your camera, or open the link below and paste
-            the one-time key.
+          <p className="text-xs text-text-secondary mt-1.5 leading-relaxed">
+            Scan the QR with your camera, or open the link below and paste the
+            one-time key.
           </p>
+          <button
+            onClick={handleRegenerate}
+            className="mt-3 inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium bg-accent/15 text-accent border border-accent/40 rounded-md hover:bg-accent/25 transition-colors"
+          >
+            <svg viewBox="0 0 24 24" className="w-3.5 h-3.5" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              <path d="M21 12a9 9 0 1 1-3-6.7L21 8" />
+              <path d="M21 3v5h-5" />
+            </svg>
+            New key
+          </button>
         </div>
-        <button
-          onClick={handleRegenerate}
-          disabled={regenerating}
-          className="shrink-0 px-3 py-1.5 text-xs font-medium bg-accent/15 text-accent border border-accent/40 rounded-md hover:bg-accent/25 transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
-        >
-          {regenerating ? 'Generating…' : 'New key'}
-        </button>
-      </header>
-
-      <div className="grid grid-cols-1 md:grid-cols-[1fr_auto] gap-5 items-start">
-        {/* Left: key + URL + status */}
-        <div className="min-w-0 space-y-4">
-          <KeyBlock
-            formatted={formattedKey}
-            disabled={!otkActive}
-            onCopy={() =>
-              otkToken && copyToClipboard(otkToken, 'key')
-            }
-            copied={copied === 'key'}
-          />
-
-          <CountdownChip
-            remaining={remaining}
-            expired={expired}
-            expiringSoon={expiringSoon}
-            hasKey={!!otkToken}
-          />
-
-          <UrlBlock
-            url={tunnelUrl}
-            onCopy={() => tunnelUrl && copyToClipboard(tunnelUrl, 'url')}
-            copied={copied === 'url'}
-          />
-
-          {errorMessage && (
-            <div className="text-xs text-danger bg-danger/10 border border-danger/30 rounded-md px-3 py-2">
-              {errorMessage}
-            </div>
-          )}
-        </div>
-
-        {/* Right: QR */}
-        <div className="md:w-48 mx-auto">
+        <div className="shrink-0 self-center sm:self-start">
           <QrPanel payload={qrPayload} active={!!tunnelUrl} otkExpired={expired} />
         </div>
+      </div>
+
+      <div className="space-y-4">
+        <KeyBlock
+          formatted={formattedKey}
+          disabled={!otkActive}
+          onCopy={() => otkToken && copyToClipboard(otkToken, 'key')}
+          copied={copied === 'key'}
+        />
+
+        <CountdownChip
+          remaining={remaining}
+          expired={expired}
+          expiringSoon={expiringSoon}
+          hasKey={!!otkToken}
+        />
+
+        <UrlBlock
+          url={tunnelUrl}
+          onCopy={() => tunnelUrl && copyToClipboard(tunnelUrl, 'url')}
+          copied={copied === 'url'}
+        />
+
+        <PermanentKeyBlock
+          meta={permanentKey}
+          plaintext={revealedPlaintext}
+          onRegenerate={onRegeneratePermanent}
+          onDismiss={onDismissReveal}
+        />
+
+        {errorMessage && (
+          <div className="text-xs text-danger bg-danger/10 border border-danger/30 rounded-md px-3 py-2">
+            {errorMessage}
+          </div>
+        )}
       </div>
     </section>
   )
@@ -168,7 +181,7 @@ function KeyBlock({ formatted, disabled, onCopy, copied }: KeyBlockProps) {
           (disabled ? 'border-border/60 opacity-60' : 'border-border')
         }
       >
-        <code className="font-mono text-base md:text-lg text-text-primary tracking-[0.18em] truncate select-all">
+        <code className="font-mono text-base md:text-lg text-text-primary tracking-[0.06em] truncate select-all">
           {formatted || '—'}
         </code>
         <button
@@ -334,6 +347,111 @@ function UrlBlock({ url, onCopy, copied }: UrlBlockProps) {
           )}
         </button>
       </div>
+    </div>
+  )
+}
+
+interface PermanentKeyBlockProps {
+  meta: PermanentKeyMeta | null
+  /** Plaintext key — present only immediately after a rotation; cleared by onDismiss. */
+  plaintext: string | null
+  onRegenerate: () => Promise<void>
+  onDismiss: () => void
+}
+
+function PermanentKeyBlock({ meta, plaintext, onRegenerate, onDismiss }: PermanentKeyBlockProps) {
+  const [regenerating, setRegenerating] = useState(false)
+  const [copied, setCopied] = useState(false)
+
+  const handleRegenerate = async () => {
+    setRegenerating(true)
+    try {
+      await onRegenerate()
+    } finally {
+      setRegenerating(false)
+    }
+  }
+
+  const handleCopy = async () => {
+    if (!plaintext) return
+    try {
+      await navigator.clipboard.writeText(plaintext)
+      setCopied(true)
+      setTimeout(() => setCopied(false), 1500)
+    } catch {
+      // Non-secure context — silently ignore.
+    }
+  }
+
+  // Masked display: short form so it fits in narrow column widths.
+  // Full form (`sk-···· ···· ···· ····ab12`) overflowed and wrapped per char.
+  const maskedDisplay = meta ? `sk-········${meta.last4}` : null
+
+  return (
+    <div>
+      <div className="text-xs font-medium text-text-muted mb-1.5">
+        Permanent API key
+      </div>
+
+      {plaintext ? (
+        // Reveal state: code on its own row (full width, can wrap on long
+        // tokens), warning + actions stacked underneath. Avoids the previous
+        // horizontal flex that forced `break-all` to wrap one char per line.
+        <div className="rounded-lg border border-warning/40 bg-warning/5 p-3 space-y-3">
+          <code className="block font-mono text-xs text-text-primary tracking-wider break-all select-all bg-surface px-2.5 py-2 rounded border border-border">
+            {plaintext}
+          </code>
+          <div className="flex items-center justify-between gap-3">
+            <span className="text-xs text-warning font-medium leading-snug">
+              Only shown once. Save it now.
+            </span>
+            <div className="shrink-0 flex items-center gap-2">
+              <button
+                onClick={handleCopy}
+                aria-label="Copy permanent API key"
+                className="inline-flex items-center gap-1 px-2 py-1 text-xs text-text-secondary hover:text-text-primary"
+              >
+                {copied ? (
+                  <>
+                    <svg viewBox="0 0 24 24" className="w-3.5 h-3.5 text-success" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+                      <polyline points="20 6 9 17 4 12" />
+                    </svg>
+                    Copied
+                  </>
+                ) : (
+                  <>
+                    <svg viewBox="0 0 24 24" className="w-3.5 h-3.5" fill="none" stroke="currentColor" strokeWidth="1.75" strokeLinecap="round" strokeLinejoin="round">
+                      <rect x="9" y="9" width="13" height="13" rx="2" />
+                      <path d="M5 15V5a2 2 0 0 1 2-2h10" />
+                    </svg>
+                    Copy
+                  </>
+                )}
+              </button>
+              <button
+                onClick={onDismiss}
+                className="px-2.5 py-1 text-xs font-medium bg-surface-alt border border-border text-text-secondary rounded-md hover:text-text-primary hover:bg-surface-hover transition-colors"
+              >
+                Done
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : (
+        // Default state: show masked key + regenerate button
+        <div className="flex items-center justify-between gap-3 px-3 py-3 bg-surface-alt border border-border rounded-lg">
+          <code className="font-mono text-sm text-text-secondary tracking-wider truncate select-none">
+            {maskedDisplay ?? 'Not yet generated'}
+          </code>
+          <button
+            onClick={handleRegenerate}
+            disabled={regenerating}
+            className="shrink-0 px-2.5 py-1 text-xs font-medium bg-danger/10 text-danger border border-danger/30 rounded-md hover:bg-danger/20 transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
+          >
+            {regenerating ? 'Rotating…' : 'Regenerate'}
+          </button>
+        </div>
+      )}
     </div>
   )
 }

@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useState } from 'react'
 import { useNavigate, useSearchParams } from 'react-router-dom'
 import { useHostStore } from '../state/host-store'
 import { loadApiKey, storeApiKey } from '../lib/api-client'
@@ -10,12 +10,10 @@ import {
   type SavedHost,
 } from '../lib/saved-hosts'
 
-// Pairing entry point. Two modes: one-time key (default, the QR-deep-link
-// flow) and pairing code (typed manually from the host's TUI). The two-mode
-// toggle keeps both visible at the cost of a tap; the deep-link flow
-// auto-submits and never shows the form to anyone who scanned a QR.
-
-type Mode = 'key' | 'code'
+// Pairing entry point. Single access-key field accepts both OTK (16-hex) and
+// pairing codes (6-16 alnum). Submit tries OTK endpoint first; on non-200/202
+// falls back to pairing-code exchange. The deep-link ?k= path auto-submits
+// without showing the form.
 
 const OTK_RAW_LEN = 16
 
@@ -23,12 +21,8 @@ export default function LoginPage() {
   const [searchParams] = useSearchParams()
   const navigate = useNavigate()
 
-  // Default to OTK; honour ?mode=code or ?mode=key.
-  const initialMode: Mode = searchParams.get('mode') === 'code' ? 'code' : 'key'
-  const [mode, setMode] = useState<Mode>(initialMode)
-
-  const [code, setCode] = useState('')
-  const [otkRaw, setOtkRaw] = useState('') // Stored without dashes, lowercase
+  // Single unified input — raw value, no auto-formatting
+  const [accessKey, setAccessKey] = useState('')
   const [deviceLabel, setDeviceLabel] = useState(
     typeof window !== 'undefined'
       ? window.localStorage.getItem('oxi:device-label') ?? ''
@@ -67,148 +61,146 @@ export default function LoginPage() {
     }
   }, [navigate])
 
-  const submitPairingCode = async (override?: string) => {
-    const trimmed = (override ?? code).trim().toUpperCase()
-    if (!trimmed) return
-    setError('')
-    setLoading(true)
-    try {
-      const res = await fetch('/api/pairing/exchange', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          code: trimmed,
+  // Success handler for OTK path (cookie-based session, no api_key in body).
+  const handleOtkSuccess = async (res: Response) => {
+    if (res.status === 202) {
+      const body = await res.json()
+      navigate('/approval-waiting', {
+        state: {
+          session_id: body.session_id,
           device_label: deviceLabel.trim() || undefined,
-        }),
+        },
       })
-      if (!res.ok) {
-        const text = await res.text()
-        throw new Error(text || 'Invalid or expired pairing code')
-      }
-      // Read response body once — clone avoids consuming the stream.
-      const body = await res.json().catch(() => ({}))
-
-      if (deviceLabel.trim()) {
-        window.localStorage.setItem('oxi:device-label', deviceLabel.trim())
-      }
-      // Persist API key BEFORE any navigation. The pending-approval path also
-      // needs the key in localStorage — once the operator approves and the
-      // user lands on the workspace, every tunnel request needs the
-      // `Authorization: Bearer …` header. Cookie auth alone covers loopback
-      // but not the tunnel.
-      try {
-        await useHostStore.getState().fetchHost()
-        const hostState = useHostStore.getState()
-        const hostId = hostState.currentHostId
-        if (body.api_key && hostId) {
-          storeApiKey(hostId, body.api_key)
-          recordSavedHost({
-            host_id: hostId,
-            label: hostState.label ?? deviceLabel.trim() ?? hostId.slice(0, 8),
-            api_key_last4: String(body.api_key).slice(-4),
-          })
-        }
-      } catch {
-        await useHostStore.getState().fetchHost()
-      }
-
-      // Pairing-code pending: operator must approve before access is granted.
-      // Mirror the OTK pending path so the user sees a clear waiting screen
-      // rather than silently landing on the workspace (which would 403).
-      if (body.approval_status === 'pending') {
-        navigate('/approval-waiting', {
-          state: {
-            device_id: body.device_id,
-            device_label: deviceLabel.trim() || undefined,
-          },
-        })
-        return
-      }
-
-      navigate('/')
-    } catch (e: unknown) {
-      setError(e instanceof Error ? e.message : 'Pairing failed')
-    } finally {
-      setLoading(false)
+      return
     }
+    // status 200
+    if (deviceLabel.trim()) {
+      window.localStorage.setItem('oxi:device-label', deviceLabel.trim())
+    }
+    await useHostStore.getState().fetchHost()
+    const hostState = useHostStore.getState()
+    if (hostState.currentHostId) {
+      // OTK auto-approved path: stamp the saved-hosts list so the user
+      // gets a one-tap reconnect next visit. The api_key isn't returned
+      // here (cookie-based session); fall back to "" for last4.
+      const existingKey = loadApiKey(hostState.currentHostId) ?? ''
+      recordSavedHost({
+        host_id: hostState.currentHostId,
+        label: hostState.label ?? deviceLabel.trim() ?? hostState.currentHostId.slice(0, 8),
+        api_key_last4: existingKey.slice(-4),
+      })
+    }
+    navigate('/')
   }
 
-  const submitOtk = async (override?: string) => {
-    const raw = (override ?? otkRaw).trim()
-    if (!raw) return
+  // Success handler for pairing-code path (returns api_key + device_id).
+  const handlePairingSuccess = async (res: Response) => {
+    // Read response body once.
+    const body = await res.json().catch(() => ({}))
+
+    if (deviceLabel.trim()) {
+      window.localStorage.setItem('oxi:device-label', deviceLabel.trim())
+    }
+    // Persist API key BEFORE any navigation. The pending-approval path also
+    // needs the key in localStorage — once the operator approves and the
+    // user lands on the workspace, every tunnel request needs the
+    // `Authorization: Bearer …` header. Cookie auth alone covers loopback
+    // but not the tunnel.
+    try {
+      await useHostStore.getState().fetchHost()
+      const hostState = useHostStore.getState()
+      const hostId = hostState.currentHostId
+      if (body.api_key && hostId) {
+        storeApiKey(hostId, body.api_key)
+        recordSavedHost({
+          host_id: hostId,
+          label: hostState.label ?? deviceLabel.trim() ?? hostId.slice(0, 8),
+          api_key_last4: String(body.api_key).slice(-4),
+        })
+      }
+    } catch {
+      await useHostStore.getState().fetchHost()
+    }
+
+    // Pairing-code pending: operator must approve before access is granted.
+    if (body.approval_status === 'pending') {
+      navigate('/approval-waiting', {
+        state: {
+          device_id: body.device_id,
+          device_label: deviceLabel.trim() || undefined,
+        },
+      })
+      return
+    }
+
+    navigate('/')
+  }
+
+  // Sanitize raw input: strip whitespace + dashes, for OTK also lowercase.
+  function sanitizeKey(s: string): string {
+    return s.replace(/[\s-]/g, '')
+  }
+
+  // Try OTK endpoint first; on non-200/202 fall back to pairing exchange.
+  // One extra RTT on pairing-code paths — invisible to the user behind the
+  // shared "Connecting…" spinner.
+  const submitAccessKey = async (raw: string) => {
     setError('')
     setLoading(true)
     try {
-      const res = await fetch('/api/login/one-time', {
+      // Try OTK first — sanitized to lowercase 16-hex shape
+      const otkAttempt = raw.toLowerCase()
+      const otkRes = await fetch('/api/login/one-time', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         credentials: 'include',
-        body: JSON.stringify({ token: raw }),
+        body: JSON.stringify({ token: otkAttempt }),
       })
-      if (res.status === 202) {
-        const body = await res.json()
-        // Pass session id + device label through router state so the
-        // approval-waiting page can show a meaningful summary card.
-        navigate('/approval-waiting', {
-          state: {
-            session_id: body.session_id,
-            device_label: deviceLabel.trim() || undefined,
-          },
-        })
-        return
+      if (otkRes.status === 200 || otkRes.status === 202) {
+        return await handleOtkSuccess(otkRes)
       }
-      if (res.status === 200) {
-        if (deviceLabel.trim()) {
-          window.localStorage.setItem('oxi:device-label', deviceLabel.trim())
-        }
-        await useHostStore.getState().fetchHost()
-        const hostState = useHostStore.getState()
-        if (hostState.currentHostId) {
-          // OTK auto-approved path: stamp the saved-hosts list so the user
-          // gets a one-tap reconnect next visit. The api_key isn't returned
-          // here (cookie-based session); fall back to "" for last4.
-          const existingKey = loadApiKey(hostState.currentHostId) ?? ''
-          recordSavedHost({
-            host_id: hostState.currentHostId,
-            label: hostState.label ?? deviceLabel.trim() ?? hostState.currentHostId.slice(0, 8),
-            api_key_last4: existingKey.slice(-4),
-          })
-        }
-        navigate('/')
-        return
+      // Fall back to pairing-code exchange — uppercased 6-16 alnum
+      const codeAttempt = raw.toUpperCase()
+      const codeRes = await fetch('/api/pairing/exchange', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          code: codeAttempt,
+          device_label: deviceLabel.trim() || undefined,
+        }),
+      })
+      if (!codeRes.ok) {
+        throw new Error('That key is invalid or expired.')
       }
-      const text = await res.text()
-      throw new Error(text || 'That key is invalid or expired.')
-    } catch (e: unknown) {
+      return await handlePairingSuccess(codeRes)
+    } catch (e) {
       setError(e instanceof Error ? e.message : 'Could not sign in.')
     } finally {
       setLoading(false)
     }
   }
 
-  // Pre-fill OTK from `?k=<token>` (QR deep-link). Auto-submit when the
-  // token looks plausible. Scrub the URL so it doesn't sit in history.
-  // Sits below `submitOtk` so the call below is well-defined statically.
-  // submitOtk + setOtkRaw/setMode are scheduled via queueMicrotask so they
+  // Pre-fill from `?k=<token>` (QR deep-link). Auto-submit when the token
+  // looks plausible. Scrubs the URL so it doesn't sit in history.
+  // submitAccessKey + setAccessKey are scheduled via queueMicrotask so they
   // run after the effect body returns — the React-hooks lint rule traces
   // sync setState calls but stops at the microtask boundary.
   useEffect(() => {
     if (checkingAuth) return
     const k = searchParams.get('k')
     if (!k) return
-    const cleaned = sanitizeOtk(k)
+    const cleaned = sanitizeKey(k).toLowerCase().slice(0, OTK_RAW_LEN)
     if (cleaned.length === OTK_RAW_LEN && !loading) {
       window.history.replaceState({}, '', '/login')
       queueMicrotask(() => {
-        void submitOtk(cleaned)
+        void submitAccessKey(cleaned)
       })
       return
     }
     // Token didn't make it intact (truncation / sanitiser drop) — leave the
     // form pre-filled so the user can fix it.
     queueMicrotask(() => {
-      setOtkRaw(cleaned)
-      setMode('key')
+      setAccessKey(cleaned)
     })
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [searchParams, checkingAuth])
@@ -243,8 +235,9 @@ export default function LoginPage() {
     )
   }
 
-  const otkValid = otkRaw.length === OTK_RAW_LEN
-  const codeValid = code.trim().length >= 6
+  // Cleaned length for validity check — pairing code minimum is 6 chars.
+  const cleanedKey = sanitizeKey(accessKey)
+  const keyValid = cleanedKey.length >= 6
 
   return (
     <div className="min-h-dvh flex items-center justify-center px-6 py-10">
@@ -254,9 +247,8 @@ export default function LoginPage() {
             Pair this device
           </h1>
           <p className="mt-1.5 text-sm text-text-secondary leading-relaxed">
-            {mode === 'key'
-              ? 'Run oxiremote on your computer, then scan its QR code or paste the one-time key below.'
-              : 'Type the 8-character pairing code shown in the OxiRemote terminal.'}
+            Run oxiremote on your computer, then paste the key shown next to its
+            QR code, or scan the QR with your phone camera.
           </p>
         </header>
 
@@ -294,49 +286,22 @@ export default function LoginPage() {
           </section>
         )}
 
-        {/* Mode toggle */}
-        <div
-          role="tablist"
-          aria-label="Pairing method"
-          className="grid grid-cols-2 gap-1 p-1 rounded-lg bg-surface-alt border border-border mb-5"
-        >
-          <ModeButton active={mode === 'key'} onClick={() => setMode('key')}>
-            One-time key
-          </ModeButton>
-          <ModeButton active={mode === 'code'} onClick={() => setMode('code')}>
-            Pairing code
-          </ModeButton>
-        </div>
-
-        {mode === 'key' ? (
-          <OtkForm
-            otkRaw={otkRaw}
-            onChange={setOtkRaw}
-            valid={otkValid}
-            onSubmit={() => submitOtk()}
-            loading={loading}
-          />
-        ) : (
-          <CodeForm
-            code={code}
-            onChange={setCode}
-            valid={codeValid}
-            onSubmit={() => submitPairingCode()}
-            loading={loading}
-          />
-        )}
+        <AccessKeyForm
+          value={accessKey}
+          onChange={setAccessKey}
+          valid={keyValid}
+          onSubmit={() => void submitAccessKey(cleanedKey)}
+          loading={loading}
+        />
 
         <DeviceLabelField value={deviceLabel} onChange={setDeviceLabel} />
 
         {error && (
           <div className="mt-4 px-3 py-2 rounded-md bg-danger/10 border border-danger/30 text-danger text-sm">
             {error}
-            {mode === 'key' && (
-              <div className="mt-1 text-xs text-danger/80">
-                Generate a fresh key from the host dashboard if this one
-                expired.
-              </div>
-            )}
+            <div className="mt-1 text-xs text-danger/80">
+              Generate a fresh key from the host dashboard if this one expired.
+            </div>
           </div>
         )}
       </div>
@@ -344,79 +309,37 @@ export default function LoginPage() {
   )
 }
 
-// Strip dashes/spaces, lowercase, and clamp to OTK_RAW_LEN.
-function sanitizeOtk(s: string): string {
-  return s.replace(/[\s-]/g, '').toLowerCase().slice(0, OTK_RAW_LEN)
-}
-
-// Format raw OTK as `xxxx-xxxx-xxxx-xxxx` for display.
-function formatOtk(raw: string): string {
-  const cleaned = sanitizeOtk(raw)
-  const groups: string[] = []
-  for (let i = 0; i < cleaned.length; i += 4) {
-    groups.push(cleaned.slice(i, i + 4))
-  }
-  return groups.join('-')
-}
-
-interface ModeButtonProps {
-  active: boolean
-  onClick: () => void
-  children: React.ReactNode
-}
-
-function ModeButton({ active, onClick, children }: ModeButtonProps) {
-  return (
-    <button
-      type="button"
-      role="tab"
-      aria-selected={active}
-      onClick={onClick}
-      className={
-        'py-2 text-sm font-medium rounded-md transition-colors ' +
-        (active
-          ? 'bg-surface text-text-primary border border-border shadow-sm'
-          : 'text-text-secondary hover:text-text-primary')
-      }
-    >
-      {children}
-    </button>
-  )
-}
-
-interface OtkFormProps {
-  otkRaw: string
-  onChange: (raw: string) => void
+interface AccessKeyFormProps {
+  value: string
+  onChange: (s: string) => void
   valid: boolean
   onSubmit: () => void
   loading: boolean
 }
 
-function OtkForm({ otkRaw, onChange, valid, onSubmit, loading }: OtkFormProps) {
-  const formatted = useMemo(() => formatOtk(otkRaw), [otkRaw])
+function AccessKeyForm({ value, onChange, valid, onSubmit, loading }: AccessKeyFormProps) {
   return (
     <div>
       <label
-        htmlFor="oxi-otk"
+        htmlFor="oxi-access-key"
         className="block text-xs font-medium text-text-muted mb-1.5"
       >
-        One-time key
+        Access key
       </label>
       <div className="relative">
         <input
-          id="oxi-otk"
-          value={formatted}
-          onChange={(e) => onChange(sanitizeOtk(e.target.value))}
+          id="oxi-access-key"
+          value={value}
+          onChange={(e) => onChange(e.target.value)}
           onKeyDown={(e) => {
             if (e.key === 'Enter' && valid && !loading) onSubmit()
           }}
-          placeholder="xxxx-xxxx-xxxx-xxxx"
+          placeholder="xxxx-xxxx-xxxx-xxxx or ABCDEFGH"
           autoComplete="off"
           autoCapitalize="none"
           autoCorrect="off"
           spellCheck={false}
-          maxLength={19}
-          className="w-full px-3 py-3 text-base bg-surface-alt border border-border rounded-lg text-text-primary text-center tracking-[0.2em] font-mono focus:outline-none focus:border-accent/50 focus:ring-2 focus:ring-accent/20"
+          className="w-full px-3 py-3 text-base bg-surface-alt border border-border rounded-lg text-text-primary font-mono focus:outline-none focus:border-accent/50 focus:ring-2 focus:ring-accent/20"
         />
         {valid && !loading && (
           <span
@@ -438,61 +361,12 @@ function OtkForm({ otkRaw, onChange, valid, onSubmit, loading }: OtkFormProps) {
           </span>
         )}
       </div>
-      <p className="mt-1.5 text-xs text-text-muted">
-        16 characters. Dashes are added automatically.
-      </p>
       <button
         onClick={onSubmit}
         disabled={loading || !valid}
         className="w-full mt-3 py-3 text-sm font-medium bg-accent/15 text-accent border border-accent/30 rounded-lg hover:bg-accent/25 transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
       >
         {loading ? 'Connecting…' : 'Pair this device'}
-      </button>
-    </div>
-  )
-}
-
-interface CodeFormProps {
-  code: string
-  onChange: (s: string) => void
-  valid: boolean
-  onSubmit: () => void
-  loading: boolean
-}
-
-function CodeForm({ code, onChange, valid, onSubmit, loading }: CodeFormProps) {
-  return (
-    <div>
-      <label
-        htmlFor="oxi-code"
-        className="block text-xs font-medium text-text-muted mb-1.5"
-      >
-        Pairing code
-      </label>
-      <input
-        id="oxi-code"
-        value={code}
-        onChange={(e) => onChange(e.target.value.toUpperCase().replace(/\s/g, ''))}
-        onKeyDown={(e) => {
-          if (e.key === 'Enter' && valid && !loading) onSubmit()
-        }}
-        placeholder="ABCDEFGH"
-        autoComplete="one-time-code"
-        autoCapitalize="characters"
-        autoCorrect="off"
-        spellCheck={false}
-        maxLength={16}
-        className="w-full px-3 py-3 text-lg bg-surface-alt border border-border rounded-lg text-text-primary text-center tracking-[0.3em] font-mono uppercase focus:outline-none focus:border-accent/50 focus:ring-2 focus:ring-accent/20"
-      />
-      <p className="mt-1.5 text-xs text-text-muted">
-        Shown next to the QR code in the OxiRemote terminal.
-      </p>
-      <button
-        onClick={onSubmit}
-        disabled={loading || !valid}
-        className="w-full mt-3 py-3 text-sm font-medium bg-accent/15 text-accent border border-accent/30 rounded-lg hover:bg-accent/25 transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
-      >
-        {loading ? 'Pairing…' : 'Pair this device'}
       </button>
     </div>
   )

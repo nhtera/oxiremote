@@ -44,6 +44,8 @@ struct State {
     /// stream. `l` keypress flips it.
     show_logs: bool,
     log_history: Vec<String>,
+    /// Braille spinner frame index (0..=9), advanced once per redraw tick.
+    spinner_frame: u8,
     /// Transient one-line status message — rendered in the footer for ~3 s
     /// after a hotkey action like "Copied URL" or "OTK regenerated".
     flash: Option<(String, SystemTime)>,
@@ -95,6 +97,7 @@ impl State {
             show_logs: false,
             log_history: Vec::new(),
             flash: None,
+            spinner_frame: 0,
         }
     }
 
@@ -372,6 +375,7 @@ pub fn run_dashboard(term: &mut Term, event_bus: Arc<EventBus>, db_path: PathBuf
 
     loop {
         term.draw(|f| draw(f, &state))?;
+        state.spinner_frame = state.spinner_frame.wrapping_add(1) % 10;
 
         // Drain buffered events without blocking so redraws stay responsive.
         while let Ok(event) = rx.try_recv() {
@@ -489,27 +493,48 @@ fn draw(f: &mut ratatui::Frame<'_>, state: &State) {
 
 fn draw_dashboard(f: &mut ratatui::Frame<'_>, state: &State) {
     let area = f.area();
-    // 5-step checklist needs more vertical room than the old 3-step version.
-    // Header height = border (1) + top padding (1) + 5 rows + bottom border (1) = 8.
-    // In narrow terminals (<80 cols) we fall back to the 3-row compact display at h=6.
     let wide = area.width >= 80;
-    let header_h = if wide { 8u16 } else { 6 };
-    let outer = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(header_h), // steps + header
-            Constraint::Min(14),          // QR + info OR logs
-            Constraint::Length(3),        // footer (keybinds + last log)
-        ])
-        .split(area);
 
-    render_header(f, outer[0], state, wide);
-    if state.show_logs {
-        render_logs(f, outer[1], state);
+    if state.is_ready() {
+        // Collapsed single-line header: frees vertical space for QR + info panes.
+        let outer = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(1), // compact status line
+                Constraint::Min(14),   // QR + info OR logs
+                Constraint::Length(3), // footer
+            ])
+            .split(area);
+
+        render_compact_header(f, outer[0], state);
+        if state.show_logs {
+            render_logs(f, outer[1], state);
+        } else {
+            render_body(f, outer[1], state);
+        }
+        render_footer(f, outer[2], state);
     } else {
-        render_body(f, outer[1], state);
+        // Onboarding path — full 5-step checklist header.
+        // Header height = border (1) + top padding (1) + 5 rows + bottom border (1) = 8.
+        // In narrow terminals (<80 cols) we fall back to the 3-row compact display at h=6.
+        let header_h = if wide { 8u16 } else { 6 };
+        let outer = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(header_h), // steps + header
+                Constraint::Min(14),          // QR + info OR logs
+                Constraint::Length(3),        // footer (keybinds + last log)
+            ])
+            .split(area);
+
+        render_header(f, outer[0], state, wide);
+        if state.show_logs {
+            render_logs(f, outer[1], state);
+        } else {
+            render_body(f, outer[1], state);
+        }
+        render_footer(f, outer[2], state);
     }
-    render_footer(f, outer[2], state);
 }
 
 // Onboarding view: step checklist only — no QR (unscannable until Ready),
@@ -601,7 +626,7 @@ fn render_header(f: &mut ratatui::Frame<'_>, area: Rect, state: &State, wide: bo
 
     if wide {
         // Full 5-step checklist.
-        super::step_progress::render_steps(f, inner, &state.steps);
+        super::step_progress::render_steps(f, inner, &state.steps, state.spinner_frame);
     } else {
         // Narrow terminal — compact 3-row summary: Server | Tunnel | Ready.
         let compact: Vec<_> = state
@@ -609,8 +634,38 @@ fn render_header(f: &mut ratatui::Frame<'_>, area: Rect, state: &State, wide: bo
             .iter()
             .filter(|s| matches!(s.name.as_str(), "Preparing" | "Tunneling" | "Ready"))
             .collect();
-        super::step_progress::render_steps_refs(f, inner, &compact);
+        super::step_progress::render_steps_refs(f, inner, &compact, state.spinner_frame);
     }
+}
+
+/// Single-line header shown once the tunnel is Ready.
+/// Format: `● OxiRemote  ·  <url>` where URL is truncated with ellipsis if needed.
+fn render_compact_header(f: &mut ratatui::Frame<'_>, area: Rect, state: &State) {
+    let url_raw = state
+        .tunnel_url
+        .as_deref()
+        .unwrap_or("—");
+
+    // Prefix spans: green dot + brand name + dim separator
+    let prefix_spans = vec![
+        Span::styled("● ", Style::default().fg(Color::Rgb(74, 222, 128)).add_modifier(Modifier::BOLD)),
+        Span::styled("OxiRemote", Style::default().fg(super::step_progress::BRAND).add_modifier(Modifier::BOLD)),
+        Span::styled("  ·  ", Style::default().fg(Color::DarkGray).add_modifier(Modifier::DIM)),
+    ];
+    // "● " (2) + "OxiRemote" (9) + "  ·  " (5) = 16 chars prefix width
+    let prefix_w: usize = 16;
+    let avail = (area.width as usize).saturating_sub(prefix_w);
+
+    let url_display = if url_raw.len() > avail && avail > 3 {
+        format!("{}…", &url_raw[..avail.saturating_sub(1)])
+    } else {
+        url_raw.to_string()
+    };
+
+    let mut spans = prefix_spans;
+    spans.push(Span::styled(url_display, Style::default().fg(Color::White)));
+
+    f.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
 fn render_body(f: &mut ratatui::Frame<'_>, area: Rect, state: &State) {

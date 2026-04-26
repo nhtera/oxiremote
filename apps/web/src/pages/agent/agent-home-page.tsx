@@ -40,6 +40,11 @@ interface PendingDevice {
   first_seen: number
 }
 
+interface PermanentKeyMeta {
+  last4: string
+  created_at: number
+}
+
 type AgentEvent =
   | { type: 'tunnel_url_changed'; url: string }
   | { type: 'tunnel_down'; reason: string }
@@ -54,13 +59,8 @@ type AgentEvent =
   | { type: 'log_entry'; level: 'info' | 'warn' | 'error'; module: string; ts: number; msg: string }
   | { type: 'step_change'; name: string; status: string; sub?: string }
   | { type: 'tunnel_step_changed'; step: string; attempt: number; info?: string; reason?: string }
-  | {
-      type: 'health_probe'
-      attempt: number
-      status: string
-      elapsed_ms: number
-      ok: boolean
-    }
+  | { type: 'health_probe'; attempt: number; status: string; elapsed_ms: number; ok: boolean }
+  | { type: 'permanent_key_rotated'; last4: string }
 
 const LOG_BUFFER = 50
 
@@ -78,24 +78,38 @@ export default function AgentHomePage() {
   const [recentLogs, setRecentLogs] = useState<LogEntry[]>([])
   const [fetchStatus, setFetchStatus] = useState<FetchStatus>('loading')
   const [retryNonce, setRetryNonce] = useState(0)
+  const [permanentKey, setPermanentKey] = useState<PermanentKeyMeta | null>(null)
+  const [revealedPlaintext, setRevealedPlaintext] = useState<string | null>(null)
+  // Confirm modal for OTK regeneration — prevents accidental QR invalidation.
+  const [confirmingOtk, setConfirmingOtk] = useState(false)
 
   useEffect(() => {
     let cancelled = false
-    fetch('/api/agent/state')
-      .then((r) => {
+
+    // Fetch agent state and permanent key metadata in parallel.
+    Promise.all([
+      fetch('/api/agent/state').then((r) => {
         if (!r.ok) throw new Error(`HTTP ${r.status}`)
-        return r.json()
-      })
-      .then((data: AgentState & { tunnel_step?: { type?: string; step?: string } | null }) => {
+        return r.json() as Promise<AgentState & { tunnel_step?: { type?: string; step?: string } | null }>
+      }),
+      fetch('/api/agent/keys/permanent').then((r) => {
+        // 404 means no key generated yet — not an error.
+        if (r.status === 404) return null
+        if (!r.ok) return null
+        return r.json() as Promise<PermanentKeyMeta>
+      }),
+    ])
+      .then(([agentData, keyMeta]) => {
         if (cancelled) return
-        setState(data)
-        setOtk(data.otk ?? null)
+        setState(agentData)
+        setOtk(agentData.otk ?? null)
         // Seed `tunnelStepReady` from the snapshot so the progress card hides
         // immediately on a page reload after the tunnel is already healthy.
-        if (data.tunnel_step?.type === 'tunnel_step_changed' && data.tunnel_step.step === 'ready') {
+        if (agentData.tunnel_step?.type === 'tunnel_step_changed' && agentData.tunnel_step.step === 'ready') {
           setTunnelStepReady(true)
           setTunnelHealthy(true)
         }
+        setPermanentKey(keyMeta)
         setFetchStatus('ready')
       })
       .catch(() => {
@@ -158,6 +172,15 @@ export default function AgentHomePage() {
           setPendingDevice((d) => (d?.device_id === ev.device_id ? null : d))
         } else if (ev.type === 'otk_expired') {
           setOtk((o) => (o ? { ...o, expires_at: 0 } : o))
+        } else if (ev.type === 'permanent_key_rotated') {
+          // Another dashboard tab rotated the key — refresh metadata from the
+          // server. We can't reconstruct created_at from the event alone.
+          fetch('/api/agent/keys/permanent')
+            .then((r) => (r.ok ? r.json() : null))
+            .then((meta: PermanentKeyMeta | null) => {
+              if (meta) setPermanentKey(meta)
+            })
+            .catch(() => { /* non-critical; stale meta is acceptable */ })
         }
       } catch {
         // drop malformed frames; server retries next event
@@ -168,6 +191,7 @@ export default function AgentHomePage() {
 
   const handleRegenOtk = async () => {
     setOtkError(null)
+    setConfirmingOtk(false)
     try {
       const res = await fetch('/api/agent/keys/one-time', { method: 'POST' })
       if (!res.ok) throw new Error(`Failed to generate key (${res.status})`)
@@ -175,6 +199,21 @@ export default function AgentHomePage() {
       setOtk({ token: data.token, expires_at: data.expires_at })
     } catch (e) {
       setOtkError(e instanceof Error ? e.message : 'Failed to generate key')
+    }
+  }
+
+  const handlePermanentRegen = async () => {
+    setOtkError(null)
+    try {
+      const res = await fetch('/api/agent/keys/permanent', { method: 'POST' })
+      if (!res.ok) throw new Error(`Failed to rotate permanent key (${res.status})`)
+      const data: { api_key: string; last4: string; created_at: number } = await res.json()
+      // Reveal the plaintext once — state cleared by onDismissReveal.
+      setRevealedPlaintext(data.api_key)
+      setPermanentKey({ last4: data.last4, created_at: data.created_at })
+    } catch (e) {
+      // Surface as otkError for simplicity; both show in the same card.
+      setOtkError(e instanceof Error ? e.message : 'Failed to rotate permanent key')
     }
   }
 
@@ -247,14 +286,18 @@ export default function AgentHomePage() {
           Tunnel went down — connections will fail. Restart the agent to reconnect.
         </div>
       )}
-      <div className="grid grid-cols-1 lg:grid-cols-[minmax(0,1fr)_minmax(0,1.4fr)] gap-6">
+      <div className="grid grid-cols-1 xl:grid-cols-[minmax(0,1.05fr)_minmax(0,1fr)] gap-6">
         <aside className="lg:sticky lg:top-6 self-start space-y-4">
           <PairingCard
             tunnelUrl={tunnelUrl}
             otkToken={otk?.token ?? null}
             otkExpiresAt={otk?.expires_at ?? null}
-            onRegenerate={handleRegenOtk}
+            onRegenerate={() => setConfirmingOtk(true)}
             errorMessage={otkError}
+            permanentKey={permanentKey}
+            revealedPlaintext={revealedPlaintext}
+            onRegeneratePermanent={handlePermanentRegen}
+            onDismissReveal={() => setRevealedPlaintext(null)}
           />
         </aside>
 
@@ -320,6 +363,13 @@ export default function AgentHomePage() {
           onClose={() => setPendingDevice(null)}
         />
       )}
+
+      {confirmingOtk && (
+        <OtkConfirmModal
+          onConfirm={handleRegenOtk}
+          onCancel={() => setConfirmingOtk(false)}
+        />
+      )}
     </div>
   )
 }
@@ -351,6 +401,59 @@ function Row({ k, v }: { k: string; v: string }) {
       <span className="text-text-primary truncate ml-3 max-w-[60%]" title={v}>
         {v}
       </span>
+    </div>
+  )
+}
+
+interface OtkConfirmModalProps {
+  onConfirm: () => void
+  onCancel: () => void
+}
+
+// Confirm dialog before invalidating the current OTK. Uses the same overlay
+// style as ApprovalModal so the two modals feel like the same system.
+function OtkConfirmModal({ onConfirm, onCancel }: OtkConfirmModalProps) {
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') onCancel()
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [onCancel])
+
+  return (
+    <div
+      role="dialog"
+      aria-modal="true"
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-sm p-4"
+      onClick={onCancel}
+    >
+      <div
+        className="w-full max-w-sm bg-surface border border-border rounded-lg p-5 shadow-xl"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="text-text-primary font-semibold text-sm mb-2">
+          Generate a new one-time key?
+        </div>
+        <p className="text-xs text-text-secondary leading-relaxed mb-5">
+          The current QR will stop working immediately. A device scanning right
+          now will need the new key.
+        </p>
+        <div className="flex gap-2 justify-end">
+          <button
+            onClick={onCancel}
+            className="px-4 py-2 text-sm font-medium border border-border text-text-secondary rounded-md hover:bg-surface-hover hover:text-text-primary transition-colors"
+          >
+            Cancel
+          </button>
+          <button
+            onClick={onConfirm}
+            className="px-4 py-2 text-sm font-medium bg-accent/20 text-accent border border-accent/40 rounded-md hover:bg-accent/30 transition-colors"
+          >
+            Generate
+          </button>
+        </div>
+      </div>
     </div>
   )
 }

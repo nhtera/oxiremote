@@ -321,6 +321,115 @@ pub async fn verify_api_key_async(db_path: PathBuf, presented: String) -> Option
         .flatten()
 }
 
+/// Generate a new permanent dashboard API key, store the Argon2id hash in the
+/// `settings` table, and return `(plaintext, last4, created_at)`.
+/// The plaintext is returned exactly once — the caller must surface it to the
+/// operator immediately because it is never stored in cleartext.
+pub fn rotate_permanent_key(db_path: &PathBuf) -> anyhow::Result<(String, String, i64)> {
+    use base64::Engine as _;
+    let mut raw = [0u8; 32];
+    OsRng.fill_bytes(&mut raw);
+    // URL-safe base64, no padding — matches the per-device key format.
+    let key = format!(
+        "sk-{}",
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(raw)
+    );
+    let last4: String = key.chars().rev().take(4).collect::<Vec<_>>().into_iter().rev().collect();
+
+    let salt = SaltString::generate(&mut OsRng);
+    let hash = Argon2::default()
+        .hash_password(key.as_bytes(), &salt)
+        .map_err(|e| anyhow::anyhow!("argon2 hash: {e}"))?
+        .to_string();
+
+    let created_at = now_ts();
+    let mut conn = Connection::open(db_path)?;
+    // Wrap the three writes in a transaction so a concurrent rotation cannot
+    // produce a hash/last4 mismatch (e.g. two browser tabs clicking Regenerate).
+    let tx = conn.transaction()?;
+    tx.execute(
+        "INSERT INTO settings(key, value) VALUES ('permanent_key_hash', ?1)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        rusqlite::params![hash],
+    )?;
+    tx.execute(
+        "INSERT INTO settings(key, value) VALUES ('permanent_key_last4', ?1)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        rusqlite::params![last4],
+    )?;
+    tx.execute(
+        "INSERT INTO settings(key, value) VALUES ('permanent_key_created_at', ?1)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        rusqlite::params![created_at.to_string()],
+    )?;
+    tx.commit()?;
+    Ok((key, last4, created_at))
+}
+
+/// Read permanent key metadata (last4 + created_at) without ever exposing the
+/// hash or plaintext. Returns `None` when no key has been generated yet (hash
+/// is the empty seed row).
+pub fn get_permanent_key_meta(db_path: &PathBuf) -> anyhow::Result<Option<(String, i64)>> {
+    let conn = Connection::open(db_path)?;
+    let hash: Option<String> = conn
+        .query_row(
+            "SELECT value FROM settings WHERE key = 'permanent_key_hash'",
+            [],
+            |row| row.get(0),
+        )
+        .ok();
+
+    // Empty hash means the key has never been generated.
+    if hash.as_deref().unwrap_or("").is_empty() {
+        return Ok(None);
+    }
+
+    let last4: String = conn
+        .query_row(
+            "SELECT value FROM settings WHERE key = 'permanent_key_last4'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap_or_default();
+
+    let created_at: i64 = conn
+        .query_row(
+            "SELECT value FROM settings WHERE key = 'permanent_key_created_at'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+
+    Ok(Some((last4, created_at)))
+}
+
+/// Verify the permanent dashboard key against the stored Argon2id hash.
+/// Returns `true` when the presented key matches.  Blocking — call from
+/// `spawn_blocking` in async contexts.
+/// Used in tests and available for future operator-authentication use cases.
+#[allow(dead_code)]
+pub fn verify_permanent_key(db_path: &PathBuf, presented: &str) -> bool {
+    let conn = match Connection::open(db_path) {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+    let hash: Option<String> = conn
+        .query_row(
+            "SELECT value FROM settings WHERE key = 'permanent_key_hash'",
+            [],
+            |row| row.get(0),
+        )
+        .ok();
+    let Some(h) = hash.filter(|s| !s.is_empty()) else {
+        return false;
+    };
+    PasswordHash::new(&h)
+        .map(|parsed| Argon2::default().verify_password(presented.as_bytes(), &parsed).is_ok())
+        .unwrap_or(false)
+}
+
 pub fn is_valid_pairing_attempt(code: &str) -> bool {
     let trimmed = code.trim();
     trimmed.len() >= 6 && trimmed.len() <= 16

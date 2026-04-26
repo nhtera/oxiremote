@@ -29,6 +29,10 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/api/agent/logs/recent", get(api_agent_logs_recent))
         .route("/api/agent/qr", get(api_agent_qr))
         .route("/api/agent/keys/one-time", post(api_agent_keys_one_time))
+        .route(
+            "/api/agent/keys/permanent",
+            get(api_agent_keys_permanent_get).post(api_agent_keys_permanent_post),
+        )
         .route("/api/agent/approvals/pending", get(api_agent_approvals_pending))
         .route("/api/agent/approvals/{id}/approve", post(api_agent_approve))
         .route("/api/agent/approvals/{id}/reject", post(api_agent_reject))
@@ -371,6 +375,75 @@ async fn api_agent_permissions_grant(
     }
 }
 
+/// GET /api/agent/keys/permanent — return metadata (last4 + created_at) for
+/// the host's permanent dashboard API key. Never returns the hash or plaintext.
+/// Returns 404 when no permanent key has been generated yet.
+async fn api_agent_keys_permanent_get(
+    State(state): State<Arc<AppState>>,
+) -> impl IntoResponse {
+    match crate::auth::get_permanent_key_meta(&state.db_path) {
+        Ok(Some((last4, created_at))) => (
+            StatusCode::OK,
+            Json(json!({ "last4": last4, "created_at": created_at })),
+        )
+            .into_response(),
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "no permanent key generated yet" })),
+        )
+            .into_response(),
+        Err(err) => {
+            warn!(error=%err, "get permanent key meta failed");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+/// POST /api/agent/keys/permanent — rotate the host's permanent dashboard API
+/// key. Generates a fresh `sk-<base64>` token, stores the Argon2id hash, and
+/// returns the plaintext **once**. Emits `AgentEvent::PermanentKeyRotated` so
+/// other dashboard tabs can refresh their metadata.
+///
+/// This key is stored in the `settings` table (not `trusted_devices`) because
+/// it belongs to the host/dashboard itself, not to any paired client device.
+/// Per-device keys in `trusted_devices.api_key_hash` are unaffected.
+async fn api_agent_keys_permanent_post(
+    State(state): State<Arc<AppState>>,
+) -> impl IntoResponse {
+    let db_path = state.db_path.clone();
+    // Argon2id hashing is CPU-intensive; run on the blocking thread pool.
+    let result = tokio::task::spawn_blocking(move || {
+        crate::auth::rotate_permanent_key(&db_path)
+    })
+    .await;
+
+    match result {
+        Ok(Ok((api_key, last4, created_at))) => {
+            info!(last4 = %last4, "permanent key rotated");
+            state
+                .event_bus
+                .send(AgentEvent::PermanentKeyRotated { last4: last4.clone() });
+            (
+                StatusCode::OK,
+                Json(json!({
+                    "api_key": api_key,
+                    "last4": last4,
+                    "created_at": created_at,
+                })),
+            )
+                .into_response()
+        }
+        Ok(Err(err)) => {
+            warn!(error=%err, "permanent key rotation failed");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+        Err(err) => {
+            warn!(error=%err, "spawn_blocking panic during permanent key rotation");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
 /// GET /api/agent/devices — host-only device list. The user-facing
 /// `/api/devices` endpoint requires a session cookie, but the agent dashboard
 /// at `/agent` runs before any device has paired, so we expose an
@@ -405,5 +478,119 @@ async fn api_agent_settings_auto_approve(
             warn!(error=%err, "set auto_approve failed");
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use dashmap::DashMap;
+
+    use crate::{auth, db::{init_db, now_ts}, local_sites, AppState};
+
+    fn test_db(name: &str) -> PathBuf {
+        let db_path = std::env::temp_dir().join(format!(
+            "oxiremote-agentapi-{name}-{}-{}.sqlite",
+            std::process::id(),
+            now_ts()
+        ));
+        let _ = std::fs::remove_file(&db_path);
+        init_db(&db_path).unwrap();
+        db_path
+    }
+
+    fn test_state(name: &str) -> std::sync::Arc<AppState> {
+        let db_path = test_db(name);
+        let data_dir = db_path.parent().unwrap().join(format!("oxi-data-agentapi-{name}"));
+        std::fs::create_dir_all(&data_dir).unwrap();
+        std::sync::Arc::new(AppState {
+            db_path,
+            signing_key: b"01234567890123456789012345678901".to_vec(),
+            secure_cookies: false,
+            terminal_sessions: DashMap::new(),
+            preview_targets: DashMap::new(),
+            preview_health: DashMap::new(),
+            local_sites: local_sites::new_cache(),
+            proxy_allowed_ports: std::sync::Arc::new(std::sync::RwLock::new(
+                std::collections::HashSet::new(),
+            )),
+            pairing_attempts: DashMap::new(),
+            workspace_root: PathBuf::from("."),
+            host_info: crate::host::HostInfo {
+                host_id: "test-host-id".to_string(),
+                label: "test-host".to_string(),
+                platform: "test".to_string(),
+            },
+            vapid_keys: std::sync::Arc::new(
+                crate::push::load_or_create_vapid(&data_dir).unwrap(),
+            ),
+            notify_token: "test-token".to_string(),
+            http_client: reqwest::Client::new(),
+            preview_client: reqwest::Client::new(),
+            rate_limiter: std::sync::Arc::new(crate::security::rate_limit::RateLimiter::new()),
+            event_bus: crate::events::EventBus::new(),
+            tunnel_url: std::sync::Arc::new(std::sync::RwLock::new(None)),
+            latest_tunnel_step: std::sync::Arc::new(std::sync::RwLock::new(None)),
+            recent_logs: std::sync::Arc::new(std::sync::Mutex::new(
+                std::collections::VecDeque::new(),
+            )),
+            desktop_available: false,
+            desktop_service: None,
+        })
+    }
+
+    /// GET returns metadata only — last4 + created_at, no hash, no plaintext.
+    #[test]
+    fn permanent_key_get_returns_last4_only() {
+        let state = test_state("pk-get");
+        // No key yet — meta returns None.
+        assert!(auth::get_permanent_key_meta(&state.db_path).unwrap().is_none());
+
+        // Rotate once.
+        let (plaintext, last4, created_at) = auth::rotate_permanent_key(&state.db_path).unwrap();
+        let (meta_last4, meta_created_at) = auth::get_permanent_key_meta(&state.db_path)
+            .unwrap()
+            .expect("meta should exist after rotation");
+
+        // Metadata matches.
+        assert_eq!(meta_last4, last4);
+        assert_eq!(meta_created_at, created_at);
+
+        // Sanity: meta does NOT contain the full key.
+        assert!(meta_last4.len() == 4);
+        assert!(!plaintext.is_empty());
+        assert!(plaintext.starts_with("sk-"));
+        // last4 is the tail of the full plaintext key.
+        assert!(plaintext.ends_with(&last4));
+    }
+
+    /// POST rotates the Argon2 hash — the new hash matches the new key.
+    #[test]
+    fn permanent_key_post_rotates_hash() {
+        let state = test_state("pk-rotate");
+        let (key1, _, _) = auth::rotate_permanent_key(&state.db_path).unwrap();
+        let (key2, _, _) = auth::rotate_permanent_key(&state.db_path).unwrap();
+
+        // Old key must no longer verify.
+        assert!(!auth::verify_permanent_key(&state.db_path, &key1));
+        // New key must verify.
+        assert!(auth::verify_permanent_key(&state.db_path, &key2));
+    }
+
+    /// After rotation the old plaintext fails verification — it's invalidated.
+    #[test]
+    fn permanent_key_post_invalidates_old_key() {
+        let state = test_state("pk-invalidate");
+        let (old_key, _, _) = auth::rotate_permanent_key(&state.db_path).unwrap();
+
+        // Old key verifies before rotation.
+        assert!(auth::verify_permanent_key(&state.db_path, &old_key));
+
+        // Rotate to new key.
+        let (_new_key, _, _) = auth::rotate_permanent_key(&state.db_path).unwrap();
+
+        // Old key no longer authenticates.
+        assert!(!auth::verify_permanent_key(&state.db_path, &old_key));
     }
 }
