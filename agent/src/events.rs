@@ -17,6 +17,27 @@ pub enum StepStatus {
     Pending,
 }
 
+/// Granular tunnel lifecycle step. Emitted as `AgentEvent::TunnelStepChanged`
+/// so both the TUI and the WebUI can render a live 5-step checklist.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "snake_case", tag = "step")]
+pub enum TunnelStep {
+    /// Locating / downloading cloudflared binary.
+    Preparing,
+    /// cloudflared process spawned, waiting for URL.
+    Connecting,
+    /// URL captured; tunnel transport is up.
+    Tunneling,
+    /// Running HTTP health probes to confirm reachability.
+    Verifying,
+    /// Tunnel healthy and serving requests.
+    Ready,
+    /// Tunnel failed — `reason` describes the root cause.
+    Failed {
+        reason: String,
+    },
+}
+
 #[derive(Debug, Clone, Copy, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum LogLevel {
@@ -78,6 +99,25 @@ pub enum AgentEvent {
         status: String,
         elapsed_ms: u64,
         ok: bool,
+    },
+    /// cloudflared process exited unexpectedly. Distinct from `TunnelUrlChanged`
+    /// (which has one-shot URL semantics). Consumers must handle this to surface
+    /// a dead-tunnel indicator; no auto-restart is performed — quick-tunnel URLs
+    /// rotate on each spawn, which would silently invalidate active QR codes.
+    TunnelDown {
+        reason: String,
+    },
+    /// Granular tunnel progress — emitted at each lifecycle step so the TUI
+    /// and WebUI can render a 5-row checklist with live sub-text.
+    TunnelStepChanged {
+        step: TunnelStep,
+        /// Monotonically increasing attempt counter (1-based); resets on each
+        /// fresh tunnel spawn so the UI can distinguish retried attempts.
+        attempt: u32,
+        /// Optional human-readable detail string (e.g. cloudflared download URL,
+        /// probe HTTP status, error snippet).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        info: Option<String>,
     },
 }
 

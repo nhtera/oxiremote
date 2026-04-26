@@ -9,6 +9,7 @@ import HealthCheckConsole, {
 import RecentLogsCard, { type LogEntry } from '../../components/recent-logs-card'
 import PermissionsWidget from '../../components/permissions-widget'
 import DevicesPanel from '../../components/devices-panel'
+import { TunnelProgressCard } from '../../components/tunnel-status-card'
 import { Button, SkeletonCard, StateView } from '../../components/ui'
 
 // Host-dashboard home. Live-updates via the `/api/agent/events` SSE stream;
@@ -44,6 +45,7 @@ interface PendingDevice {
 
 type AgentEvent =
   | { type: 'tunnel_url_changed'; url: string }
+  | { type: 'tunnel_down'; reason: string }
   | { type: 'device_connected'; device_id: string }
   | { type: 'device_disconnected'; device_id: string }
   | { type: 'device_pending'; device_id: string; ip: string; ua_parsed: string; first_seen: number }
@@ -54,6 +56,7 @@ type AgentEvent =
   | { type: 'otk_expired'; token_prefix: string }
   | { type: 'log_entry'; level: 'info' | 'warn' | 'error'; module: string; ts: number; msg: string }
   | { type: 'step_change'; name: string; status: string; sub?: string }
+  | { type: 'tunnel_step_changed'; step: string; attempt: number; info?: string; reason?: string }
   | {
       type: 'health_probe'
       attempt: number
@@ -74,6 +77,9 @@ export default function AgentHomePage() {
   const [otkError, setOtkError] = useState<string | null>(null)
   const [probeLog, setProbeLog] = useState<ProbeEntry[]>([])
   const [tunnelHealthy, setTunnelHealthy] = useState(false)
+  const [tunnelDown, setTunnelDown] = useState(false)
+  // Set true when tunnel_step_changed { step: 'ready' } fires — hides the progress card.
+  const [tunnelStepReady, setTunnelStepReady] = useState(false)
   const [recentLogs, setRecentLogs] = useState<LogEntry[]>([])
   const [fetchStatus, setFetchStatus] = useState<FetchStatus>('loading')
   const [retryNonce, setRetryNonce] = useState(0)
@@ -109,10 +115,17 @@ export default function AgentHomePage() {
     es.onmessage = (msg) => {
       try {
         const ev: AgentEvent = JSON.parse(msg.data)
-        if (ev.type === 'tunnel_url_changed') {
+        if (ev.type === 'tunnel_step_changed' && ev.step === 'ready') {
+          setTunnelStepReady(true)
+        } else if (ev.type === 'tunnel_url_changed') {
           setState((s) => (s ? { ...s, tunnel_url: ev.url } : s))
           setTunnelHealthy(false)
+          setTunnelDown(false)
+          setTunnelStepReady(false)
           setProbeLog([])
+        } else if (ev.type === 'tunnel_down') {
+          setTunnelDown(true)
+          setTunnelHealthy(false)
         } else if (ev.type === 'health_probe') {
           if (ev.ok) setTunnelHealthy(true)
           setProbeLog((prev) => {
@@ -210,6 +223,11 @@ export default function AgentHomePage() {
 
   return (
     <div className="p-6 max-w-6xl mx-auto">
+      {tunnelDown && (
+        <div className="mb-4 px-4 py-3 rounded-md bg-danger/10 border border-danger/40 text-danger text-sm font-medium">
+          Tunnel went down — connections will fail. Restart the agent to reconnect.
+        </div>
+      )}
       <div className="grid grid-cols-1 lg:grid-cols-[minmax(0,1fr)_minmax(0,1.4fr)] gap-6">
         <aside className="lg:sticky lg:top-6 self-start space-y-4">
           <PairingCard
@@ -220,16 +238,17 @@ export default function AgentHomePage() {
             errorMessage={otkError}
           />
 
-          {/* Health-check console only stays on screen while tunnel hasn't
-              passed a probe; once it does, we hide the noise. */}
-          {tunnelUrl && !tunnelHealthy && (
+          {/* Tunnel progress checklist — visible while tunnel startup is in progress.
+              Once tunnel_step_changed { step: 'ready' } fires and tunnel is healthy,
+              the card disappears so the operator's attention stays on the pairing card. */}
+          {!tunnelStepReady && !tunnelHealthy && (
+            <TunnelProgressCard />
+          )}
+          {/* Legacy health-check probe console once we have a URL but no step events
+              (e.g. named tunnel path that skips step events). */}
+          {tunnelUrl && !tunnelHealthy && tunnelStepReady && (
             <Card title="Tunnel health">
               <HealthCheckConsole entries={probeLog} reachable={tunnelHealthy} />
-            </Card>
-          )}
-          {!tunnelUrl && fetchStatus === 'ready' && (
-            <Card title="Tunnel health">
-              <HealthCheckConsole entries={probeLog} reachable={false} />
             </Card>
           )}
         </aside>

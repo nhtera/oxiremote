@@ -28,13 +28,13 @@ pub fn show_startup(addr: SocketAddr) {
     });
 }
 
-/// Subscribe to the event bus and surface device-pending events as desktop
-/// notifications. Throttles per-device so a flapping client cannot spam.
+/// Subscribe to the event bus and surface device-pending and tunnel-down events
+/// as desktop notifications. Throttles per-key (device or "tunnel") so
+/// a flapping client/process cannot spam.
 pub fn spawn_event_notifier(bus: Arc<EventBus>) {
     let mut rx = bus.subscribe();
     tokio::spawn(async move {
-        // (device_id, last_fired_instant) — single-slot to keep this simple;
-        // pending notifications are rare, repeats are rarer still.
+        // (dedup_key, last_fired_instant) — single-slot; one category at a time.
         let mut last_fired: Option<(String, std::time::Instant)> = None;
         const DEDUP_WINDOW: Duration = Duration::from_secs(30);
 
@@ -54,6 +54,23 @@ pub fn spawn_event_notifier(bus: Arc<EventBus>) {
                             .appname(APP_NAME)
                             .summary("OxiRemote — device pending")
                             .body(&body)
+                            .timeout(notify_rust::Timeout::Milliseconds(8_000))
+                            .show();
+                    });
+                }
+                Ok(AgentEvent::TunnelDown { .. }) => {
+                    const TUNNEL_DEDUP_KEY: &str = "tunnel_down";
+                    if let Some((ref last_id, last_at)) = last_fired
+                        && last_id == TUNNEL_DEDUP_KEY && last_at.elapsed() < DEDUP_WINDOW {
+                            continue;
+                        }
+                    last_fired = Some((TUNNEL_DEDUP_KEY.to_string(), std::time::Instant::now()));
+
+                    tokio::task::spawn_blocking(move || {
+                        let _ = notify_rust::Notification::new()
+                            .appname(APP_NAME)
+                            .summary("OxiRemote — tunnel down")
+                            .body("Tunnel went down — connections will fail.")
                             .timeout(notify_rust::Timeout::Milliseconds(8_000))
                             .show();
                     });

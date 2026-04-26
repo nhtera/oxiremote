@@ -119,6 +119,11 @@ fn default_data_dir() -> anyhow::Result<PathBuf> {
 }
 
 fn main() -> anyhow::Result<()> {
+    // Sweep any leftover `.exe.bak` files from a previous Windows self-update
+    // (the running process holds an exclusive lock on the binary until exit).
+    // No-op on Unix.
+    update::cleanup_stale_bak();
+
     // Subcommand dispatch BEFORE the tokio runtime so `notify` runs on a tiny
     // single-threaded runtime and the long-lived server uses the full one.
     let argv: Vec<String> = std::env::args().collect();
@@ -267,10 +272,7 @@ fn run_with_tui() -> anyhow::Result<()> {
     let lock = instance_lock::InstanceLock::acquire(&data_dir)
         .context("acquire instance lock")?;
 
-    // Init db on the main thread before the TUI starts reading the active OTK.
-    // `init_db` is idempotent; `server_main` calls it again on its runtime.
     let db_path = data_dir.join("oxiremote.sqlite");
-    db::init_db(&db_path).context("init db")?;
 
     let bus_for_server = bus.clone();
     std::thread::Builder::new()
@@ -572,6 +574,9 @@ async fn server_main(event_bus: Arc<EventBus>) -> anyhow::Result<()> {
         .layer(TraceLayer::new_for_http());
 
     let addr: SocketAddr = SocketAddr::from(([127, 0, 0, 1], AGENT_PORT));
+    // The tunnel-origin detection in route_scope relies on the agent binding
+    // loopback-only. If this assert fires the threat model breaks.
+    debug_assert!(addr.ip().is_loopback(), "agent must bind loopback only");
     info!(%addr, "starting agent server");
 
     // Dev affordance: tell the operator which URL to open. If the SPA has
@@ -616,7 +621,7 @@ async fn server_main(event_bus: Arc<EventBus>) -> anyhow::Result<()> {
                     None
                 }
             },
-            None => match tunnel::ensure_quick_tunnel(addr, cloudflared).await {
+            None => match tunnel::ensure_quick_tunnel(addr, cloudflared, tunnel_state.event_bus.clone()).await {
                 Ok(url) => {
                     info!(%url, "quick tunnel ready");
                     Some(url)
@@ -635,15 +640,29 @@ async fn server_main(event_bus: Arc<EventBus>) -> anyhow::Result<()> {
                 .event_bus
                 .send(events::AgentEvent::TunnelUrlChanged { url: u.clone() });
 
+            // Step 4 — tunnel transport up; begin health probes.
+            tunnel_state.event_bus.send(events::AgentEvent::TunnelStepChanged {
+                step: events::TunnelStep::Verifying,
+                attempt: 1,
+                info: Some("running HTTP health probes…".into()),
+            });
+
             // Verify reachability — emits HealthProbe events per attempt so the
             // TUI/dashboard can show "DNS not propagated yet" instead of going silent.
             let healthy = health_check::run_health_check(
-                u,
+                u.clone(),
                 tunnel_state.event_bus.clone(),
                 tunnel_state.http_client.clone(),
             )
             .await;
-            if !healthy {
+            if healthy {
+                // Step 5 — all probes passed.
+                tunnel_state.event_bus.send(events::AgentEvent::TunnelStepChanged {
+                    step: events::TunnelStep::Ready,
+                    attempt: 1,
+                    info: Some(u),
+                });
+            } else {
                 warn!("tunnel URL did not pass health check within timeout");
             }
         }

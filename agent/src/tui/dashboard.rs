@@ -21,7 +21,7 @@ use ratatui::{
 };
 
 use super::approval;
-use crate::events::{AgentEvent, EventBus, StepStatus};
+use crate::events::{AgentEvent, EventBus, StepStatus, TunnelStep};
 use crate::{approval as approval_db, one_time_keys};
 
 type Term = Terminal<CrosstermBackend<io::Stdout>>;
@@ -29,6 +29,9 @@ type Term = Terminal<CrosstermBackend<io::Stdout>>;
 struct State {
     db_path: PathBuf,
     tunnel_url: Option<String>,
+    /// Set to `Some(reason)` when `TunnelDown` fires; renders the tunnel step
+    /// red and shows "tunnel down" instead of the URL.
+    tunnel_down: Option<String>,
     steps: Vec<super::step_progress::Step>,
     connected_devices: usize,
     last_log: Option<String>,
@@ -69,16 +72,27 @@ impl State {
         Self {
             db_path,
             tunnel_url: None,
+            tunnel_down: None,
             steps: vec![
                 Step {
-                    name: "Server".into(),
+                    name: "Preparing".into(),
                     status: StepStatus::Done,
-                    sub: Some("localhost:8787".into()),
+                    sub: Some("server ready".into()),
                 },
                 Step {
-                    name: "Tunnel".into(),
+                    name: "Connecting".into(),
                     status: StepStatus::Active,
-                    sub: Some("starting…".into()),
+                    sub: Some("starting cloudflared…".into()),
+                },
+                Step {
+                    name: "Tunneling".into(),
+                    status: StepStatus::Pending,
+                    sub: None,
+                },
+                Step {
+                    name: "Verifying".into(),
+                    status: StepStatus::Pending,
+                    sub: None,
                 },
                 Step {
                     name: "Ready".into(),
@@ -131,13 +145,68 @@ impl State {
 
     fn apply(&mut self, event: &AgentEvent) {
         match event {
+            AgentEvent::TunnelStepChanged { step, info, .. } => {
+                // Map TunnelStep enum → step name in the checklist.
+                let (step_name, sub_text) = match step {
+                    TunnelStep::Preparing => (
+                        "Preparing",
+                        info.clone().unwrap_or_else(|| "locating cloudflared…".into()),
+                    ),
+                    TunnelStep::Connecting => (
+                        "Connecting",
+                        info.clone().unwrap_or_else(|| "spawning cloudflared…".into()),
+                    ),
+                    TunnelStep::Tunneling => (
+                        "Tunneling",
+                        info.clone().unwrap_or_else(|| "tunnel up".into()),
+                    ),
+                    TunnelStep::Verifying => (
+                        "Verifying",
+                        info.clone().unwrap_or_else(|| "checking reachability…".into()),
+                    ),
+                    TunnelStep::Ready => (
+                        "Ready",
+                        info.clone().unwrap_or_else(|| "serving".into()),
+                    ),
+                    TunnelStep::Failed { reason } => {
+                        // Mark the currently-active step as failed by setting sub text.
+                        for s in &mut self.steps {
+                            if matches!(s.status, StepStatus::Active) {
+                                s.sub = Some(format!("failed: {reason}"));
+                            }
+                        }
+                        return;
+                    }
+                };
+
+                // Mark all steps before this one as Done, this one as Active,
+                // and all after as Pending.
+                let names = ["Preparing", "Connecting", "Tunneling", "Verifying", "Ready"];
+                let target_idx = names.iter().position(|&n| n == step_name).unwrap_or(0);
+                for (i, s) in self.steps.iter_mut().enumerate() {
+                    if i < target_idx {
+                        s.status = StepStatus::Done;
+                    } else if i == target_idx {
+                        // Ready is the terminal state — mark Done.
+                        s.status = if step_name == "Ready" {
+                            StepStatus::Done
+                        } else {
+                            StepStatus::Active
+                        };
+                        s.sub = Some(sub_text.clone());
+                    } else {
+                        s.status = StepStatus::Pending;
+                    }
+                }
+            }
             AgentEvent::TunnelUrlChanged { url } => {
                 self.tunnel_url = Some(url.clone());
-                if let Some(s) = self.steps.iter_mut().find(|s| s.name == "Tunnel") {
+                // Update Tunneling step sub-text with the actual URL.
+                if let Some(s) = self.steps.iter_mut().find(|s| s.name == "Tunneling") {
                     s.status = StepStatus::Done;
                     s.sub = Some(url.clone());
                 }
-                if let Some(s) = self.steps.iter_mut().find(|s| s.name == "Ready") {
+                if let Some(s) = self.steps.iter_mut().find(|s| s.name == "Verifying") {
                     s.status = StepStatus::Active;
                     s.sub = Some("verifying…".into());
                 }
@@ -152,13 +221,19 @@ impl State {
                 while self.probe_log.len() > PROBE_LOG_MAX {
                     self.probe_log.remove(0);
                 }
-                if let Some(s) = self.steps.iter_mut().find(|s| s.name == "Ready") {
+                if let Some(s) = self.steps.iter_mut().find(|s| s.name == "Verifying") {
                     if *ok {
                         s.status = StepStatus::Done;
-                        s.sub = Some("waiting for devices".into());
+                        s.sub = Some(format!("#{attempt} ok ({}ms)", elapsed_ms));
                     } else {
+                        s.status = StepStatus::Active;
                         s.sub = Some(format!("#{attempt} → {status}"));
                     }
+                }
+                if *ok
+                    && let Some(s) = self.steps.iter_mut().find(|s| s.name == "Ready") {
+                    s.status = StepStatus::Done;
+                    s.sub = Some("waiting for devices".into());
                 }
             }
             AgentEvent::DeviceConnected { .. } => {
@@ -176,6 +251,22 @@ impl State {
             }
             AgentEvent::OtkIssued { .. } | AgentEvent::OtkUsed { .. } | AgentEvent::OtkExpired { .. } => {
                 self.refresh_otk_from_db();
+            }
+            AgentEvent::TunnelDown { reason } => {
+                self.tunnel_down = Some(reason.clone());
+                // Mark the currently-active tunnel step with a "down" sub-text.
+                // The Tunneling step is the most appropriate anchor.
+                if let Some(s) = self.steps.iter_mut().find(|s| s.name == "Tunneling") {
+                    s.status = StepStatus::Active; // reuse Active coloring for dead state
+                    s.sub = Some(format!("tunnel down: {}", reason.chars().take(40).collect::<String>()));
+                }
+                // Reset downstream steps to Pending so the checklist looks consistent.
+                for name in ["Verifying", "Ready"] {
+                    if let Some(s) = self.steps.iter_mut().find(|s| s.name == name) {
+                        s.status = StepStatus::Pending;
+                        s.sub = None;
+                    }
+                }
             }
             _ => {}
         }
@@ -290,16 +381,21 @@ fn copy_to_clipboard(value: &str) -> Result<()> {
 
 fn draw(f: &mut ratatui::Frame<'_>, state: &State) {
     let area = f.area();
+    // 5-step checklist needs more vertical room than the old 3-step version.
+    // Header height = border (1) + top padding (1) + 5 rows + bottom border (1) = 8.
+    // In narrow terminals (<80 cols) we fall back to the 3-row compact display at h=6.
+    let wide = area.width >= 80;
+    let header_h = if wide { 8u16 } else { 6 };
     let outer = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(6),  // steps + header
-            Constraint::Min(14),    // QR + info OR logs
-            Constraint::Length(3),  // footer (keybinds + last log)
+            Constraint::Length(header_h), // steps + header
+            Constraint::Min(14),          // QR + info OR logs
+            Constraint::Length(3),        // footer (keybinds + last log)
         ])
         .split(area);
 
-    render_header(f, outer[0], state);
+    render_header(f, outer[0], state, wide);
     if state.show_logs {
         render_logs(f, outer[1], state);
     } else {
@@ -308,7 +404,7 @@ fn draw(f: &mut ratatui::Frame<'_>, state: &State) {
     render_footer(f, outer[2], state);
 }
 
-fn render_header(f: &mut ratatui::Frame<'_>, area: Rect, state: &State) {
+fn render_header(f: &mut ratatui::Frame<'_>, area: Rect, state: &State, wide: bool) {
     let block = Block::default()
         .borders(Borders::BOTTOM)
         .border_style(Style::default().fg(Color::DarkGray))
@@ -326,7 +422,19 @@ fn render_header(f: &mut ratatui::Frame<'_>, area: Rect, state: &State) {
         width: area.width.saturating_sub(2),
         height: area.height.saturating_sub(2),
     };
-    super::step_progress::render_steps(f, inner, &state.steps);
+
+    if wide {
+        // Full 5-step checklist.
+        super::step_progress::render_steps(f, inner, &state.steps);
+    } else {
+        // Narrow terminal — compact 3-row summary: Server | Tunnel | Ready.
+        let compact: Vec<_> = state
+            .steps
+            .iter()
+            .filter(|s| matches!(s.name.as_str(), "Preparing" | "Tunneling" | "Ready"))
+            .collect();
+        super::step_progress::render_steps_refs(f, inner, &compact);
+    }
 }
 
 fn render_body(f: &mut ratatui::Frame<'_>, area: Rect, state: &State) {
@@ -340,29 +448,48 @@ fn render_body(f: &mut ratatui::Frame<'_>, area: Rect, state: &State) {
 }
 
 fn render_qr_panel(f: &mut ratatui::Frame<'_>, area: Rect, state: &State) {
+    // Determine OTK expiry for dim styling.
+    let otk_expired = match state.otk_expires_at {
+        Some(exp) => now_secs() >= exp,
+        None => false,
+    };
+
+    let title = if otk_expired { " Pair a device (key expired — press r) " } else { " Pair a device " };
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::DarkGray))
-        .title(" Pair a device ");
+        .title(title);
     let inner = block.inner(area);
     f.render_widget(block, area);
 
+    if state.tunnel_url.is_none() {
+        // Tunnel not yet ready — show a placeholder instead of passing the
+        // fallback string into QrCode::new(), which would render garbage.
+        let placeholder = Paragraph::new("Tunnel not ready yet\u{2026}")
+            .alignment(Alignment::Center)
+            .style(Style::default().fg(Color::DarkGray));
+        f.render_widget(placeholder, inner);
+        return;
+    }
+
     let payload = state.qr_payload();
-    let body = if state.tunnel_url.is_some() {
-        match QrCode::new(payload.as_bytes()) {
-            Ok(code) => code
-                .render::<unicode::Dense1x2>()
-                .dark_color(unicode::Dense1x2::Light)
-                .light_color(unicode::Dense1x2::Dark)
-                .quiet_zone(false)
-                .build(),
-            Err(_) => payload,
-        }
-    } else {
-        payload
+    let body = match QrCode::new(payload.as_bytes()) {
+        Ok(code) => code
+            .render::<unicode::Dense1x2>()
+            .dark_color(unicode::Dense1x2::Light)
+            .light_color(unicode::Dense1x2::Dark)
+            .quiet_zone(false)
+            .build(),
+        Err(_) => payload,
     };
 
-    let para = Paragraph::new(body).alignment(Alignment::Center);
+    // Dim the QR when the OTK has expired — scanning it will fail anyway.
+    let qr_style = if otk_expired {
+        Style::default().add_modifier(Modifier::DIM)
+    } else {
+        Style::default()
+    };
+    let para = Paragraph::new(body).alignment(Alignment::Center).style(qr_style);
     f.render_widget(para, inner);
 }
 
@@ -374,14 +501,20 @@ fn render_info_panel(f: &mut ratatui::Frame<'_>, area: Rect, state: &State) {
     let inner = block.inner(area);
     f.render_widget(block, area);
 
-    let url = state
-        .tunnel_url
-        .clone()
-        .unwrap_or_else(|| "—".to_string());
+    let url = if state.tunnel_down.is_some() {
+        "tunnel down — connections will fail".to_string()
+    } else {
+        state.tunnel_url.clone().unwrap_or_else(|| "—".to_string())
+    };
+    let url_style = if state.tunnel_down.is_some() {
+        Style::default().fg(Color::Red)
+    } else {
+        Style::default().fg(Color::White)
+    };
     let devices_str = state.connected_devices.to_string();
     let otk_display = format_otk_status(state);
     let mut lines = vec![
-        kv("App URL", &url),
+        kv_styled("App URL", &url, url_style),
         kv("One-Time Key", &otk_display),
         kv("Connected Devices", &devices_str),
     ];
@@ -489,12 +622,16 @@ fn render_footer(f: &mut ratatui::Frame<'_>, area: Rect, state: &State) {
 }
 
 fn kv<'a>(k: &'a str, v: &'a str) -> Line<'a> {
+    kv_styled(k, v, Style::default().fg(Color::White))
+}
+
+fn kv_styled<'a>(k: &'a str, v: &'a str, value_style: Style) -> Line<'a> {
     Line::from(vec![
         Span::styled(
             format!("  {:<20}", k),
             Style::default().fg(Color::Gray),
         ),
-        Span::styled(v, Style::default().fg(Color::White)),
+        Span::styled(v, value_style),
     ])
 }
 

@@ -10,6 +10,8 @@ use tar::Archive;
 use tokio::io::AsyncBufReadExt;
 use tracing::info;
 
+use crate::events::{AgentEvent, EventBus, TunnelStep};
+
 fn cloudflared_path(data_dir: &Path) -> PathBuf {
     #[cfg(windows)]
     {
@@ -193,7 +195,15 @@ async fn cloudflared_latest_version() -> anyhow::Result<String> {
 pub async fn ensure_quick_tunnel(
     addr: std::net::SocketAddr,
     cloudflared: PathBuf,
+    bus: Arc<EventBus>,
 ) -> anyhow::Result<String> {
+    // Step 1 — process is about to spawn.
+    bus.send(AgentEvent::TunnelStepChanged {
+        step: TunnelStep::Preparing,
+        attempt: 1,
+        info: Some(format!("cloudflared at {}", cloudflared.display())),
+    });
+
     let mut child = tokio::process::Command::new(&cloudflared)
         .args(["tunnel", "--url", &format!("http://{addr}")])
         .stdout(std::process::Stdio::piped())
@@ -203,6 +213,13 @@ pub async fn ensure_quick_tunnel(
 
     let stderr = child.stderr.take().context("no stderr")?;
     let stdout = child.stdout.take().context("no stdout")?;
+
+    // Step 2 — cloudflared spawned, waiting for tunnel URL on stderr.
+    bus.send(AgentEvent::TunnelStepChanged {
+        step: TunnelStep::Connecting,
+        attempt: 1,
+        info: Some(format!("waiting for tunnel URL on http://{addr}")),
+    });
 
     let re = Regex::new(r"https://[a-z0-9\-]+\.trycloudflare\.com").unwrap();
     let url = Arc::new(tokio::sync::Mutex::new(None::<String>));
@@ -234,14 +251,39 @@ pub async fn ensure_quick_tunnel(
         }
     });
 
+    // Wait for the URL to appear before handing back to the caller.
     for _ in 0..60 {
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
         let u = url.lock().await;
         if let Some(ref tunnel_url) = *u {
+            // Step 3 — URL captured, transport layer is up.
+            bus.send(AgentEvent::TunnelStepChanged {
+                step: TunnelStep::Tunneling,
+                attempt: 1,
+                info: Some(tunnel_url.clone()),
+            });
+
+            // Spawn a separate task that blocks until the child exits, then
+            // fires TunnelDown. No auto-restart — quick-tunnel URLs rotate on
+            // each spawn which would silently invalidate active QR codes.
+            let bus_for_wait = bus.clone();
+            tokio::spawn(async move {
+                let status = child.wait().await;
+                bus_for_wait.send(AgentEvent::TunnelDown {
+                    reason: format!("{status:?}"),
+                });
+            });
             return Ok(tunnel_url.clone());
         }
     }
 
+    bus.send(AgentEvent::TunnelStepChanged {
+        step: TunnelStep::Failed {
+            reason: "timed out waiting for tunnel URL (60 s)".into(),
+        },
+        attempt: 1,
+        info: None,
+    });
     anyhow::bail!("timed out waiting for quick tunnel URL")
 }
 
@@ -292,6 +334,44 @@ pub async fn ensure_named_tunnel(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Verify that `TunnelDown` is emitted when the child exits immediately.
+    /// Uses `/usr/bin/false` (exits 1 immediately) as a stand-in for a crashed
+    /// cloudflared. The URL-scraping loop won't find a URL, so ensure_quick_tunnel
+    /// returns an error; but the child-wait task still fires. We test the task in
+    /// isolation here to avoid the 60-second timeout of the outer loop.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn tunnel_down_fires_when_child_exits() {
+        use crate::events::EventBus;
+
+        let bus = EventBus::new();
+        let mut rx = bus.subscribe();
+
+        // Spawn `/usr/bin/false` which exits immediately with code 1.
+        let mut child = tokio::process::Command::new("/usr/bin/false")
+            .spawn()
+            .expect("spawn /usr/bin/false");
+
+        let bus_clone = bus.clone();
+        tokio::spawn(async move {
+            let status = child.wait().await;
+            bus_clone.send(AgentEvent::TunnelDown {
+                reason: format!("{status:?}"),
+            });
+        });
+
+        // Should receive TunnelDown within 2 seconds.
+        let event = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+            .await
+            .expect("timed out waiting for TunnelDown event")
+            .expect("bus closed unexpectedly");
+
+        assert!(
+            matches!(event, AgentEvent::TunnelDown { .. }),
+            "expected TunnelDown, got {event:?}"
+        );
+    }
 
     #[test]
     fn artifact_supports_mainstream_hosts() {

@@ -159,6 +159,8 @@ pub fn revoke_device(db_path: &PathBuf, device_id: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+// Used in preview.rs integration tests which are cfg(test)-only.
+#[allow(dead_code)]
 pub fn insert_or_update_device(
     db_path: &PathBuf,
     device_id: &str,
@@ -197,12 +199,15 @@ pub struct TrustedDevice {
     pub created_at: i64,
     pub last_seen_at: i64,
     pub revoked_at: Option<i64>,
+    /// NULL in pre-migration rows is surfaced as `None`; the SPA treats it as
+    /// `'approved'` to preserve backward compatibility with legacy devices.
+    pub approval_status: Option<String>,
 }
 
 pub fn list_trusted_devices(db_path: &PathBuf) -> anyhow::Result<Vec<TrustedDevice>> {
     let conn = Connection::open(db_path)?;
     let mut stmt = conn.prepare(
-        "SELECT device_id, label, user_agent, created_at, last_seen_at, revoked_at
+        "SELECT device_id, label, user_agent, created_at, last_seen_at, revoked_at, approval_status
          FROM trusted_devices
          WHERE revoked_at IS NULL
          ORDER BY last_seen_at DESC, created_at DESC",
@@ -216,6 +221,7 @@ pub fn list_trusted_devices(db_path: &PathBuf) -> anyhow::Result<Vec<TrustedDevi
             created_at: row.get(3)?,
             last_seen_at: row.get(4)?,
             revoked_at: row.get(5)?,
+            approval_status: row.get(6)?,
         })
     })?;
 
@@ -434,6 +440,45 @@ mod tests {
         assert!(is_valid_pairing_attempt("ABC123"));
         assert!(!is_valid_pairing_attempt("A"));
         assert!(!is_valid_pairing_attempt("12345678901234567"));
+    }
+
+    #[test]
+    fn list_trusted_devices_includes_approval_status() {
+        let state = test_state("list-approval-status");
+        let conn = Connection::open(&state.db_path).unwrap();
+        let now = now_ts();
+
+        // Insert three devices with distinct approval statuses.
+        for (id, label, status) in [
+            ("dev-approved", "Laptop", "approved"),
+            ("dev-pending", "Phone", "pending"),
+            ("dev-rejected", "Tablet", "rejected"),
+        ] {
+            conn.execute(
+                "INSERT INTO trusted_devices(device_id, label, user_agent, created_at, last_seen_at, revoked_at, approval_status)
+                 VALUES (?1, ?2, NULL, ?3, ?3, NULL, ?4)",
+                params![id, label, now, status],
+            )
+            .unwrap();
+        }
+
+        let devices = list_trusted_devices(&state.db_path).unwrap();
+        assert_eq!(devices.len(), 3);
+
+        let find = |id: &str| {
+            devices
+                .iter()
+                .find(|d| d.device_id == id)
+                .expect("device not found")
+                .approval_status
+                .as_deref()
+                .unwrap_or("")
+                .to_string()
+        };
+
+        assert_eq!(find("dev-approved"), "approved");
+        assert_eq!(find("dev-pending"), "pending");
+        assert_eq!(find("dev-rejected"), "rejected");
     }
 
     #[test]
