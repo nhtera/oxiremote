@@ -1,7 +1,14 @@
 import { useEffect, useMemo, useState } from 'react'
 import { useNavigate, useSearchParams } from 'react-router-dom'
 import { useHostStore } from '../state/host-store'
-import { storeApiKey } from '../lib/api-client'
+import { loadApiKey, storeApiKey } from '../lib/api-client'
+import {
+  formatRelative,
+  listSavedHosts,
+  recordSavedHost,
+  removeSavedHost,
+  type SavedHost,
+} from '../lib/saved-hosts'
 
 // Pairing entry point. Two modes: one-time key (default, the QR-deep-link
 // flow) and pairing code (typed manually from the host's TUI). The two-mode
@@ -30,6 +37,9 @@ export default function LoginPage() {
   const [error, setError] = useState('')
   const [loading, setLoading] = useState(false)
   const [checkingAuth, setCheckingAuth] = useState(true)
+  // Snapshot the saved-hosts list once on mount — adding a new pair after
+  // the form is open shouldn't reorder the panel under the user's finger.
+  const [savedHosts, setSavedHosts] = useState<SavedHost[]>(() => listSavedHosts())
 
   const rejectedError =
     searchParams.get('error') === 'rejected'
@@ -98,8 +108,16 @@ export default function LoginPage() {
       try {
         const body = await res.clone().json()
         await useHostStore.getState().fetchHost()
-        const hostId = useHostStore.getState().currentHostId
-        if (body.api_key && hostId) storeApiKey(hostId, body.api_key)
+        const hostState = useHostStore.getState()
+        const hostId = hostState.currentHostId
+        if (body.api_key && hostId) {
+          storeApiKey(hostId, body.api_key)
+          recordSavedHost({
+            host_id: hostId,
+            label: hostState.label ?? deviceLabel.trim() ?? hostId.slice(0, 8),
+            api_key_last4: String(body.api_key).slice(-4),
+          })
+        }
       } catch {
         await useHostStore.getState().fetchHost()
       }
@@ -140,6 +158,18 @@ export default function LoginPage() {
           window.localStorage.setItem('oxi:device-label', deviceLabel.trim())
         }
         await useHostStore.getState().fetchHost()
+        const hostState = useHostStore.getState()
+        if (hostState.currentHostId) {
+          // OTK auto-approved path: stamp the saved-hosts list so the user
+          // gets a one-tap reconnect next visit. The api_key isn't returned
+          // here (cookie-based session); fall back to "" for last4.
+          const existingKey = loadApiKey(hostState.currentHostId) ?? ''
+          recordSavedHost({
+            host_id: hostState.currentHostId,
+            label: hostState.label ?? deviceLabel.trim() ?? hostState.currentHostId.slice(0, 8),
+            api_key_last4: existingKey.slice(-4),
+          })
+        }
         navigate('/')
         return
       }
@@ -150,6 +180,28 @@ export default function LoginPage() {
     } finally {
       setLoading(false)
     }
+  }
+
+  const tryReconnect = async (h: SavedHost) => {
+    setError('')
+    // Surface the per-host API key into the active-host slot so the fetch
+    // interceptor attaches Bearer for /api/me. If the cookie session is
+    // also alive we'll get a 200; otherwise prune the entry and return.
+    const key = loadApiKey(h.host_id)
+    if (key) storeApiKey(h.host_id, key)
+    try {
+      const res = await fetch('/api/me', { credentials: 'include' })
+      if (res.ok) {
+        await useHostStore.getState().fetchHost()
+        navigate('/', { replace: true })
+        return
+      }
+    } catch {
+      // Network-level error: treat as session expired below.
+    }
+    removeSavedHost(h.host_id)
+    setSavedHosts((list) => list.filter((x) => x.host_id !== h.host_id))
+    setError('That session expired. Pair this device again.')
   }
 
   if (checkingAuth) {
@@ -181,6 +233,34 @@ export default function LoginPage() {
           <div className="mb-4 px-3 py-2.5 rounded-md bg-danger/10 border border-danger/30 text-danger text-sm">
             {rejectedError}
           </div>
+        )}
+
+        {savedHosts.length > 0 && (
+          <section className="mb-5">
+            <h2 className="text-xs font-medium text-text-muted mb-2">Recently paired</h2>
+            <div className="space-y-1.5">
+              {savedHosts.map((h) => (
+                <button
+                  key={h.host_id}
+                  type="button"
+                  onClick={() => tryReconnect(h)}
+                  className="w-full flex items-center gap-2 px-3 py-2 bg-surface-alt border border-border rounded-lg hover:bg-surface-hover transition-colors text-left"
+                >
+                  <span className="w-1.5 h-1.5 rounded-full bg-text-muted shrink-0" />
+                  <div className="flex-1 min-w-0">
+                    <div className="text-sm text-text-primary truncate">{h.label}</div>
+                    <div className="text-xs text-text-muted truncate">
+                      {formatRelative(h.last_seen)}
+                      {h.api_key_last4 ? ` · ····${h.api_key_last4}` : ''}
+                    </div>
+                  </div>
+                </button>
+              ))}
+            </div>
+            <div className="text-center text-xs text-text-muted mt-3">
+              — or pair a new device —
+            </div>
+          </section>
         )}
 
         {/* Mode toggle */}
