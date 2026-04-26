@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -28,6 +29,130 @@ fn sanitize_paths(paths: &[String], root: &Path) -> Result<Vec<String>, &'static
         }
     }
     Ok(paths.to_vec())
+}
+
+/// Per-directory git status overlay used by the file browser. Returns a map
+/// of entry-name (relative to `dir`) → single-letter status char so the SPA
+/// can paint a colored stripe in the file tree without parsing porcelain.
+///
+/// Status precedence: working-tree state wins over index, so a file modified
+/// after staging shows 'M' (the most actionable signal for the user). Caps
+/// the parsed line count at 1000 so a worst-case repo can't blow latency.
+pub async fn status_for_dir(repo: &Path, dir: &Path) -> HashMap<String, char> {
+    let mut map = HashMap::new();
+    let dir_rel = dir
+        .strip_prefix(repo)
+        .unwrap_or(Path::new(""))
+        .to_string_lossy()
+        .replace('\\', "/");
+
+    let mut cmd = Command::new("git");
+    cmd.arg("status").arg("--porcelain=v1").arg("--untracked-files=all").arg("--");
+    if dir_rel.is_empty() {
+        cmd.arg(".");
+    } else {
+        cmd.arg(&dir_rel);
+    }
+    cmd.current_dir(repo);
+
+    let Ok(output) = cmd.output().await else { return map };
+    if !output.status.success() {
+        return map;
+    }
+
+    for (i, line) in String::from_utf8_lossy(&output.stdout).lines().enumerate() {
+        if i >= 1000 {
+            break;
+        }
+        if line.len() < 4 {
+            continue;
+        }
+        let mut chars = line.chars();
+        let x = chars.next().unwrap_or(' ');
+        let y = chars.next().unwrap_or(' ');
+        // Working tree (`Y`) takes precedence over index (`X`) because that's
+        // what the operator most cares about when scanning the tree.
+        let c = match (x, y) {
+            ('?', '?') => '?',
+            (_, 'M') | ('M', _) => 'M',
+            (_, 'A') | ('A', _) => 'A',
+            (_, 'D') | ('D', _) => 'D',
+            (_, 'R') | ('R', _) => 'R',
+            _ => continue,
+        };
+        let path_part = &line[3..];
+        // Trim renamed-from segment ("oldpath -> newpath"); the new name is
+        // what shows in the listing. `Split<&str>` isn't DoubleEndedIterator
+        // so we use `rfind` to slice past the last separator instead.
+        let path_part = match path_part.rfind(" -> ") {
+            Some(idx) => &path_part[idx + 4..],
+            None => path_part,
+        };
+        // Strip the dir prefix, then take the first segment so subdir entries
+        // bubble up as their containing-dir name in the listing.
+        let stripped = if dir_rel.is_empty() {
+            path_part
+        } else {
+            let prefix = format!("{dir_rel}/");
+            path_part.strip_prefix(&prefix).unwrap_or(path_part)
+        };
+        let entry_name = stripped.split('/').next().unwrap_or(stripped).to_string();
+        // Don't downgrade a stronger status: M > A > ? > D for display purposes.
+        map.entry(entry_name).or_insert(c);
+    }
+    map
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::process::Command as StdCommand;
+
+    fn temp_repo(label: &str) -> std::path::PathBuf {
+        let p = std::env::temp_dir().join(format!(
+            "oxi-git-test-{label}-{}-{}",
+            std::process::id(),
+            crate::db::now_ts()
+        ));
+        let _ = std::fs::remove_dir_all(&p);
+        std::fs::create_dir_all(&p).unwrap();
+        let init_ok = StdCommand::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(&p)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        assert!(init_ok, "git init failed — is git on PATH?");
+        // Set up identity so commit doesn't fail in CI.
+        let _ = StdCommand::new("git").args(["config", "user.email", "t@t"]).current_dir(&p).status();
+        let _ = StdCommand::new("git").args(["config", "user.name", "test"]).current_dir(&p).status();
+        let _ = StdCommand::new("git").args(["config", "commit.gpgsign", "false"]).current_dir(&p).status();
+        p
+    }
+
+    #[tokio::test]
+    async fn status_for_dir_parses_modified_added_deleted_untracked() {
+        let repo = temp_repo("status");
+        std::fs::write(repo.join("kept.txt"), b"keep").unwrap();
+        std::fs::write(repo.join("doomed.txt"), b"bye").unwrap();
+        let _ = StdCommand::new("git").args(["add", "-A"]).current_dir(&repo).status();
+        let _ = StdCommand::new("git").args(["commit", "-m", "init", "--quiet"]).current_dir(&repo).status();
+
+        // Modify a tracked file, delete a tracked file, add a new + untracked.
+        std::fs::write(repo.join("kept.txt"), b"changed").unwrap();
+        std::fs::remove_file(repo.join("doomed.txt")).unwrap();
+        std::fs::write(repo.join("brand-new.txt"), b"x").unwrap();
+        let _ = StdCommand::new("git").args(["add", "brand-new.txt"]).current_dir(&repo).status();
+        std::fs::write(repo.join("scratch.tmp"), b"u").unwrap();
+
+        let map = status_for_dir(&repo, &repo).await;
+        assert_eq!(map.get("kept.txt"), Some(&'M'));
+        assert_eq!(map.get("doomed.txt"), Some(&'D'));
+        assert_eq!(map.get("brand-new.txt"), Some(&'A'));
+        assert_eq!(map.get("scratch.tmp"), Some(&'?'));
+
+        let _ = std::fs::remove_dir_all(&repo);
+    }
 }
 
 async fn run_git(root: &Path, args: &[&str]) -> Result<String, (StatusCode, String)> {

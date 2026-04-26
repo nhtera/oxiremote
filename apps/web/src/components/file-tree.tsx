@@ -6,6 +6,9 @@ export interface FileEntry {
   is_dir: boolean
   size: number
   modified: number
+  /** Single-letter porcelain status: 'M' modified, 'A' added, 'D' deleted,
+   *  'R' renamed, '?' untracked. Absent when no overlay (non-git workspace). */
+  git_status?: 'M' | 'A' | 'D' | 'R' | '?'
 }
 
 interface FileTreeProps {
@@ -162,8 +165,13 @@ function FileRow({ index, style, rows, currentPath, selectedPath, onOpenDir, onO
       onTouchEnd={clearLongPress}
       onTouchMove={clearLongPress}
       onTouchCancel={clearLongPress}
+      aria-label={
+        entry.git_status ? `${entry.name} (${gitStatusLabel(entry.git_status)})` : entry.name
+      }
       className={[
-        'cursor-pointer px-2 py-1 text-sm truncate hover:bg-surface-hover rounded',
+        'cursor-pointer pl-2 pr-2 py-1 text-sm truncate hover:bg-surface-hover rounded',
+        'border-l-2',
+        gitStripeClass(entry.git_status),
         entry.is_dir ? 'text-accent font-semibold' : 'text-text-secondary',
         isSelected ? 'bg-surface-hover' : '',
       ].join(' ')}
@@ -175,6 +183,33 @@ function FileRow({ index, style, rows, currentPath, selectedPath, onOpenDir, onO
       )}
     </div>
   )
+}
+
+function gitStripeClass(status: FileEntry['git_status']): string {
+  // Color choices match the SPA convention: untracked/added = success (green),
+  // modified/renamed = warning (yellow), deleted = danger (red).
+  switch (status) {
+    case 'A':
+    case '?':
+      return 'border-l-success'
+    case 'M':
+    case 'R':
+      return 'border-l-warning'
+    case 'D':
+      return 'border-l-danger'
+    default:
+      return 'border-l-transparent'
+  }
+}
+
+function gitStatusLabel(status: NonNullable<FileEntry['git_status']>): string {
+  switch (status) {
+    case 'A': return 'added'
+    case '?': return 'untracked'
+    case 'M': return 'modified'
+    case 'R': return 'renamed'
+    case 'D': return 'deleted'
+  }
 }
 
 function fmtSize(n: number): string {

@@ -4,6 +4,7 @@ import { useHostStore } from '../state/host-store'
 import { useWorkspaceStore } from '../state/workspace-store'
 import FileTree, { type FileEntry } from '../components/file-tree'
 import FileActionsMenu, { type FileAction } from '../components/file-actions-menu'
+import FileSearchInput from '../components/file-search-input'
 import { useConfirm, usePrompt } from '../components/ui'
 
 const CodeEditor = lazy(() => import('../components/code-editor'))
@@ -47,6 +48,8 @@ export default function FilesPage() {
       const params = new URLSearchParams()
       params.set('ws_id', String(wsId))
       if (path) params.set('path', path)
+      // Opt in to the git-status overlay; agent skips it in non-git workspaces.
+      params.set('with_git', '1')
       const res = await fetch(`/api/files/list?${params}`, { credentials: 'include' })
       if (!res.ok) {
         setError(await res.text())
@@ -81,8 +84,7 @@ export default function FilesPage() {
     setDirty(false)
   }
 
-  const openFileByName = async (name: string) => {
-    const filePath = currentPath ? `${currentPath}/${name}` : name
+  const openFileByPath = async (filePath: string) => {
     setError('')
     const params = new URLSearchParams()
     params.set('ws_id', String(wsId))
@@ -104,6 +106,11 @@ export default function FilesPage() {
     setOpenFile(filePath)
     setDirty(false)
     setConflict(null)
+  }
+
+  const openFileByName = async (name: string) => {
+    const filePath = currentPath ? `${currentPath}/${name}` : name
+    await openFileByPath(filePath)
   }
 
   const saveFile = async (overwrite = false) => {
@@ -305,6 +312,19 @@ export default function FilesPage() {
         >
           + actions
         </button>
+        {wsId != null && (
+          <FileSearchInput
+            wsId={wsId}
+            onPick={async (path) => {
+              // Drive currentPath for the breadcrumb + tree, then open the
+              // file directly from its full path so we don't race React state.
+              const lastSlash = path.lastIndexOf('/')
+              const dir = lastSlash >= 0 ? path.slice(0, lastSlash) : ''
+              setCurrentPath(dir)
+              await openFileByPath(path)
+            }}
+          />
+        )}
         <div className="flex-1 min-h-0">
           <FileTree
             currentPath={currentPath}

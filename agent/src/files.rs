@@ -135,6 +135,11 @@ struct FileEntry {
     is_dir: bool,
     size: u64,
     modified: i64,
+    /// Single-letter porcelain status when the workspace is a git repo and
+    /// the client opted in via `with_git=1`. None when no overlay applies so
+    /// non-git workspaces stay zero-cost.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    git_status: Option<char>,
 }
 
 #[derive(Deserialize)]
@@ -145,6 +150,11 @@ pub struct ListQuery {
     show_hidden: Option<bool>,
     #[serde(default)]
     ws_id: Option<i64>,
+    /// Opt-in for git-status overlay. The walker invokes `git status` per
+    /// listed directory; we keep it gated so big non-git workspaces don't
+    /// pay the fork cost.
+    #[serde(default)]
+    with_git: Option<bool>,
 }
 
 pub async fn api_files_list(
@@ -194,8 +204,24 @@ pub async fn api_files_list(
             is_dir: meta.is_dir(),
             size: meta.len(),
             modified: mtime_secs(&meta),
+            git_status: None,
         });
     }
+
+    // Optional git overlay: only consults `git` when the client asked + the
+    // workspace root has a .git directory. status_for_dir caps porcelain
+    // output internally so big repos can't blow the listing latency.
+    if q.with_git.unwrap_or(false) && root.join(".git").exists() {
+        let status_map = crate::git::status_for_dir(&root, &dir).await;
+        if !status_map.is_empty() {
+            for entry in entries.iter_mut() {
+                if let Some(c) = status_map.get(&entry.name) {
+                    entry.git_status = Some(*c);
+                }
+            }
+        }
+    }
+
     entries.sort_by(|a, b| b.is_dir.cmp(&a.is_dir).then(a.name.cmp(&b.name)));
     (StatusCode::OK, Json(entries)).into_response()
 }
