@@ -23,6 +23,8 @@ interface Props {
   onSettingsChange: (next: { hidpi: boolean; smoothScaling: boolean }) => void
   /** Active video pipeline. Surfaced as a chip so the user knows which path is in use. */
   pipeline: 'h264' | 'jpeg'
+  /** Operator-initiated session end. Triggers a confirm dialog up in the page. */
+  onExit?: () => void
 }
 
 // Sticky modifier keys — toggled on tap, cleared after next key dispatch
@@ -70,6 +72,7 @@ export default function DesktopToolbar({
   smoothScaling,
   onSettingsChange,
   pipeline,
+  onExit,
 }: Props) {
   const [activeModifiers, setActiveModifiers] = useState<Set<ModKey>>(new Set())
   const [settingsOpen, setSettingsOpen] = useState(false)
@@ -199,7 +202,11 @@ export default function DesktopToolbar({
       <div className="flex items-center gap-2 min-w-0">
         <button
           onClick={onInputModeToggle}
-          title={`Mode: ${inputMode}`}
+          title={
+            inputMode === 'touch'
+              ? 'Touch (Direct): tap = click at finger position. Drag with one finger to move the pointer.'
+              : 'Trackpad: relative cursor. Two-finger swipe scrolls; tap clicks at the cursor.'
+          }
           className="flex-1 min-w-0 text-xs px-2 py-1 border border-border rounded-md bg-surface-alt text-text-secondary hover:bg-surface-hover transition-colors"
         >
           {inputMode === 'touch' ? 'Touch' : 'Trackpad'}
@@ -236,6 +243,17 @@ export default function DesktopToolbar({
           className="text-xs py-1.5 rounded-md border border-border bg-surface-alt text-text-secondary hover:bg-surface-hover hover:text-text-primary transition-colors"
         >
           ⌨ More keys
+        </button>
+      )}
+
+      {/* Desktop-only Exit. The mobile path goes through DesktopTopStrip;
+          rendering both lets the desktop sidebar match the same affordance. */}
+      {onExit && (
+        <button
+          onClick={onExit}
+          className="hidden lg:block text-xs py-1.5 rounded-md border border-danger/30 bg-danger/10 text-danger hover:bg-danger/20 transition-colors"
+        >
+          Exit remote desktop
         </button>
       )}
     </div>

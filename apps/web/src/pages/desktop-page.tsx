@@ -9,7 +9,7 @@
 // shared toolbar, gesture help sheet, and reconnect modal.
 
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { useParams } from 'react-router-dom'
+import { useNavigate, useParams } from 'react-router-dom'
 import type {
   DesktopInputEvent,
   DesktopStatus,
@@ -20,6 +20,7 @@ import { supportsH264Video } from '../hooks/use-desktop-video-session'
 import DesktopJpegView from '../components/desktop-jpeg-view'
 import DesktopH264View from '../components/desktop-h264-view'
 import DesktopToolbar from '../components/desktop-toolbar'
+import DesktopTopStrip from '../components/desktop-top-strip'
 import DesktopGestureHelp from '../components/desktop-gesture-help'
 import DesktopOnscreenKeyboard from '../components/desktop-onscreen-keyboard'
 import ReconnectModal from '../components/reconnect-modal'
@@ -75,6 +76,7 @@ function loadSettings(): DisplaySettings {
 
 export default function DesktopPage() {
   const { hostId = '' } = useParams<{ hostId: string }>()
+  const navigate = useNavigate()
   const [caps, setCaps] = useState<Capabilities | null>(null)
   const [capsError, setCapsError] = useState('')
   const [deviceId, setDeviceId] = useState<string | null>(null)
@@ -82,6 +84,11 @@ export default function DesktopPage() {
   const [inputMode, setInputMode] = useState<InputMode>('touch')
   const [showHelp, setShowHelp] = useState(false)
   const [showKeyboard, setShowKeyboard] = useState(false)
+  // Forces a remount of the active video view — used by the mobile Reload
+  // button so the operator can recover from a stuck stream without leaving
+  // the page (browser-back would lose any partial gesture / tool state).
+  const [reloadNonce, setReloadNonce] = useState(0)
+  const [inFullscreen, setInFullscreen] = useState(false)
   // Phase 04 — HiDPI + smooth-scaling toggles, persisted per-device.
   const [settings, setSettingsState] = useState<DisplaySettings>(() => loadSettings())
   useEffect(() => {
@@ -142,6 +149,63 @@ export default function DesktopPage() {
   }, [])
 
   const confirm = useConfirm()
+
+  const handleExit = useCallback(async () => {
+    const ok = await confirm({
+      title: 'Exit remote desktop?',
+      message: 'The current session will end. You can rejoin from the host page.',
+      confirmText: 'Exit',
+      danger: true,
+    })
+    if (!ok) return
+    sessionApiRef.current.disconnect()
+    navigate(`/h/${hostId}`)
+  }, [confirm, hostId, navigate])
+
+  const handleReload = useCallback(() => {
+    sessionApiRef.current.disconnect()
+    setReloadNonce((n) => n + 1)
+  }, [])
+
+  const handleFullscreen = useCallback(async () => {
+    type FsElement = HTMLElement & {
+      webkitRequestFullscreen?: () => Promise<void> | void
+    }
+    type FsDocument = Document & {
+      webkitFullscreenElement?: Element | null
+      webkitExitFullscreen?: () => Promise<void> | void
+    }
+    const doc = document as FsDocument
+    const isOn = !!(document.fullscreenElement || doc.webkitFullscreenElement)
+    try {
+      if (isOn) {
+        if (document.exitFullscreen) await document.exitFullscreen()
+        else if (doc.webkitExitFullscreen) await doc.webkitExitFullscreen()
+      } else {
+        const el = document.documentElement as FsElement
+        if (el.requestFullscreen) await el.requestFullscreen()
+        else if (el.webkitRequestFullscreen) await el.webkitRequestFullscreen()
+      }
+    } catch {
+      // Permission denied / API missing — silently no-op so a misclick on
+      // unsupported iOS Safari doesn't surface an error toast.
+    }
+  }, [])
+
+  useEffect(() => {
+    const onChange = () => {
+      type FsDocument = Document & { webkitFullscreenElement?: Element | null }
+      const doc = document as FsDocument
+      setInFullscreen(!!(document.fullscreenElement || doc.webkitFullscreenElement))
+    }
+    document.addEventListener('fullscreenchange', onChange)
+    document.addEventListener('webkitfullscreenchange', onChange)
+    return () => {
+      document.removeEventListener('fullscreenchange', onChange)
+      document.removeEventListener('webkitfullscreenchange', onChange)
+    }
+  }, [])
+
   // Settings change handler. HiDPI flips trigger a brief session reconnect on
   // the H.264 path (encoder dims fixed at init) — confirm before sending so
   // the user isn't surprised by a freeze. Smooth-scaling is render-only.
@@ -208,9 +272,17 @@ export default function DesktopPage() {
 
   return (
     <div className="relative flex flex-col lg:flex-row w-full h-full overflow-hidden bg-black">
+      <DesktopTopStrip
+        onExit={handleExit}
+        onReload={handleReload}
+        onFullscreen={handleFullscreen}
+        inFullscreen={inFullscreen}
+      />
+
       <div className="flex-1 relative min-h-0">
         {useH264 ? (
           <DesktopH264View
+            key={`h264-${reloadNonce}`}
             hostId={hostId}
             deviceId={deviceId}
             quality={quality}
@@ -223,6 +295,7 @@ export default function DesktopPage() {
           />
         ) : (
           <DesktopJpegView
+            key={`jpeg-${reloadNonce}`}
             hostId={hostId}
             deviceId={deviceId}
             quality={quality}
@@ -249,6 +322,7 @@ export default function DesktopPage() {
           smoothScaling={settings.smoothScaling}
           onSettingsChange={handleSettingsChange}
           pipeline={useH264 ? 'h264' : 'jpeg'}
+          onExit={handleExit}
         />
       </div>
 
