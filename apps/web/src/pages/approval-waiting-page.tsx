@@ -282,8 +282,8 @@ function Countdown({ remainingMs }: { remainingMs: number }) {
       aria-live="polite"
     >
       {urgent
-        ? `Hurry — the key expires in ${m}:${s.toString().padStart(2, '0')}`
-        : `Expires in ${m}:${s.toString().padStart(2, '0')}`}
+        ? `Hurry — waiting expires in ${m}:${s.toString().padStart(2, '0')}`
+        : `Waiting expires in ${m}:${s.toString().padStart(2, '0')}`}
     </div>
   )
 }

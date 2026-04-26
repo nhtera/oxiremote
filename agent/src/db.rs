@@ -83,6 +83,11 @@ pub fn init_db(db_path: &Path) -> anyhow::Result<()> {
     .context("create tables")?;
 
     let _ = conn.execute("ALTER TABLE sessions ADD COLUMN device_id TEXT", []);
+    // Index for device_id lookups on the sessions table (session-by-device queries).
+    let _ = conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_sessions_device_id ON sessions(device_id)",
+        [],
+    );
     // Per-device API key for tunnel-side Bearer auth. Issued at pairing,
     // rotatable. `last4` is cosmetic — lets the UI show "••••abcd" to the
     // user without ever reading the hash.

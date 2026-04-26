@@ -58,6 +58,47 @@ fn asset_extension() -> &'static str {
     }
 }
 
+/// Check whether a newer release is available. Returns the latest version tag
+/// (without `v` prefix) if it differs from the compiled-in version, or `None`
+/// if already up-to-date or the check fails (network unavailable, etc.).
+///
+/// Intentionally non-async and synchronous so it can be called from the TUI
+/// startup path before the tokio runtime is running on the server thread.
+pub fn check_latest() -> Option<String> {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .ok()?;
+    rt.block_on(async {
+        let client = reqwest::Client::builder()
+            .user_agent(USER_AGENT)
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+            .ok()?;
+        let body = client
+            .get(format!(
+                "https://api.github.com/repos/{RELEASE_REPO}/releases/latest"
+            ))
+            .header("Accept", "application/vnd.github+json")
+            .send()
+            .await
+            .ok()?
+            .error_for_status()
+            .ok()?
+            .text()
+            .await
+            .ok()?;
+        let release: GhRelease = serde_json::from_str(&body).ok()?;
+        let latest = release
+            .tag_name
+            .strip_prefix('v')
+            .unwrap_or(&release.tag_name)
+            .to_string();
+        let current = env!("CARGO_PKG_VERSION");
+        if latest != current { Some(latest) } else { None }
+    })
+}
+
 pub fn run() -> Result<()> {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -269,7 +310,6 @@ fn atomic_replace(target: &Path, new_binary: &Path) -> Result<()> {
 /// Best-effort sweep of `<exe>.exe.bak` left behind by a Windows self-update
 /// (the running process locks the file until exit). Called from `main`
 /// during normal startup. No-op on Unix.
-#[allow(dead_code)]
 pub fn cleanup_stale_bak() {
     #[cfg(windows)]
     {

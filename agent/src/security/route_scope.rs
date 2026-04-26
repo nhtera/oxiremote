@@ -45,6 +45,15 @@ pub fn scope_for_path(path: &str) -> RouteScope {
 
 /// Tunnel-origin heuristic. cloudflared always sets `cf-connecting-ip`.
 /// Loopback requests never have it.
+///
+/// # Threat model assumption
+///
+/// This detection is only sound when the agent binds exclusively to the
+/// loopback interface (`127.0.0.1`). If the agent were exposed on a
+/// non-loopback address, an adversary on the same LAN could forge the
+/// `cf-connecting-ip` header and bypass the Localhost route guard.
+/// A `debug_assert!` in `main` enforces the loopback-only invariant at
+/// startup so deviations are caught immediately during development.
 pub fn is_tunnel_request(headers: &HeaderMap) -> bool {
     headers
         .get("cf-connecting-ip")
