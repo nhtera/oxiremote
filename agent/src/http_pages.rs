@@ -15,7 +15,7 @@ use tracing::warn;
 use uuid::Uuid;
 
 use crate::auth::{
-    bind_session_to_device, clear_stale_pairing_attempts, client_ip_key, insert_or_update_device,
+    bind_session_to_device, clear_stale_pairing_attempts, client_ip_key,
     is_valid_pairing_attempt, issue_api_key, list_trusted_devices, random_device_id, rate_limit_key,
     require_active_auth, require_auth, revoke_device, sanitize_device_label,
     should_allow_pairing_attempt, sign_session, touch_session_and_device, new_pairing_code,
@@ -115,7 +115,19 @@ pub async fn api_pairing_exchange(
 
     match res {
         Ok((session_id, device_id)) => {
-            if let Err(err) = insert_or_update_device(&state.db_path, &device_id, &label, user_agent) {
+            // Gate on auto_approve — mirror the OTK path in api_login_one_time.
+            let auto_approve = approval::get_auto_approve(&state.db_path);
+            let approval_status = if auto_approve { "approved" } else { "pending" };
+            let ip = client_ip_key(&headers);
+
+            if let Err(err) = approval::insert_device_with_approval(
+                &state.db_path,
+                &device_id,
+                &label,
+                user_agent,
+                &ip,
+                approval_status,
+            ) {
                 warn!(error=%err, "device insert failed");
                 return StatusCode::INTERNAL_SERVER_ERROR.into_response();
             }
@@ -141,14 +153,33 @@ pub async fn api_pairing_exchange(
                 .max_age(TimeDuration::seconds(SESSION_TTL_SECS))
                 .build();
 
+            // When pending, emit DevicePending so the TUI/dashboard approval
+            // queue shows the code-paired device alongside OTK-paired ones.
+            if !auto_approve {
+                let first_seen = crate::db::now_ts();
+                state.event_bus.send(crate::events::AgentEvent::DevicePending {
+                    device_id: device_id.clone(),
+                    ip: ip.clone(),
+                    ua_parsed: user_agent.unwrap_or("").to_string(),
+                    first_seen,
+                });
+            }
+
+            let http_status = if auto_approve {
+                StatusCode::OK
+            } else {
+                StatusCode::ACCEPTED
+            };
+
             (
-                StatusCode::OK,
+                http_status,
                 jar.add(cookie),
                 Json(serde_json::json!({
                     "ok": true,
                     "device_id": device_id,
                     "api_key": api_key_pair.0,
                     "api_key_last4": api_key_pair.1,
+                    "approval_status": approval_status,
                 })),
             )
                 .into_response()
@@ -617,6 +648,17 @@ mod tests {
     #[tokio::test]
     async fn pairing_exchange_succeeds_once_and_rejects_reuse() {
         let state = test_state("pair-reuse");
+
+        // Enable auto_approve so this test focuses on reuse rejection, not approval gating.
+        let conn = Connection::open(&state.db_path).unwrap();
+        conn.execute(
+            "INSERT INTO settings(key, value) VALUES ('auto_approve', 'true')
+             ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
         let pairing = create_pairing_code(state.as_ref()).unwrap();
         let mut headers = HeaderMap::new();
         headers.insert("user-agent", HeaderValue::from_static("test-device"));
@@ -675,6 +717,95 @@ mod tests {
         .into_response();
 
         assert_eq!(rejected.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    // F7 regression: pairing-code exchange must respect the auto_approve setting.
+
+    #[tokio::test]
+    async fn pairing_exchange_pending_when_auto_approve_off() {
+        let state = test_state("pair-pending");
+
+        // Ensure auto_approve=false (the default, but set explicitly for clarity).
+        let conn = Connection::open(&state.db_path).unwrap();
+        conn.execute(
+            "INSERT INTO settings(key, value) VALUES ('auto_approve', 'false')
+             ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        let pairing = create_pairing_code(state.as_ref()).unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert("user-agent", HeaderValue::from_static("test-device"));
+
+        let resp = api_pairing_exchange(
+            State(state.clone()),
+            headers,
+            CookieJar::new(),
+            Json(ExchangePairingRequest {
+                code: pairing.code,
+                device_label: Some("Test Phone".into()),
+            }),
+        )
+        .await
+        .into_response();
+
+        // 202 Accepted when pending, cookie still set so the client can poll.
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+        assert!(resp.headers().get(SET_COOKIE).is_some());
+
+        // Read body to verify approval_status field.
+        let body_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+        assert_eq!(body["approval_status"], "pending");
+        assert!(body["api_key"].is_string());
+        assert!(body["device_id"].is_string());
+
+        // Verify the DB row has approval_status='pending'.
+        let device_id = body["device_id"].as_str().unwrap().to_string();
+        let conn = Connection::open(&state.db_path).unwrap();
+        let status: String = conn
+            .query_row(
+                "SELECT COALESCE(approval_status, 'approved') FROM trusted_devices WHERE device_id=?1",
+                params![device_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(status, "pending");
+    }
+
+    #[tokio::test]
+    async fn pairing_exchange_approved_when_auto_approve_on() {
+        let state = test_state("pair-auto-approve");
+
+        let conn = Connection::open(&state.db_path).unwrap();
+        conn.execute(
+            "INSERT INTO settings(key, value) VALUES ('auto_approve', 'true')
+             ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        let pairing = create_pairing_code(state.as_ref()).unwrap();
+        let resp = api_pairing_exchange(
+            State(state.clone()),
+            HeaderMap::new(),
+            CookieJar::new(),
+            Json(ExchangePairingRequest {
+                code: pairing.code,
+                device_label: None,
+            }),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+        assert_eq!(body["approval_status"], "approved");
     }
 }
 

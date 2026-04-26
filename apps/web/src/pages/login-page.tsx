@@ -85,12 +85,18 @@ export default function LoginPage() {
         const text = await res.text()
         throw new Error(text || 'Invalid or expired pairing code')
       }
+      // Read response body once — clone avoids consuming the stream.
+      const body = await res.json().catch(() => ({}))
+
       if (deviceLabel.trim()) {
         window.localStorage.setItem('oxi:device-label', deviceLabel.trim())
       }
-      // Persist API key for tunnel `Authorization: Bearer …`.
+      // Persist API key BEFORE any navigation. The pending-approval path also
+      // needs the key in localStorage — once the operator approves and the
+      // user lands on the workspace, every tunnel request needs the
+      // `Authorization: Bearer …` header. Cookie auth alone covers loopback
+      // but not the tunnel.
       try {
-        const body = await res.clone().json()
         await useHostStore.getState().fetchHost()
         const hostState = useHostStore.getState()
         const hostId = hostState.currentHostId
@@ -105,6 +111,20 @@ export default function LoginPage() {
       } catch {
         await useHostStore.getState().fetchHost()
       }
+
+      // Pairing-code pending: operator must approve before access is granted.
+      // Mirror the OTK pending path so the user sees a clear waiting screen
+      // rather than silently landing on the workspace (which would 403).
+      if (body.approval_status === 'pending') {
+        navigate('/approval-waiting', {
+          state: {
+            device_id: body.device_id,
+            device_label: deviceLabel.trim() || undefined,
+          },
+        })
+        return
+      }
+
       navigate('/')
     } catch (e: unknown) {
       setError(e instanceof Error ? e.message : 'Pairing failed')

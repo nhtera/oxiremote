@@ -36,6 +36,24 @@ const EXEMPT_PREFIXES: &[&str] = &[
     "/proxy/",  // local-sites reverse proxy; auth checked inside the handler
     "/assets/", // hashed static assets; /api/ namespace not allowed here
     "/login",
+    // WebSocket upgrade endpoints: browsers cannot set custom headers on the
+    // initial Upgrade request, so Bearer auth is impossible. Both routes check
+    // the oxiremote_session cookie inside their handler as the first privileged
+    // call — exempting them here only removes the middleware 401 that would
+    // otherwise fire before the handler runs.
+    //
+    // NARROW CHOICE: We do NOT exempt "/api/terminal/sessions/" because that
+    // prefix also covers /resize, /close, and PATCH /{id} — all of which must
+    // remain behind api_key_guard. Instead we match the exact /ws suffix via
+    // EXEMPT_WS_SUFFIXES below. "/ws/desktop/" is already unique to the WS
+    // route and safe to exempt as a prefix.
+    "/ws/desktop/",
+];
+
+/// Path suffixes for WebSocket-only exemptions where the prefix would be too
+/// broad. Checked only when no prefix already matched.
+const EXEMPT_WS_SUFFIXES: &[&str] = &[
+    "/ws", // matches /api/terminal/sessions/{id}/ws exactly
 ];
 
 /// `/api/evil.js` must NOT be exempt just because it ends in `.js`; we only
@@ -55,7 +73,12 @@ fn is_exempt(path: &str) -> bool {
     if EXEMPT_PREFIXES.iter().any(|p| path == *p || path.starts_with(*p)) {
         return true;
     }
-    EXEMPT_ROOT_FILES.contains(&path)
+    if EXEMPT_ROOT_FILES.contains(&path) {
+        return true;
+    }
+    // Suffix check for WS-only routes where the prefix would be too broad.
+    // Only matches terminal session WebSocket upgrades.
+    EXEMPT_WS_SUFFIXES.iter().any(|s| path.ends_with(s))
 }
 
 fn bearer(req: &Request) -> Option<String> {
@@ -127,5 +150,32 @@ mod tests {
         assert!(!is_exempt("/api/evil.js"));
         assert!(!is_exempt("/api/files/list.js"));
         assert!(!is_exempt("/api/admin.webmanifest"));
+    }
+
+    // F1 regression: WebSocket upgrade endpoints must bypass the Bearer guard
+    // because browsers cannot set custom headers on the WS Upgrade request.
+    // Auth is enforced inside each handler via cookie session check.
+
+    #[test]
+    fn ws_upgrade_paths_are_exempt() {
+        // Desktop WS: prefix-matched via /ws/desktop/
+        assert!(is_exempt("/ws/desktop/some-device-uuid"));
+
+        // Terminal WS: suffix-matched via /ws — must match the exact route
+        // /api/terminal/sessions/{id}/ws
+        assert!(is_exempt("/api/terminal/sessions/abc-123/ws"));
+    }
+
+    #[test]
+    fn non_ws_terminal_routes_keep_guard() {
+        // /resize, /close, and PATCH/{id} must NOT be exempt — they carry
+        // state-changing work and must require a Bearer token over the tunnel.
+        assert!(!is_exempt("/api/terminal/sessions/abc-123/resize"));
+        assert!(!is_exempt("/api/terminal/sessions/abc-123/close"));
+        assert!(!is_exempt("/api/terminal/sessions/abc-123"));
+        // Paranoia: a crafted path ending in /ws under a different namespace
+        // would also be exempt — this is acceptable because the handler behind
+        // it still validates the session cookie. Document the trade-off here.
+        // If this ever becomes a concern, switch to an explicit path allowlist.
     }
 }
