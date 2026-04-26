@@ -17,6 +17,20 @@ pub struct Step {
     pub sub: Option<String>,
 }
 
+/// Same as `render_steps` but accepts a slice of references — used by the
+/// narrow-terminal compact path in `dashboard.rs` which filters a subset.
+pub fn render_steps_refs(f: &mut Frame<'_>, area: Rect, steps: &[&Step]) {
+    let owned: Vec<_> = steps
+        .iter()
+        .map(|s| Step {
+            name: s.name.clone(),
+            status: s.status,
+            sub: s.sub.clone(),
+        })
+        .collect();
+    render_steps(f, area, &owned);
+}
+
 pub fn render_steps(f: &mut Frame<'_>, area: Rect, steps: &[Step]) {
     let mut lines: Vec<Line> = Vec::with_capacity(steps.len());
     for step in steps {

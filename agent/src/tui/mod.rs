@@ -58,11 +58,16 @@ fn new_terminal() -> Result<Term> {
 /// or Ctrl+C. `db_path` is threaded through so the dashboard can read/refresh
 /// the active OTK directly (server thread shares the same SQLite file).
 pub fn run_tui(event_bus: Arc<EventBus>, db_path: PathBuf) -> Result<()> {
-    let _guard = TerminalGuard::enter()?;
+    let mut _guard = TerminalGuard::enter()?;
     let mut term = new_terminal()?;
 
+    // Check for a newer release once at startup. 5s network timeout in
+    // `check_latest` keeps it bounded; cached here so re-entering the menu
+    // from the dashboard doesn't re-probe on every loop iteration.
+    let update_version = crate::update::check_latest();
+
     loop {
-        match menu::run_menu(&mut term)? {
+        match menu::run_menu(&mut term, update_version.as_deref())? {
             MenuChoice::OpenWebUi => {
                 // Best-effort browser launch; fall through to dashboard so the
                 // user keeps event visibility even if open(1) is missing.
@@ -71,6 +76,15 @@ pub fn run_tui(event_bus: Arc<EventBus>, db_path: PathBuf) -> Result<()> {
             }
             MenuChoice::TerminalUi => {
                 dashboard::run_dashboard(&mut term, event_bus.clone(), db_path.clone())?;
+            }
+            MenuChoice::UpdateAvailable(_ver) => {
+                // Temporarily leave alternate screen so the update output is
+                // visible on the normal scrollback buffer, then restore TUI.
+                drop(_guard);
+                let _ = crate::update::run();
+                // Re-enter TUI after the update completes (or errors out).
+                _guard = TerminalGuard::enter()?;
+                term = new_terminal()?;
             }
             MenuChoice::Exit => break,
         }

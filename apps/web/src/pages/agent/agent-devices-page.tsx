@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from 'react'
 import { Button, StateView, StatusChip, type StatusVariant } from '../../components/ui'
+import AutoApproveToggle from '../../components/auto-approve-toggle'
 
 interface PendingDevice {
   device_id: string
@@ -32,6 +33,7 @@ export default function AgentDevicesPage() {
   const [error, setError] = useState<string | null>(null)
   const [query, setQuery] = useState('')
   const [busyId, setBusyId] = useState<string | null>(null)
+  const [autoApprove, setAutoApprove] = useState(false)
 
   const fetchDevices = async () => {
     setError(null)
@@ -67,6 +69,13 @@ export default function AgentDevicesPage() {
     // but here it's the documented pattern for "load initial data once".
     // eslint-disable-next-line react-hooks/set-state-in-effect
     fetchDevices()
+    // Load the current auto-approve setting alongside devices.
+    fetch('/api/agent/state')
+      .then((r) => (r.ok ? r.json() : null))
+      .then((data) => {
+        if (data) setAutoApprove(Boolean(data.auto_approve))
+      })
+      .catch(() => { /* non-critical — toggle still renders with default false */ })
   }, [])
 
   async function approve(id: string) {
@@ -133,6 +142,20 @@ export default function AgentDevicesPage() {
           placeholder="Filter by id, label, or ip…"
           className="w-full bg-surface border border-border rounded-md px-3 py-2 text-[length:var(--text-body)] text-text-primary placeholder:text-text-muted focus:outline-none focus:border-accent/50"
         />
+      </div>
+
+      {/* Auto-approve toggle — always visible as the first row of the list,
+          above any device row, so the operator finds it immediately. */}
+      <div className="rounded-lg border border-border bg-surface px-4 py-3 mb-3 flex items-center justify-between gap-4">
+        <div>
+          <div className="text-sm font-medium text-text-primary">Auto-approve</div>
+          <div className="text-xs text-text-muted mt-0.5">
+            {autoApprove
+              ? 'New devices are approved automatically'
+              : 'New devices require manual approval'}
+          </div>
+        </div>
+        <AutoApproveToggle enabled={autoApprove} onChange={setAutoApprove} />
       </div>
 
       {loading ? (

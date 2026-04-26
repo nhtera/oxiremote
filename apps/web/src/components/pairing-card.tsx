@@ -133,7 +133,7 @@ export default function PairingCard({
 
         {/* Right: QR */}
         <div className="md:w-48 mx-auto">
-          <QrPanel payload={qrPayload} active={!!tunnelUrl} />
+          <QrPanel payload={qrPayload} active={!!tunnelUrl} otkExpired={expired} />
         </div>
       </div>
     </section>
@@ -341,9 +341,11 @@ function UrlBlock({ url, onCopy, copied }: UrlBlockProps) {
 interface QrPanelProps {
   payload: string
   active: boolean
+  /** When true, blur the QR and overlay an "Expired" pill — scanning is useless. */
+  otkExpired?: boolean
 }
 
-function QrPanel({ payload, active }: QrPanelProps) {
+function QrPanel({ payload, active, otkExpired }: QrPanelProps) {
   if (!active) {
     return (
       <div className="w-48 h-48 rounded-md border border-border bg-surface-alt flex items-center justify-center text-xs text-text-muted text-center px-3">
@@ -352,12 +354,20 @@ function QrPanel({ payload, active }: QrPanelProps) {
     )
   }
   return (
-    <div className="rounded-md bg-white p-2 border border-border">
+    <div className="relative rounded-md bg-white p-2 border border-border">
       <img
         src={`/api/agent/qr?url=${encodeURIComponent(payload)}`}
         alt="Pairing QR code"
         className="w-44 h-44"
+        style={otkExpired ? { filter: 'blur(6px)' } : undefined}
       />
+      {otkExpired && (
+        <div className="absolute inset-0 flex items-center justify-center rounded-md">
+          <span className="px-3 py-1.5 text-xs font-semibold text-white bg-orange-500 rounded-full shadow-lg whitespace-nowrap">
+            Expired — regenerate
+          </span>
+        </div>
+      )}
     </div>
   )
 }
