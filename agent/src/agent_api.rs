@@ -51,6 +51,7 @@ async fn api_agent_shutdown(State(state): State<Arc<AppState>>) -> impl IntoResp
     let _ = state; // currently unused; kept for future graceful-shutdown wiring
     tokio::spawn(async {
         tokio::time::sleep(Duration::from_millis(500)).await;
+        crate::tui::restore_terminal_if_active();
         std::process::exit(0);
     });
     StatusCode::ACCEPTED

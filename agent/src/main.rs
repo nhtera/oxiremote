@@ -777,7 +777,10 @@ async fn server_main(event_bus: Arc<EventBus>) -> anyhow::Result<()> {
 
 async fn shutdown_signal() {
     let _ = tokio::signal::ctrl_c().await;
-    info!("shutdown signal received")
+    info!("shutdown signal received");
+    // Wake any parked main thread (background mode) so the process can exit
+    // cleanly. The server thread will return from axum::serve right after.
+    crate::tui::wake_background_main();
 }
 
 async fn api_health() -> &'static str {

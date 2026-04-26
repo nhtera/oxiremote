@@ -2,7 +2,7 @@
 // `/api/agent/events` SSE clients. Overflow drops oldest; lagged subscribers
 // re-sync via `/api/agent/state` snapshot.
 
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use serde::Serialize;
 use tokio::sync::broadcast;
@@ -128,18 +128,51 @@ pub enum AgentEvent {
     },
 }
 
+/// Lightweight tunnel-state snapshot kept in lockstep with broadcast events.
+/// Lets late subscribers (e.g. the TUI dashboard, which subscribes only after
+/// the menu picks "Terminal UI") catch up on tunnel progress that already
+/// fired before they listened.
+#[derive(Debug, Clone, Default)]
+pub struct TunnelSnapshot {
+    pub url: Option<String>,
+    pub latest_step: Option<AgentEvent>,
+    pub down_reason: Option<String>,
+}
+
 #[derive(Debug)]
 pub struct EventBus {
     tx: broadcast::Sender<AgentEvent>,
+    snapshot: Arc<RwLock<TunnelSnapshot>>,
 }
 
 impl EventBus {
     pub fn new() -> Arc<Self> {
         let (tx, _rx) = broadcast::channel(EVENT_BUS_CAPACITY);
-        Arc::new(Self { tx })
+        Arc::new(Self {
+            tx,
+            snapshot: Arc::new(RwLock::new(TunnelSnapshot::default())),
+        })
     }
 
     pub fn send(&self, event: AgentEvent) {
+        // Mirror tunnel-shaped events into the snapshot before broadcasting so
+        // a subscriber that arrives between `snapshot()` and `subscribe()` can
+        // still see the latest state without coordination.
+        if let Ok(mut snap) = self.snapshot.write() {
+            match &event {
+                AgentEvent::TunnelUrlChanged { url } => {
+                    snap.url = Some(url.clone());
+                    snap.down_reason = None;
+                }
+                AgentEvent::TunnelStepChanged { .. } => {
+                    snap.latest_step = Some(event.clone());
+                }
+                AgentEvent::TunnelDown { reason } => {
+                    snap.down_reason = Some(reason.clone());
+                }
+                _ => {}
+            }
+        }
         // No subscribers is fine; drop silently. Overflow (slow receiver) is
         // logged by the consumer via `RecvError::Lagged`.
         let _ = self.tx.send(event);
@@ -147,5 +180,57 @@ impl EventBus {
 
     pub fn subscribe(&self) -> broadcast::Receiver<AgentEvent> {
         self.tx.subscribe()
+    }
+
+    pub fn snapshot(&self) -> TunnelSnapshot {
+        self.snapshot
+            .read()
+            .map(|s| s.clone())
+            .unwrap_or_default()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn snapshot_mirrors_tunnel_events_for_late_subscribers() {
+        let bus = EventBus::new();
+        // Late subscribers (e.g. TUI dashboard after the menu) call snapshot()
+        // before subscribe() and must see what already fired.
+        bus.send(AgentEvent::TunnelUrlChanged {
+            url: "https://abc.trycloudflare.com".into(),
+        });
+        bus.send(AgentEvent::TunnelStepChanged {
+            step: TunnelStep::Ready,
+            attempt: 1,
+            info: Some("serving".into()),
+            reason: None,
+        });
+
+        let snap = bus.snapshot();
+        assert_eq!(snap.url.as_deref(), Some("https://abc.trycloudflare.com"));
+        assert!(matches!(
+            snap.latest_step,
+            Some(AgentEvent::TunnelStepChanged { step: TunnelStep::Ready, .. })
+        ));
+        assert!(snap.down_reason.is_none());
+    }
+
+    #[test]
+    fn snapshot_records_tunnel_down_and_url_clears_it() {
+        let bus = EventBus::new();
+        bus.send(AgentEvent::TunnelDown {
+            reason: "exit code 1".into(),
+        });
+        assert_eq!(bus.snapshot().down_reason.as_deref(), Some("exit code 1"));
+
+        // A fresh tunnel coming back up clears the down marker so re-entries
+        // don't see a stale "tunnel down" overlay after recovery.
+        bus.send(AgentEvent::TunnelUrlChanged {
+            url: "https://new.trycloudflare.com".into(),
+        });
+        assert!(bus.snapshot().down_reason.is_none());
     }
 }

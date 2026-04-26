@@ -6,6 +6,9 @@
 use std::io;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread::Thread;
 
 use anyhow::Result;
 use crossterm::{
@@ -25,8 +28,47 @@ pub mod step_progress;
 
 use menu::MenuChoice;
 
-/// Restores the terminal on drop — even if a panic unwinds through the TUI
-/// loop. Without this, a ratatui crash leaves the shell in raw mode.
+/// True while the TUI owns the terminal (raw mode + alternate screen + mouse
+/// capture enabled). Read by [`restore_terminal_if_active`] so external exit
+/// paths (`process::exit`, panic hook, libc atexit) can cleanly tear the
+/// terminal back down — `TerminalGuard::drop` only runs on normal unwinding,
+/// not on `process::exit`, so without this the shell ends up still in
+/// mouse-tracking mode and prints SGR motion reports as plain text.
+static TUI_ACTIVE: AtomicBool = AtomicBool::new(false);
+static ATEXIT_REGISTERED: AtomicBool = AtomicBool::new(false);
+
+/// Main-thread handle stashed when the TUI menu picks "Open Web UI
+/// (background)" and parks. The server thread's SIGINT handler unparks via
+/// [`wake_background_main`] so Ctrl+C exits the process — without this, tokio
+/// consumes SIGINT for axum's graceful shutdown and the main thread parks
+/// forever even after the server thread returns.
+static BACKGROUND_MAIN: OnceLock<Thread> = OnceLock::new();
+static BACKGROUND_SHUTDOWN: AtomicBool = AtomicBool::new(false);
+
+/// Called from the server thread's shutdown handler to release the parked
+/// main thread. Safe to call repeatedly and from any thread.
+pub fn wake_background_main() {
+    BACKGROUND_SHUTDOWN.store(true, Ordering::SeqCst);
+    if let Some(t) = BACKGROUND_MAIN.get() {
+        t.unpark();
+    }
+}
+
+/// Best-effort terminal restore. Idempotent; safe to call multiple times and
+/// from any thread. No-op when the TUI was never entered.
+pub fn restore_terminal_if_active() {
+    if !TUI_ACTIVE.swap(false, Ordering::SeqCst) {
+        return;
+    }
+    let mut out = io::stdout();
+    let _ = execute!(out, LeaveAlternateScreen, DisableMouseCapture);
+    let _ = disable_raw_mode();
+}
+
+extern "C" fn atexit_restore() {
+    restore_terminal_if_active();
+}
+
 struct TerminalGuard;
 
 impl TerminalGuard {
@@ -34,15 +76,19 @@ impl TerminalGuard {
         enable_raw_mode()?;
         let mut out = io::stdout();
         execute!(out, EnterAlternateScreen, EnableMouseCapture)?;
+        TUI_ACTIVE.store(true, Ordering::SeqCst);
+        if !ATEXIT_REGISTERED.swap(true, Ordering::SeqCst) {
+            unsafe {
+                libc::atexit(atexit_restore);
+            }
+        }
         Ok(Self)
     }
 }
 
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
-        let mut out = io::stdout();
-        let _ = execute!(out, LeaveAlternateScreen, DisableMouseCapture);
-        let _ = disable_raw_mode();
+        restore_terminal_if_active();
     }
 }
 
@@ -69,10 +115,23 @@ pub fn run_tui(event_bus: Arc<EventBus>, db_path: PathBuf) -> Result<()> {
     loop {
         match menu::run_menu(&mut term, update_version.as_deref())? {
             MenuChoice::OpenWebUi => {
-                // Best-effort browser launch; fall through to dashboard so the
-                // user keeps event visibility even if open(1) is missing.
+                // Restore the host terminal first so the user sees the prompt
+                // and the friendly status line on the normal screen — the
+                // agent then keeps running on its sibling server thread.
+                drop(term);
+                drop(_guard);
                 let _ = open::that("http://localhost:8787/agent");
-                dashboard::run_dashboard(&mut term, event_bus.clone(), db_path.clone())?;
+                println!("OxiRemote agent running in the background.");
+                println!("  Dashboard: http://localhost:8787/agent");
+                println!("  Press Ctrl+C to stop.");
+                // Register this thread so the server's SIGINT handler can
+                // wake us. Park until shutdown is requested; loop guards
+                // against spurious wakeups.
+                let _ = BACKGROUND_MAIN.set(std::thread::current());
+                while !BACKGROUND_SHUTDOWN.load(Ordering::SeqCst) {
+                    std::thread::park();
+                }
+                return Ok(());
             }
             MenuChoice::TerminalUi => {
                 dashboard::run_dashboard(&mut term, event_bus.clone(), db_path.clone())?;

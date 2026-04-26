@@ -111,6 +111,7 @@ pub fn run_event_loop(handle: &TrayHandle, event_bus: Arc<EventBus>) {
             if id == handle.ids.open_web || id == handle.ids.open_host {
                 let _ = open::that("http://localhost:8787/agent");
             } else if id == handle.ids.shutdown {
+                crate::tui::restore_terminal_if_active();
                 std::process::exit(0);
             } else if id == handle.ids.status {
                 // noop — disabled item

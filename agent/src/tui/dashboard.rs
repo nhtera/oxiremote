@@ -352,6 +352,24 @@ pub fn run_dashboard(term: &mut Term, event_bus: Arc<EventBus>, db_path: PathBuf
     let mut rx = event_bus.subscribe();
     let mut state = State::new(db_path);
 
+    // Hydrate from the bus's tunnel snapshot before starting the event loop.
+    // The TUI subscribes lazily (after the menu picks "Terminal UI"), so events
+    // that fired during boot — TunnelStepChanged / TunnelUrlChanged / Ready —
+    // would otherwise be lost: tokio broadcast has no replay. Without this, a
+    // user who lingers in the menu past the ~8s health-probe window enters a
+    // dashboard stuck on the onboarding view forever.
+    let snap = event_bus.snapshot();
+    if let Some(url) = snap.url {
+        state.tunnel_url = Some(url);
+        state.cascade_done_through("Tunneling");
+    }
+    if let Some(step_ev) = snap.latest_step {
+        state.apply(&step_ev);
+    }
+    if let Some(reason) = snap.down_reason {
+        state.apply(&AgentEvent::TunnelDown { reason });
+    }
+
     loop {
         term.draw(|f| draw(f, &state))?;
 
@@ -925,6 +943,42 @@ mod tests {
         assert_eq!(
             state.tunnel_url.as_deref(),
             Some("https://abc-def.trycloudflare.com")
+        );
+    }
+
+    /// Late-joiner via snapshot: simulate the TUI subscribing AFTER tunnel
+    /// boot completes. Hydrating from `EventBus::snapshot()` must reach
+    /// `is_ready()` without any further events arriving — otherwise the
+    /// onboarding view sticks forever.
+    #[test]
+    fn snapshot_hydration_reaches_ready_without_further_events() {
+        let bus = EventBus::new();
+        // Replay the boot the TUI missed (URL fired, then Ready fired).
+        bus.send(AgentEvent::TunnelUrlChanged {
+            url: "https://abc.trycloudflare.com".into(),
+        });
+        bus.send(AgentEvent::TunnelStepChanged {
+            step: TunnelStep::Ready,
+            attempt: 1,
+            info: Some("https://abc.trycloudflare.com".into()),
+            reason: None,
+        });
+
+        // Now run the same hydration the dashboard does on entry.
+        let snap = bus.snapshot();
+        let mut state = State::new(PathBuf::from("/tmp/dummy.sqlite"));
+        if let Some(url) = snap.url {
+            state.tunnel_url = Some(url);
+            state.cascade_done_through("Tunneling");
+        }
+        if let Some(ev) = snap.latest_step {
+            state.apply(&ev);
+        }
+
+        assert!(state.is_ready(), "TUI must reach Ready via snapshot alone");
+        assert_eq!(
+            state.tunnel_url.as_deref(),
+            Some("https://abc.trycloudflare.com")
         );
     }
 
