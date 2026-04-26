@@ -1,24 +1,77 @@
-// HEAD-probe loop against the freshly-issued tunnel URL. Cloudflare Quick
-// Tunnels need 30-60s for the new subdomain to propagate; surfacing each
-// attempt to the user removes the "is it stuck?" anxiety.
+// HEAD-probe loop against the freshly-issued tunnel URL.
 //
-// This deliberately uses the system resolver (no 1.1.1.1 bypass yet — YAGNI).
-// If users report long waits we'll add hickory-resolver later.
+// `*.trycloudflare.com` subdomains are anycast on Cloudflare's edge, but the
+// system resolver can lag 60-180s before learning the new record (negative
+// DNS cache, slow ISP forwarder, VPN caches). Real clients (phones over
+// cellular) reach the tunnel via Cloudflare's own resolver and connect
+// instantly — only the local probe is stuck. To match that experience we
+// resolve the tunnel host via Cloudflare DoH (1.1.1.1) and pin the result
+// into a probe-only `reqwest::Client`. DoH unreachable → silent fallback to
+// the existing system-DNS client.
 
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use tracing::{info, warn};
+
 use crate::events::{AgentEvent, EventBus};
 
-const HEALTH_TIMEOUT: Duration = Duration::from_secs(180);
+// Aggressive timeout — the probe is nice-to-have telemetry, not a gate.
+// `ensure_quick_tunnel` only returns after cloudflared logs "Registered
+// tunnel connection", which IS the real liveness signal. After this window
+// expires, main.rs flips to Ready with a soft "(probe inconclusive)"
+// suffix rather than blocking the dashboard behind a hard failure.
+pub const HEALTH_TIMEOUT: Duration = Duration::from_secs(8);
 const PROBE_INTERVAL: Duration = Duration::from_secs(2);
-const PER_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(5);
+const PER_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(3);
+const DOH_TIMEOUT: Duration = Duration::from_secs(3);
 
 pub async fn run_health_check(
     tunnel_url: String,
     bus: Arc<EventBus>,
-    client: reqwest::Client,
+    fallback_client: reqwest::Client,
 ) -> bool {
+    // Build a probe client that resolves the tunnel host via Cloudflare DoH
+    // instead of system DNS. On any failure (malformed URL, DoH blocked,
+    // empty answer) fall back to the system-DNS client so behavior on
+    // restricted networks matches today. Surface the outcome via a
+    // HealthProbe(attempt=0) event so the operator can see in the probe log
+    // whether DoH actually took effect.
+    let (probe_client, doh_status) = match extract_host(&tunnel_url) {
+        Some(host) => {
+            let doh_started = Instant::now();
+            match doh_resolve(&host).await {
+                Some(ip) => {
+                    info!(target: "health_check", host = %host, ip = %ip, "doh resolved");
+                    let elapsed = doh_started.elapsed().as_millis() as u64;
+                    let client = build_pinned_client(&host, ip).unwrap_or_else(|| {
+                        warn!(target: "health_check", "pinned-client build failed; falling back");
+                        fallback_client.clone()
+                    });
+                    (client, format!("doh resolved → {ip} ({elapsed}ms)"))
+                }
+                None => {
+                    warn!(target: "health_check", host = %host, "doh failed; using system dns");
+                    let elapsed = doh_started.elapsed().as_millis() as u64;
+                    (
+                        fallback_client.clone(),
+                        format!("doh blocked or failed ({elapsed}ms) → system dns"),
+                    )
+                }
+            }
+        }
+        None => (fallback_client.clone(), "non-https url; system dns".into()),
+    };
+
+    // attempt=0 marks this as a pre-probe diagnostic, distinct from real probes.
+    bus.send(AgentEvent::HealthProbe {
+        attempt: 0,
+        status: doh_status,
+        elapsed_ms: 0,
+        ok: false,
+    });
+
     let health_url = format!("{}/api/health", tunnel_url.trim_end_matches('/'));
     let start = Instant::now();
     let mut attempt: u32 = 0;
@@ -26,7 +79,7 @@ pub async fn run_health_check(
     while start.elapsed() < HEALTH_TIMEOUT {
         attempt += 1;
         let probe_start = Instant::now();
-        let result = client
+        let result = probe_client
             .head(&health_url)
             .timeout(PER_ATTEMPT_TIMEOUT)
             .send()
@@ -74,6 +127,75 @@ pub async fn run_health_check(
     false
 }
 
+/// Extract the host portion of `https://host[:port][/path]`. Lighter than
+/// pulling in the `url` crate for a one-shot helper. Returns `None` for
+/// non-HTTPS schemes (the tunnel URL is always HTTPS) or malformed input.
+fn extract_host(url: &str) -> Option<String> {
+    let after_scheme = url.strip_prefix("https://")?;
+    let host_with_port = after_scheme.split('/').next()?;
+    let host = host_with_port.split(':').next()?;
+    if host.is_empty() {
+        None
+    } else {
+        Some(host.to_string())
+    }
+}
+
+/// Resolve `host` via Cloudflare's DoH-JSON endpoint. Returns the first A
+/// record's IP, or `None` if DoH is unreachable, returns a non-2xx status,
+/// returns no Answer section, or returns a malformed IP.
+async fn doh_resolve(host: &str) -> Option<IpAddr> {
+    let url = format!(
+        "https://1.1.1.1/dns-query?name={}&type=A",
+        urlencode(host)
+    );
+    let client = reqwest::Client::builder()
+        .timeout(DOH_TIMEOUT)
+        .build()
+        .ok()?;
+    let resp = client
+        .get(&url)
+        .header("Accept", "application/dns-json")
+        .send()
+        .await
+        .ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    // Parse manually via text() — reqwest's `json` feature isn't enabled in
+    // this project. serde_json is already a transitive dep.
+    let text = resp.text().await.ok()?;
+    let body: serde_json::Value = serde_json::from_str(&text).ok()?;
+    let answers = body.get("Answer")?.as_array()?;
+    for ans in answers {
+        let Some(data) = ans.get("data").and_then(|v| v.as_str()) else { continue };
+        if let Ok(ip) = data.parse::<IpAddr>() {
+            return Some(ip);
+        }
+    }
+    None
+}
+
+/// Build a `reqwest::Client` that pins `host` → `ip:443`, bypassing whatever
+/// the system resolver thinks. Used only for probe traffic — every probe
+/// request targets the same tunnel host, so the pin is comprehensive.
+fn build_pinned_client(host: &str, ip: IpAddr) -> Option<reqwest::Client> {
+    reqwest::Client::builder()
+        .timeout(PER_ATTEMPT_TIMEOUT + Duration::from_secs(1))
+        .resolve(host, SocketAddr::new(ip, 443))
+        .build()
+        .ok()
+}
+
+/// Minimal URL-component encoder for ASCII hostnames. `*.trycloudflare.com`
+/// subdomains use only `[a-z0-9-]`, so this is a defense-in-depth strip
+/// rather than a real percent-encoder.
+fn urlencode(host: &str) -> String {
+    host.chars()
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '.'))
+        .collect()
+}
+
 trait ErrorChain {
     /// First useful description in the source chain — `reqwest::Error`'s
     /// Display is usually a wrapper; the inner cause has the real reason
@@ -92,5 +214,60 @@ impl ErrorChain for reqwest::Error {
             src = std::error::Error::source(s);
         }
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extract_host_strips_scheme_and_path() {
+        assert_eq!(
+            extract_host("https://abc.trycloudflare.com").as_deref(),
+            Some("abc.trycloudflare.com")
+        );
+        assert_eq!(
+            extract_host("https://abc.trycloudflare.com/api/health").as_deref(),
+            Some("abc.trycloudflare.com")
+        );
+    }
+
+    #[test]
+    fn extract_host_strips_port() {
+        assert_eq!(
+            extract_host("https://abc.trycloudflare.com:443/x").as_deref(),
+            Some("abc.trycloudflare.com")
+        );
+    }
+
+    #[test]
+    fn extract_host_rejects_non_https() {
+        // The probe always runs against HTTPS tunnels — http/ws aren't valid.
+        assert_eq!(extract_host("http://abc.trycloudflare.com"), None);
+        assert_eq!(extract_host("ws://abc.trycloudflare.com"), None);
+        assert_eq!(extract_host("not-a-url"), None);
+        assert_eq!(extract_host(""), None);
+    }
+
+    #[test]
+    fn extract_host_rejects_empty_host() {
+        assert_eq!(extract_host("https:///path"), None);
+    }
+
+    #[test]
+    fn urlencode_preserves_legal_hostnames() {
+        assert_eq!(urlencode("abc.trycloudflare.com"), "abc.trycloudflare.com");
+        assert_eq!(urlencode("foo-bar-123.example.com"), "foo-bar-123.example.com");
+    }
+
+    #[test]
+    fn urlencode_strips_injection_attempts() {
+        // Defense-in-depth: even though extract_host returns valid hostnames,
+        // confirm that any unexpected characters are stripped before they
+        // reach the DoH URL.
+        assert_eq!(urlencode("evil.com&injected=1"), "evil.cominjected1");
+        assert_eq!(urlencode("a b c"), "abc");
+        assert_eq!(urlencode("a/b"), "ab");
     }
 }

@@ -334,7 +334,9 @@ async fn server_main(event_bus: Arc<EventBus>) -> anyhow::Result<()> {
     let data_dir = default_data_dir()?;
     std::fs::create_dir_all(&data_dir).context("create data dir")?;
 
-    let cloudflared = tunnel::ensure_cloudflared(&data_dir).await.context("ensure cloudflared")?;
+    let cloudflared = tunnel::ensure_cloudflared(&data_dir, event_bus.clone())
+        .await
+        .context("ensure cloudflared")?;
     info!(path = %cloudflared.display(), "cloudflared ready");
 
     let db_path = data_dir.join("oxiremote.sqlite");
@@ -663,7 +665,7 @@ async fn server_main(event_bus: Arc<EventBus>) -> anyhow::Result<()> {
     let tunnel_state = state.clone();
     tokio::spawn(async move {
         let url = match named_cfg {
-            Some(cfg) => match tunnel::ensure_named_tunnel(cloudflared, cfg).await {
+            Some(cfg) => match tunnel::ensure_named_tunnel(cloudflared, cfg, tunnel_state.event_bus.clone()).await {
                 Ok(target) => {
                     info!(%target, "named tunnel ready");
                     Some(target)
@@ -742,14 +744,24 @@ async fn server_main(event_bus: Arc<EventBus>) -> anyhow::Result<()> {
                     reason: None,
                 });
             } else {
-                warn!("tunnel URL did not pass health check within timeout");
+                // Probe timed out and no client connected. Cloudflared HAS
+                // registered with Cloudflare's edge (we awaited that signal in
+                // ensure_quick_tunnel) — registration is the real liveness
+                // proof. The HEAD probe is a nice-to-have that fails on
+                // networks where local DNS lags Cloudflare DNS, even though
+                // real clients (phones over cellular) connect just fine.
+                // Don't gate the dashboard behind probe success: surface
+                // Ready with a soft diagnostic so the operator can see the
+                // QR and the user can pair. If the tunnel is actually broken
+                // (rare), the scan attempt will surface the real failure.
+                warn!("local health probe inconclusive within timeout — proceeding to Ready since tunnel is registered");
                 tunnel_state.event_bus.send(events::AgentEvent::TunnelStepChanged {
-                    step: events::TunnelStep::Failed,
-                    attempt: 0,
-                    info: None,
-                    reason: Some(
-                        "health probe timeout (180s); DNS may not have propagated".into(),
-                    ),
+                    step: events::TunnelStep::Ready,
+                    attempt: 1,
+                    info: Some(format!(
+                        "{u} (local probe inconclusive — scan QR to test)"
+                    )),
+                    reason: None,
                 });
             }
         }

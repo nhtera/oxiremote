@@ -69,36 +69,23 @@ impl State {
             Some(rec) => (Some(rec.token), Some(rec.expires_at)),
             None => (None, None),
         };
+        // All steps start Pending. The event bus drives transitions to
+        // Active/Done. Earlier this seeded Preparing=Done and Connecting=Active
+        // as a "boot looks busy" hint — but the TUI subscribes only after the
+        // menu, so quick-tunnel paths emit Connecting/Tunneling before we
+        // listen, and the seeded Active state for Connecting then sticks
+        // forever (no later event clears it). Cascading via HealthProbe
+        // (below) recovers the visual state when we miss earlier events.
         Self {
             db_path,
             tunnel_url: None,
             tunnel_down: None,
             steps: vec![
-                Step {
-                    name: "Preparing".into(),
-                    status: StepStatus::Done,
-                    sub: Some("server ready".into()),
-                },
-                Step {
-                    name: "Connecting".into(),
-                    status: StepStatus::Active,
-                    sub: Some("starting cloudflared…".into()),
-                },
-                Step {
-                    name: "Tunneling".into(),
-                    status: StepStatus::Pending,
-                    sub: None,
-                },
-                Step {
-                    name: "Verifying".into(),
-                    status: StepStatus::Pending,
-                    sub: None,
-                },
-                Step {
-                    name: "Ready".into(),
-                    status: StepStatus::Pending,
-                    sub: None,
-                },
+                Step { name: "Preparing".into(), status: StepStatus::Pending, sub: None },
+                Step { name: "Connecting".into(), status: StepStatus::Pending, sub: None },
+                Step { name: "Tunneling".into(), status: StepStatus::Pending, sub: None },
+                Step { name: "Verifying".into(), status: StepStatus::Pending, sub: None },
+                Step { name: "Ready".into(), status: StepStatus::Pending, sub: None },
             ],
             connected_devices: 0,
             last_log: None,
@@ -111,12 +98,63 @@ impl State {
         }
     }
 
+    /// Mark every step up to AND including `last_done_name` as Done, clearing
+    /// any stale sub-text. Used by handlers that imply a later step is current
+    /// (HealthProbe → we're already past Tunneling) so a TUI that joined the
+    /// bus mid-startup recovers consistent state instead of leaving earlier
+    /// rows visually stuck on whatever they were initialized to.
+    fn cascade_done_through(&mut self, last_done_name: &str) {
+        let names = ["Preparing", "Connecting", "Tunneling", "Verifying", "Ready"];
+        let upto = match names.iter().position(|&n| n == last_done_name) {
+            Some(i) => i,
+            None => return,
+        };
+        for (i, s) in self.steps.iter_mut().enumerate() {
+            if i <= upto {
+                s.status = StepStatus::Done;
+                s.sub = None;
+            }
+        }
+    }
+
     fn ready_verifying(&self) -> bool {
         self.steps
             .iter()
             .find(|s| s.name == "Ready")
             .map(|s| matches!(s.status, StepStatus::Active))
             .unwrap_or(false)
+    }
+
+    /// True once the tunnel is fully serving — Ready step Done AND no down
+    /// signal active. Used to gate the full 4-pane dashboard vs. the
+    /// onboarding view (step checklist only). A post-Ready `TunnelDown`
+    /// flips this back to false so the onboarding view re-renders with the
+    /// failure surfaced inline on the checklist.
+    fn is_ready(&self) -> bool {
+        self.tunnel_down.is_none()
+            && self
+                .steps
+                .iter()
+                .any(|s| s.name == "Ready" && matches!(s.status, StepStatus::Done))
+    }
+
+    /// One-line summary of where the tunnel currently is — either the active
+    /// step's sub-text or, if everything is Pending, a generic hint. Rendered
+    /// in the onboarding footer so the operator sees live progress without
+    /// the QR pane (QR is unscannable until Ready).
+    fn onboarding_hint(&self) -> String {
+        if let Some(reason) = &self.tunnel_down {
+            return format!("tunnel down: {}", reason.chars().take(60).collect::<String>());
+        }
+        for s in &self.steps {
+            if matches!(s.status, StepStatus::Active) {
+                return match s.sub.as_ref() {
+                    Some(sub) => format!("{} — {}", s.name, sub),
+                    None => s.name.clone(),
+                };
+            }
+        }
+        "setting up tunnel — press q to quit, l for logs".into()
     }
 
     fn refresh_otk_from_db(&mut self) {
@@ -146,6 +184,17 @@ impl State {
     fn apply(&mut self, event: &AgentEvent) {
         match event {
             AgentEvent::TunnelStepChanged { step, info, reason, .. } => {
+                // Late-joiner hydration: TUI subscribes to the bus only after
+                // the menu, which means TunnelUrlChanged may have fired and
+                // been dropped before we listen. Step events for Tunneling /
+                // Verifying / Ready carry the URL in `info`. Salvage it so
+                // the QR pane and Host Info don't render "—" forever.
+                if self.tunnel_url.is_none()
+                    && let Some(s) = info
+                    && let Some(url) = extract_tunnel_url(s)
+                {
+                    self.tunnel_url = Some(url);
+                }
                 // Map TunnelStep enum → step name in the checklist.
                 let (step_name, sub_text) = match step {
                     TunnelStep::Preparing => (
@@ -208,9 +257,12 @@ impl State {
             }
             AgentEvent::TunnelUrlChanged { url } => {
                 self.tunnel_url = Some(url.clone());
-                // Update Tunneling step sub-text with the actual URL.
+                // Cascade: arriving at Verifying implies Preparing/Connecting/
+                // Tunneling are done. Idempotent in the normal flow; recovers
+                // visual state when those earlier events were broadcast before
+                // the TUI subscribed.
+                self.cascade_done_through("Tunneling");
                 if let Some(s) = self.steps.iter_mut().find(|s| s.name == "Tunneling") {
-                    s.status = StepStatus::Done;
                     s.sub = Some(url.clone());
                 }
                 if let Some(s) = self.steps.iter_mut().find(|s| s.name == "Verifying") {
@@ -228,6 +280,9 @@ impl State {
                 while self.probe_log.len() > PROBE_LOG_MAX {
                     self.probe_log.remove(0);
                 }
+                // A probe is only emitted after the tunnel transport is up —
+                // mark all earlier steps Done to recover from missed events.
+                self.cascade_done_through("Tunneling");
                 if let Some(s) = self.steps.iter_mut().find(|s| s.name == "Verifying") {
                     if *ok {
                         s.status = StepStatus::Done;
@@ -380,6 +435,26 @@ fn short_id(id: &str) -> String {
     id.chars().take(8).collect()
 }
 
+/// Pluck the first `https://...` token from free-form text. Used to recover
+/// the tunnel URL from a TunnelStepChanged event's `info` field when the TUI
+/// missed the original `TunnelUrlChanged` event (subscription happens after
+/// the menu, so early events go to /dev/null). Stops at the first
+/// whitespace, paren, or quote so suffixes like "(probe inconclusive)"
+/// don't end up in the URL.
+fn extract_tunnel_url(info: &str) -> Option<String> {
+    let start = info.find("https://")?;
+    let tail = &info[start..];
+    let end = tail
+        .find(|c: char| c.is_whitespace() || matches!(c, '(' | ')' | '"' | '\'' | '<' | '>'))
+        .unwrap_or(tail.len());
+    let url = &tail[..end];
+    if url.len() > "https://".len() {
+        Some(url.to_string())
+    } else {
+        None
+    }
+}
+
 fn copy_to_clipboard(value: &str) -> Result<()> {
     let mut cb = arboard::Clipboard::new()?;
     cb.set_text(value.to_string())?;
@@ -387,6 +462,14 @@ fn copy_to_clipboard(value: &str) -> Result<()> {
 }
 
 fn draw(f: &mut ratatui::Frame<'_>, state: &State) {
+    if state.is_ready() {
+        draw_dashboard(f, state);
+    } else {
+        draw_onboarding(f, state);
+    }
+}
+
+fn draw_dashboard(f: &mut ratatui::Frame<'_>, state: &State) {
     let area = f.area();
     // 5-step checklist needs more vertical room than the old 3-step version.
     // Header height = border (1) + top padding (1) + 5 rows + bottom border (1) = 8.
@@ -409,6 +492,65 @@ fn draw(f: &mut ratatui::Frame<'_>, state: &State) {
         render_body(f, outer[1], state);
     }
     render_footer(f, outer[2], state);
+}
+
+// Onboarding view: step checklist only — no QR (unscannable until Ready),
+// no Host Info (most fields aren't real until Ready), no Actions list (most
+// keybinds are no-ops pre-Ready). The operator sees just what matters: the
+// 5-step progress and a one-line live status hint. `q` (quit) and `l`
+// (toggle logs) still work via the global key handler.
+fn draw_onboarding(f: &mut ratatui::Frame<'_>, state: &State) {
+    let area = f.area();
+    if state.show_logs {
+        // Logs view stays available even pre-Ready so the operator can debug
+        // a stuck startup. Keep header + log body + footer to mirror the
+        // dashboard layout shape.
+        let wide = area.width >= 80;
+        let header_h = if wide { 8u16 } else { 6 };
+        let outer = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(header_h),
+                Constraint::Min(14),
+                Constraint::Length(3),
+            ])
+            .split(area);
+        render_header(f, outer[0], state, wide);
+        render_logs(f, outer[1], state);
+        render_footer(f, outer[2], state);
+        return;
+    }
+
+    let wide = area.width >= 80;
+    let header_h = if wide { 8u16 } else { 6 };
+    let outer = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(header_h), // step checklist
+            Constraint::Min(0),            // hint area (large spacer; centers the message)
+            Constraint::Length(2),         // probe-info / hint footer
+            Constraint::Length(2),         // bottom spacer
+        ])
+        .split(area);
+
+    render_header(f, outer[0], state, wide);
+    render_onboarding_hint(f, outer[2], state);
+}
+
+fn render_onboarding_hint(f: &mut ratatui::Frame<'_>, area: Rect, state: &State) {
+    let hint = state.onboarding_hint();
+    let color = if state.tunnel_down.is_some() {
+        Color::Red
+    } else {
+        Color::Rgb(108, 180, 255)
+    };
+    let para = Paragraph::new(Line::from(Span::styled(
+        hint,
+        Style::default().fg(color).add_modifier(Modifier::BOLD),
+    )))
+    .alignment(Alignment::Center)
+    .wrap(Wrap { trim: true });
+    f.render_widget(para, area);
 }
 
 fn render_header(f: &mut ratatui::Frame<'_>, area: Rect, state: &State, wide: bool) {
@@ -650,4 +792,190 @@ fn action_line<'a>(key: &'a str, label: &'a str) -> Line<'a> {
         ),
         Span::styled(label, Style::default().fg(Color::White)),
     ])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn step_status(state: &State, name: &str) -> StepStatus {
+        state
+            .steps
+            .iter()
+            .find(|s| s.name == name)
+            .map(|s| s.status)
+            .unwrap_or(StepStatus::Pending)
+    }
+
+    /// Late-joiner recovery: TUI subscribes to the bus AFTER the menu, so
+    /// quick-tunnel paths emit Connecting/Tunneling before we listen. Only
+    /// HealthProbe events arrive at the TUI in that case. Verify that an
+    /// incoming probe event marks Preparing/Connecting/Tunneling as Done so
+    /// the checklist doesn't show two simultaneous Active steps.
+    #[test]
+    fn health_probe_cascades_earlier_steps_to_done() {
+        let mut state = State::new(PathBuf::from("/tmp/dummy.sqlite"));
+        // Default: every step Pending. Simulate the "TUI joined late" case
+        // where Connecting/Tunneling events were lost.
+        state.apply(&AgentEvent::HealthProbe {
+            attempt: 1,
+            status: "connecting…".into(),
+            elapsed_ms: 4200,
+            ok: false,
+        });
+
+        assert!(matches!(step_status(&state, "Preparing"), StepStatus::Done));
+        assert!(matches!(step_status(&state, "Connecting"), StepStatus::Done));
+        assert!(matches!(step_status(&state, "Tunneling"), StepStatus::Done));
+        assert!(matches!(step_status(&state, "Verifying"), StepStatus::Active));
+        assert!(matches!(step_status(&state, "Ready"), StepStatus::Pending));
+    }
+
+    /// Same recovery via TunnelUrlChanged — the URL also implies the tunnel
+    /// transport is up.
+    #[test]
+    fn tunnel_url_changed_cascades_earlier_steps_to_done() {
+        let mut state = State::new(PathBuf::from("/tmp/dummy.sqlite"));
+        state.apply(&AgentEvent::TunnelUrlChanged {
+            url: "https://test.trycloudflare.com".into(),
+        });
+        assert!(matches!(step_status(&state, "Preparing"), StepStatus::Done));
+        assert!(matches!(step_status(&state, "Connecting"), StepStatus::Done));
+        assert!(matches!(step_status(&state, "Tunneling"), StepStatus::Done));
+        assert!(matches!(step_status(&state, "Verifying"), StepStatus::Active));
+    }
+
+    /// Default state should not pre-mark any step Active — that's what caused
+    /// the original "two-active-step" rendering bug when events were missed.
+    #[test]
+    fn default_state_has_no_active_steps() {
+        let state = State::new(PathBuf::from("/tmp/dummy.sqlite"));
+        assert!(
+            state.steps.iter().all(|s| !matches!(s.status, StepStatus::Active)),
+            "no step should default to Active"
+        );
+    }
+
+    /// Successful HealthProbe must promote Ready → Done. Locks in the
+    /// `if *ok && let Some(s) = ...` chain that's otherwise untested.
+    #[test]
+    fn health_probe_ok_promotes_ready_to_done() {
+        let mut state = State::new(PathBuf::from("/tmp/dummy.sqlite"));
+        state.apply(&AgentEvent::HealthProbe {
+            attempt: 5,
+            status: "200 OK".into(),
+            elapsed_ms: 87,
+            ok: true,
+        });
+        assert!(matches!(step_status(&state, "Verifying"), StepStatus::Done));
+        assert!(matches!(step_status(&state, "Ready"), StepStatus::Done));
+        assert!(state.is_ready(), "is_ready() should be true after probe ok=true");
+    }
+
+    /// `is_ready()` must flip back to false when TunnelDown fires after Ready,
+    /// so the dashboard re-enters the onboarding view to surface the failure.
+    #[test]
+    fn tunnel_down_after_ready_flips_is_ready_false() {
+        let mut state = State::new(PathBuf::from("/tmp/dummy.sqlite"));
+        // Reach Ready via successful probe.
+        state.apply(&AgentEvent::HealthProbe {
+            attempt: 1,
+            status: "200 OK".into(),
+            elapsed_ms: 50,
+            ok: true,
+        });
+        assert!(state.is_ready());
+
+        // Cloudflared crashes post-Ready.
+        state.apply(&AgentEvent::TunnelDown {
+            reason: "exit code 1".into(),
+        });
+        assert!(!state.is_ready(), "TunnelDown must defeat is_ready()");
+        assert!(state.tunnel_down.is_some());
+    }
+
+    /// Late-joiner hydration: if the TUI missed `TunnelUrlChanged` (broadcast
+    /// before the dashboard subscribed), it must still extract the tunnel
+    /// URL from a step event's info field. Otherwise the QR pane and Host
+    /// Info pane render "—" forever even after Ready=Done.
+    #[test]
+    fn step_event_hydrates_tunnel_url_from_info() {
+        let mut state = State::new(PathBuf::from("/tmp/dummy.sqlite"));
+        assert!(state.tunnel_url.is_none());
+
+        // Bare URL (matches what ensure_quick_tunnel emits for Tunneling).
+        state.apply(&AgentEvent::TunnelStepChanged {
+            step: TunnelStep::Tunneling,
+            attempt: 1,
+            info: Some("https://abc-def.trycloudflare.com".into()),
+            reason: None,
+        });
+        assert_eq!(
+            state.tunnel_url.as_deref(),
+            Some("https://abc-def.trycloudflare.com")
+        );
+    }
+
+    /// Ready event's info has the URL plus a soft suffix; we must stop at
+    /// the first space so the suffix doesn't end up in the URL.
+    #[test]
+    fn extract_tunnel_url_stops_at_suffix() {
+        assert_eq!(
+            extract_tunnel_url("https://x.trycloudflare.com (probe inconclusive)").as_deref(),
+            Some("https://x.trycloudflare.com")
+        );
+        assert_eq!(
+            extract_tunnel_url("URL issued: https://x.trycloudflare.com (waiting for edge)")
+                .as_deref(),
+            Some("https://x.trycloudflare.com")
+        );
+        assert_eq!(extract_tunnel_url("no url here"), None);
+        assert_eq!(extract_tunnel_url("https://"), None);
+    }
+
+    /// A Failed event must not alter step status (StepStatus has no Failed
+    /// variant) but must annotate the currently-active step's sub-text. After
+    /// the cascade fix, only one step is Active at a time — so Failed touches
+    /// at most one row, not two like before.
+    #[test]
+    fn failed_event_annotates_only_active_step() {
+        let mut state = State::new(PathBuf::from("/tmp/dummy.sqlite"));
+        // Move into Verifying via cascade, simulating mid-startup failure.
+        state.apply(&AgentEvent::HealthProbe {
+            attempt: 12,
+            status: "connecting…".into(),
+            elapsed_ms: 4000,
+            ok: false,
+        });
+        assert!(matches!(step_status(&state, "Verifying"), StepStatus::Active));
+
+        state.apply(&AgentEvent::TunnelStepChanged {
+            step: TunnelStep::Failed,
+            attempt: 1,
+            info: None,
+            reason: Some("health probe timeout (180s)".into()),
+        });
+
+        // Verifying still Active (no Failed status variant), but sub-text
+        // now carries the failure reason.
+        assert!(matches!(step_status(&state, "Verifying"), StepStatus::Active));
+        let verifying = state.steps.iter().find(|s| s.name == "Verifying").unwrap();
+        assert!(
+            verifying.sub.as_deref().unwrap_or("").contains("failed:"),
+            "Verifying.sub should carry 'failed: ...' annotation, got {:?}",
+            verifying.sub
+        );
+
+        // Earlier steps are Done (cascade), so they're NOT Active and must
+        // not have been annotated. Catches a regression of the original
+        // two-failed-step rendering bug.
+        for name in ["Preparing", "Connecting", "Tunneling"] {
+            let s = state.steps.iter().find(|s| s.name == name).unwrap();
+            assert!(
+                !s.sub.as_deref().unwrap_or("").contains("failed:"),
+                "{name} should NOT carry a failed annotation"
+            );
+        }
+    }
 }
