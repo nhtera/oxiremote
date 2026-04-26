@@ -55,12 +55,12 @@ export default function ReconnectModal({
       </div>
       <div id="reconnect-desc" className="text-text-secondary text-[length:var(--text-body)] mt-2 leading-relaxed">
         {exhausted ? (
-          `Could not reconnect after ${maxAttempts} attempts. Your terminal session is still preserved on the host — try opening the page again to resume.`
+          `Could not reconnect after ${maxAttempts} attempts. Your session is still preserved on the host — try opening the page again to resume.`
         ) : (
           <>
             Your session is preserved — we'll resume where you left off.
             <div className="text-[length:var(--text-meta)] text-text-muted mt-2">
-              Retrying… ({attempt} of {maxAttempts})
+              Reconnecting… Attempt {attempt} of {maxAttempts}
               {onRetry && (
                 <> — next try in <span className="font-mono">{secondsLeft}s</span></>
               )}
@@ -68,14 +68,28 @@ export default function ReconnectModal({
           </>
         )}
       </div>
-      <div className="mt-5 flex justify-end gap-2">
+
+      {/* Orange progress bar — visible only while retrying. Width reflects
+          the countdown as a fraction of countdownSeconds so the user can
+          see how long until the next attempt. */}
+      {!exhausted && (
+        <div className="mt-4 h-1.5 w-full rounded-full bg-surface-alt overflow-hidden">
+          <div
+            className="h-full bg-orange-500 transition-all duration-1000 ease-linear"
+            style={{ width: `${Math.round((secondsLeft / countdownSeconds) * 100)}%` }}
+            aria-hidden="true"
+          />
+        </div>
+      )}
+
+      <div className="mt-4 flex justify-end gap-2">
         {!exhausted && onRetry && (
           <Button variant="primary" size="sm" onClick={onRetry}>
             Retry now
           </Button>
         )}
-        <Button variant="ghost" size="sm" onClick={onCancel}>
-          {exhausted ? 'Exit' : 'Cancel'}
+        <Button variant={exhausted ? 'danger' : 'ghost'} size="sm" onClick={onCancel}>
+          Exit
         </Button>
       </div>
     </Dialog>

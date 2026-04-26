@@ -25,6 +25,10 @@ interface Props {
   pipeline: 'h264' | 'jpeg'
   /** Operator-initiated session end. Triggers a confirm dialog up in the page. */
   onExit?: () => void
+  /** Whether the text-batch sheet is currently open. */
+  textBatchOpen?: boolean
+  /** Toggle the text-batch sheet. */
+  onToggleTextBatch?: () => void
 }
 
 // Sticky modifier keys — toggled on tap, cleared after next key dispatch
@@ -73,6 +77,8 @@ export default function DesktopToolbar({
   onSettingsChange,
   pipeline,
   onExit,
+  textBatchOpen = false,
+  onToggleTextBatch,
 }: Props) {
   const [activeModifiers, setActiveModifiers] = useState<Set<ModKey>>(new Set())
   const [settingsOpen, setSettingsOpen] = useState(false)
@@ -198,7 +204,10 @@ export default function DesktopToolbar({
         </div>
       </div>
 
-      {/* Input mode + gesture help row */}
+      {/* Input mode + Aa text-batch + gesture help row.
+          Layout: [Touch/Trackpad toggle] [Aa] [?]
+          Aa is orange when the text-batch sheet is open.
+          ? is always rightmost. */}
       <div className="flex items-center gap-2 min-w-0">
         <button
           onClick={onInputModeToggle}
@@ -212,11 +221,28 @@ export default function DesktopToolbar({
           {inputMode === 'touch' ? 'Touch' : 'Trackpad'}
         </button>
 
+        {onToggleTextBatch && (
+          <button
+            onClick={onToggleTextBatch}
+            title="Text input — type long strings to the remote machine"
+            aria-label="Toggle text input sheet"
+            aria-pressed={textBatchOpen}
+            className={[
+              'shrink-0 text-xs px-2 py-1 border rounded-md transition-colors font-medium',
+              textBatchOpen
+                ? 'bg-[hsl(var(--accent-primary)/0.2)] text-[hsl(var(--accent-primary))] border-[hsl(var(--accent-primary)/0.4)]'
+                : 'bg-surface-alt text-text-muted border-border hover:text-text-primary hover:bg-surface-hover',
+            ].join(' ')}
+          >
+            Aa
+          </button>
+        )}
+
         <button
           onClick={onShowGestureHelp}
           title="Gesture help"
-          className="shrink-0 text-xs px-2 py-1 border border-border rounded-md bg-surface-alt text-text-muted hover:text-text-primary hover:bg-surface-hover transition-colors"
           aria-label="Gesture help"
+          className="shrink-0 text-xs px-2 py-1 border border-border rounded-md bg-surface-alt text-text-muted hover:text-text-primary hover:bg-surface-hover transition-colors"
         >
           ?
         </button>

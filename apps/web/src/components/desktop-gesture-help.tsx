@@ -1,7 +1,9 @@
 // Gesture help bottom sheet — two tabs: Touch and Trackpad.
-// Dismisses on backdrop click or X button. Accent underline on active tab.
+// Dismisses on backdrop click, X button, or Escape key.
+// Accent underline on active tab.
+// Content covers all gestures from the UX parity spec plus toolbar legend.
 
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 
 interface Props {
   open: boolean
@@ -11,17 +13,44 @@ interface Props {
 type Tab = 'touch' | 'trackpad'
 
 const TOUCH_GESTURES = [
-  { gesture: 'Tap', action: 'Left click' },
-  { gesture: 'Two-finger tap', action: 'Right click' },
-  { gesture: 'Long press (0.5s)', action: 'Right click' },
-  { gesture: 'Two-finger swipe', action: 'Scroll' },
-  { gesture: 'Drag', action: 'Click and drag' },
-  { gesture: 'Three-finger swipe', action: 'Reserved (v2)' },
-  { gesture: 'Pinch', action: 'Zoom (disabled v1)' },
+  { gesture: '1-finger tap', action: 'Left click' },
+  { gesture: 'Long press (0.5 s)', action: 'Right click' },
+  { gesture: 'Double tap', action: 'Double click' },
+  { gesture: '2-finger tap', action: 'Right click' },
+  { gesture: '2-finger swipe', action: 'Scroll' },
+  { gesture: '2-finger pinch', action: 'Zoom canvas' },
+  { gesture: '1-finger drag (zoomed in)', action: 'Pan view' },
+  { gesture: '1-finger drag (no zoom)', action: 'Click and drag' },
+]
+
+const TRACKPAD_GESTURES = [
+  { gesture: 'Move', action: 'Move cursor' },
+  { gesture: 'Click', action: 'Left click' },
+  { gesture: 'Right-click', action: 'Right click' },
+  { gesture: '2-finger scroll', action: 'Scroll' },
+]
+
+const TOOLBAR_LEGEND = [
+  { key: 'Touch / Trackpad', desc: 'Toggle pointer input mode' },
+  { key: 'Aa', desc: 'Open text-batch input for long strings' },
+  { key: '?', desc: 'Show this gesture guide' },
 ]
 
 export default function DesktopGestureHelp({ open, onClose }: Props) {
   const [tab, setTab] = useState<Tab>('touch')
+
+  // Esc closes the sheet
+  useEffect(() => {
+    if (!open) return
+    function onKeyDown(e: KeyboardEvent) {
+      if (e.key === 'Escape') {
+        e.stopPropagation()
+        onClose()
+      }
+    }
+    document.addEventListener('keydown', onKeyDown)
+    return () => document.removeEventListener('keydown', onKeyDown)
+  }, [open, onClose])
 
   if (!open) return null
 
@@ -29,15 +58,22 @@ export default function DesktopGestureHelp({ open, onClose }: Props) {
     <div
       className="fixed inset-0 z-40 flex items-end justify-center"
       onClick={onClose}
+      role="dialog"
+      aria-modal="true"
+      aria-label="Gesture guide"
     >
       {/* Backdrop */}
-      <div className="absolute inset-0 bg-black/50" />
+      <div className="absolute inset-0 bg-black/50" aria-hidden="true" />
 
       {/* Sheet */}
       <div
-        className="relative z-10 w-full max-w-lg bg-surface border border-border rounded-t-xl p-4 pb-safe"
+        className="relative z-10 w-full max-w-lg bg-surface border border-border rounded-t-xl p-4"
+        style={{ paddingBottom: 'calc(env(safe-area-inset-bottom, 0px) + 1rem)' }}
         onClick={(e) => e.stopPropagation()}
       >
+        {/* Drag handle */}
+        <div className="mx-auto mb-3 h-1 w-10 rounded-full bg-border" />
+
         {/* Header */}
         <div className="flex items-center justify-between mb-3">
           <span className="text-sm font-medium text-text-primary">Gesture guide</span>
@@ -79,25 +115,28 @@ export default function DesktopGestureHelp({ open, onClose }: Props) {
             ))}
           </div>
         ) : (
-          <div className="grid gap-1.5 text-xs">
-            <div className="flex justify-between gap-3">
-              <span className="text-text-muted">Move</span>
-              <span className="text-text-primary text-right">Move cursor</span>
-            </div>
-            <div className="flex justify-between gap-3">
-              <span className="text-text-muted">Click</span>
-              <span className="text-text-primary text-right">Left click</span>
-            </div>
-            <div className="flex justify-between gap-3">
-              <span className="text-text-muted">Right-click</span>
-              <span className="text-text-primary text-right">Right click</span>
-            </div>
-            <div className="flex justify-between gap-3">
-              <span className="text-text-muted">Two-finger scroll</span>
-              <span className="text-text-primary text-right">Scroll</span>
-            </div>
+          <div className="grid gap-1.5">
+            {TRACKPAD_GESTURES.map(({ gesture, action }) => (
+              <div key={gesture} className="flex justify-between text-xs gap-3">
+                <span className="text-text-muted shrink-0">{gesture}</span>
+                <span className="text-text-primary text-right">{action}</span>
+              </div>
+            ))}
           </div>
         )}
+
+        {/* Toolbar legend */}
+        <div className="mt-4 pt-3 border-t border-border">
+          <div className="text-xs font-medium text-text-secondary mb-2">Toolbar</div>
+          <div className="grid gap-1.5">
+            {TOOLBAR_LEGEND.map(({ key, desc }) => (
+              <div key={key} className="flex justify-between text-xs gap-3">
+                <span className="text-text-muted shrink-0 font-mono">{key}</span>
+                <span className="text-text-primary text-right">{desc}</span>
+              </div>
+            ))}
+          </div>
+        </div>
       </div>
     </div>
   )

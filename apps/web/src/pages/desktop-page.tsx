@@ -23,8 +23,11 @@ import DesktopToolbar from '../components/desktop-toolbar'
 import DesktopTopStrip from '../components/desktop-top-strip'
 import DesktopGestureHelp from '../components/desktop-gesture-help'
 import DesktopOnscreenKeyboard from '../components/desktop-onscreen-keyboard'
+import DesktopTextBatchSheet from '../components/desktop-text-batch-sheet'
+import DesktopExitConfirm from '../components/desktop-exit-confirm'
 import ReconnectModal from '../components/reconnect-modal'
 import { useConfirm } from '../components/ui'
+import { useSendTextBatch } from '../hooks/use-desktop-input'
 
 interface Capabilities {
   available: boolean
@@ -84,6 +87,8 @@ export default function DesktopPage() {
   const [inputMode, setInputMode] = useState<InputMode>('touch')
   const [showHelp, setShowHelp] = useState(false)
   const [showKeyboard, setShowKeyboard] = useState(false)
+  const [showTextBatch, setShowTextBatch] = useState(false)
+  const [showExitConfirm, setShowExitConfirm] = useState(false)
   // Forces a remount of the active video view — used by the mobile Reload
   // button so the operator can recover from a stuck stream without leaving
   // the page (browser-back would lose any partial gesture / tool state).
@@ -194,6 +199,43 @@ export default function DesktopPage() {
     sessionApiRef.current.disconnect()
     navigate(`/h/${hostId}`)
   }, [confirm, hostId, navigate])
+
+  // Mobile back-gesture / browser back interception.
+  // On mobile (pointer: coarse), we push a dummy history entry when a session
+  // is active so the OS back gesture pops it back to our dummy rather than
+  // navigating away. We then show the exit-confirm modal instead.
+  // On PC (pointer: fine) we skip this — no native back gesture in the browser.
+  const isMobile =
+    typeof window !== 'undefined' && window.matchMedia('(pointer: coarse)').matches
+
+  useEffect(() => {
+    if (!isMobile) return
+    // Push a dummy state so the next back gesture hits popstate before leaving.
+    history.pushState({ desktopBackGuard: true }, '')
+
+    function onPopState(_e: PopStateEvent) {
+      // The dummy guard entry just popped. Re-push it so the next back gesture
+      // also fires popstate, and show the exit-confirm modal now.
+      history.pushState({ desktopBackGuard: true }, '')
+      setShowExitConfirm(true)
+    }
+
+    // Listen on the window so we catch the popstate from the guard entry above.
+    window.addEventListener('popstate', onPopState)
+    return () => {
+      window.removeEventListener('popstate', onPopState)
+    }
+  }, [isMobile])
+
+  // Confirm exit from the mobile exit-confirm modal.
+  const handleExitConfirm = useCallback(() => {
+    setShowExitConfirm(false)
+    sessionApiRef.current.disconnect()
+    navigate(`/h/${hostId}`)
+  }, [hostId, navigate])
+
+  // Text-batch send — dispatches typed characters through the existing input channel.
+  const handleSendTextBatch = useSendTextBatch(sendInput)
 
   const handleReload = useCallback(() => {
     sessionApiRef.current.disconnect()
@@ -313,7 +355,9 @@ export default function DesktopPage() {
         zoom={zoom}
       />
 
-      <div ref={canvasWrapRef} className="flex-1 relative min-h-0">
+      {/* Disable touch/pointer events on the canvas while text-batch sheet is open
+          so taps on the visible canvas don't register as remote clicks. */}
+      <div ref={canvasWrapRef} className={`flex-1 relative min-h-0${showTextBatch ? ' pointer-events-none' : ''}`}>
         {useH264 ? (
           <DesktopH264View
             key={`h264-${reloadNonce}`}
@@ -357,6 +401,8 @@ export default function DesktopPage() {
           onSettingsChange={handleSettingsChange}
           pipeline={useH264 ? 'h264' : 'jpeg'}
           onExit={handleExit}
+          textBatchOpen={showTextBatch}
+          onToggleTextBatch={() => setShowTextBatch((v) => !v)}
         />
       </div>
 
@@ -365,6 +411,20 @@ export default function DesktopPage() {
         open={showKeyboard}
         onClose={() => setShowKeyboard(false)}
         onKeyEvent={sendInput}
+      />
+
+      {/* Text-batch sheet — canvas pointer events disabled while open so
+          accidental taps on the visible canvas don't register as clicks. */}
+      <DesktopTextBatchSheet
+        open={showTextBatch}
+        onClose={() => setShowTextBatch(false)}
+        onSend={handleSendTextBatch}
+      />
+
+      <DesktopExitConfirm
+        open={showExitConfirm}
+        onCancel={() => setShowExitConfirm(false)}
+        onExit={handleExitConfirm}
       />
 
       <ReconnectModal

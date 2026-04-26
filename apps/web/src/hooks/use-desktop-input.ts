@@ -2,11 +2,78 @@
 // Touch mode: tap → click, two-finger-tap → right-click, long-press → right-click,
 //             two-finger swipe → scroll, drag → drag.
 // Trackpad mode: mouse move → cursor move, click → click, two-finger scroll → scroll.
+//
+// Also exports `sendTextBatch`: dispatches a string as a throttled sequence of
+// key events (~30 ms/char) so input ordering is preserved on slow tunnels.
 
-import { type RefObject, useEffect, useRef } from 'react'
+import { type RefObject, useCallback, useEffect, useRef } from 'react'
 import type { DesktopInputEvent } from './use-desktop-session'
 
 export type InputMode = 'touch' | 'trackpad'
+
+// Character → key code mapping for printable ASCII.
+// Keys outside this map are sent as-is using the character itself.
+function charToCode(ch: string): string {
+  if (ch === ' ') return 'Space'
+  if (ch === '\n' || ch === '\r') return 'Enter'
+  if (ch === '\t') return 'Tab'
+  const upper = ch.toUpperCase()
+  // A–Z
+  if (/^[A-Z]$/.test(upper)) return `Key${upper}`
+  // 0–9
+  if (/^[0-9]$/.test(ch)) return `Digit${ch}`
+  // Punctuation: use the raw character; the agent maps code → char.
+  return ch
+}
+
+// Shift-required characters on a US QWERTY layout.
+const SHIFT_CHARS = new Set('~!@#$%^&*()_+{}|:"<>?ABCDEFGHIJKLMNOPQRSTUVWXYZ')
+
+/**
+ * Sends `text` to the remote machine as a sequence of key-down/key-up events.
+ * Throttled at `delayMs` per character (default 30 ms) so the agent's ordered
+ * ctrl DataChannel never reorders events under network jitter.
+ * Returns a cancel function that stops dispatching mid-sequence.
+ */
+export function sendTextBatch(
+  text: string,
+  sendInput: (ev: DesktopInputEvent) => void,
+  delayMs = 30,
+): () => void {
+  let cancelled = false
+  let idx = 0
+
+  function sendNext() {
+    if (cancelled || idx >= text.length) return
+    const ch = text[idx++]
+    const code = charToCode(ch)
+    const shift = SHIFT_CHARS.has(ch)
+    const ev: DesktopInputEvent = { t: 'key', code, action: 'down', ctrl: false, alt: false, shift, meta: false }
+    sendInput(ev)
+    sendInput({ ...ev, action: 'up' })
+    window.setTimeout(sendNext, delayMs)
+  }
+
+  // Kick off the first character immediately (no leading delay).
+  sendNext()
+
+  return () => { cancelled = true }
+}
+
+/**
+ * Hook that returns a stable `sendTextBatch` bound to the caller's `sendInput`.
+ * The returned function signature matches the phase spec: `(text: string) => void`.
+ * Internally it starts the async dispatch and discards the cancel handle —
+ * callers that need to abort (e.g. on unmount) should call the raw export.
+ */
+export function useSendTextBatch(sendInput: (ev: DesktopInputEvent) => void) {
+  const sendInputRef = useRef(sendInput)
+  useEffect(() => { sendInputRef.current = sendInput }, [sendInput])
+
+  return useCallback((text: string) => {
+    sendTextBatch(text, (ev) => sendInputRef.current(ev))
+  }, [])
+}
 
 interface Props {
   canvas: RefObject<HTMLCanvasElement | null>
