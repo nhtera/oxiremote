@@ -9,12 +9,16 @@ import HealthCheckConsole, {
 import RecentLogsCard, { type LogEntry } from '../../components/recent-logs-card'
 import PermissionsWidget from '../../components/permissions-widget'
 import DevicesPanel from '../../components/devices-panel'
-import TunnelStatusCard from '../../components/tunnel-status-card'
 import { Button, SkeletonCard, StateView } from '../../components/ui'
 
 // Host-dashboard home. Live-updates via the `/api/agent/events` SSE stream;
 // initial snapshot from `/api/agent/state`. Both endpoints are localhost-only
 // — the agent's `route_scope` middleware returns 403 over the tunnel.
+//
+// Layout: 2-col grid at `lg:` (≥1024px). Left column = sticky PairingCard
+// (the hero — operator's primary action). Right column = host info + devices
+// + permissions + proxy + recent logs. Tunnel-status pill lives in the
+// agent-layout header so it's visible from every /agent/* page.
 
 interface OtkState {
   token: string
@@ -74,9 +78,6 @@ export default function AgentHomePage() {
   const [fetchStatus, setFetchStatus] = useState<FetchStatus>('loading')
   const [retryNonce, setRetryNonce] = useState(0)
 
-  // Fetch initial state (includes otk if present). Surface fetch failures so
-  // the user gets a "couldn't reach agent" panel instead of an empty page.
-  // Retry button bumps retryNonce → re-runs this effect.
   useEffect(() => {
     let cancelled = false
     fetch('/api/agent/state')
@@ -103,7 +104,6 @@ export default function AgentHomePage() {
     setRetryNonce((n) => n + 1)
   }
 
-  // Subscribe to SSE events
   useEffect(() => {
     const es = new EventSource('/api/agent/events')
     es.onmessage = (msg) => {
@@ -111,8 +111,6 @@ export default function AgentHomePage() {
         const ev: AgentEvent = JSON.parse(msg.data)
         if (ev.type === 'tunnel_url_changed') {
           setState((s) => (s ? { ...s, tunnel_url: ev.url } : s))
-          // New tunnel URL → reset health-check state so the console shows
-          // probes again instead of leaving the previous "reachable" badge.
           setTunnelHealthy(false)
           setProbeLog([])
         } else if (ev.type === 'health_probe') {
@@ -153,10 +151,8 @@ export default function AgentHomePage() {
             first_seen: ev.first_seen,
           })
         } else if (ev.type === 'device_approved' || ev.type === 'device_rejected') {
-          // Clear modal if it was for this device
           setPendingDevice((d) => (d?.device_id === ev.device_id ? null : d))
         } else if (ev.type === 'otk_expired') {
-          // Mark token as expired by setting expires_at to past
           setOtk((o) => (o ? { ...o, expires_at: 0 } : o))
         }
       } catch {
@@ -166,7 +162,6 @@ export default function AgentHomePage() {
     return () => es.close()
   }, [])
 
-  // Regenerate OTK via POST /api/agent/keys/one-time
   const handleRegenOtk = async () => {
     setOtkError(null)
     try {
@@ -179,14 +174,12 @@ export default function AgentHomePage() {
     }
   }
 
-  // Approve a pending device
   const handleApprove = async () => {
     if (!pendingDevice) return
     await fetch(`/api/agent/approvals/${pendingDevice.device_id}/approve`, { method: 'POST' })
     setPendingDevice(null)
   }
 
-  // Reject a pending device
   const handleReject = async () => {
     if (!pendingDevice) return
     await fetch(`/api/agent/approvals/${pendingDevice.device_id}/reject`, { method: 'POST' })
@@ -216,100 +209,84 @@ export default function AgentHomePage() {
   }
 
   return (
-    <div className="p-6 max-w-4xl mx-auto space-y-6">
-      <header className="flex items-start justify-between gap-4">
-        <div>
-          <h1 className="text-[length:var(--text-h1)] font-semibold tracking-tight text-text-primary">Host Dashboard</h1>
-          <p className="text-[length:var(--text-meta)] text-text-muted mt-1">
-            {state ? `${state.label} · ${state.platform}` : 'Loading…'}
-          </p>
-        </div>
-        {state && (
-          <AutoApproveToggle
-            enabled={state.auto_approve ?? false}
-            onChange={(next) =>
-              setState((s) => (s ? { ...s, auto_approve: next } : s))
-            }
+    <div className="p-6 max-w-6xl mx-auto">
+      <div className="grid grid-cols-1 lg:grid-cols-[minmax(0,1fr)_minmax(0,1.4fr)] gap-6">
+        <aside className="lg:sticky lg:top-6 self-start space-y-4">
+          <PairingCard
+            tunnelUrl={tunnelUrl}
+            otkToken={otk?.token ?? null}
+            otkExpiresAt={otk?.expires_at ?? null}
+            onRegenerate={handleRegenOtk}
+            errorMessage={otkError}
           />
-        )}
-      </header>
 
-      {/* Tunnel status banner — second-most-prominent element after pairing.
-          Hidden while the very first /api/agent/state response is in flight
-          to avoid a flash of "tunnel unreachable" copy. */}
-      {fetchStatus === 'ready' && (
-        <TunnelStatusCard tunnelUrl={tunnelUrl} healthy={tunnelHealthy} />
-      )}
-
-      {/* Hero: pairing card combines QR + OTK + URL + countdown. PairingCard
-          carries its own loading-state for the OTK so we render it eagerly. */}
-      <PairingCard
-        tunnelUrl={tunnelUrl}
-        otkToken={otk?.token ?? null}
-        otkExpiresAt={otk?.expires_at ?? null}
-        onRegenerate={handleRegenOtk}
-        errorMessage={otkError}
-      />
-
-      {/* Tunnel health check is only useful while the tunnel hasn't passed
-          a probe yet — once it has, hide the noise. */}
-      {tunnelUrl && !tunnelHealthy && (
-        <Card title="Tunnel health">
-          <HealthCheckConsole entries={probeLog} reachable={tunnelHealthy} />
-        </Card>
-      )}
-      {!tunnelUrl && fetchStatus === 'ready' && (
-        <Card title="Tunnel health">
-          <HealthCheckConsole entries={probeLog} reachable={false} />
-        </Card>
-      )}
-
-      <section className="grid grid-cols-1 md:grid-cols-2 gap-4">
-        {fetchStatus === 'loading' ? (
-          <>
-            <SkeletonCard lines={3} />
-            <SkeletonCard lines={3} />
-          </>
-        ) : (
-          <>
-            <Card title="Host">
-              <Row k="Host ID" v={state?.host_id ?? '—'} />
-              <Row k="Label" v={state?.label ?? '—'} />
-              <Row k="Platform" v={state?.platform ?? '—'} />
+          {/* Health-check console only stays on screen while tunnel hasn't
+              passed a probe; once it does, we hide the noise. */}
+          {tunnelUrl && !tunnelHealthy && (
+            <Card title="Tunnel health">
+              <HealthCheckConsole entries={probeLog} reachable={tunnelHealthy} />
             </Card>
-
-            <Card title="Connected Devices">
-              <div className="flex items-baseline gap-2 mb-3">
-                <div className="text-[length:var(--text-display)] font-semibold text-text-primary leading-none">
-                  {state?.connected_devices ?? '—'}
-                </div>
-                <div className="text-[length:var(--text-meta)] text-text-muted">
-                  active terminal/preview sessions
-                </div>
-              </div>
-              <DevicesPanel />
+          )}
+          {!tunnelUrl && fetchStatus === 'ready' && (
+            <Card title="Tunnel health">
+              <HealthCheckConsole entries={probeLog} reachable={false} />
             </Card>
-          </>
-        )}
-      </section>
+          )}
+        </aside>
 
-      <section>
-        <Card title="Remote Desktop Permissions">
-          <PermissionsWidget />
-        </Card>
-      </section>
+        <section className="space-y-4">
+          {fetchStatus === 'loading' ? (
+            <>
+              <SkeletonCard lines={3} />
+              <SkeletonCard lines={3} />
+            </>
+          ) : (
+            <>
+              <Card title="Host">
+                <Row k="Host ID" v={state?.host_id ?? '—'} />
+                <Row k="Label" v={state?.label ?? '—'} />
+                <Row k="Platform" v={state?.platform ?? '—'} />
+              </Card>
 
-      <section>
-        <Card title="Local Sites Proxy">
-          <ProxyPortsCard tunnelUrl={tunnelUrl} />
-        </Card>
-      </section>
+              <Card
+                title="Connected Devices"
+                action={
+                  state ? (
+                    <AutoApproveToggle
+                      enabled={state.auto_approve ?? false}
+                      onChange={(next) =>
+                        setState((s) => (s ? { ...s, auto_approve: next } : s))
+                      }
+                    />
+                  ) : null
+                }
+              >
+                <div className="flex items-baseline gap-2 mb-3">
+                  <div className="text-[length:var(--text-display)] font-semibold text-text-primary leading-none">
+                    {state?.connected_devices ?? '—'}
+                  </div>
+                  <div className="text-[length:var(--text-meta)] text-text-muted">
+                    active terminal/preview sessions
+                  </div>
+                </div>
+                <DevicesPanel />
+              </Card>
 
-      <section>
-        <Card title="Recent Logs">
-          <RecentLogsCard entries={recentLogs} />
-        </Card>
-      </section>
+              <Card title="Remote Desktop Permissions">
+                <PermissionsWidget />
+              </Card>
+
+              <Card title="Local Sites Proxy">
+                <ProxyPortsCard tunnelUrl={tunnelUrl} />
+              </Card>
+
+              <Card title="Recent Logs">
+                <RecentLogsCard entries={recentLogs} />
+              </Card>
+            </>
+          )}
+        </section>
+      </div>
 
       {pendingDevice && (
         <ApprovalModal
@@ -323,10 +300,21 @@ export default function AgentHomePage() {
   )
 }
 
-function Card({ title, children }: { title: string; children: React.ReactNode }) {
+function Card({
+  title,
+  action,
+  children,
+}: {
+  title: string
+  action?: React.ReactNode
+  children: React.ReactNode
+}) {
   return (
     <div className="rounded-lg border border-border bg-surface p-4">
-      <div className="text-xs uppercase tracking-wide text-text-muted mb-3">{title}</div>
+      <div className="flex items-center justify-between gap-3 mb-3">
+        <div className="text-xs uppercase tracking-wide text-text-muted">{title}</div>
+        {action}
+      </div>
       {children}
     </div>
   )

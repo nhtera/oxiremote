@@ -4,6 +4,7 @@ mod auth;
 mod db;
 mod events;
 mod files;
+mod files_search;
 mod files_upload;
 mod git;
 mod host;
@@ -266,6 +267,11 @@ fn run_with_tui() -> anyhow::Result<()> {
     let lock = instance_lock::InstanceLock::acquire(&data_dir)
         .context("acquire instance lock")?;
 
+    // Init db on the main thread before the TUI starts reading the active OTK.
+    // `init_db` is idempotent; `server_main` calls it again on its runtime.
+    let db_path = data_dir.join("oxiremote.sqlite");
+    db::init_db(&db_path).context("init db")?;
+
     let bus_for_server = bus.clone();
     std::thread::Builder::new()
         .name("oxiremote-server".into())
@@ -297,7 +303,7 @@ fn run_with_tui() -> anyhow::Result<()> {
         })
         .context("spawn server thread")?;
 
-    let result = tui::run_tui(bus);
+    let result = tui::run_tui(bus, db_path);
     // Explicit drop — process::exit skips destructors so we'd otherwise leak
     // the PID file and lock out the next start.
     drop(lock);
@@ -483,6 +489,7 @@ async fn server_main(event_bus: Arc<EventBus>) -> anyhow::Result<()> {
         .route("/api/git/commit", post(git::api_git_commit))
         // files
         .route("/api/files/list", get(files::api_files_list))
+        .route("/api/files/search", get(files_search::api_files_search))
         .route("/api/files/stat", get(files::api_files_stat))
         .route("/api/files/read", get(files::api_files_read))
         .route("/api/files/write", post(files::api_files_write))

@@ -70,6 +70,12 @@ tray-icon = "0.19"
 notify-rust = "4"
 image = { version = "0.25", default-features = false, features = ["png"] }
 open = "5"
+# TUI clipboard (`c`/`k` hotkeys). Linux backend needs libxcb1-dev which the
+# existing X11/xcb deps in .github/workflows/release.yml already provide.
+arboard = { version = "3", default-features = false }
+# Walker for the file-tree git overlay + filename search (Phase 02 uses this
+# but the dep lands here so both phases can build independently).
+ignore = "0.4"
 
 # Detach child from controlling TTY in `oxiremote ui` (setsid).
 [target.'cfg(unix)'.dependencies]

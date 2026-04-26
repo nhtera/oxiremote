@@ -21,8 +21,8 @@ impl InstanceLock {
         std::fs::create_dir_all(data_dir).context("create data dir for pid file")?;
         let pid_path = data_dir.join("agent.pid");
 
-        if let Ok(contents) = std::fs::read_to_string(&pid_path) {
-            if let Ok(pid) = contents.trim().parse::<i32>() {
+        if let Ok(contents) = std::fs::read_to_string(&pid_path)
+            && let Ok(pid) = contents.trim().parse::<i32>() {
                 let me = std::process::id() as i32;
                 if pid != me && process_alive(pid) {
                     let _ = kill_process(pid, false);
@@ -33,7 +33,6 @@ impl InstanceLock {
                     }
                 }
             }
-        }
 
         std::fs::write(&pid_path, std::process::id().to_string())
             .context("write pid file")?;

@@ -467,7 +467,7 @@ pub struct RawBgraFrame {
 /// resolutions (≤ 1512×982 logical) this is ~1.5 M pixels ≈ < 3 ms on an
 /// M-series core — well under the 33 ms frame budget.
 fn rgba_to_bgra(rgba: &[u8]) -> Vec<u8> {
-    debug_assert!(rgba.len() % 4 == 0);
+    debug_assert!(rgba.len().is_multiple_of(4));
     let mut out = Vec::with_capacity(rgba.len());
     for p in rgba.chunks_exact(4) {
         out.push(p[2]); // B

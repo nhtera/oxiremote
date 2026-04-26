@@ -5,7 +5,7 @@
 
 use anyhow::{anyhow, Context};
 use base32::Alphabet;
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use serde::Serialize;
 use std::path::PathBuf;
 
@@ -51,6 +51,36 @@ pub fn generate_otk(db_path: &PathBuf, issued_by_session: Option<&str>) -> anyho
         expires_at,
         used_at: None,
     })
+}
+
+/// Returns the currently-live OTK if one exists (unused, unexpired). Returns
+/// `Ok(None)` cleanly when the table is empty, missing, or db file absent so
+/// the TUI can render an empty pairing-key panel during startup races.
+pub fn active_otk(db_path: &PathBuf) -> anyhow::Result<Option<OtkRecord>> {
+    let now = now_ts();
+    let conn = match Connection::open(db_path) {
+        Ok(c) => c,
+        Err(_) => return Ok(None),
+    };
+    let row = conn
+        .query_row(
+            "SELECT token, created_at, expires_at, used_at
+             FROM one_time_keys
+             WHERE used_at IS NULL AND expires_at > ?1
+             ORDER BY created_at DESC LIMIT 1",
+            params![now],
+            |r| {
+                Ok(OtkRecord {
+                    token: r.get(0)?,
+                    created_at: r.get(1)?,
+                    expires_at: r.get(2)?,
+                    used_at: r.get(3)?,
+                })
+            },
+        )
+        .optional()
+        .unwrap_or(None);
+    Ok(row)
 }
 
 /// Atomically consumes an OTK. Returns the record on success, or an error if

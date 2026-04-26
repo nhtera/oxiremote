@@ -43,7 +43,7 @@ fn spa_fallback() -> Response {
         None => {
             #[cfg(debug_assertions)]
             {
-                return debug_help_page();
+                debug_help_page()
             }
             #[cfg(not(debug_assertions))]
             {

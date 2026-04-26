@@ -4,6 +4,7 @@
 // host terminal in raw+alt-screen state.
 
 use std::io;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -54,8 +55,9 @@ fn new_terminal() -> Result<Term> {
 }
 
 /// Main entry. Owns the terminal lifecycle; returns on "Exit" menu selection
-/// or Ctrl+C.
-pub fn run_tui(event_bus: Arc<EventBus>) -> Result<()> {
+/// or Ctrl+C. `db_path` is threaded through so the dashboard can read/refresh
+/// the active OTK directly (server thread shares the same SQLite file).
+pub fn run_tui(event_bus: Arc<EventBus>, db_path: PathBuf) -> Result<()> {
     let _guard = TerminalGuard::enter()?;
     let mut term = new_terminal()?;
 
@@ -65,10 +67,10 @@ pub fn run_tui(event_bus: Arc<EventBus>) -> Result<()> {
                 // Best-effort browser launch; fall through to dashboard so the
                 // user keeps event visibility even if open(1) is missing.
                 let _ = open::that("http://localhost:8787/agent");
-                dashboard::run_dashboard(&mut term, event_bus.clone())?;
+                dashboard::run_dashboard(&mut term, event_bus.clone(), db_path.clone())?;
             }
             MenuChoice::TerminalUi => {
-                dashboard::run_dashboard(&mut term, event_bus.clone())?;
+                dashboard::run_dashboard(&mut term, event_bus.clone(), db_path.clone())?;
             }
             MenuChoice::Exit => break,
         }

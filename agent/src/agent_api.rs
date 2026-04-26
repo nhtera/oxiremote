@@ -39,6 +39,20 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/api/agent/permissions", get(api_agent_permissions))
         .route("/api/agent/permissions/grant", post(api_agent_permissions_grant))
         .route("/api/agent/devices", get(api_agent_devices))
+        .route("/api/agent/shutdown", post(api_agent_shutdown))
+}
+
+/// POST /api/agent/shutdown — operator-initiated stop from the host dashboard.
+/// Localhost-only (route_scope rejects tunnel callers). Returns 202 immediately
+/// so the SPA's fetch settles before the process exits ~500 ms later.
+async fn api_agent_shutdown(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    info!("shutdown requested via /api/agent/shutdown");
+    let _ = state; // currently unused; kept for future graceful-shutdown wiring
+    tokio::spawn(async {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        std::process::exit(0);
+    });
+    StatusCode::ACCEPTED
 }
 
 async fn api_agent_state(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
@@ -257,7 +271,7 @@ async fn api_agent_permissions() -> impl IntoResponse {
                 screen_recording: false,
                 accessibility: false,
             });
-        return (
+        (
             StatusCode::OK,
             Json(json!({
                 "screen_recording": status.screen_recording,
@@ -266,7 +280,7 @@ async fn api_agent_permissions() -> impl IntoResponse {
                 "supported": true,
             })),
         )
-            .into_response();
+            .into_response()
     }
     #[cfg(not(feature = "desktop"))]
     {

@@ -41,11 +41,10 @@ pub fn spawn_event_notifier(bus: Arc<EventBus>) {
         loop {
             match rx.recv().await {
                 Ok(AgentEvent::DevicePending { device_id, ip, .. }) => {
-                    if let Some((ref last_id, last_at)) = last_fired {
-                        if last_id == &device_id && last_at.elapsed() < DEDUP_WINDOW {
+                    if let Some((ref last_id, last_at)) = last_fired
+                        && last_id == &device_id && last_at.elapsed() < DEDUP_WINDOW {
                             continue;
                         }
-                    }
                     last_fired = Some((device_id.clone(), std::time::Instant::now()));
 
                     let short = device_id.chars().take(10).collect::<String>();

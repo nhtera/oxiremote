@@ -1,10 +1,64 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import StatusChip from './ui/status-chip'
 
 interface Props {
   tunnelUrl: string | null
   /** True once the agent's health probe has succeeded against the URL. */
   healthy: boolean
+}
+
+interface AgentEventTunnelUrlChanged { type: 'tunnel_url_changed'; url: string }
+interface AgentEventHealthProbe { type: 'health_probe'; ok: boolean }
+type PillEvent = AgentEventTunnelUrlChanged | AgentEventHealthProbe | { type: string }
+
+// Compact pill version of the tunnel status — mounts in the agent-layout
+// header so the operator sees connectivity at a glance from any /agent/* page.
+// Self-fetches /api/agent/state and subscribes to SSE so the layout doesn't
+// have to know anything about tunnel state. Cheap: localhost-only SSE with
+// at most a handful of internal subscribers.
+export function TunnelStatusPill() {
+  const [tunnelUrl, setTunnelUrl] = useState<string | null>(null)
+  const [healthy, setHealthy] = useState(false)
+
+  useEffect(() => {
+    let cancelled = false
+    fetch('/api/agent/state')
+      .then((r) => (r.ok ? r.json() : null))
+      .then((data) => {
+        if (cancelled || !data) return
+        setTunnelUrl(data.tunnel_url ?? null)
+      })
+      .catch(() => {
+        // The dashboard's /api/agent/events stream will resync once it lands.
+      })
+
+    const es = new EventSource('/api/agent/events')
+    es.onmessage = (msg) => {
+      try {
+        const ev = JSON.parse(msg.data) as PillEvent
+        if (ev.type === 'tunnel_url_changed') {
+          setTunnelUrl((ev as AgentEventTunnelUrlChanged).url)
+          setHealthy(false)
+        } else if (ev.type === 'health_probe' && (ev as AgentEventHealthProbe).ok) {
+          setHealthy(true)
+        }
+      } catch {
+        // Drop malformed frames; SSE keep-alive will deliver fresh state.
+      }
+    }
+    return () => {
+      cancelled = true
+      es.close()
+    }
+  }, [])
+
+  const variant = !tunnelUrl ? 'offline' : healthy ? 'online' : 'pending'
+  const label = !tunnelUrl
+    ? 'Starting'
+    : healthy
+      ? 'Reachable'
+      : 'Probing'
+  return <StatusChip variant={variant}>{label}</StatusChip>
 }
 
 // Tunnel status banner — second-most-prominent element on /agent (after the

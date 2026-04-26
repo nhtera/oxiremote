@@ -100,8 +100,7 @@ mod tests {
 
     #[test]
     fn client_capability_alone_does_not_enable_h264() {
-        let mut client = ClientCapabilities::default();
-        client.webcodecs = true;
+        let client = ClientCapabilities { webcodecs: true, ..Default::default() };
         // Operator prefers JPEG → stay on JPEG even if client could decode.
         assert_eq!(choose(Pipeline::Jpeg, &client), Pipeline::Jpeg);
     }
@@ -112,19 +111,22 @@ mod tests {
         let no_caps = ClientCapabilities::default();
         assert_eq!(choose(Pipeline::H264, &no_caps), Pipeline::Jpeg);
 
-        let mut yes_caps = ClientCapabilities::default();
-        yes_caps.webcodecs = true;
+        let yes_caps = ClientCapabilities { webcodecs: true, ..Default::default() };
         assert_eq!(choose(Pipeline::H264, &yes_caps), Pipeline::H264);
 
-        let mut caps_list = ClientCapabilities::default();
-        caps_list.codecs = vec!["h264-baseline-3.1".to_string()];
+        let caps_list = ClientCapabilities {
+            codecs: vec!["h264-baseline-3.1".to_string()],
+            ..Default::default()
+        };
         assert_eq!(choose(Pipeline::H264, &caps_list), Pipeline::H264);
     }
 
     #[test]
     fn codec_matching_is_case_insensitive() {
-        let mut c = ClientCapabilities::default();
-        c.codecs = vec!["H264-Baseline-3.1".to_string()];
+        let c = ClientCapabilities {
+            codecs: vec!["H264-Baseline-3.1".to_string()],
+            ..Default::default()
+        };
         assert!(c.supports_h264_baseline());
     }
 
