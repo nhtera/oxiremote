@@ -80,35 +80,119 @@ function applyStepEvent(steps: StepState[], ev: AgentEventTunnelStep): StepState
   return next
 }
 
-// Pulsing orange spinner for the active step.
-function StepSpinner() {
-  return (
-    <span className="inline-block w-3.5 h-3.5 rounded-full border-2 border-accent border-t-transparent animate-spin shrink-0" />
-  )
-}
-
 function StepIcon({ status }: { status: StepState['status'] }) {
+  const base =
+    'inline-flex w-7 h-7 items-center justify-center rounded-full shrink-0 ' +
+    'transition-colors'
   if (status === 'done') {
     return (
-      <span className="inline-flex w-3.5 h-3.5 items-center justify-center shrink-0 text-success">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round" className="w-3 h-3">
+      <span className={`${base} bg-accent text-white shadow-[0_0_0_3px_rgba(255,122,64,0.10)]`}>
+        <svg
+          viewBox="0 0 24 24"
+          fill="none"
+          stroke="currentColor"
+          strokeWidth="3"
+          strokeLinecap="round"
+          strokeLinejoin="round"
+          className="w-3.5 h-3.5"
+        >
           <polyline points="20 6 9 17 4 12" />
         </svg>
       </span>
     )
   }
-  if (status === 'active') return <StepSpinner />
+  if (status === 'active') {
+    return (
+      <span className={`${base} bg-accent/10 border border-accent/40 text-accent`}>
+        <span className="inline-block w-2 h-2 rounded-full bg-accent animate-ping absolute" />
+        <span className="inline-block w-2 h-2 rounded-full bg-accent" />
+      </span>
+    )
+  }
   if (status === 'failed') {
     return (
-      <span className="inline-flex w-3.5 h-3.5 items-center justify-center shrink-0 text-danger">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round" className="w-3 h-3">
-          <line x1="18" y1="6" x2="6" y2="18" /><line x1="6" y1="6" x2="18" y2="18" />
+      <span className={`${base} bg-danger/15 border border-danger/40 text-danger`}>
+        <svg
+          viewBox="0 0 24 24"
+          fill="none"
+          stroke="currentColor"
+          strokeWidth="3"
+          strokeLinecap="round"
+          strokeLinejoin="round"
+          className="w-3.5 h-3.5"
+        >
+          <line x1="18" y1="6" x2="6" y2="18" />
+          <line x1="6" y1="6" x2="18" y2="18" />
         </svg>
       </span>
     )
   }
-  // pending
-  return <span className="inline-block w-3.5 h-3.5 rounded-full border border-border bg-surface-alt shrink-0" />
+  return (
+    <span className={`${base} border border-border bg-surface-alt`}>
+      <span className="inline-block w-1.5 h-1.5 rounded-full bg-text-muted/60" />
+    </span>
+  )
+}
+
+function defaultSub(name: StepName, status: StepState['status']): string | undefined {
+  if (status === 'done') {
+    switch (name) {
+      case 'Preparing':
+        return 'Tunnel binary ready'
+      case 'Connecting':
+        return 'Session established'
+      case 'Tunneling':
+        return 'Secure tunnel up'
+      case 'Verifying':
+        return 'Reachable from edge'
+      case 'Ready':
+        return 'Listening for clients'
+    }
+  }
+  if (status === 'pending') {
+    switch (name) {
+      case 'Preparing':
+        return 'Checking tunnel binary'
+      case 'Connecting':
+        return 'Creating session'
+      case 'Tunneling':
+        return 'Starting secure tunnel'
+      case 'Verifying':
+        return 'Probing edge reachability'
+      case 'Ready':
+        return 'Waiting for first client'
+    }
+  }
+  return undefined
+}
+
+function StatusBadge({ status }: { status: StepState['status'] }) {
+  if (status === 'done') {
+    return (
+      <span className="text-[11px] font-medium tracking-wide text-text-muted shrink-0">
+        Done
+      </span>
+    )
+  }
+  if (status === 'active') {
+    return (
+      <span className="inline-flex items-center gap-1.5 text-[11px] font-medium tracking-wide text-accent bg-accent/10 border border-accent/30 rounded-full px-2 py-0.5 shrink-0">
+        <span className="relative inline-flex w-1.5 h-1.5">
+          <span className="absolute inline-flex w-full h-full rounded-full bg-accent opacity-60 animate-ping" />
+          <span className="relative inline-flex w-1.5 h-1.5 rounded-full bg-accent" />
+        </span>
+        Running
+      </span>
+    )
+  }
+  if (status === 'failed') {
+    return (
+      <span className="text-[11px] font-medium tracking-wide text-danger shrink-0">
+        Failed
+      </span>
+    )
+  }
+  return null
 }
 
 // TunnelProgressCard: self-subscribes to SSE and renders a 5-row checklist.
@@ -162,37 +246,53 @@ export function TunnelProgressCard() {
   }, [])
 
   return (
-    <div className="rounded-lg border border-border bg-surface p-4">
-      <div className="text-xs uppercase tracking-wide text-text-muted mb-3">Tunnel startup</div>
-      <ol className="space-y-2">
-        {steps.map((step) => (
-          <li key={step.name} className="flex items-start gap-2.5">
-            <span className="mt-0.5">
+    <div className="rounded-2xl border border-border bg-surface-alt/60 backdrop-blur-sm shadow-[0_1px_0_rgba(255,255,255,0.02)_inset,0_8px_28px_-12px_rgba(0,0,0,0.6)] p-5 md:p-6">
+      <div className="flex items-center justify-between gap-3 mb-5">
+        <div className="text-[11px] uppercase tracking-[0.18em] text-text-muted font-medium">
+          Setting up connection
+        </div>
+        <span className="inline-flex items-center gap-1.5 text-[11px] text-text-muted">
+          <span className="inline-block w-1.5 h-1.5 rounded-full bg-accent animate-pulse" />
+          Live
+        </span>
+      </div>
+      <ol className="space-y-3">
+        {steps.map((step) => {
+          const sub = step.info ?? defaultSub(step.name, step.status)
+          return (
+            <li key={step.name} className="flex items-center gap-3.5">
               <StepIcon status={step.status} />
-            </span>
-            <div className="min-w-0">
-              <span
-                className={
-                  'text-sm font-medium ' +
-                  (step.status === 'done'
-                    ? 'text-text-primary'
-                    : step.status === 'active'
-                      ? 'text-accent'
-                      : step.status === 'failed'
-                        ? 'text-danger'
-                        : 'text-text-muted')
-                }
-              >
-                {step.name}
-              </span>
-              {step.info && (
-                <div className="text-xs text-text-muted truncate mt-0.5" title={step.info}>
-                  {step.info}
+              <div className="min-w-0 flex-1">
+                <div
+                  className={
+                    'text-sm font-semibold leading-tight ' +
+                    (step.status === 'done'
+                      ? 'text-text-primary'
+                      : step.status === 'active'
+                        ? 'text-text-primary'
+                        : step.status === 'failed'
+                          ? 'text-danger'
+                          : 'text-text-muted')
+                  }
+                >
+                  {step.name}
                 </div>
-              )}
-            </div>
-          </li>
-        ))}
+                {sub && (
+                  <div
+                    className={
+                      'text-xs truncate mt-0.5 ' +
+                      (step.status === 'failed' ? 'text-danger/80' : 'text-text-muted')
+                    }
+                    title={sub}
+                  >
+                    {sub}
+                  </div>
+                )}
+              </div>
+              <StatusBadge status={step.status} />
+            </li>
+          )
+        })}
       </ol>
     </div>
   )

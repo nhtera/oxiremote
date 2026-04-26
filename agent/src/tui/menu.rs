@@ -118,11 +118,11 @@ fn draw(f: &mut ratatui::Frame<'_>, items: &[MenuItem], selected: usize) {
 
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Rgb(255, 140, 0)))
+        .border_style(Style::default().fg(super::step_progress::BRAND_DIM))
         .title(Span::styled(
-            " OxiRemote ",
+            "  OxiRemote  ",
             Style::default()
-                .fg(Color::Rgb(255, 140, 0))
+                .fg(super::step_progress::BRAND)
                 .add_modifier(Modifier::BOLD),
         ));
     f.render_widget(block.clone(), inner[1]);
@@ -133,13 +133,16 @@ fn draw(f: &mut ratatui::Frame<'_>, items: &[MenuItem], selected: usize) {
     });
 
     let mut lines: Vec<Line> = Vec::with_capacity(items.len() + 3);
-    lines.push(Line::from(Span::styled(
-        "Self-hosted remote agent",
-        Style::default().fg(Color::Gray),
-    )));
+    lines.push(Line::from(vec![
+        Span::styled("▸ ", Style::default().fg(super::step_progress::BRAND)),
+        Span::styled(
+            "Your dev box, in your pocket.",
+            Style::default().fg(Color::Gray),
+        ),
+    ]));
     lines.push(Line::from(""));
     for (i, item) in items.iter().enumerate() {
-        let marker = if i == selected { "▸ " } else { "  " };
+        let marker = if i == selected { "★ " } else { "  " };
         let style = if item.highlight {
             // Update item is always rendered in yellow regardless of selection.
             if i == selected {
@@ -151,10 +154,10 @@ fn draw(f: &mut ratatui::Frame<'_>, items: &[MenuItem], selected: usize) {
             }
         } else if i == selected {
             Style::default()
-                .fg(Color::Rgb(255, 140, 0))
+                .fg(super::step_progress::BRAND)
                 .add_modifier(Modifier::BOLD)
         } else {
-            Style::default().fg(Color::White)
+            Style::default().fg(Color::Gray)
         };
         lines.push(Line::from(vec![
             Span::styled(marker, style),

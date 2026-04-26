@@ -542,7 +542,7 @@ fn render_onboarding_hint(f: &mut ratatui::Frame<'_>, area: Rect, state: &State)
     let color = if state.tunnel_down.is_some() {
         Color::Red
     } else {
-        Color::Rgb(108, 180, 255)
+        super::step_progress::BRAND
     };
     let para = Paragraph::new(Line::from(Span::styled(
         hint,
@@ -557,12 +557,21 @@ fn render_header(f: &mut ratatui::Frame<'_>, area: Rect, state: &State, wide: bo
     let block = Block::default()
         .borders(Borders::BOTTOM)
         .border_style(Style::default().fg(Color::DarkGray))
-        .title(Span::styled(
-            " OxiRemote Host ",
-            Style::default()
-                .fg(Color::Rgb(108, 180, 255))
-                .add_modifier(Modifier::BOLD),
-        ));
+        .title(Line::from(vec![
+            Span::styled("  ", Style::default()),
+            Span::styled(
+                "OxiRemote",
+                Style::default()
+                    .fg(super::step_progress::BRAND)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("  ", Style::default()),
+            Span::styled(
+                if state.is_ready() { "host" } else { "setting up connection" },
+                Style::default().fg(Color::DarkGray),
+            ),
+            Span::raw("  "),
+        ]));
     f.render_widget(block, area);
 
     let inner = Rect {
@@ -673,7 +682,7 @@ fn render_info_panel(f: &mut ratatui::Frame<'_>, area: Rect, state: &State) {
         lines.push(Line::from(Span::styled(
             "Verifying tunnel…",
             Style::default()
-                .fg(Color::Rgb(108, 180, 255))
+                .fg(super::step_progress::BRAND)
                 .add_modifier(Modifier::BOLD),
         )));
         for entry in &state.probe_log {
@@ -695,7 +704,7 @@ fn render_info_panel(f: &mut ratatui::Frame<'_>, area: Rect, state: &State) {
         Line::from(Span::styled(
             "Actions",
             Style::default()
-                .fg(Color::Rgb(108, 180, 255))
+                .fg(super::step_progress::BRAND)
                 .add_modifier(Modifier::BOLD),
         )),
         action_line("c", "Copy tunnel URL"),
@@ -778,7 +787,7 @@ fn kv_styled<'a>(k: &'a str, v: &'a str, value_style: Style) -> Line<'a> {
     Line::from(vec![
         Span::styled(
             format!("  {:<20}", k),
-            Style::default().fg(Color::Gray),
+            Style::default().fg(Color::DarkGray),
         ),
         Span::styled(v, value_style),
     ])
@@ -788,9 +797,11 @@ fn action_line<'a>(key: &'a str, label: &'a str) -> Line<'a> {
     Line::from(vec![
         Span::styled(
             format!("  {key}  "),
-            Style::default().fg(Color::Rgb(108, 180, 255)).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(super::step_progress::BRAND)
+                .add_modifier(Modifier::BOLD),
         ),
-        Span::styled(label, Style::default().fg(Color::White)),
+        Span::styled(label, Style::default().fg(Color::Gray)),
     ])
 }
 

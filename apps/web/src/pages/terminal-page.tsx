@@ -38,9 +38,6 @@ interface SettingsProps {
   onClose: () => void
 }
 
-// Settings popover — theme, font size, scrollback, cursor style. Mirrors
-// the breadth of 9Remote's terminal preferences while keeping the layout
-// compact enough to fit on mobile (max-w bound, scrollable if cramped).
 function TerminalSettingsPopover({ prefs, onChange, onClose }: SettingsProps) {
   const update = (patch: Partial<TerminalPrefs>) => {
     const merged = savePrefs(patch)

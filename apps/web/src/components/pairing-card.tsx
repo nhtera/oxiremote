@@ -76,16 +76,16 @@ export default function PairingCard({
   }
 
   return (
-    <section className="rounded-xl border border-border bg-surface p-5 md:p-6">
+    <section className="rounded-2xl border border-border bg-surface p-5 md:p-6 shadow-[0_8px_28px_-12px_rgba(0,0,0,0.55)]">
       <header className="flex items-start justify-between gap-3 mb-5">
         <div>
-          <div className="text-xs uppercase tracking-wide text-text-muted">
+          <div className="text-[11px] uppercase tracking-[0.18em] text-text-muted font-medium">
             Pairing
           </div>
-          <h2 className="text-lg font-semibold text-text-primary mt-0.5">
+          <h2 className="text-lg font-semibold text-text-primary mt-1 tracking-tight">
             Connect a phone or tablet
           </h2>
-          <p className="text-xs text-text-secondary mt-1 max-w-md leading-relaxed">
+          <p className="text-xs text-text-secondary mt-1.5 max-w-md leading-relaxed">
             Scan the QR with your camera, or open the link below and paste
             the one-time key.
           </p>
@@ -93,7 +93,7 @@ export default function PairingCard({
         <button
           onClick={handleRegenerate}
           disabled={regenerating}
-          className="shrink-0 px-3 py-1.5 text-xs font-medium bg-accent/10 text-accent border border-accent/30 rounded-md hover:bg-accent/20 transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
+          className="shrink-0 px-3 py-1.5 text-xs font-medium bg-accent/15 text-accent border border-accent/40 rounded-md hover:bg-accent/25 transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
         >
           {regenerating ? 'Generating…' : 'New key'}
         </button>
@@ -363,7 +363,7 @@ function QrPanel({ payload, active, otkExpired }: QrPanelProps) {
       />
       {otkExpired && (
         <div className="absolute inset-0 flex items-center justify-center rounded-md">
-          <span className="px-3 py-1.5 text-xs font-semibold text-white bg-orange-500 rounded-full shadow-lg whitespace-nowrap">
+          <span className="px-3 py-1.5 text-xs font-semibold text-white bg-accent rounded-full shadow-lg whitespace-nowrap">
             Expired — regenerate
           </span>
         </div>

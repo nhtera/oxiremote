@@ -1,15 +1,16 @@
 @import "tailwindcss";
 
 @theme {
-  --color-surface: #16171d;
-  --color-surface-alt: #1f2028;
-  --color-surface-hover: #2a2b35;
-  --color-border: #2e303a;
+  --color-surface: #14151a;
+  --color-surface-alt: #1c1d24;
+  --color-surface-hover: #262731;
+  --color-border: #2c2e38;
   --color-text-primary: #f3f4f6;
   --color-text-secondary: #9ca3af;
   --color-text-muted: #6b7280;
-  --color-accent: #6cb4ff;
-  --color-accent-hover: #93c9ff;
+  --color-accent: #ff7a40;
+  --color-accent-hover: #ff8f5a;
+  --color-info: #6cb4ff;
   --color-danger: #f87171;
   --color-success: #4ade80;
   --color-warning: #fbbf24;
@@ -17,13 +18,13 @@
 }
 
 /* Design tokens — HSL channels for opacity composition (hsl(var(--x)/0.1)).
-   --accent-primary mirrors --color-accent (#6cb4ff) so primitives that compose
-   opacity (Button accent-primary variant, modifier highlights) stay aligned with
-   the canonical brand accent.
+   --accent-primary mirrors --color-accent (the brand coral) so primitives that
+   compose opacity (Button accent-primary variant, modifier highlights) stay
+   aligned with the canonical brand accent.
    Sizing tokens give Button a single source of truth for height/radius.
    Type scale tokens give Heading + page hero text a consistent ladder. */
 :root {
-  --accent-primary: 211 100% 71%;
+  --accent-primary: 18 100% 62%;
   --accent-danger:  0 80% 55%;
   --accent-success: 140 60% 45%;
   --accent-warning: 40 90% 55%;

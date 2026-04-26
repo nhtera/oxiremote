@@ -11,6 +11,9 @@ use ratatui::{
 
 use crate::events::StepStatus;
 
+pub const BRAND: Color = Color::Rgb(255, 122, 64);
+pub const BRAND_DIM: Color = Color::Rgb(168, 82, 44);
+
 pub struct Step {
     pub name: String,
     pub status: StepStatus,
@@ -32,34 +35,46 @@ pub fn render_steps_refs(f: &mut Frame<'_>, area: Rect, steps: &[&Step]) {
 }
 
 pub fn render_steps(f: &mut Frame<'_>, area: Rect, steps: &[Step]) {
+    let total_w = area.width as usize;
     let mut lines: Vec<Line> = Vec::with_capacity(steps.len());
     for step in steps {
-        let (icon, style) = match step.status {
+        let (icon, name_style, badge) = match step.status {
             StepStatus::Done => (
-                "✓",
-                Style::default()
-                    .fg(Color::Green)
-                    .add_modifier(Modifier::BOLD),
+                "●",
+                Style::default().fg(Color::Rgb(74, 222, 128)).add_modifier(Modifier::BOLD),
+                Some(("Done", Style::default().fg(Color::Rgb(74, 222, 128)))),
             ),
             StepStatus::Active => (
-                "◌",
-                Style::default()
-                    .fg(Color::Rgb(255, 140, 0))
-                    .add_modifier(Modifier::BOLD),
+                "●",
+                Style::default().fg(BRAND).add_modifier(Modifier::BOLD),
+                Some(("Running", Style::default().fg(BRAND).add_modifier(Modifier::BOLD))),
             ),
-            StepStatus::Pending => ("○", Style::default().fg(Color::DarkGray)),
+            StepStatus::Pending => (
+                "○",
+                Style::default().fg(Color::DarkGray),
+                None,
+            ),
         };
-        let mut spans = vec![
-            Span::styled(icon, style),
-            Span::raw("  "),
-            Span::styled(step.name.as_str(), style),
-        ];
-        if let Some(sub) = &step.sub {
-            spans.push(Span::raw("  "));
-            spans.push(Span::styled(
-                sub.as_str(),
-                Style::default().fg(Color::Gray),
-            ));
+
+        let icon_span = Span::styled(icon, name_style);
+        let name_span = Span::styled(step.name.as_str(), name_style);
+        let sub_span = step.sub.as_ref().map(|s| Span::styled(
+            format!("  {s}"),
+            Style::default().fg(Color::Gray),
+        ));
+
+        let used_left = 1 + 2 + step.name.len()
+            + step.sub.as_ref().map(|s| s.len() + 2).unwrap_or(0);
+        let badge_label_w = badge.map(|(t, _)| t.len()).unwrap_or(0);
+        let pad = total_w
+            .saturating_sub(used_left)
+            .saturating_sub(badge_label_w);
+
+        let mut spans = vec![icon_span, Span::raw("  "), name_span];
+        if let Some(s) = sub_span { spans.push(s); }
+        if let Some((label, style)) = badge {
+            spans.push(Span::raw(" ".repeat(pad)));
+            spans.push(Span::styled(label, style));
         }
         lines.push(Line::from(spans));
     }

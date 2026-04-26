@@ -218,10 +218,19 @@ export default function AgentHomePage() {
 
   if (onboarding) {
     return (
-      <div className="min-h-[80vh] flex items-start justify-center pt-24 px-4">
-        <div className="w-full max-w-md space-y-4">
+      <div className="min-h-[80vh] flex items-start justify-center pt-16 md:pt-24 px-4">
+        <div className="w-full max-w-lg space-y-5">
+          <div className="text-center space-y-2">
+            <h1 className="text-[length:var(--text-h1)] font-semibold tracking-tight text-text-primary">
+              Bringing your tunnel online
+            </h1>
+            <p className="text-sm text-text-secondary leading-relaxed max-w-md mx-auto">
+              Cloudflare is opening a secure outbound tunnel to your machine.
+              No port forwarding, no inbound exposure.
+            </p>
+          </div>
           {tunnelDown && (
-            <div className="px-4 py-3 rounded-md bg-danger/10 border border-danger/40 text-danger text-sm font-medium">
+            <div className="px-4 py-3 rounded-lg bg-danger/10 border border-danger/40 text-danger text-sm font-medium">
               Tunnel went down — connections will fail. Restart the agent to reconnect.
             </div>
           )}
