@@ -252,17 +252,24 @@ pub async fn ensure_quick_tunnel(
         reason: None,
     });
 
+    // Let cloudflared pick its preferred transport (defaults to QUIC with
+    // automatic http2 fallback). Forcing `--protocol http2` here regressed the
+    // happy path: when Cloudflare's edge intermittently rejects http2
+    // registration with "context deadline exceeded", QUIC would have
+    // succeeded — and there's no in-process fallback once we pin the flag.
+    // kill_on_drop ensures cloudflared dies with the agent (panic, SIGINT,
+    // OS shutdown). Without it, every crash leaves an orphaned cloudflared
+    // reparented to init, accumulating Cloudflare quick-tunnel slot usage.
     let mut child = tokio::process::Command::new(&cloudflared)
         .args([
             "tunnel",
             "--no-autoupdate",
-            "--protocol",
-            "http2",
             "--url",
             &format!("http://{addr}"),
         ])
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true)
         .spawn()
         .context("spawn cloudflared")?;
 
@@ -383,7 +390,23 @@ pub async fn ensure_quick_tunnel(
                 }
             }
         }
-        _ => {
+        Ok(Err(_)) => {
+            // The stderr task dropped its sender — cloudflared closed stderr,
+            // which means the child exited (typically within seconds, not 60).
+            // Surfacing "did not register within 60s" here is a lie that
+            // wastes the user's time. The real error is in the agent log.
+            let _ = child.wait().await;
+            bus.send(AgentEvent::TunnelStepChanged {
+                step: TunnelStep::Failed,
+                attempt: 1,
+                info: None,
+                reason: Some(
+                    "cloudflared exited before registering — see agent log for the cloudflared ERR line".into(),
+                ),
+            });
+            anyhow::bail!("cloudflared exited before quick-tunnel registration");
+        }
+        Err(_) => {
             bus.send(AgentEvent::TunnelStepChanged {
                 step: TunnelStep::Failed,
                 attempt: 1,
@@ -414,11 +437,11 @@ pub async fn ensure_named_tunnel(
         reason: None,
     });
 
+    // Same rationale as the quick-tunnel path: let cloudflared default to
+    // QUIC with built-in http2 fallback rather than pinning http2.
     let mut args: Vec<String> = vec![
         "tunnel".into(),
         "--no-autoupdate".into(),
-        "--protocol".into(),
-        "http2".into(),
         "run".into(),
     ];
     if let Some(cred) = cfg.credentials_file.as_deref() {
@@ -438,6 +461,7 @@ pub async fn ensure_named_tunnel(
         .args(&args)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true)
         .spawn()
         .context("spawn cloudflared named tunnel")
     {
