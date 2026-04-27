@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import { useLocation, useNavigate } from 'react-router-dom'
 import { useHostStore } from '../state/host-store'
+import { storeApiKey } from '../lib/api-client'
 
 // Maximum time to poll before giving up. Matches the OTK TTL pattern —
 // 5 min is plenty for a human to reach their computer and tap Approve.
@@ -17,6 +18,7 @@ type Phase = 'pending' | 'rejected' | 'timeout'
 
 interface RouterState {
   session_id?: string
+  device_id?: string
   device_label?: string
 }
 
@@ -67,6 +69,27 @@ export default function ApprovalWaitingPage() {
           // Refresh host info before navigating so RootRoute sees the
           // paired host on first render and doesn't bounce back to /welcome.
           await useHostStore.getState().fetchHost()
+          // Promote the pending API key (stashed by login-page during
+          // pairing-exchange) to the active per-host slot now that we know
+          // the host_id. Without this the user lands on / with cookies but
+          // no Bearer header — every tunnel request 401s and bounces back
+          // to /login. Loopback always worked because api_key_guard
+          // bypasses for cf-connecting-ip-less requests.
+          const hostId = useHostStore.getState().currentHostId
+          const deviceId = routerState.device_id
+          if (hostId && deviceId) {
+            try {
+              const pending = window.sessionStorage.getItem(
+                `oxi_pending_api_key_${deviceId}`,
+              )
+              if (pending) {
+                storeApiKey(hostId, pending)
+                window.sessionStorage.removeItem(
+                  `oxi_pending_api_key_${deviceId}`,
+                )
+              }
+            } catch { /* private mode / quota */ }
+          }
           navigate('/', { replace: true })
           return
         }

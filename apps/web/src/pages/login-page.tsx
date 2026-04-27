@@ -106,6 +106,14 @@ export default function LoginPage() {
     // user lands on the workspace, every tunnel request needs the
     // `Authorization: Bearer …` header. Cookie auth alone covers loopback
     // but not the tunnel.
+    //
+    // Pending-state subtlety: while approval_status === 'pending' the server
+    // rejects Bearer auth (verify_api_key SQL filters non-approved devices),
+    // so /api/host returns 401 → fetchHost has no host_id → we cannot key
+    // localStorage by hostId yet. Stash the api_key in sessionStorage under
+    // device_id; ApprovalWaitingPage promotes it to oxi_api_key_<hostId> on
+    // approval observation. This keeps the "no Bearer auth before approval"
+    // contract while preserving the key for the post-approval navigation.
     try {
       await useHostStore.getState().fetchHost()
       const hostState = useHostStore.getState()
@@ -117,6 +125,14 @@ export default function LoginPage() {
           label: hostState.label ?? deviceLabel.trim() ?? hostId.slice(0, 8),
           api_key_last4: String(body.api_key).slice(-4),
         })
+      } else if (body.api_key && body.device_id) {
+        // Pending path: hostId not yet known. Stash for promotion below.
+        try {
+          window.sessionStorage.setItem(
+            `oxi_pending_api_key_${body.device_id}`,
+            body.api_key,
+          )
+        } catch { /* storage quota / private mode — degrade gracefully */ }
       }
     } catch {
       await useHostStore.getState().fetchHost()
