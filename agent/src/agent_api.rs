@@ -20,7 +20,7 @@ use tracing::{info, warn};
 
 use crate::AppState;
 use crate::events::AgentEvent;
-use crate::{approval, one_time_keys};
+use crate::{approval, one_time_keys, settings};
 
 pub fn router() -> Router<Arc<AppState>> {
     Router::new()
@@ -44,6 +44,7 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/api/agent/permissions", get(api_agent_permissions))
         .route("/api/agent/permissions/grant", post(api_agent_permissions_grant))
         .route("/api/agent/devices", get(api_agent_devices))
+        .route("/api/agent/services/desktop", post(api_agent_services_desktop))
         .route("/api/agent/shutdown", post(api_agent_shutdown))
 }
 
@@ -69,6 +70,7 @@ async fn api_agent_state(State(state): State<Arc<AppState>>) -> Json<serde_json:
         .and_then(|g| g.clone());
     let connected_devices = state.terminal_sessions.len();
     let auto_approve = approval::get_auto_approve(&state.db_path);
+    let desktop_enabled = settings::get_desktop_enabled(&state.db_path);
     // Mirror the latest TunnelStepChanged event so SSE late-joiners can
     // hydrate the 5-step progress card. Shape matches the SSE frame so the
     // client can apply it via the same reducer.
@@ -86,7 +88,29 @@ async fn api_agent_state(State(state): State<Arc<AppState>>) -> Json<serde_json:
         "platform": state.host_info.platform,
         "connected_devices": connected_devices,
         "auto_approve": auto_approve,
+        "desktop_enabled": desktop_enabled,
+        "version": env!("CARGO_PKG_VERSION"),
     }))
+}
+
+#[derive(Deserialize)]
+struct DesktopServiceToggleReq {
+    enabled: bool,
+}
+
+/// POST /api/agent/services/desktop — operator toggles remote desktop on/off.
+/// Persists to the settings table; the WS upgrade reads it per-connection so
+/// the change takes effect for the next attach without a restart.
+async fn api_agent_services_desktop(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<DesktopServiceToggleReq>,
+) -> impl IntoResponse {
+    if let Err(e) = settings::set_desktop_enabled(&state.db_path, req.enabled) {
+        warn!("set_desktop_enabled failed: {e}");
+        return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() })))
+            .into_response();
+    }
+    Json(json!({ "ok": true, "enabled": req.enabled })).into_response()
 }
 
 /// GET /api/agent/logs/recent — backfill for the `/agent/logs` page when it

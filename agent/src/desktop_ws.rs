@@ -249,6 +249,17 @@ mod inner {
             return StatusCode::SERVICE_UNAVAILABLE.into_response();
         }
 
+        // Operator-controlled kill switch — toggled from the dashboard. Read
+        // per-connection so flipping it off applies to the next attach without
+        // touching live sessions.
+        if !crate::settings::get_desktop_enabled(&state.db_path) {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "remote desktop disabled by operator",
+            )
+                .into_response();
+        }
+
         let Some(ref svc) = state.desktop_service else {
             return StatusCode::SERVICE_UNAVAILABLE.into_response();
         };

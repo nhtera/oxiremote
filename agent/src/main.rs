@@ -22,6 +22,7 @@ mod proxy;
 mod push;
 mod push_api;
 mod security;
+mod settings;
 mod tracing_setup;
 mod update;
 mod static_files;

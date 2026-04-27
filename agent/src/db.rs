@@ -139,6 +139,12 @@ pub fn init_db(db_path: &Path) -> anyhow::Result<()> {
         "INSERT OR IGNORE INTO settings(key, value) VALUES ('tunnel_mode', 'quick')",
         [],
     );
+    // Phase 04: operator can toggle remote desktop off so the WS upgrade
+    // returns 503 even when the binary was built with the desktop feature.
+    let _ = conn.execute(
+        "INSERT OR IGNORE INTO settings(key, value) VALUES ('desktop_enabled', 'true')",
+        [],
+    );
     // Phase 02: per-port opt-in for the local sites reverse proxy. Empty by default.
     let _ = conn.execute(
         "INSERT OR IGNORE INTO settings(key, value) VALUES ('proxy_allowed_ports', '[]')",
