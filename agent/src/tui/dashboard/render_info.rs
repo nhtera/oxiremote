@@ -82,7 +82,7 @@ pub(super) fn render_info_panel(f: &mut ratatui::Frame<'_>, area: Rect, state: &
         }
     }
 
-    let log_action_label = format!("Toggle log view ({} entries)", state.log_history.len());
+    let log_action_label = format_log_action_label(state.log_history.len());
     lines.extend(vec![
         Line::from(""),
         Line::from(Span::styled(
@@ -101,6 +101,13 @@ pub(super) fn render_info_panel(f: &mut ratatui::Frame<'_>, area: Rect, state: &
         action_line("q", "Exit TUI"),
     ]);
     f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), inner);
+}
+
+/// Action-line label for the "toggle log view" hotkey, including buffer size.
+/// Surfaced separately so the operator knows there's history worth flipping
+/// to (action_line_includes_log_count test pins this contract).
+pub(super) fn format_log_action_label(count: usize) -> String {
+    format!("Toggle log view ({count} entries)")
 }
 
 pub(super) fn format_otk_status(state: &State) -> String {

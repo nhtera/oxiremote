@@ -32,6 +32,13 @@ struct MenuItem {
     highlight: bool,
 }
 
+/// Splash title rendered in the menu's bordered box. The version stamp lives
+/// here so users can confirm the build at a glance — every bug report starts
+/// with "what version?". Compile-time `env!` ensures a rebuild ships the bump.
+pub(super) fn splash_title() -> String {
+    format!("  OxiRemote v{}  ", env!("CARGO_PKG_VERSION"))
+}
+
 fn build_items(update_version: Option<&str>) -> Vec<MenuItem> {
     let mut items: Vec<MenuItem> = Vec::with_capacity(4);
     if let Some(ver) = update_version {
@@ -120,11 +127,7 @@ fn draw(f: &mut ratatui::Frame<'_>, items: &[MenuItem], selected: usize) {
         .borders(Borders::ALL)
         .border_style(Style::default().fg(super::step_progress::BRAND_DIM))
         .title(Span::styled(
-            // Version stamp lives in the title so users can confirm at a
-            // glance which build they're on (matters for paired devices that
-            // bug-report a flaky tunnel — first question is always "what
-            // version?"). env! is compile-time so a rebuild ships the bump.
-            format!("  OxiRemote v{}  ", env!("CARGO_PKG_VERSION")),
+            splash_title(),
             Style::default()
                 .fg(super::step_progress::BRAND)
                 .add_modifier(Modifier::BOLD),
@@ -176,4 +179,30 @@ fn draw(f: &mut ratatui::Frame<'_>, items: &[MenuItem], selected: usize) {
 
     let para = Paragraph::new(lines).alignment(Alignment::Left);
     f.render_widget(para, content_area);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn splash_includes_version() {
+        let title = splash_title();
+        assert!(title.contains("OxiRemote"));
+        assert!(
+            title.contains(env!("CARGO_PKG_VERSION")),
+            "splash title {title:?} should embed the package version"
+        );
+    }
+
+    #[test]
+    fn build_items_prepends_update_when_available() {
+        let items = build_items(Some("1.2.3"));
+        assert!(items[0].highlight, "update item must be highlighted");
+        assert!(matches!(items[0].choice, MenuChoice::UpdateAvailable(_)));
+        assert!(items[0].label.contains("1.2.3"));
+        // No update → first item is OpenWebUi (no update banner).
+        let plain = build_items(None);
+        assert!(matches!(plain[0].choice, MenuChoice::OpenWebUi));
+    }
 }

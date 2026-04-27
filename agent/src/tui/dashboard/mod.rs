@@ -872,4 +872,54 @@ mod tests {
             );
         }
     }
+
+    /// QR sidecar mirrors `pairing-card.tsx` so a phone scan reaches /login
+    /// with `k=` pre-filled. Pin: payload = `{url}/login?k={otk}` with no
+    /// trailing slash on the URL even when one was passed in.
+    #[test]
+    fn render_qr_shows_app_url_and_otk_and_expiry() {
+        let mut state = State::new(PathBuf::from("/tmp/dummy.sqlite"));
+        state.tunnel_url = Some("https://example.trycloudflare.com/".into());
+        state.otk_token = Some("ABCDEF1234567890".into());
+        state.otk_expires_at = Some(now_secs() + 600);
+
+        let payload = state.qr_payload();
+        assert_eq!(
+            payload,
+            "https://example.trycloudflare.com/login?k=ABCDEF1234567890",
+            "QR payload must trim trailing slash and include the OTK"
+        );
+
+        // OTK status line carries both a masked tail and the countdown so the
+        // operator sees expiry without scrolling.
+        let status = render_info::format_otk_status(&state);
+        assert!(status.contains("7890"), "expected last4 in {status:?}");
+        assert!(
+            status.contains("expires in"),
+            "expected countdown in {status:?}"
+        );
+
+        // No OTK → URL only, used while the operator hasn't pressed `r` yet.
+        state.otk_token = None;
+        state.otk_expires_at = None;
+        assert_eq!(
+            state.qr_payload(),
+            "https://example.trycloudflare.com/",
+            "missing OTK should fall back to bare URL (deep-link form requires both)"
+        );
+    }
+
+    /// Action line carries the live log buffer count so the user knows
+    /// there's history worth pressing `l` for.
+    #[test]
+    fn action_line_includes_log_count() {
+        assert_eq!(
+            render_info::format_log_action_label(0),
+            "Toggle log view (0 entries)"
+        );
+        assert_eq!(
+            render_info::format_log_action_label(42),
+            "Toggle log view (42 entries)"
+        );
+    }
 }
