@@ -1,22 +1,18 @@
 import { useEffect, useState } from 'react'
 import PairingCard from '../../components/pairing-card'
 import ApprovalModal from '../../components/approval-modal'
-import ProxyPortsCard from '../../components/proxy-ports-card'
-import AutoApproveToggle from '../../components/auto-approve-toggle'
-import RecentLogsCard, { type LogEntry } from '../../components/recent-logs-card'
-import PermissionsWidget from '../../components/permissions-widget'
-import DevicesPanel from '../../components/devices-panel'
-import { TunnelProgressCard } from '../../components/tunnel-status-card'
-import { Button, SkeletonCard, StateView } from '../../components/ui'
+import { Button, StateView } from '../../components/ui'
+import ConnTab from '../../components/agent/conn-tab'
+import ConnLogsTabs from '../../components/agent/conn-logs-tabs'
+import InlineLogsPanel from '../../components/agent/inline-logs-panel'
+import OnboardingView from '../../components/agent/onboarding-view'
+import OtkConfirmModal from '../../components/agent/otk-confirm-modal'
 
 // Host-dashboard home. Live-updates via the `/api/agent/events` SSE stream;
-// initial snapshot from `/api/agent/state`. Both endpoints are localhost-only
-// — the agent's `route_scope` middleware returns 403 over the tunnel.
+// initial snapshot from `/api/agent/state`. Both endpoints are localhost-only.
 //
-// Layout: 2-col grid at `lg:` (≥1024px). Left column = sticky PairingCard
-// (the hero — operator's primary action). Right column = host info + devices
-// + permissions + proxy + recent logs. Tunnel-status pill lives in the
-// agent-layout header so it's visible from every /agent/* page.
+// Layout: 2-col grid at xl. Left = sticky PairingCard hero. Right = Connection
+// / Logs tab switcher.
 
 interface OtkState {
   token: string
@@ -30,6 +26,7 @@ type AgentState = {
   platform: string
   connected_devices: number
   auto_approve?: boolean
+  desktop_enabled?: boolean
   otk?: OtkState | null
 }
 
@@ -62,8 +59,6 @@ type AgentEvent =
   | { type: 'health_probe'; attempt: number; status: string; elapsed_ms: number; ok: boolean }
   | { type: 'permanent_key_rotated'; last4: string }
 
-const LOG_BUFFER = 50
-
 type FetchStatus = 'loading' | 'ready' | 'error'
 
 export default function AgentHomePage() {
@@ -73,27 +68,23 @@ export default function AgentHomePage() {
   const [otkError, setOtkError] = useState<string | null>(null)
   const [tunnelHealthy, setTunnelHealthy] = useState(false)
   const [tunnelDown, setTunnelDown] = useState(false)
-  // Set true when tunnel_step_changed { step: 'ready' } fires — hides the progress card.
   const [tunnelStepReady, setTunnelStepReady] = useState(false)
-  const [recentLogs, setRecentLogs] = useState<LogEntry[]>([])
   const [fetchStatus, setFetchStatus] = useState<FetchStatus>('loading')
   const [retryNonce, setRetryNonce] = useState(0)
   const [permanentKey, setPermanentKey] = useState<PermanentKeyMeta | null>(null)
   const [revealedPlaintext, setRevealedPlaintext] = useState<string | null>(null)
-  // Confirm modal for OTK regeneration — prevents accidental QR invalidation.
   const [confirmingOtk, setConfirmingOtk] = useState(false)
+  const [tab, setTab] = useState<'connection' | 'logs'>('connection')
 
   useEffect(() => {
     let cancelled = false
 
-    // Fetch agent state and permanent key metadata in parallel.
     Promise.all([
       fetch('/api/agent/state').then((r) => {
         if (!r.ok) throw new Error(`HTTP ${r.status}`)
         return r.json() as Promise<AgentState & { tunnel_step?: { type?: string; step?: string } | null }>
       }),
       fetch('/api/agent/keys/permanent').then((r) => {
-        // 404 means no key generated yet — not an error.
         if (r.status === 404) return null
         if (!r.ok) return null
         return r.json() as Promise<PermanentKeyMeta>
@@ -103,9 +94,10 @@ export default function AgentHomePage() {
         if (cancelled) return
         setState(agentData)
         setOtk(agentData.otk ?? null)
-        // Seed `tunnelStepReady` from the snapshot so the progress card hides
-        // immediately on a page reload after the tunnel is already healthy.
-        if (agentData.tunnel_step?.type === 'tunnel_step_changed' && agentData.tunnel_step.step === 'ready') {
+        if (
+          agentData.tunnel_step?.type === 'tunnel_step_changed'
+          && agentData.tunnel_step.step === 'ready'
+        ) {
           setTunnelStepReady(true)
           setTunnelHealthy(true)
         }
@@ -131,9 +123,6 @@ export default function AgentHomePage() {
       try {
         const ev: AgentEvent = JSON.parse(msg.data)
         if (ev.type === 'tunnel_step_changed' && ev.step === 'ready') {
-          // Ready proves the tunnel works (HTTP probe succeeded OR a real
-          // client just hit it). Bridge to tunnelHealthy so the onboarding
-          // gate flips even when the first-client race wins the verify step.
           setTunnelStepReady(true)
           setTunnelHealthy(true)
           setTunnelDown(false)
@@ -147,14 +136,6 @@ export default function AgentHomePage() {
           setTunnelHealthy(false)
         } else if (ev.type === 'health_probe') {
           if (ev.ok) setTunnelHealthy(true)
-        } else if (ev.type === 'log_entry') {
-          setRecentLogs((prev) => {
-            const next = [
-              ...prev,
-              { level: ev.level, module: ev.module, ts: ev.ts, msg: ev.msg },
-            ]
-            return next.length > LOG_BUFFER ? next.slice(-LOG_BUFFER) : next
-          })
         } else if (ev.type === 'device_connected') {
           setState((s) => (s ? { ...s, connected_devices: s.connected_devices + 1 } : s))
         } else if (ev.type === 'device_disconnected') {
@@ -173,8 +154,6 @@ export default function AgentHomePage() {
         } else if (ev.type === 'otk_expired') {
           setOtk((o) => (o ? { ...o, expires_at: 0 } : o))
         } else if (ev.type === 'permanent_key_rotated') {
-          // Another dashboard tab rotated the key — refresh metadata from the
-          // server. We can't reconstruct created_at from the event alone.
           fetch('/api/agent/keys/permanent')
             .then((r) => (r.ok ? r.json() : null))
             .then((meta: PermanentKeyMeta | null) => {
@@ -208,11 +187,9 @@ export default function AgentHomePage() {
       const res = await fetch('/api/agent/keys/permanent', { method: 'POST' })
       if (!res.ok) throw new Error(`Failed to rotate permanent key (${res.status})`)
       const data: { api_key: string; last4: string; created_at: number } = await res.json()
-      // Reveal the plaintext once — state cleared by onDismissReveal.
       setRevealedPlaintext(data.api_key)
       setPermanentKey({ last4: data.last4, created_at: data.created_at })
     } catch (e) {
-      // Surface as otkError for simplicity; both show in the same card.
       setOtkError(e instanceof Error ? e.message : 'Failed to rotate permanent key')
     }
   }
@@ -230,9 +207,6 @@ export default function AgentHomePage() {
   }
 
   const tunnelUrl = state?.tunnel_url ?? null
-  // Onboarding mode: hide the full dashboard until the tunnel is both
-  // step-ready AND healthy. Independent of fetchStatus — the progress card
-  // self-fetches and self-subscribes, so we don't need /api/agent/state.
   const onboarding = !tunnelStepReady || !tunnelHealthy
 
   if (fetchStatus === 'error') {
@@ -256,27 +230,7 @@ export default function AgentHomePage() {
   }
 
   if (onboarding) {
-    return (
-      <div className="min-h-[80vh] flex items-start justify-center pt-16 md:pt-24 px-4">
-        <div className="w-full max-w-lg space-y-5">
-          <div className="text-center space-y-2">
-            <h1 className="text-[length:var(--text-h1)] font-semibold tracking-tight text-text-primary">
-              Bringing your tunnel online
-            </h1>
-            <p className="text-sm text-text-secondary leading-relaxed max-w-md mx-auto">
-              Cloudflare is opening a secure outbound tunnel to your machine.
-              No port forwarding, no inbound exposure.
-            </p>
-          </div>
-          {tunnelDown && (
-            <div className="px-4 py-3 rounded-lg bg-danger/10 border border-danger/40 text-danger text-sm font-medium">
-              Tunnel went down — connections will fail. Restart the agent to reconnect.
-            </div>
-          )}
-          <TunnelProgressCard />
-        </div>
-      </div>
-    )
+    return <OnboardingView tunnelDown={tunnelDown} />
   }
 
   return (
@@ -302,56 +256,25 @@ export default function AgentHomePage() {
         </aside>
 
         <section className="space-y-4">
-          {fetchStatus === 'loading' ? (
-            <>
-              <SkeletonCard lines={3} />
-              <SkeletonCard lines={3} />
-            </>
-          ) : (
-            <>
-              <Card title="Host">
-                <Row k="Host ID" v={state?.host_id ?? '—'} />
-                <Row k="Label" v={state?.label ?? '—'} />
-                <Row k="Platform" v={state?.platform ?? '—'} />
-              </Card>
-
-              <Card
-                title="Connected Devices"
-                action={
-                  state ? (
-                    <AutoApproveToggle
-                      enabled={state.auto_approve ?? false}
-                      onChange={(next) =>
-                        setState((s) => (s ? { ...s, auto_approve: next } : s))
-                      }
-                    />
-                  ) : null
-                }
-              >
-                <div className="flex items-baseline gap-2 mb-3">
-                  <div className="text-[length:var(--text-display)] font-semibold text-text-primary leading-none">
-                    {state?.connected_devices ?? '—'}
-                  </div>
-                  <div className="text-[length:var(--text-meta)] text-text-muted">
-                    active terminal/preview sessions
-                  </div>
-                </div>
-                <DevicesPanel />
-              </Card>
-
-              <Card title="Remote Desktop Permissions">
-                <PermissionsWidget />
-              </Card>
-
-              <Card title="Local Sites Proxy">
-                <ProxyPortsCard tunnelUrl={tunnelUrl} />
-              </Card>
-
-              <Card title="Recent Logs">
-                <RecentLogsCard entries={recentLogs} />
-              </Card>
-            </>
+          <ConnLogsTabs tab={tab} onChange={setTab} />
+          {tab === 'connection' && state && (
+            <ConnTab
+              hostId={state.host_id}
+              label={state.label}
+              platform={state.platform}
+              connectedDevices={state.connected_devices}
+              autoApprove={state.auto_approve ?? false}
+              desktopEnabled={state.desktop_enabled ?? true}
+              tunnelUrl={tunnelUrl}
+              onAutoApproveChange={(next) =>
+                setState((s) => (s ? { ...s, auto_approve: next } : s))
+              }
+              onDesktopEnabledChange={(next) =>
+                setState((s) => (s ? { ...s, desktop_enabled: next } : s))
+              }
+            />
           )}
+          {tab === 'logs' && <InlineLogsPanel />}
         </section>
       </div>
 
@@ -374,86 +297,3 @@ export default function AgentHomePage() {
   )
 }
 
-function Card({
-  title,
-  action,
-  children,
-}: {
-  title: string
-  action?: React.ReactNode
-  children: React.ReactNode
-}) {
-  return (
-    <div className="rounded-lg border border-border bg-surface p-4">
-      <div className="flex items-center justify-between gap-3 mb-3">
-        <div className="text-xs uppercase tracking-wide text-text-muted">{title}</div>
-        {action}
-      </div>
-      {children}
-    </div>
-  )
-}
-
-function Row({ k, v }: { k: string; v: string }) {
-  return (
-    <div className="flex justify-between py-1 text-sm">
-      <span className="text-text-muted">{k}</span>
-      <span className="text-text-primary truncate ml-3 max-w-[60%]" title={v}>
-        {v}
-      </span>
-    </div>
-  )
-}
-
-interface OtkConfirmModalProps {
-  onConfirm: () => void
-  onCancel: () => void
-}
-
-// Confirm dialog before invalidating the current OTK. Uses the same overlay
-// style as ApprovalModal so the two modals feel like the same system.
-function OtkConfirmModal({ onConfirm, onCancel }: OtkConfirmModalProps) {
-  useEffect(() => {
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') onCancel()
-    }
-    window.addEventListener('keydown', onKey)
-    return () => window.removeEventListener('keydown', onKey)
-  }, [onCancel])
-
-  return (
-    <div
-      role="dialog"
-      aria-modal="true"
-      className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-sm p-4"
-      onClick={onCancel}
-    >
-      <div
-        className="w-full max-w-sm bg-surface border border-border rounded-lg p-5 shadow-xl"
-        onClick={(e) => e.stopPropagation()}
-      >
-        <div className="text-text-primary font-semibold text-sm mb-2">
-          Generate a new one-time key?
-        </div>
-        <p className="text-xs text-text-secondary leading-relaxed mb-5">
-          The current QR will stop working immediately. A device scanning right
-          now will need the new key.
-        </p>
-        <div className="flex gap-2 justify-end">
-          <button
-            onClick={onCancel}
-            className="px-4 py-2 text-sm font-medium border border-border text-text-secondary rounded-md hover:bg-surface-hover hover:text-text-primary transition-colors"
-          >
-            Cancel
-          </button>
-          <button
-            onClick={onConfirm}
-            className="px-4 py-2 text-sm font-medium bg-accent/20 text-accent border border-accent/40 rounded-md hover:bg-accent/30 transition-colors"
-          >
-            Generate
-          </button>
-        </div>
-      </div>
-    </div>
-  )
-}

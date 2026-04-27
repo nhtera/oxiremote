@@ -2,119 +2,21 @@ import { useEffect, useMemo, useRef, useState } from 'react'
 import { List, type RowComponentProps } from 'react-window'
 import { useToast } from '../../components/ui'
 import StatusChip from '../../components/ui/status-chip'
+import { useAgentLogsStream, type LogEntry, type LogLevel } from '../../hooks/use-agent-logs-stream'
 
-// Localhost-only log viewer. Streams `LogEntry` events over SSE filtered by
-// `?filter=log` (see agent_api.rs). Hard-capped at 5000 entries so long-running
-// sessions don't leak memory. Pause buffers incoming entries client-side so the
-// list stays steady while the operator reads.
+// Localhost-only log viewer. SSE stream + pause buffer live in
+// `useAgentLogsStream` so the inline Logs tab on /agent shares the same logic.
 
-type Level = 'info' | 'warn' | 'error'
-
-interface LogEntry {
-  level: Level
-  module: string
-  ts: number
-  msg: string
-}
-
-const MAX_BUFFER = 5000
 const ROW_HEIGHT = 32
-
 const MODULES = ['all', 'tunnel', 'pty', 'files', 'push', 'desktop', 'agent'] as const
 
 export default function AgentLogsPage() {
-  const [entries, setEntries] = useState<LogEntry[]>([])
-  const [levels, setLevels] = useState<Set<Level>>(new Set(['info', 'warn', 'error']))
+  const { entries, setEntries, connected, paused, setPaused, pendingCount, resume } =
+    useAgentLogsStream()
+  const [levels, setLevels] = useState<Set<LogLevel>>(new Set(['info', 'warn', 'error']))
   const [modFilter, setModFilter] = useState<string>('all')
   const [query, setQuery] = useState('')
-  const [connected, setConnected] = useState(false)
-  const [paused, setPaused] = useState(false)
-  const [pendingCount, setPendingCount] = useState(0)
   const toast = useToast()
-
-  // While paused, incoming entries land in bufferRef instead of state, so the
-  // visible list stays steady while the operator reads. resume() drains it.
-  const pausedRef = useRef(false)
-  const bufferRef = useRef<LogEntry[]>([])
-
-  useEffect(() => {
-    pausedRef.current = paused
-  }, [paused])
-
-  useEffect(() => {
-    let cancelled = false
-
-    // Hydrate from the snapshot — without this, a fresh page mount sees only
-    // future events. After pairing the agent often goes idle for minutes, so
-    // the operator stares at "0 / 0" with no indication anything is wrong.
-    fetch('/api/agent/logs/recent')
-      .then((r) => (r.ok ? r.json() : null))
-      .then((data) => {
-        if (cancelled || !data?.entries) return
-        const seeded: LogEntry[] = (data.entries as Array<Partial<LogEntry> & { type?: string }>)
-          .filter((e) => e.type === 'log_entry')
-          .map((e) => ({
-            level: (e.level as Level) ?? 'info',
-            module: e.module ?? '',
-            ts: Number(e.ts ?? 0),
-            msg: e.msg ?? '',
-          }))
-        setEntries((prev) => {
-          // Merge seed first, then anything the SSE stream already pushed
-          // between mount and snapshot resolve.
-          const merged = [...seeded, ...prev]
-          return merged.length > MAX_BUFFER ? merged.slice(-MAX_BUFFER) : merged
-        })
-      })
-      .catch(() => { /* SSE will keep streaming; backfill is best-effort */ })
-
-    const es = new EventSource('/api/agent/events?filter=log')
-    es.onopen = () => setConnected(true)
-    es.onerror = () => setConnected(false)
-    es.onmessage = (msg) => {
-      try {
-        const ev = JSON.parse(msg.data) as { type?: string } & Partial<LogEntry>
-        if (ev.type !== 'log_entry') return
-        const entry: LogEntry = {
-          level: (ev.level as Level) ?? 'info',
-          module: ev.module ?? '',
-          ts: Number(ev.ts ?? 0),
-          msg: ev.msg ?? '',
-        }
-        if (pausedRef.current) {
-          bufferRef.current.push(entry)
-          if (bufferRef.current.length > MAX_BUFFER) {
-            bufferRef.current = bufferRef.current.slice(-MAX_BUFFER)
-          }
-          setPendingCount(bufferRef.current.length)
-        } else {
-          setEntries((prev) => {
-            const next = prev.length >= MAX_BUFFER ? prev.slice(-(MAX_BUFFER - 1)) : prev
-            return [...next, entry]
-          })
-        }
-      } catch {
-        // drop malformed frames
-      }
-    }
-    return () => {
-      cancelled = true
-      es.close()
-    }
-  }, [])
-
-  function resume() {
-    if (bufferRef.current.length > 0) {
-      const drained = bufferRef.current
-      bufferRef.current = []
-      setEntries((prev) => {
-        const merged = [...prev, ...drained]
-        return merged.length > MAX_BUFFER ? merged.slice(-MAX_BUFFER) : merged
-      })
-    }
-    setPendingCount(0)
-    setPaused(false)
-  }
 
   const filtered = useMemo(() => {
     const q = query.trim().toLowerCase()
@@ -126,7 +28,7 @@ export default function AgentLogsPage() {
     })
   }, [entries, levels, modFilter, query])
 
-  function toggleLevel(l: Level) {
+  function toggleLevel(l: LogLevel) {
     setLevels((prev) => {
       const next = new Set(prev)
       if (next.has(l)) next.delete(l)
@@ -181,7 +83,7 @@ export default function AgentLogsPage() {
       </header>
 
       <div className="flex flex-wrap gap-2 items-center shrink-0">
-        {(['info', 'warn', 'error'] as Level[]).map((l) => {
+        {(['info', 'warn', 'error'] as LogLevel[]).map((l) => {
           const active = levels.has(l)
           return (
             <button
@@ -280,13 +182,13 @@ function LogRow({ index, style, rows, onCopy }: RowComponentProps<RowProps>) {
   )
 }
 
-function badgeClass(l: Level): string {
+function badgeClass(l: LogLevel): string {
   if (l === 'error') return 'text-danger'
   if (l === 'warn') return 'text-warning'
   return 'text-text-muted'
 }
 
-function levelActiveClass(l: Level): string {
+function levelActiveClass(l: LogLevel): string {
   if (l === 'error') return 'bg-danger/10 text-danger border-danger/30'
   if (l === 'warn') return 'bg-warning/10 text-warning border-warning/30'
   return 'bg-accent/10 text-accent border-accent/30'
