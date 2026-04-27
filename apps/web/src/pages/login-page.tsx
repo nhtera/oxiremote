@@ -9,20 +9,17 @@ import {
   removeSavedHost,
   type SavedHost,
 } from '../lib/saved-hosts'
-import Button from '../components/ui/button'
+import AccessKeyForm, { isPermanentKey, sanitizeAccessKey } from '../components/login/access-key-form'
+import DeviceLabelField from '../components/login/device-label-field'
 
-// Pairing entry point. Single access-key field accepts both OTK (16-hex) and
-// pairing codes (6-16 alnum). Submit tries OTK endpoint first; on non-200/202
-// falls back to pairing-code exchange. The deep-link ?k= path auto-submits
-// without showing the form.
-
-const OTK_RAW_LEN = 16
+// Pairing entry point. A single input accepts OTK (16-hex), pairing codes
+// (6-16 alnum), or permanent keys (sk-…). The submit path auto-detects by
+// `sk-` prefix. Deep-link `?k=` auto-submits without showing the form.
 
 export default function LoginPage() {
   const [searchParams] = useSearchParams()
   const navigate = useNavigate()
 
-  // Single unified input — raw value, no auto-formatting
   const [accessKey, setAccessKey] = useState('')
   const [deviceLabel, setDeviceLabel] = useState(
     typeof window !== 'undefined'
@@ -32,6 +29,8 @@ export default function LoginPage() {
   const [error, setError] = useState('')
   const [loading, setLoading] = useState(false)
   const [checkingAuth, setCheckingAuth] = useState(true)
+  // Per-host reconnect spinner state: stores host_id of the card being reconnected.
+  const [reconnectingId, setReconnectingId] = useState<string | null>(null)
   // Snapshot the saved-hosts list once on mount — adding a new pair after
   // the form is open shouldn't reorder the panel under the user's finger.
   const [savedHosts, setSavedHosts] = useState<SavedHost[]>(() => listSavedHosts())
@@ -81,9 +80,6 @@ export default function LoginPage() {
     await useHostStore.getState().fetchHost()
     const hostState = useHostStore.getState()
     if (hostState.currentHostId) {
-      // OTK auto-approved path: stamp the saved-hosts list so the user
-      // gets a one-tap reconnect next visit. The api_key isn't returned
-      // here (cookie-based session); fall back to "" for last4.
       const existingKey = loadApiKey(hostState.currentHostId) ?? ''
       recordSavedHost({
         host_id: hostState.currentHostId,
@@ -96,7 +92,6 @@ export default function LoginPage() {
 
   // Success handler for pairing-code path (returns api_key + device_id).
   const handlePairingSuccess = async (res: Response) => {
-    // Read response body once.
     const body = await res.json().catch(() => ({}))
 
     if (deviceLabel.trim()) {
@@ -105,16 +100,14 @@ export default function LoginPage() {
     // Persist API key BEFORE any navigation. The pending-approval path also
     // needs the key in localStorage — once the operator approves and the
     // user lands on the workspace, every tunnel request needs the
-    // `Authorization: Bearer …` header. Cookie auth alone covers loopback
+    // Authorization: Bearer header. Cookie auth alone covers loopback
     // but not the tunnel.
     //
     // Pending-state subtlety: while approval_status === 'pending' the server
     // rejects Bearer auth (verify_api_key SQL filters non-approved devices),
     // so /api/host returns 401 → fetchHost has no host_id → we cannot key
     // localStorage by hostId yet. Stash the api_key in sessionStorage under
-    // device_id; ApprovalWaitingPage promotes it to oxi_api_key_<hostId> on
-    // approval observation. This keeps the "no Bearer auth before approval"
-    // contract while preserving the key for the post-approval navigation.
+    // device_id; ApprovalWaitingPage promotes it on approval observation.
     try {
       await useHostStore.getState().fetchHost()
       const hostState = useHostStore.getState()
@@ -139,7 +132,6 @@ export default function LoginPage() {
       await useHostStore.getState().fetchHost()
     }
 
-    // Pairing-code pending: operator must approve before access is granted.
     if (body.approval_status === 'pending') {
       navigate('/approval-waiting', {
         state: {
@@ -153,20 +145,29 @@ export default function LoginPage() {
     navigate('/')
   }
 
-  // Sanitize raw input: strip whitespace + dashes, for OTK also lowercase.
-  function sanitizeKey(s: string): string {
-    return s.replace(/[\s-]/g, '')
-  }
-
-  // Try OTK endpoint first; on non-200/202 fall back to pairing exchange.
-  // One extra RTT on pairing-code paths — invisible to the user behind the
-  // shared "Connecting…" spinner.
+  // Single submit path. Auto-detects by `sk-` prefix:
+  //   - permanent key   → /api/pairing/exchange { permanent_key }
+  //   - everything else → try /api/login/one-time, fall back to /api/pairing/exchange { code }
   const submitAccessKey = async (raw: string) => {
     setError('')
     setLoading(true)
     try {
-      // Try OTK first — sanitized to lowercase 16-hex shape
-      const otkAttempt = raw.toLowerCase()
+      if (isPermanentKey(raw)) {
+        const res = await fetch('/api/pairing/exchange', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            permanent_key: raw.trim(),
+            device_label: deviceLabel.trim() || undefined,
+          }),
+        })
+        if (!res.ok) {
+          throw new Error('Permanent key is invalid or has not been generated yet.')
+        }
+        return await handlePairingSuccess(res)
+      }
+      const cleaned = sanitizeAccessKey(raw)
+      const otkAttempt = cleaned.toLowerCase()
       const otkRes = await fetch('/api/login/one-time', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -176,8 +177,7 @@ export default function LoginPage() {
       if (otkRes.status === 200 || otkRes.status === 202) {
         return await handleOtkSuccess(otkRes)
       }
-      // Fall back to pairing-code exchange — uppercased 6-16 alnum
-      const codeAttempt = raw.toUpperCase()
+      const codeAttempt = cleaned.toUpperCase()
       const codeRes = await fetch('/api/pairing/exchange', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -197,16 +197,14 @@ export default function LoginPage() {
     }
   }
 
-  // Pre-fill from `?k=<token>` (QR deep-link). Auto-submit when the token
+  // Pre-fill from ?k=<token> (QR deep-link). Auto-submits when the token
   // looks plausible. Scrubs the URL so it doesn't sit in history.
-  // submitAccessKey + setAccessKey are scheduled via queueMicrotask so they
-  // run after the effect body returns — the React-hooks lint rule traces
-  // sync setState calls but stops at the microtask boundary.
   useEffect(() => {
     if (checkingAuth) return
     const k = searchParams.get('k')
     if (!k) return
-    const cleaned = sanitizeKey(k).toLowerCase().slice(0, OTK_RAW_LEN)
+    const OTK_RAW_LEN = 16
+    const cleaned = sanitizeAccessKey(k).toLowerCase().slice(0, OTK_RAW_LEN)
     if (cleaned.length === OTK_RAW_LEN && !loading) {
       window.history.replaceState({}, '', '/login')
       queueMicrotask(() => {
@@ -214,8 +212,6 @@ export default function LoginPage() {
       })
       return
     }
-    // Token didn't make it intact (truncation / sanitiser drop) — leave the
-    // form pre-filled so the user can fix it.
     queueMicrotask(() => {
       setAccessKey(cleaned)
     })
@@ -224,9 +220,7 @@ export default function LoginPage() {
 
   const tryReconnect = async (h: SavedHost) => {
     setError('')
-    // Surface the per-host API key into the active-host slot so the fetch
-    // interceptor attaches Bearer for /api/me. If the cookie session is
-    // also alive we'll get a 200; otherwise prune the entry and return.
+    setReconnectingId(h.host_id)
     const key = loadApiKey(h.host_id)
     if (key) storeApiKey(h.host_id, key)
     try {
@@ -238,6 +232,8 @@ export default function LoginPage() {
       }
     } catch {
       // Network-level error: treat as session expired below.
+    } finally {
+      setReconnectingId(null)
     }
     removeSavedHost(h.host_id)
     setSavedHosts((list) => list.filter((x) => x.host_id !== h.host_id))
@@ -251,10 +247,6 @@ export default function LoginPage() {
       </div>
     )
   }
-
-  // Cleaned length for validity check — pairing code minimum is 6 chars.
-  const cleanedKey = sanitizeKey(accessKey)
-  const keyValid = cleanedKey.length >= 6
 
   return (
     <div className="min-h-dvh bg-dot-grid flex items-center justify-center px-6 py-10">
@@ -279,23 +271,41 @@ export default function LoginPage() {
           <section className="mb-5">
             <h2 className="text-xs font-medium text-text-muted mb-2">Recently paired</h2>
             <div className="space-y-1.5">
-              {savedHosts.map((h) => (
-                <button
-                  key={h.host_id}
-                  type="button"
-                  onClick={() => tryReconnect(h)}
-                  className="w-full flex items-center gap-2 px-3 py-2 bg-surface-alt border border-border rounded-lg hover:bg-surface-hover transition-colors text-left"
-                >
-                  <span className="w-1.5 h-1.5 rounded-full bg-text-muted shrink-0" />
-                  <div className="flex-1 min-w-0">
-                    <div className="text-sm text-text-primary truncate">{h.label}</div>
-                    <div className="text-xs text-text-muted truncate">
-                      {formatRelative(h.last_seen)}
-                      {h.api_key_last4 ? ` · ····${h.api_key_last4}` : ''}
+              {savedHosts.map((h) => {
+                const hasKey = Boolean(loadApiKey(h.host_id))
+                const isReconnecting = reconnectingId === h.host_id
+                return (
+                  <button
+                    key={h.host_id}
+                    type="button"
+                    onClick={() => { if (!isReconnecting) void tryReconnect(h) }}
+                    disabled={isReconnecting}
+                    className="w-full flex items-center gap-2 px-3 py-2 bg-surface-alt border border-border rounded-lg hover:bg-surface-hover transition-colors text-left disabled:opacity-70"
+                  >
+                    {/* Status dot or inline spinner */}
+                    {isReconnecting ? (
+                      <span
+                        aria-hidden="true"
+                        className="w-3.5 h-3.5 rounded-full border-2 border-current border-t-transparent animate-spin text-text-muted shrink-0"
+                      />
+                    ) : (
+                      <span
+                        className={[
+                          'w-1.5 h-1.5 rounded-full shrink-0',
+                          hasKey ? 'bg-success' : 'bg-text-muted',
+                        ].join(' ')}
+                      />
+                    )}
+                    <div className="flex-1 min-w-0">
+                      <div className="text-sm text-text-primary truncate">{h.label}</div>
+                      <div className="text-xs text-text-muted truncate">
+                        {formatRelative(h.last_seen)}
+                        {h.api_key_last4 ? ` · ····${h.api_key_last4}` : ''}
+                      </div>
                     </div>
-                  </div>
-                </button>
-              ))}
+                  </button>
+                )
+              })}
             </div>
             <div className="text-center text-xs text-text-muted mt-3">
               — or pair a new device —
@@ -306,9 +316,8 @@ export default function LoginPage() {
         <AccessKeyForm
           value={accessKey}
           onChange={setAccessKey}
-          valid={keyValid}
-          onSubmit={() => void submitAccessKey(cleanedKey)}
           loading={loading}
+          onSubmit={(raw) => void submitAccessKey(raw)}
         />
 
         <DeviceLabelField value={deviceLabel} onChange={setDeviceLabel} />
@@ -326,104 +335,3 @@ export default function LoginPage() {
   )
 }
 
-interface AccessKeyFormProps {
-  value: string
-  onChange: (s: string) => void
-  valid: boolean
-  onSubmit: () => void
-  loading: boolean
-}
-
-function AccessKeyForm({ value, onChange, valid, onSubmit, loading }: AccessKeyFormProps) {
-  return (
-    <div>
-      <label
-        htmlFor="oxi-access-key"
-        className="block text-xs font-medium text-text-muted mb-1.5"
-      >
-        Access key
-      </label>
-      <div className="relative">
-        <input
-          id="oxi-access-key"
-          value={value}
-          onChange={(e) => onChange(e.target.value)}
-          onKeyDown={(e) => {
-            if (e.key === 'Enter' && valid && !loading) onSubmit()
-          }}
-          placeholder="xxxx-xxxx-xxxx-xxxx or ABCDEFGH"
-          autoComplete="off"
-          autoCapitalize="none"
-          autoCorrect="off"
-          spellCheck={false}
-          className="w-full px-3 py-3 text-base bg-surface-alt border border-border rounded-lg text-text-primary font-mono focus:outline-none focus:border-accent/50 focus:ring-2 focus:ring-accent/20"
-        />
-        {valid && !loading && (
-          <span
-            aria-hidden="true"
-            className="absolute right-3 top-1/2 -translate-y-1/2 text-success"
-            title="Looks good"
-          >
-            <svg
-              viewBox="0 0 24 24"
-              className="w-5 h-5"
-              fill="none"
-              stroke="currentColor"
-              strokeWidth="2.25"
-              strokeLinecap="round"
-              strokeLinejoin="round"
-            >
-              <polyline points="20 6 9 17 4 12" />
-            </svg>
-          </span>
-        )}
-      </div>
-      <Button
-        variant="accent-glow"
-        size="lg"
-        onClick={onSubmit}
-        disabled={!valid}
-        loading={loading}
-        className="w-full mt-3"
-      >
-        {loading ? 'Connecting…' : 'Pair this device'}
-      </Button>
-    </div>
-  )
-}
-
-interface DeviceLabelFieldProps {
-  value: string
-  onChange: (s: string) => void
-}
-
-function DeviceLabelField({ value, onChange }: DeviceLabelFieldProps) {
-  return (
-    <details className="mt-4 group">
-      <summary className="cursor-pointer text-xs text-text-muted hover:text-text-secondary list-none flex items-center gap-1 select-none">
-        <svg
-          viewBox="0 0 24 24"
-          className="w-3 h-3 transition-transform group-open:rotate-90"
-          fill="none"
-          stroke="currentColor"
-          strokeWidth="2.5"
-          strokeLinecap="round"
-          strokeLinejoin="round"
-        >
-          <polyline points="9 18 15 12 9 6" />
-        </svg>
-        Name this device (optional)
-      </summary>
-      <input
-        value={value}
-        onChange={(e) => onChange(e.target.value)}
-        placeholder="iPhone 15 Pro"
-        maxLength={80}
-        className="w-full mt-2 px-3 py-2.5 text-sm bg-surface-alt border border-border rounded-lg text-text-primary focus:outline-none focus:border-accent/50"
-      />
-      <p className="mt-1.5 text-xs text-text-muted">
-        Helps you identify this device in the host's device list later.
-      </p>
-    </details>
-  )
-}

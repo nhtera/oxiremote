@@ -102,6 +102,7 @@ export default function PairingCard({
           expiringSoon={expiringSoon}
           hasKey={!!otkToken}
           otkActive={otkActive}
+          onRegenerate={onRegenerate}
         />
 
         <PermanentRow
