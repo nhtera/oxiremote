@@ -3,6 +3,7 @@ import { useNavigate } from 'react-router-dom'
 import Sheet from '../ui/sheet'
 import GitSheet from './git-sheet'
 import PreviewSheet from './preview-sheet'
+import FilesSheet from './files-sheet'
 import {
   TerminalIcon,
   RemoteDesktopIcon,
@@ -27,7 +28,7 @@ type Item = {
   description?: string
   Icon: IconCmp
   /** Either a route to navigate to, or a sheet key to open inline. */
-  action: { kind: 'route'; path: string } | { kind: 'sheet'; key: 'git' | 'preview' }
+  action: { kind: 'route'; path: string } | { kind: 'sheet'; key: 'git' | 'preview' | 'files' }
 }
 
 // Right-side settings drawer triggered from the topbar gear icon. Items
@@ -36,7 +37,7 @@ type Item = {
 // alive behind the overlay.
 export default function GearDrawer({ open, hostId, onClose }: Props) {
   const navigate = useNavigate()
-  const [activeSheet, setActiveSheet] = useState<'git' | 'preview' | null>(null)
+  const [activeSheet, setActiveSheet] = useState<'git' | 'preview' | 'files' | null>(null)
 
   function handle(item: Item) {
     if (item.action.kind === 'route') {
@@ -50,7 +51,7 @@ export default function GearDrawer({ open, hostId, onClose }: Props) {
   const surfaces: Item[] = [
     { label: 'Workspace', description: 'Terminal sessions', Icon: TerminalIcon, action: { kind: 'route', path: `/h/${hostId}/workspace` } },
     { label: 'Remote Desktop', Icon: RemoteDesktopIcon, action: { kind: 'route', path: `/h/${hostId}/desktop` } },
-    { label: 'Files', Icon: FilesIcon, action: { kind: 'route', path: `/h/${hostId}/files` } },
+    { label: 'Files', description: 'Browse, edit, upload', Icon: FilesIcon, action: { kind: 'sheet', key: 'files' } },
     { label: 'Git', description: 'Status, diff, commit', Icon: GitIcon, action: { kind: 'sheet', key: 'git' } },
     { label: 'Sites (Preview)', description: 'Local servers, share links', Icon: PreviewIcon, action: { kind: 'sheet', key: 'preview' } },
   ]
@@ -96,6 +97,7 @@ export default function GearDrawer({ open, hostId, onClose }: Props) {
 
       <GitSheet open={activeSheet === 'git'} onClose={() => setActiveSheet(null)} />
       <PreviewSheet open={activeSheet === 'preview'} onClose={() => setActiveSheet(null)} />
+      <FilesSheet open={activeSheet === 'files'} onClose={() => setActiveSheet(null)} />
     </>
   )
 }

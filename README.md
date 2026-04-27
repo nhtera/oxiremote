@@ -105,6 +105,23 @@ bun run dev:web    # web UI only
 bun run dev:agent  # agent only
 ```
 
+### Tests
+
+```bash
+bun run test:web                                          # vitest unit tests (pure logic)
+cargo test --manifest-path agent/Cargo.toml               # rust unit + integration tests
+OXI_PAIRING_CODE=<code> bun run e2e                       # playwright (needs running agent)
+```
+
+E2E opt-in env vars (specs `test.skip` themselves when unset):
+
+| Var | Purpose |
+|---|---|
+| `OXI_PAIRING_CODE` | Required for any spec that pairs a device. Fresh 8-char pairing code; consumed once by `global-setup.ts`. |
+| `OXI_E2E_OTK=1` | Enables `otk-approval-desktop.spec.ts` (localhost-only OTK + approval flow). |
+| `OXI_E2E_DESKTOP=1` | Enables `desktop-permission-revoked.spec.ts` (capture-end signal verification — planned). |
+| `OXI_E2E_VISUAL=1` | Enables visual-snapshot specs (planned, gated to avoid CI flake). |
+
 ## Releases (maintainers)
 
 ```bash
