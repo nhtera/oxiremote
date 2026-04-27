@@ -84,11 +84,11 @@ pub fn active_otk(db_path: &PathBuf) -> anyhow::Result<Option<OtkRecord>> {
 }
 
 /// Atomically consumes an OTK. Returns the record on success, or an error if
-/// the token is unknown, already used, or expired.
-pub fn consume_otk(db_path: &PathBuf, token: &str) -> anyhow::Result<OtkRecord> {
+/// the token is unknown, already used, or expired. Caller owns the connection
+/// — pass a `&Transaction` so a downstream insert/hash failure rolls back the
+/// consume and the user can retry the same code.
+pub fn consume_otk_tx(conn: &Connection, token: &str) -> anyhow::Result<OtkRecord> {
     let now = now_ts();
-    let conn = Connection::open(db_path).context("open db")?;
-
     let rows_affected = conn.execute(
         "UPDATE one_time_keys SET used_at=?1
          WHERE token=?2 AND used_at IS NULL AND expires_at > ?1",
@@ -127,6 +127,11 @@ mod tests {
 
     use super::*;
 
+    fn consume_otk_via_path(db_path: &PathBuf, token: &str) -> anyhow::Result<OtkRecord> {
+        let conn = Connection::open(db_path).context("open db")?;
+        consume_otk_tx(&conn, token)
+    }
+
     fn temp_db(name: &str) -> PathBuf {
         let path = std::env::temp_dir().join(format!(
             "oxiremote-otk-{name}-{}-{}.sqlite",
@@ -151,10 +156,10 @@ mod tests {
         let db = temp_db("consume");
         let rec = generate_otk(&db, None).unwrap();
 
-        let first = consume_otk(&db, &rec.token);
+        let first = consume_otk_via_path(&db, &rec.token);
         assert!(first.is_ok(), "first consume must succeed");
 
-        let second = consume_otk(&db, &rec.token);
+        let second = consume_otk_via_path(&db, &rec.token);
         assert!(second.is_err(), "second consume must fail");
     }
 
@@ -170,7 +175,7 @@ mod tests {
         )
         .unwrap();
 
-        let result = consume_otk(&db, "expiredtoken1234");
+        let result = consume_otk_via_path(&db, "expiredtoken1234");
         assert!(result.is_err(), "expired token must be rejected");
     }
 
@@ -205,7 +210,7 @@ mod tests {
         let bar1 = barrier.clone();
         let t1 = std::thread::spawn(move || {
             bar1.wait(); // synchronize start
-            consume_otk(&db1, &tok1).is_ok()
+            consume_otk_via_path(&db1, &tok1).is_ok()
         });
 
         let db2 = db.clone();
@@ -213,7 +218,7 @@ mod tests {
         let bar2 = barrier.clone();
         let t2 = std::thread::spawn(move || {
             bar2.wait(); // synchronize start
-            consume_otk(&db2, &tok2).is_ok()
+            consume_otk_via_path(&db2, &tok2).is_ok()
         });
 
         let r1 = t1.join().expect("thread 1 panicked");

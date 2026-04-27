@@ -106,15 +106,17 @@ pub fn set_auto_approve(db_path: &PathBuf, enabled: bool) -> anyhow::Result<()> 
 
 /// Insert a new trusted device with the given approval_status, ip, and ua.
 /// Used by the OTK login path.
-pub fn insert_device_with_approval(
-    db_path: &PathBuf,
+/// Insert (or update) a trusted device with the given approval_status, ip, ua.
+/// Caller owns the connection — wrap in `conn.transaction()` to participate
+/// in the multi-step pairing/OTK atomicity flow (see http_pages.rs).
+pub fn insert_device_with_approval_tx(
+    conn: &Connection,
     device_id: &str,
     label: &str,
     user_agent: Option<&str>,
     ip: &str,
     approval_status: &str,
 ) -> anyhow::Result<()> {
-    let conn = Connection::open(db_path).context("open db")?;
     let now = now_ts();
     conn.execute(
         "INSERT INTO trusted_devices(

@@ -15,8 +15,8 @@ use tracing::warn;
 use uuid::Uuid;
 
 use crate::auth::{
-    bind_session_to_device, clear_stale_pairing_attempts, client_ip_key,
-    is_valid_pairing_attempt, issue_api_key, list_trusted_devices, random_device_id, rate_limit_key,
+    bind_session_to_device_tx, clear_stale_pairing_attempts, client_ip_key,
+    is_valid_pairing_attempt, issue_api_key_tx, list_trusted_devices, random_device_id, rate_limit_key,
     require_active_auth, require_auth, revoke_device, sanitize_device_label,
     should_allow_pairing_attempt, sign_session, touch_session_and_device, new_pairing_code,
     PAIRING_TTL_SECS, SESSION_TTL_SECS,
@@ -74,13 +74,21 @@ pub async fn api_pairing_exchange(
 
     let user_agent = headers.get("user-agent").and_then(|v| v.to_str().ok());
     let label = sanitize_device_label(req.device_label.as_deref(), user_agent);
+    let ip = client_ip_key(&headers);
+    let auto_approve = approval::get_auto_approve(&state.db_path);
+    let approval_status = if auto_approve { "approved" } else { "pending" };
 
-    let res: anyhow::Result<(String, String)> = (|| {
-        let conn = Connection::open(&state.db_path)?;
+    // Atomic pairing exchange. All five writes (consume code, insert device,
+    // insert session, bind session, issue api key) live inside one txn so a
+    // mid-flight failure leaves no orphan rows and the code stays unconsumed
+    // for retry. See plans/260427-0511-stability-and-9remote-polish phase-01.
+    let res: anyhow::Result<(String, String, String, String)> = (|| {
+        let mut conn = Connection::open(&state.db_path)?;
+        let tx = conn.transaction()?;
         let now = now_ts();
 
         let mut stmt =
-            conn.prepare("SELECT expires_at, used_at FROM pairing_codes WHERE code = ?1")?;
+            tx.prepare("SELECT expires_at, used_at FROM pairing_codes WHERE code = ?1")?;
         let mut rows = stmt.query(params![code])?;
         let row = rows
             .next()?
@@ -94,8 +102,10 @@ pub async fn api_pairing_exchange(
         if now > expires_at {
             anyhow::bail!("code expired");
         }
+        drop(rows);
+        drop(stmt);
 
-        let updated = conn.execute(
+        let updated = tx.execute(
             "UPDATE pairing_codes SET used_at = ?2 WHERE code = ?1 AND used_at IS NULL",
             params![code, now],
         )?;
@@ -105,45 +115,28 @@ pub async fn api_pairing_exchange(
 
         let session_id = Uuid::new_v4().to_string();
         let device_id = random_device_id();
-        conn.execute(
+        tx.execute(
             "INSERT INTO sessions(session_id, created_at, last_seen_at, device_id) VALUES (?1, ?2, ?2, ?3)",
             params![session_id, now, device_id],
         )?;
 
-        Ok((session_id, device_id))
+        approval::insert_device_with_approval_tx(
+            &tx,
+            &device_id,
+            &label,
+            user_agent,
+            &ip,
+            approval_status,
+        )?;
+        bind_session_to_device_tx(&tx, &session_id, &device_id)?;
+        let (api_key, api_key_last4) = issue_api_key_tx(&tx, &device_id)?;
+
+        tx.commit()?;
+        Ok((session_id, device_id, api_key, api_key_last4))
     })();
 
     match res {
-        Ok((session_id, device_id)) => {
-            // Gate on auto_approve — mirror the OTK path in api_login_one_time.
-            let auto_approve = approval::get_auto_approve(&state.db_path);
-            let approval_status = if auto_approve { "approved" } else { "pending" };
-            let ip = client_ip_key(&headers);
-
-            if let Err(err) = approval::insert_device_with_approval(
-                &state.db_path,
-                &device_id,
-                &label,
-                user_agent,
-                &ip,
-                approval_status,
-            ) {
-                warn!(error=%err, "device insert failed");
-                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-            }
-            if let Err(err) = bind_session_to_device(&state.db_path, &session_id, &device_id) {
-                warn!(error=%err, "bind session to device failed");
-                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-            }
-
-            let api_key_pair = match issue_api_key(&state.db_path, &device_id) {
-                Ok(pair) => pair,
-                Err(err) => {
-                    warn!(error=%err, "api key issuance failed");
-                    return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-                }
-            };
-
+        Ok((session_id, device_id, api_key, api_key_last4)) => {
             let cookie_value = sign_session(&state.signing_key, &session_id);
             let cookie = Cookie::build(("oxiremote_session", cookie_value))
                 .http_only(true)
@@ -177,16 +170,26 @@ pub async fn api_pairing_exchange(
                 Json(serde_json::json!({
                     "ok": true,
                     "device_id": device_id,
-                    "api_key": api_key_pair.0,
-                    "api_key_last4": api_key_pair.1,
+                    "api_key": api_key,
+                    "api_key_last4": api_key_last4,
                     "approval_status": approval_status,
                 })),
             )
                 .into_response()
         }
         Err(err) => {
+            // Code-validation failures (not found / used / expired) stay 401
+            // so the SPA shows the same "invalid code" message as before.
+            // Insert/hash failures inside the txn surface as 500 — txn rolled
+            // back, code is still consumable for retry.
+            let msg = err.to_string();
+            let code_invalid = msg.contains("code");
             warn!(error=%err, "pairing exchange failed");
-            StatusCode::UNAUTHORIZED.into_response()
+            if code_invalid {
+                StatusCode::UNAUTHORIZED.into_response()
+            } else {
+                StatusCode::INTERNAL_SERVER_ERROR.into_response()
+            }
         }
     }
 }
@@ -317,9 +320,57 @@ pub async fn api_login_one_time(
         return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "invalid token"}))).into_response();
     }
 
-    // Consume OTK atomically — returns error if not found, used, or expired.
-    match one_time_keys::consume_otk(&state.db_path, &token) {
-        Err(err) => {
+    let user_agent = headers.get("user-agent").and_then(|v| v.to_str().ok());
+    let ip = client_ip_key(&headers);
+    let ua_str = user_agent.unwrap_or("").to_string();
+    let label = sanitize_device_label(None, user_agent);
+    let auto_approve = approval::get_auto_approve(&state.db_path);
+    let approval_status = if auto_approve { "approved" } else { "pending" };
+
+    // Atomic OTK login. OTK consume runs first inside the txn; if any later
+    // write fails the txn rolls back and the OTK stays consumable.
+    let session_id = uuid::Uuid::new_v4().to_string();
+    let device_id = random_device_id();
+
+    enum OtkErr {
+        Consume(anyhow::Error),
+        Other(anyhow::Error),
+    }
+
+    let token_for_event = token.clone();
+    let res: Result<(), OtkErr> = (|| {
+        let mut conn = Connection::open(&state.db_path).map_err(|e| OtkErr::Other(e.into()))?;
+        let tx = conn.transaction().map_err(|e| OtkErr::Other(e.into()))?;
+
+        one_time_keys::consume_otk_tx(&tx, &token_for_event).map_err(OtkErr::Consume)?;
+
+        let now = now_ts();
+        tx.execute(
+            "INSERT INTO sessions(session_id, created_at, last_seen_at, device_id) VALUES (?1, ?2, ?2, ?3)",
+            params![session_id, now, device_id],
+        ).map_err(|e| OtkErr::Other(e.into()))?;
+
+        approval::insert_device_with_approval_tx(
+            &tx,
+            &device_id,
+            &label,
+            user_agent,
+            &ip,
+            approval_status,
+        ).map_err(OtkErr::Other)?;
+
+        bind_session_to_device_tx(&tx, &session_id, &device_id).map_err(OtkErr::Other)?;
+
+        tx.commit().map_err(|e| OtkErr::Other(e.into()))?;
+        Ok(())
+    })();
+
+    match res {
+        Ok(()) => {
+            let prefix: String = token.chars().take(4).collect();
+            state.event_bus.send(crate::events::AgentEvent::OtkUsed { token_prefix: prefix });
+        }
+        Err(OtkErr::Consume(err)) => {
             warn!(error=%err, "OTK consume failed");
             return (
                 StatusCode::GONE,
@@ -327,52 +378,10 @@ pub async fn api_login_one_time(
             )
                 .into_response();
         }
-        Ok(rec) => {
-            let prefix: String = rec.token.chars().take(4).collect();
-            state.event_bus.send(crate::events::AgentEvent::OtkUsed { token_prefix: prefix });
+        Err(OtkErr::Other(err)) => {
+            warn!(error=%err, "OTK login failed mid-txn — rolled back; token still valid");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
-    }
-
-    let user_agent = headers.get("user-agent").and_then(|v| v.to_str().ok());
-    let ip = client_ip_key(&headers);
-    let ua_str = user_agent.unwrap_or("").to_string();
-    let label = sanitize_device_label(None, user_agent);
-
-    let device_id = random_device_id();
-    let auto_approve = approval::get_auto_approve(&state.db_path);
-    let approval_status = if auto_approve { "approved" } else { "pending" };
-
-    if let Err(err) = approval::insert_device_with_approval(
-        &state.db_path,
-        &device_id,
-        &label,
-        user_agent,
-        &ip,
-        approval_status,
-    ) {
-        warn!(error=%err, "OTK device insert failed");
-        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-    }
-
-    // Create session and bind to device.
-    let session_id = uuid::Uuid::new_v4().to_string();
-    let res: anyhow::Result<()> = (|| {
-        let conn = Connection::open(&state.db_path)?;
-        let now = now_ts();
-        conn.execute(
-            "INSERT INTO sessions(session_id, created_at, last_seen_at, device_id) VALUES (?1, ?2, ?2, ?3)",
-            params![session_id, now, device_id],
-        )?;
-        Ok(())
-    })();
-    if let Err(err) = res {
-        warn!(error=%err, "OTK session insert failed");
-        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-    }
-
-    if let Err(err) = bind_session_to_device(&state.db_path, &session_id, &device_id) {
-        warn!(error=%err, "OTK bind session failed");
-        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
 
     let cookie_value = sign_session(&state.signing_key, &session_id);
@@ -808,6 +817,136 @@ mod tests {
         let body_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
         let body: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
         assert_eq!(body["approval_status"], "approved");
+    }
+
+    // ── S1 atomicity regression tests ────────────────────────────────────────
+
+    /// Drop-without-commit on a transaction holding `consume_otk_tx` must
+    /// leave the OTK row consumable by a subsequent attempt. This is the
+    /// invariant the atomic OTK login flow relies on: if any later step
+    /// fails, the rollback returns the OTK to the user.
+    #[test]
+    fn otk_consume_rolled_back_when_tx_dropped() {
+        let state = test_state("otk-rollback");
+        let rec = one_time_keys::generate_otk(&state.db_path, None).unwrap();
+
+        {
+            let mut conn = Connection::open(&state.db_path).unwrap();
+            let tx = conn.transaction().unwrap();
+            one_time_keys::consume_otk_tx(&tx, &rec.token).expect("consume in txn");
+            // Intentional: do NOT commit. Drop rolls back.
+            drop(tx);
+        }
+
+        // OTK must still be consumable.
+        let conn2 = Connection::open(&state.db_path).unwrap();
+        let used_at: Option<i64> = conn2
+            .query_row(
+                "SELECT used_at FROM one_time_keys WHERE token=?1",
+                params![rec.token],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(used_at.is_none(), "OTK must remain unconsumed after txn rollback");
+
+        // And consume_otk_tx must succeed on the retry.
+        let tx2 = conn2.unchecked_transaction().unwrap();
+        let ok = one_time_keys::consume_otk_tx(&tx2, &rec.token);
+        assert!(ok.is_ok(), "OTK retry after rollback must succeed");
+    }
+
+    /// Mirror of the OTK rollback test for the pairing-code path: if any
+    /// step inside the pairing transaction fails, the code stays unconsumed
+    /// and the user can retry without operator intervention.
+    #[tokio::test]
+    async fn pairing_code_rolled_back_when_tx_dropped() {
+        let state = test_state("pair-rollback");
+        let pairing = create_pairing_code(state.as_ref()).unwrap();
+
+        {
+            let mut conn = Connection::open(&state.db_path).unwrap();
+            let tx = conn.transaction().unwrap();
+            tx.execute(
+                "UPDATE pairing_codes SET used_at = ?2 WHERE code = ?1 AND used_at IS NULL",
+                params![pairing.code, now_ts()],
+            )
+            .unwrap();
+            // Drop without commit → rolls back.
+            drop(tx);
+        }
+
+        let conn2 = Connection::open(&state.db_path).unwrap();
+        let used_at: Option<i64> = conn2
+            .query_row(
+                "SELECT used_at FROM pairing_codes WHERE code=?1",
+                params![pairing.code],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(used_at.is_none(), "pairing code must remain unconsumed after rollback");
+
+        // Real exchange should still succeed.
+        let resp = api_pairing_exchange(
+            State(state),
+            HeaderMap::new(),
+            CookieJar::new(),
+            Json(ExchangePairingRequest {
+                code: pairing.code,
+                device_label: None,
+            }),
+        )
+        .await
+        .into_response();
+        // Either 200 (auto_approve on by some prior test? no) or 202 — both
+        // are success; the assertion is that it isn't 401 (already used).
+        assert!(
+            resp.status().is_success(),
+            "pairing exchange after rollback must succeed; got {}",
+            resp.status()
+        );
+    }
+
+    /// Two simultaneous `api_pairing_exchange` calls with the same code:
+    /// exactly one must succeed (200 or 202); the other must be rejected.
+    /// Guards against the prior bug where multi-step writes raced and could
+    /// both partially succeed.
+    #[tokio::test]
+    async fn concurrent_pairing_exchange_serializes() {
+        let state = test_state("pair-concurrent");
+        let pairing = create_pairing_code(state.as_ref()).unwrap();
+
+        let s1 = state.clone();
+        let s2 = state.clone();
+        let code1 = pairing.code.clone();
+        let code2 = pairing.code.clone();
+
+        let (r1, r2) = tokio::join!(
+            async move {
+                api_pairing_exchange(
+                    State(s1),
+                    HeaderMap::new(),
+                    CookieJar::new(),
+                    Json(ExchangePairingRequest { code: code1, device_label: None }),
+                )
+                .await
+                .into_response()
+                .status()
+            },
+            async move {
+                api_pairing_exchange(
+                    State(s2),
+                    HeaderMap::new(),
+                    CookieJar::new(),
+                    Json(ExchangePairingRequest { code: code2, device_label: None }),
+                )
+                .await
+                .into_response()
+                .status()
+            }
+        );
+
+        let successes = [r1, r2].iter().filter(|s| s.is_success()).count();
+        assert_eq!(successes, 1, "exactly one concurrent exchange must succeed; got r1={r1}, r2={r2}");
     }
 }
 

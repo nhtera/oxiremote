@@ -182,8 +182,9 @@ pub fn insert_or_update_device(
     Ok(())
 }
 
-pub fn bind_session_to_device(db_path: &PathBuf, session_id: &str, device_id: &str) -> anyhow::Result<()> {
-    let conn = Connection::open(db_path)?;
+/// Bind a session row to a device. Caller owns the connection — pass a
+/// `&Transaction` to participate in the pairing/OTK atomic flow.
+pub fn bind_session_to_device_tx(conn: &Connection, session_id: &str, device_id: &str) -> anyhow::Result<()> {
     conn.execute(
         "UPDATE sessions SET device_id=?2 WHERE session_id=?1",
         params![session_id, device_id],
@@ -244,13 +245,14 @@ pub fn sanitize_device_label(label: Option<&str>, fallback_user_agent: Option<&s
     device_label_from_user_agent(fallback_user_agent)
 }
 
-/// Generate + store a fresh API key for this device.
-/// Returns the plaintext key (only time the caller sees it) + last4.
-pub fn issue_api_key(db_path: &PathBuf, device_id: &str) -> anyhow::Result<(String, String)> {
+/// Generate + store a fresh API key for this device. Returns the plaintext
+/// key (only time the caller sees it) + last4. Caller owns the connection —
+/// pass a `&Transaction` so an Argon2/UPDATE failure rolls back the whole
+/// pairing transaction and preserves the unconsumed pairing code for retry.
+pub fn issue_api_key_tx(conn: &Connection, device_id: &str) -> anyhow::Result<(String, String)> {
     use base64::Engine as _;
     let mut raw = [0u8; 32];
     OsRng.fill_bytes(&mut raw);
-    // URL-safe base64 without padding — short, pasteable, header-friendly.
     let key = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(raw);
     let last4: String = key.chars().rev().take(4).collect::<Vec<_>>().into_iter().rev().collect();
 
@@ -260,7 +262,6 @@ pub fn issue_api_key(db_path: &PathBuf, device_id: &str) -> anyhow::Result<(Stri
         .map_err(|e| anyhow::anyhow!("argon2 hash: {e}"))?
         .to_string();
 
-    let conn = Connection::open(db_path)?;
     conn.execute(
         "UPDATE trusted_devices SET api_key_hash=?2, api_key_last4=?3 WHERE device_id=?1",
         params![device_id, hash, last4],
