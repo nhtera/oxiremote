@@ -3,8 +3,8 @@
 // Fetches capabilities first; unavailable state shows a helpful message.
 // Branches between two pipeline views based on `preferred_pipeline` from
 // the server plus client-side feature detection:
-//   - H.264 over WebRTC video track (Phase 03) — `DesktopH264View`
-//   - JPEG tiles over DataChannel (Phase 02) — `DesktopJpegView`
+//   - H.264 over WebRTC video track — `DesktopH264View`
+//   - JPEG tiles over DataChannel — `DesktopJpegView`
 // Both views push session state + API up to this shell, which owns the
 // shared toolbar, gesture help sheet, and reconnect modal.
 
@@ -94,7 +94,7 @@ export default function DesktopPage() {
   // the page (browser-back would lose any partial gesture / tool state).
   const [reloadNonce, setReloadNonce] = useState(0)
   const [inFullscreen, setInFullscreen] = useState(false)
-  // Phase 04 — HiDPI + smooth-scaling toggles, persisted per-device.
+  // HiDPI + smooth-scaling toggles, persisted per-device.
   const [settings, setSettingsState] = useState<DisplaySettings>(() => loadSettings())
   useEffect(() => {
     try {

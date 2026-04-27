@@ -1,4 +1,4 @@
-// Phase 02: opt-in localhost-port reverse proxy mounted at `/proxy/{port}/...`.
+// Opt-in localhost-port reverse proxy mounted at `/proxy/{port}/...`.
 //
 // Goal: a phone hits `<tunnel>/proxy/3000/` and lands on the laptop's Vite dev
 // server with HMR (WS) and SSE intact. Distinct from `/preview/{id}/...` —

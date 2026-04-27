@@ -4,7 +4,7 @@
 
 let ctx: OffscreenCanvasRenderingContext2D | null = null
 let tileSize = 128
-// Phase 04 — persisted across resize because canvas resize resets ctx state.
+// Persisted across resize because canvas resize resets ctx state.
 let smoothingEnabled = false
 
 interface InitMessage {

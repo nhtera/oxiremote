@@ -1,8 +1,7 @@
 // Full-screen device-approval takeover. Triggered by AgentEvent::DevicePending.
-// Posts approve/reject back to the localhost `/api/agent/approvals/*` endpoints
-// (stub in Phase 01 — Phase 02 adds the real handlers). Keeps the TUI
-// synchronous by blocking on a tiny reqwest call via ureq-style blocking
-// pattern: spawn a short-lived thread.
+// Posts approve/reject back to the localhost `/api/agent/approvals/*` endpoints.
+// Keeps the TUI synchronous by blocking on a tiny reqwest call via ureq-style
+// blocking pattern: spawn a short-lived thread.
 
 use std::io;
 use std::time::Duration;
@@ -56,9 +55,8 @@ pub fn run_approval(term: &mut Term, event: &AgentEvent) -> Result<()> {
 }
 
 fn call_decision(device_id: &str, decision: &str) {
-    // Fire-and-forget POST. Phase 02 implements the handler; until then this
-    // returns 404, which we intentionally ignore — the UI flow is already
-    // complete from the TUI side.
+    // Fire-and-forget POST. We intentionally ignore errors — the UI flow is
+    // already complete from the TUI side.
     let url = format!(
         "http://localhost:8787/api/agent/approvals/{}/{}",
         device_id, decision

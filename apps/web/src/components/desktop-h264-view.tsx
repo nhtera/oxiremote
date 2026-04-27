@@ -1,4 +1,4 @@
-// H.264 over WebRTC desktop view — Phase 03 pipeline.
+// H.264 over WebRTC desktop view.
 //
 // Mounts `useDesktopVideoSession` which owns a hidden <video> sink for the
 // incoming MediaStreamTrack and invokes `onFrame` once per decoded frame

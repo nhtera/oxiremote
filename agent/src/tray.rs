@@ -2,13 +2,9 @@
 // main thread on macOS/Windows (platform constraint); the tokio runtime must
 // already be running on a sibling thread before `run_tray` is called.
 //
-// Phase 01 scope: icons + menu items + click dispatch. Event loop is driven
-// by a polling `MenuEvent::receiver()` that this module owns. A richer winit
-// integration can replace the poll loop in Phase 06 without changing callers.
-//
-// Not wired to the default bare-invocation dispatch in Phase 01 (main-thread
-// contention with the TUI's raw-mode stdio). Invokable separately once we add
-// a `daemon` runtime mode in Phase 06. Kept here to lock the API surface.
+// Event loop is driven by a polling `MenuEvent::receiver()` that this module
+// owns. Not wired to the default bare-invocation dispatch due to main-thread
+// contention with the TUI's raw-mode stdio. Kept here to lock the API surface.
 #![allow(dead_code)]
 
 use std::sync::Arc;

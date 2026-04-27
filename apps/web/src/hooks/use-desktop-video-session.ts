@@ -1,4 +1,4 @@
-// WebRTC session hook for the Phase 03 H.264 video-track pipeline.
+// WebRTC session hook for the H.264 video-track pipeline.
 //
 // Sibling to `use-desktop-session.ts` (JPEG-over-DataChannel). The server
 // announces its chosen pipeline via the `pipeline` signaling message; the

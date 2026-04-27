@@ -1,4 +1,4 @@
-//! Pipeline selection (Phase 03).
+//! Pipeline selection.
 //!
 //! Decides whether a desktop-streaming session runs over the legacy JPEG
 //! DataChannel pipeline or the H.264 WebRTC-track pipeline. Inputs:

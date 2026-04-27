@@ -1,4 +1,4 @@
-// JPEG-over-DataChannel desktop view — Phase 02 pipeline.
+// JPEG-over-DataChannel desktop view.
 //
 // Mounts the OffscreenCanvas worker (with main-thread 2D fallback) and runs
 // the `useDesktopSession` hook. Pipelines incoming tile frames from the

@@ -1,7 +1,6 @@
 // Desktop notifications via `notify-rust`. Independent of the tray runtime
-// (which is `#![allow(dead_code)]` until Phase 06 main-thread arbitration is
-// solved). Silently no-ops on hosts without a notification daemon (e.g.
-// headless servers, Codespaces).
+// (dead code — main-thread arbitration not yet wired). Silently no-ops on
+// hosts without a notification daemon (e.g. headless servers, Codespaces).
 
 use std::net::SocketAddr;
 use std::sync::Arc;

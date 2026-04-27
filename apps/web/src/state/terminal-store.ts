@@ -14,7 +14,6 @@ export type Session = {
   // legacy field from existing API; kept for compat
   status: string
   exit_code: number | null
-  // Phase 02: persistent PTY metadata
   last_seq?: number
   buffer_bytes?: number
   attached?: boolean

@@ -8,12 +8,10 @@ import TopbarIconNav from './topbar/topbar-icon-nav'
 import TopbarMobile from './topbar/topbar-mobile'
 import GearDrawer from './gear/gear-drawer'
 
-// Workspace-centric chrome (Phase 05). The sidebar is gone; navigation lives
-// in a 48px top bar with a host-switcher dropdown on the left and an icon
-// strip on the right. Mobile collapses to a 44px variant. Banners
-// (PWA/push) sit between the top bar and the routed page so they don't
-// interfere with the new chrome. Phase 07 adds a right-side gear drawer
-// triggered from the Settings icon.
+// Workspace-centric chrome. The sidebar is gone; navigation lives in a 48px
+// top bar with a host-switcher dropdown on the left and an icon strip on the
+// right. Mobile collapses to a 44px variant. Banners (PWA/push) sit between
+// the top bar and the routed page so they don't interfere with the chrome.
 export default function AppLayout() {
   const { pathname } = useLocation()
   const { currentHostId } = useHostStore()

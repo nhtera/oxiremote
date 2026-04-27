@@ -7,7 +7,7 @@
 /// - Input injection via `InputInjector` wrapped in `Mutex` (injector is !Sync)
 /// - Quality-tier changes restart the `CaptureLoop` via a `watch` channel
 ///
-/// Wire formats: phase-04-remote-desktop-transport-and-ui.md
+/// Wire formats: see CLAUDE.md → "Remote desktop pipeline selection".
 #[cfg(feature = "desktop")]
 mod inner {
     use std::sync::Arc;
@@ -53,19 +53,19 @@ mod inner {
     enum SignalIn {
         Offer { sdp: String },
         Ice { candidate: RTCIceCandidateInit },
-        /// Phase 03: client announces decoder support. Agent uses this to
-        /// pick JPEG vs H.264 pipeline. Presence of `webcodecs: true` and a
-        /// codec in `codecs` matching our fmtp means H.264 is viable.
+        /// Client announces decoder support. Agent uses this to pick JPEG vs
+        /// H.264 pipeline. Presence of `webcodecs: true` and a codec in
+        /// `codecs` matching our fmtp means H.264 is viable.
         CapabilitiesClient {
             #[serde(default)]
             codecs: Vec<String>,
             #[serde(default)]
             webcodecs: bool,
         },
-        /// Phase 04: per-session capture settings. `hidpi=true` skips logical
-        /// downscale so the encoder gets native physical pixels — costs ~4×
-        /// pixel throughput on retina, paid for by a 2× bitrate multiplier
-        /// in `tier_bitrate`. Toggling triggers a capture-pipeline restart
+        /// Per-session capture settings. `hidpi=true` skips logical downscale
+        /// so the encoder gets native physical pixels — costs ~4× pixel
+        /// throughput on retina, paid for by a 2× bitrate multiplier in
+        /// `tier_bitrate`. Toggling triggers a capture-pipeline restart
         /// because encoder dims are fixed once H.264 starts.
         Settings {
             #[serde(default)]
@@ -91,9 +91,9 @@ mod inner {
             scale_factor: f32,
             tile_size: u32,
         },
-        /// Phase 03: server tells client which pipeline was selected and the
-        /// per-tier bitrate presets. On H.264 mode `avcc_description` carries
-        /// the base64-encoded `avcC` box built from the first IDR's SPS+PPS,
+        /// Server tells client which pipeline was selected and the per-tier
+        /// bitrate presets. On H.264 mode `avcc_description` carries the
+        /// base64-encoded `avcC` box built from the first IDR's SPS+PPS,
         /// ready for `VideoDecoder.configure({ description })`.
         Pipeline {
             mode: &'a str, // "h264" | "jpeg"
@@ -144,7 +144,7 @@ mod inner {
         Quality {
             tier: String, // "high" | "med" | "low"
         },
-        /// Phase 04: mid-session HiDPI toggle. JPEG path applies live;
+        /// Mid-session HiDPI toggle. JPEG path applies live;
         /// H.264 path triggers full session restart (encoder dims locked).
         Settings {
             #[serde(default)]
@@ -363,10 +363,9 @@ mod inner {
         let (quality_tx, mut quality_rx) = watch::channel(QualityTier::Med);
 
         // ── Settings watch channel ────────────────────────────────────────────
-        // Phase 04 HiDPI toggle. Initial value is filled in from the
-        // pre-offer `Settings` signal (persisted in client localStorage); if
-        // the client never sends one we stay in default-off (preserves
-        // pre-Phase-04 behaviour).
+        // HiDPI toggle. Initial value is filled in from the pre-offer
+        // `Settings` signal (persisted in client localStorage); if the client
+        // never sends one we stay in default-off.
         let (settings_tx, mut settings_rx) = watch::channel(false);
         let _ = &mut settings_rx; // silence unused-mut on JPEG-only builds
 

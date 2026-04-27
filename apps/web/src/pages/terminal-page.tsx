@@ -1,6 +1,6 @@
 import { Navigate, useParams } from 'react-router-dom'
 
-// Phase 06: terminal lives inside the workspace shell now. This page is kept
+// Terminal lives inside the workspace shell now. This page is kept
 // as a redirect so old deep links and notifications keep working.
 export default function TerminalPage() {
   const { hostId, sessionId } = useParams<{ hostId: string; sessionId?: string }>()

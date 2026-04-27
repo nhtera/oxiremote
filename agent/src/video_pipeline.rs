@@ -1,4 +1,4 @@
-//! H.264 capture → encode → RTP pipeline (Phase 03).
+//! H.264 capture → encode → RTP pipeline.
 //!
 //! Wires a `desktop::H264Encoder` into a webrtc-rs `TrackLocalStaticSample`
 //! behind two tokio tasks:
