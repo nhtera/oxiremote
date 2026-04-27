@@ -1,6 +1,7 @@
 export { default as Button, type ButtonProps } from './button'
 export { default as Heading } from './heading'
 export { default as Dialog, type DialogTone } from './dialog'
+export { default as Sheet } from './sheet'
 export { SkeletonCard, SkeletonLine } from './skeleton'
 export { default as StateView } from './state-view'
 export { default as StatusChip, type StatusVariant } from './status-chip'
