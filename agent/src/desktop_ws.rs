@@ -103,6 +103,12 @@ mod inner {
             tier_bitrates_kbps_high: u32,
             avcc_description_b64: Option<String>,
         },
+        /// Capture pipeline exited mid-session (permission revoked, monitor
+        /// unplugged, encoder error). Client uses this to fire its reconnect
+        /// modal with the reason instead of staring at a frozen frame.
+        CaptureEnded {
+            reason: String,
+        },
     }
 
     /// Input events the client sends on the "ctrl" DataChannel (or WS in fallback).
@@ -563,6 +569,10 @@ mod inner {
 
         // ── Capture pipeline ──────────────────────────────────────────────────
         let (cap_shutdown_tx, cap_shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        // Capture → ws_loop signal: fires when capture exits unexpectedly so
+        // the WS-fallback path can tell the client to reconnect instead of
+        // hanging on a closed binary channel.
+        let (cap_ended_tx, mut cap_ended_rx) = mpsc::channel::<String>(1);
         // Read initial tier + hidpi before moving the watches into the pipeline.
         let initial_tier = *quality_rx.borrow();
         let initial_hidpi_jpeg = *settings_rx.borrow();
@@ -595,6 +605,7 @@ mod inner {
             settings_rx_for_pipeline,
             cap_shutdown_rx,
             scale_factor,
+            cap_ended_tx,
         );
 
         // ── Main WS event loop ────────────────────────────────────────────────
@@ -611,6 +622,7 @@ mod inner {
             &mut close_rx,
             scale_factor,
             &ws_out_tx,
+            &mut cap_ended_rx,
         )
         .await;
 
@@ -993,12 +1005,23 @@ mod inner {
         close_rx: &mut tokio::sync::oneshot::Receiver<()>,
         scale_factor: f32,
         ws_out_tx: &mpsc::Sender<String>,
+        cap_ended_rx: &mut mpsc::Receiver<String>,
     ) {
         loop {
             tokio::select! {
                 biased;
 
                 _ = &mut *close_rx => return,
+
+                // Capture pipeline exited unexpectedly — surface the reason
+                // to the client so it can show a reconnect modal instead of
+                // staring at a frozen frame, then tear down the WS.
+                Some(reason) = cap_ended_rx.recv() => {
+                    if let Ok(msg) = serde_json::to_string(&SignalOut::CaptureEnded { reason }) {
+                        let _ = socket.send(Message::Text(msg.into())).await;
+                    }
+                    return;
+                }
 
                 // Forward outgoing ICE to the WS text channel.
                 Some(text) = ws_out_rx.recv() => {

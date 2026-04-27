@@ -30,6 +30,10 @@ interface SessionApi {
   disconnect: () => void
   attempt: number
   screenDims?: { width: number; height: number }
+  /// Reason from the agent's last `captureEnded` signal (e.g. "screen capture
+  /// stopped"). Set when the capture pipeline exits mid-session so the UI can
+  /// show a meaningful reconnect message instead of a frozen frame.
+  lastEndReason?: string
 }
 
 // Callback invoked for every raw tile binary message (DC or WS fallback).
@@ -60,6 +64,7 @@ export function useDesktopSession(
   const [status, setStatus] = useState<DesktopStatus>('idle')
   const [attempt, setAttempt] = useState(0)
   const [screenDims, setScreenDims] = useState<{ width: number; height: number } | undefined>()
+  const [lastEndReason, setLastEndReason] = useState<string | undefined>()
 
   // Refs hold live handles so reconnect logic can tear down and rebuild.
   const wsRef = useRef<WebSocket | null>(null)
@@ -261,6 +266,15 @@ export function useDesktopSession(
             setScreenDims({ width: msg.width as number, height: msg.height as number })
           }
           break
+
+        case 'captureEnded': {
+          // Agent's capture pipeline exited unexpectedly (permission revoked,
+          // monitor unplugged). Surface the reason and trigger reconnect.
+          const reason = typeof msg.reason === 'string' ? msg.reason : 'capture ended'
+          setLastEndReason(reason)
+          if (!destroyedRef.current) handleDisconnect()
+          break
+        }
       }
     }
 
@@ -343,5 +357,5 @@ export function useDesktopSession(
     }
   }, [hostId, deviceId]) // eslint-disable-line react-hooks/exhaustive-deps
 
-  return { status, sendInput, setQuality, setSettings, disconnect, attempt, screenDims }
+  return { status, sendInput, setQuality, setSettings, disconnect, attempt, screenDims, lastEndReason }
 }

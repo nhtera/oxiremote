@@ -57,6 +57,7 @@ pub mod inner {
     ///
     /// The whole capture pipeline stops when `shutdown_rx` fires or when the
     /// `Sink` send fails (WS/DC closed).
+    #[allow(clippy::too_many_arguments)]
     pub fn spawn_capture_pipeline(
         initial_tier: QualityTier,
         initial_hidpi: bool,
@@ -65,11 +66,19 @@ pub mod inner {
         mut hidpi_rx: watch::Receiver<bool>,
         mut shutdown_rx: tokio::sync::oneshot::Receiver<()>,
         scale_factor: f32,
+        cap_ended_tx: tokio::sync::mpsc::Sender<String>,
     ) {
         tokio::spawn(async move {
             let sink = Arc::new(sink);
             let mut current_tier = initial_tier;
             let mut current_hidpi = initial_hidpi;
+
+            // Helper: signal ws_loop with a reason string, ignoring failure
+            // (caller may have shut down already, or channel buffer full —
+            // we only need the first reason to reach ws_loop).
+            let signal_end = |reason: &str| {
+                let _ = cap_ended_tx.try_send(reason.to_string());
+            };
 
             loop {
                 // Small channel so capture thread's drop-newest kicks in
@@ -124,8 +133,12 @@ pub mod inner {
 
                         frame = frame_rx.recv() => {
                             let Some(frame_output) = frame else {
-                                // CaptureLoop exited (e.g. monitor disappeared).
+                                // CaptureLoop exited (monitor unplugged, capture
+                                // permission revoked, encoder error). Signal
+                                // ws_loop so the WS-fallback path doesn't hang
+                                // waiting for binary frames that will never come.
                                 warn!("CaptureLoop channel closed unexpectedly");
+                                signal_end("screen capture stopped");
                                 return;
                             };
 
