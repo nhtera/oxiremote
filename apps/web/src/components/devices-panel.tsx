@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useState } from 'react'
+import { WifiIcon } from './icons'
 
 // Localhost-only list of paired devices. /api/agent/devices is auth-free on
 // loopback (the host operator owns the machine), so this works on a freshly
@@ -54,8 +55,14 @@ export default function DevicesPanel() {
 
   if (devices.length === 0) {
     return (
-      <div className="text-xs text-text-muted">
-        No paired devices yet. Scan the QR or share the one-time key.
+      <div className="flex flex-col items-center justify-center text-center py-6 px-4 gap-2">
+        <span className="inline-flex w-10 h-10 items-center justify-center rounded-full bg-accent/10 border border-accent/30 text-accent">
+          <WifiIcon size={20} />
+        </span>
+        <div className="text-sm font-medium text-text-primary">No clients yet</div>
+        <div className="text-xs text-text-muted leading-relaxed max-w-[280px]">
+          Scan the QR code to connect your first device.
+        </div>
       </div>
     )
   }
@@ -67,9 +74,12 @@ export default function DevicesPanel() {
         return (
           <div
             key={d.device_id}
-            className="flex items-center gap-2 py-1.5 border-b border-border/60 last:border-0"
+            className="flex items-center gap-2.5 py-1.5 border-b border-border/60 last:border-0"
           >
-            <span className={`inline-block w-2 h-2 rounded-full ${dotClass}`} title={title} />
+            <span className={`inline-block w-2.5 h-2.5 rounded-full ${dotClass} shrink-0`} title={title} />
+            <span className="text-text-muted shrink-0" aria-hidden>
+              <WifiIcon size={14} />
+            </span>
             <span className="flex-1 truncate text-sm text-text-primary" title={d.label}>
               {d.label}
             </span>

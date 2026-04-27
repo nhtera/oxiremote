@@ -1,3 +1,4 @@
+import { useEffect, useState } from 'react'
 import { NavLink, Outlet } from 'react-router-dom'
 import { TunnelStatusPill } from './tunnel-status-card'
 import AgentDisconnectButton from './agent-disconnect-button'
@@ -14,6 +15,19 @@ type IconCmp = (props: { size?: number }) => React.ReactNode
 // operator can read connectivity at a glance and shut the agent from any
 // /agent/* route, not just the home page.
 export default function AgentLayout() {
+  // Cheap one-shot fetch — version is fixed for the process lifetime, no SSE.
+  const [version, setVersion] = useState<string | null>(null)
+  useEffect(() => {
+    let cancelled = false
+    fetch('/api/agent/state')
+      .then((r) => (r.ok ? r.json() : null))
+      .then((data) => {
+        if (!cancelled && data?.version) setVersion(data.version as string)
+      })
+      .catch(() => { /* version pill is non-critical */ })
+    return () => { cancelled = true }
+  }, [])
+
   const navItems: { to: string; label: string; Icon: IconCmp; exact: boolean }[] = [
     { to: '/agent', label: 'Home', Icon: HomeIcon, exact: true },
     { to: '/agent/devices', label: 'Devices', Icon: DevicesIcon, exact: false },
@@ -35,8 +49,13 @@ export default function AgentLayout() {
           </svg>
         </span>
         <div className="min-w-0">
-          <div className="text-sm font-semibold text-text-primary tracking-tight leading-tight">
-            OxiRemote <span className="text-text-muted font-normal">host</span>
+          <div className="text-sm font-semibold text-text-primary tracking-tight leading-tight flex items-center gap-2">
+            <span>OxiRemote <span className="text-text-muted font-normal">host</span></span>
+            {version && (
+              <span className="text-[10px] font-medium text-accent bg-accent/10 border border-accent/30 rounded px-1.5 py-0.5 leading-none">
+                v{version}
+              </span>
+            )}
           </div>
           <div className="text-[11px] text-text-muted leading-tight">localhost dashboard</div>
         </div>

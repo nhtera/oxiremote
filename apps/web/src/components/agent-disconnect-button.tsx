@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { Button, useConfirm } from './ui'
+import { useConfirm } from './ui'
 
 type Phase = 'idle' | 'stopping' | 'stopped'
 
@@ -65,15 +65,20 @@ export default function AgentDisconnectButton() {
 
   return (
     <>
-      <Button
-        variant="danger"
-        size="sm"
+      <button
+        type="button"
         onClick={handleClick}
-        loading={phase !== 'idle'}
         disabled={phase !== 'idle'}
+        className="inline-flex items-center gap-2 rounded-full px-4 py-1.5 text-xs font-semibold border border-danger/40 text-danger hover:bg-danger/10 transition-colors disabled:opacity-60 disabled:cursor-not-allowed"
       >
+        <span className="relative inline-flex w-2.5 h-2.5">
+          {phase === 'idle' && (
+            <span className="absolute inline-flex w-full h-full rounded-full bg-danger opacity-50 animate-ping" />
+          )}
+          <span className="relative inline-flex w-2.5 h-2.5 rounded-full bg-danger" />
+        </span>
         {phase === 'stopping' ? 'Stopping…' : phase === 'stopped' ? 'Stopped' : 'Stop agent'}
-      </Button>
+      </button>
       {phase === 'stopped' && <AgentStoppedOverlay />}
     </>
   )
