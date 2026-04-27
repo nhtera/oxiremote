@@ -3,6 +3,8 @@ import TerminalKeybarExpanded from './terminal-keybar-expanded'
 
 type Props = {
   onSend: (bytes: string) => void
+  /** Optional callback for transient user-visible messages (clipboard deny). */
+  onToast?: (msg: string) => void
 }
 
 type Key = { label: string; value: string; isCtrlTarget?: boolean }
@@ -22,9 +24,18 @@ const PRIMARY: Key[] = [
   { label: '~', value: '~', isCtrlTarget: true },
 ]
 
-export default function TerminalKeybar({ onSend }: Props) {
+export default function TerminalKeybar({ onSend, onToast }: Props) {
   const [ctrlActive, setCtrlActive] = useState(false)
   const [expanded, setExpanded] = useState(false)
+
+  async function handlePaste() {
+    try {
+      const text = await navigator.clipboard.readText()
+      if (text) onSend(text)
+    } catch {
+      onToast?.('Clipboard access denied')
+    }
+  }
 
   function handleKey(key: Key) {
     if (key.label === 'Ctrl') {
@@ -60,6 +71,17 @@ export default function TerminalKeybar({ onSend }: Props) {
             {key.label}
           </button>
         ))}
+        {/* Paste button: iOS Safari requires a synchronous user-gesture to
+            access navigator.clipboard.readText(). A dedicated button is the
+            only reliable path on WKWebView. Hidden on desktop (md:hidden). */}
+        <button
+          className="btn-secondary text-xs py-1 px-2 min-w-9 text-center md:hidden"
+          onClick={() => void handlePaste()}
+          title="Paste from clipboard"
+          aria-label="Paste"
+        >
+          Paste
+        </button>
         <button
           className={
             expanded

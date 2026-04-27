@@ -5,17 +5,57 @@ use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::Json;
 use axum::Router;
-use axum::routing::get;
+use axum::routing::{get, patch};
 use axum_extra::extract::cookie::CookieJar;
+use serde::Deserialize;
 use serde_json::json;
+use tracing::{info, warn};
 
 use crate::auth::require_active_auth;
+use crate::events::AgentEvent;
 use crate::AppState;
 
 pub fn router() -> Router<Arc<AppState>> {
     Router::new()
         .route("/api/host", get(api_host_info))
         .route("/api/hosts/{id}/desktop/capabilities", get(api_desktop_capabilities))
+        .route("/api/devices/{id}", patch(api_device_rename))
+}
+
+#[derive(Deserialize)]
+struct DeviceRenameBody {
+    name: Option<String>,
+}
+
+/// PATCH /api/devices/{id} — tunnel-scoped device rename.
+async fn api_device_rename(
+    State(state): State<Arc<AppState>>,
+    jar: CookieJar,
+    Path(device_id): Path<String>,
+    Json(body): Json<DeviceRenameBody>,
+) -> impl IntoResponse {
+    if require_active_auth(&state.db_path, &state.signing_key, &jar).is_none() {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+
+    let name_ref: Option<&str> = body.name.as_deref();
+    match crate::auth::rename_device(&state.db_path, &device_id, name_ref) {
+        Ok(()) => {
+            info!(device_id = %device_id, "device renamed via host api");
+            // DeviceApproved is the closest existing event that causes the SPA
+            // Devices page to refresh a device row.
+            state.event_bus.send(AgentEvent::DeviceApproved { device_id });
+            (StatusCode::OK, Json(json!({ "ok": true }))).into_response()
+        }
+        Err(err) => {
+            warn!(error=%err, device_id=%device_id, "rename device via host api failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": err.to_string() })),
+            )
+                .into_response()
+        }
+    }
 }
 
 async fn api_host_info(

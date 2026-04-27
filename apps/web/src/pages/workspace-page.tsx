@@ -25,6 +25,7 @@ import TerminalSendComposer from '../components/terminal-send-composer'
 import ReconnectModal from '../components/reconnect-modal'
 import NewSessionRow from '../components/workspace/new-session-row'
 import MultiPaneGrid from '../components/workspace/multi-pane-grid'
+import KeyboardShortcutOverlay from '../components/workspace/keyboard-shortcut-overlay'
 import { StateView, useConfirm } from '../components/ui'
 
 type CreateSessionReq = { cols: number; rows: number; name?: string }
@@ -158,6 +159,9 @@ export default function WorkspacePage() {
   const [showSettings, setShowSettings] = useState(false)
   const [prefs, setPrefs] = useState<TerminalPrefs>(loadPrefs)
   const [reconnectNonce, setReconnectNonce] = useState(0)
+  const [shortcutOverlayOpen, setShortcutOverlayOpen] = useState(false)
+  // Brief toast for clipboard-deny feedback from the mobile Paste button.
+  const [keybarToast, setKeybarToast] = useState<string | null>(null)
   // Per-session connection telemetry. Drives tab-bar dots, the focused pane's
   // status pill, and the reconnect modal. Records (not zustand) keep this
   // ephemeral state out of the global store.
@@ -221,6 +225,40 @@ export default function WorkspacePage() {
     })
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [sessionIdParam])
+
+  // Auto-clear keybar toast after 3 s.
+  useEffect(() => {
+    if (!keybarToast) return
+    const id = window.setTimeout(() => setKeybarToast(null), 3000)
+    return () => window.clearTimeout(id)
+  }, [keybarToast])
+
+  // ? keydown → open shortcut overlay (skip when xterm canvas has focus).
+  useEffect(() => {
+    function onKeyDown(e: KeyboardEvent) {
+      if (e.key !== '?') return
+      const active = document.activeElement
+      // xterm mounts a <canvas> or <textarea> for its input; skip when focused.
+      if (active && (active.tagName === 'CANVAS' || active.tagName === 'TEXTAREA' || active.tagName === 'INPUT')) return
+      e.preventDefault()
+      setShortcutOverlayOpen((v) => !v)
+    }
+    document.addEventListener('keydown', onKeyDown)
+    return () => document.removeEventListener('keydown', onKeyDown)
+  }, [])
+
+  // beforeunload guard — warn on tab close / refresh when sessions are active.
+  const hasActiveSessions = sessions.some(
+    (s) => s.state !== 'exited' && connectedById[s.id],
+  )
+  useEffect(() => {
+    function onBeforeUnload(e: BeforeUnloadEvent) {
+      if (!hasActiveSessions) return
+      e.preventDefault()
+    }
+    window.addEventListener('beforeunload', onBeforeUnload)
+    return () => window.removeEventListener('beforeunload', onBeforeUnload)
+  }, [hasActiveSessions])
 
   function defaultName(): string {
     const used = new Set<number>()
@@ -439,7 +477,10 @@ export default function WorkspacePage() {
 
       {hasSessions && anyAssigned && (
         <div className="md:hidden px-2 py-1.5 border-t border-border bg-surface-alt shrink-0">
-          <TerminalKeybar onSend={sendInput} />
+          {keybarToast && (
+            <div className="text-[length:var(--text-meta)] text-warning mb-1 px-1">{keybarToast}</div>
+          )}
+          <TerminalKeybar onSend={sendInput} onToast={(msg) => setKeybarToast(msg)} />
         </div>
       )}
 
@@ -472,6 +513,12 @@ export default function WorkspacePage() {
               }
         }
       />
+
+      <KeyboardShortcutOverlay
+        open={shortcutOverlayOpen}
+        onClose={() => setShortcutOverlayOpen(false)}
+      />
+
     </div>
   )
 }
