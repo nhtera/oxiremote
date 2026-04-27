@@ -11,6 +11,7 @@
     "build:web": "bun --cwd apps/web build",
     "typecheck:web": "bun --cwd apps/web typecheck",
     "lint:web": "bun --cwd apps/web lint",
+    "test:web": "bun --cwd apps/web test",
     "e2e": "playwright test --config=tests/e2e/playwright.config.ts",
     "check:bundle": "bun run scripts/check-bundle-size.ts"
   },
