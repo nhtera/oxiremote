@@ -15,10 +15,11 @@ import {
   SCROLLBACK_OPTIONS,
   type TerminalPrefs,
 } from '../lib/terminal-prefs'
-import { useTerminalWs, destroyHandle, type SessionHandle } from '../lib/terminal-ws-hook'
+import { useTerminalWs, destroyHandle, MAX_RECONNECT_ATTEMPTS, type SessionHandle } from '../lib/terminal-ws-hook'
 import TerminalTabBar from '../components/terminal-tab-bar'
 import TerminalKeybar from '../components/terminal-keybar'
 import TerminalSendComposer from '../components/terminal-send-composer'
+import ReconnectModal from '../components/reconnect-modal'
 import { Button, StateView } from '../components/ui'
 
 function debounce<F extends (...args: unknown[]) => void>(fn: F, ms: number) {
@@ -131,6 +132,8 @@ export default function TerminalPage() {
   const [err, setErr] = useState<string | null>(null)
   const [isConnected, setIsConnected] = useState(false)
   const [reconnectNonce, setReconnectNonce] = useState(0)
+  const [reconnectAttempt, setReconnectAttempt] = useState(0)
+  const [reconnectExhausted, setReconnectExhausted] = useState(false)
   const [showSettings, setShowSettings] = useState(false)
   const [prefs, setPrefs] = useState<TerminalPrefs>(loadPrefs)
 
@@ -184,8 +187,17 @@ export default function TerminalPage() {
   const { refreshSessions } = useTerminalWs(handlesRef, {
     activeId,
     reconnectNonce,
-    onConnected: setIsConnected,
+    onConnected: (c) => {
+      setIsConnected(c)
+      if (c) {
+        // Successful (re)connect — clear modal state.
+        setReconnectAttempt(0)
+        setReconnectExhausted(false)
+      }
+    },
     onError: setErr,
+    onReconnectAttempt: setReconnectAttempt,
+    onReconnectExhausted: () => setReconnectExhausted(true),
   })
 
   // Apply prefs to all live terminals when the user changes them.
@@ -368,6 +380,39 @@ export default function TerminalPage() {
       )}
 
       {hasSessions && <TerminalSendComposer onSend={sendInput} />}
+
+      <ReconnectModal
+        open={!isConnected && (reconnectAttempt > 0 || reconnectExhausted)}
+        attempt={reconnectAttempt}
+        maxAttempts={MAX_RECONNECT_ATTEMPTS}
+        exhausted={reconnectExhausted}
+        onCancel={() => {
+          // User gave up — destroy the active handle so we don't keep a
+          // stale WS slot around. Refresh the list so the UI shows the
+          // session as exited (or removed).
+          if (activeId) destroyHandle(handlesRef, activeId)
+          setReconnectExhausted(false)
+          setReconnectAttempt(0)
+          refreshSessions()
+        }}
+        onRetry={
+          reconnectExhausted
+            ? undefined
+            : () => {
+                // Manual retry — bump nonce so the effect re-runs `connect`.
+                if (activeId) {
+                  const h = handlesRef.current.get(activeId)
+                  if (h) {
+                    h.reconnectAttempt = 0
+                    h.closedByUser = false
+                  }
+                }
+                setReconnectExhausted(false)
+                setReconnectAttempt(0)
+                setReconnectNonce((n) => n + 1)
+              }
+        }
+      />
     </div>
   )
 }

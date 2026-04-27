@@ -21,19 +21,29 @@ function wsUrl(path: string) {
 
 // Exponential-ish backoff capped at 5s, matches "reconnect within 3s" success criterion.
 const BACKOFF_MS = [500, 1000, 2000, 3000, 5000]
+// Stop trying after 8 attempts (~21s of cumulative back-off + the WS handshake
+// time-out). Past this the disconnect is almost always permanent — agent
+// crash, device revoke, network split — and silently retrying forever both
+// burns battery and hides the failure from the user. Surface it via the
+// reconnect modal so they can choose to retry or give up.
+export const MAX_RECONNECT_ATTEMPTS = 8
 
 type Options = {
   activeId: string | null
   reconnectNonce: number
   onConnected: (connected: boolean) => void
   onError: (msg: string) => void
+  /** Fired once when the reconnect cap is hit; UI uses this to surface the modal. */
+  onReconnectExhausted?: () => void
+  /** Fired on each new reconnect attempt so the UI can show "attempt N of M". */
+  onReconnectAttempt?: (attempt: number) => void
 }
 
 export function useTerminalWs(
   handlesRef: React.MutableRefObject<Map<string, SessionHandle>>,
   options: Options
 ) {
-  const { activeId, reconnectNonce, onConnected, onError } = options
+  const { activeId, reconnectNonce, onConnected, onError, onReconnectExhausted, onReconnectAttempt } = options
   const activeIdRef = useRef<string | null>(null)
   const { setSessions } = useTerminalStore.getState()
 
@@ -64,7 +74,8 @@ export function useTerminalWs(
 
     const sessionId = activeId
     handle.closedByUser = false
-    connect(handle, sessionId, onConnected, activeIdRef)
+    handle.reconnectAttempt = 0
+    connect(handle, sessionId, onConnected, activeIdRef, onReconnectExhausted, onReconnectAttempt)
 
     const onData = handle.term.onData((data) => {
       if (handle.ws?.readyState === WebSocket.OPEN) {
@@ -83,7 +94,9 @@ function connect(
   handle: SessionHandle,
   sessionId: string,
   onConnected: (c: boolean) => void,
-  activeIdRef: React.MutableRefObject<string | null>
+  activeIdRef: React.MutableRefObject<string | null>,
+  onReconnectExhausted?: () => void,
+  onReconnectAttempt?: (attempt: number) => void,
 ) {
   if (handle.reconnectTimer != null) {
     window.clearTimeout(handle.reconnectTimer)
@@ -112,12 +125,21 @@ function connect(
     handle.ws = null
     if (activeIdRef.current === sessionId) onConnected(false)
     if (handle.closedByUser) return
+    // Cap reconnect attempts so a permanent failure (agent crash, device
+    // revoke) surfaces in the UI instead of looping in the background
+    // forever and burning battery on a connection that will never come back.
+    if (handle.reconnectAttempt >= MAX_RECONNECT_ATTEMPTS) {
+      handle.closedByUser = true
+      onReconnectExhausted?.()
+      return
+    }
     // Auto-reconnect with backoff.
     const delay = BACKOFF_MS[Math.min(handle.reconnectAttempt, BACKOFF_MS.length - 1)]
     handle.reconnectAttempt += 1
+    onReconnectAttempt?.(handle.reconnectAttempt)
     handle.reconnectTimer = window.setTimeout(() => {
       handle.reconnectTimer = null
-      connect(handle, sessionId, onConnected, activeIdRef)
+      connect(handle, sessionId, onConnected, activeIdRef, onReconnectExhausted, onReconnectAttempt)
     }, delay)
   }
 
