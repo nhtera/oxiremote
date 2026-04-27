@@ -88,7 +88,7 @@ pub struct AppState {
     pub db_path: PathBuf,
     pub signing_key: Vec<u8>,
     pub secure_cookies: bool,
-    pub terminal_sessions: DashMap<String, Arc<TerminalSession>>,
+    pub terminal_sessions: Arc<DashMap<String, Arc<TerminalSession>>>,
     pub preview_targets: DashMap<String, PreviewTarget>,
     pub preview_health: DashMap<String, PreviewHealth>,
     pub local_sites: LocalSitesCache,
@@ -438,7 +438,7 @@ async fn server_main(event_bus: Arc<EventBus>) -> anyhow::Result<()> {
         db_path,
         signing_key,
         secure_cookies,
-        terminal_sessions: DashMap::new(),
+        terminal_sessions: Arc::new(DashMap::new()),
         preview_targets,
         preview_health: DashMap::new(),
         local_sites: local_sites_cache.clone(),
@@ -666,9 +666,23 @@ async fn server_main(event_bus: Arc<EventBus>) -> anyhow::Result<()> {
     tokio::spawn(async move {
         let url = match named_cfg {
             Some(cfg) => match tunnel::ensure_named_tunnel(cloudflared, cfg, tunnel_state.event_bus.clone()).await {
-                Ok(target) => {
+                Ok(Some(target)) => {
                     info!(%target, "named tunnel ready");
                     Some(target)
+                }
+                Ok(None) => {
+                    // Named tunnel up, but operator did not configure a
+                    // public hostname — there is nothing meaningful to show
+                    // to clients. Surface a Verifying step so the WebUI/TUI
+                    // tunnel card stops sitting on Tunneling forever.
+                    info!("named tunnel ready without public hostname");
+                    tunnel_state.event_bus.send(events::AgentEvent::TunnelStepChanged {
+                        step: events::TunnelStep::Ready,
+                        attempt: 1,
+                        info: Some("named tunnel active (no public hostname configured)".into()),
+                        reason: None,
+                    });
+                    None
                 }
                 Err(err) => {
                     warn!(error=%err, "named tunnel failed");

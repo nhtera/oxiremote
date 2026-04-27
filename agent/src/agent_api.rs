@@ -484,6 +484,7 @@ async fn api_agent_settings_auto_approve(
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
+    use std::sync::Arc;
 
     use dashmap::DashMap;
 
@@ -508,7 +509,7 @@ mod tests {
             db_path,
             signing_key: b"01234567890123456789012345678901".to_vec(),
             secure_cookies: false,
-            terminal_sessions: DashMap::new(),
+            terminal_sessions: Arc::new(DashMap::new()),
             preview_targets: DashMap::new(),
             preview_health: DashMap::new(),
             local_sites: local_sites::new_cache(),

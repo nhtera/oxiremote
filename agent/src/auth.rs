@@ -493,6 +493,7 @@ pub fn clear_stale_pairing_attempts(attempts: &dashmap::DashMap<String, i64>, wi
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
+    use std::sync::Arc;
 
     use axum_extra::extract::cookie::{Cookie, CookieJar};
     use dashmap::DashMap;
@@ -517,7 +518,7 @@ mod tests {
             db_path,
             signing_key: b"01234567890123456789012345678901".to_vec(),
             secure_cookies: false,
-            terminal_sessions: DashMap::new(),
+            terminal_sessions: Arc::new(DashMap::new()),
             preview_targets: DashMap::new(),
             preview_health: DashMap::new(),
             local_sites: local_sites::new_cache(),

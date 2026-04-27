@@ -499,7 +499,7 @@ mod tests {
             db_path,
             signing_key: b"01234567890123456789012345678901".to_vec(),
             secure_cookies: false,
-            terminal_sessions: DashMap::<String, Arc<TerminalSession>>::new(),
+            terminal_sessions: Arc::new(DashMap::<String, Arc<TerminalSession>>::new()),
             preview_targets: DashMap::<String, PreviewTarget>::new(),
             preview_health: DashMap::new(),
             local_sites: local_sites::new_cache(),

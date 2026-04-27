@@ -3,6 +3,7 @@ use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 use std::time::Instant;
 
+use dashmap::DashMap;
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
@@ -160,6 +161,12 @@ pub fn build_default_command(command: Option<&[String]>) -> Vec<String> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+/// Spawn a PTY session, register it in the in-memory `sessions` map, and
+/// start the reader + idle watchdog threads. The reader thread auto-removes
+/// the session from the map on PTY exit so the count gate in
+/// `terminal_api::api_terminal_sessions_create` stays in sync with reality
+/// (DB rows are the audit log; the map is the source of truth for "alive").
 pub fn spawn_terminal_session(
     id: &str,
     owner_session_id: &str,
@@ -168,7 +175,8 @@ pub fn spawn_terminal_session(
     cols: u16,
     rows: u16,
     db_path: PathBuf,
-) -> anyhow::Result<TerminalSession> {
+    sessions: Arc<DashMap<String, Arc<TerminalSession>>>,
+) -> anyhow::Result<Arc<TerminalSession>> {
     let pty_system = native_pty_system();
     let pair = pty_system.openpty(PtySize {
         rows,
@@ -197,6 +205,8 @@ pub fn spawn_terminal_session(
     let child_for_wait = child.clone();
     let db_path = db_path.clone();
     let id = id.to_string();
+    let id_for_reader = id.clone();
+    let sessions_for_reader = sessions.clone();
 
     let last_activity = Arc::new(std::sync::Mutex::new(Instant::now()));
     let last_activity2 = last_activity.clone();
@@ -214,6 +224,22 @@ pub fn spawn_terminal_session(
     let is_active_reader = is_active.clone();
     let is_active_watch = is_active.clone();
     let output_tx_watch = output_tx.clone();
+
+    // Build the session and register it BEFORE the reader thread spawns so a
+    // PTY that exits in microseconds (e.g. `false`) never races the map
+    // insertion: the reader's self-removal would no-op and leave a phantom
+    // entry that survives until the next /api/terminal/sessions list query.
+    let session = Arc::new(TerminalSession {
+        owner_session_id: owner_session_id.to_string(),
+        writer: std::sync::Mutex::new(writer),
+        output_tx: output_tx.clone(),
+        child,
+        master: std::sync::Mutex::new(master),
+        last_activity,
+        buffer,
+        last_seq,
+    });
+    sessions.insert(id, session.clone());
 
     // Idle watchdog: emit State{idle} once output has been quiet for > ACTIVE_THRESHOLD.
     std::thread::spawn(move || {
@@ -296,7 +322,16 @@ pub fn spawn_terminal_session(
             }
         }
 
-        let code = match child_for_wait.lock().unwrap().wait() {
+        // Recover from poisoned guard: if a previous holder panicked while
+        // owning the lock, the data is still valid for our purposes (we only
+        // need to call wait on the child). Without this, a single panic
+        // upthread would propagate here and abort the reader thread before
+        // it can update the DB / clear the in-memory map.
+        let code = match child_for_wait
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .wait()
+        {
             Ok(status) => Some(status.exit_code() as i64),
             Err(_) => None,
         };
@@ -306,23 +341,19 @@ pub fn spawn_terminal_session(
             let conn = Connection::open(&db_path)?;
             conn.execute(
                 "UPDATE terminal_sessions SET status='exited', exit_code=?2, last_seen_at=?3 WHERE terminal_session_id=?1",
-                params![id.to_string(), code, now],
+                params![id_for_reader, code, now],
             )?;
             Ok(())
         })();
+
+        // Remove from the in-memory map so the per-user count gate in
+        // `api_terminal_sessions_create` reflects reality immediately,
+        // not after the next /api/terminal/sessions list query.
+        sessions_for_reader.remove(&id_for_reader);
 
         let _ = output_tx2.send(WsOut::State { state: "exited".into() });
         let _ = output_tx2.send(WsOut::Exit { code });
     });
 
-    Ok(TerminalSession {
-        owner_session_id: owner_session_id.to_string(),
-        writer: std::sync::Mutex::new(writer),
-        output_tx,
-        child,
-        master: std::sync::Mutex::new(master),
-        last_activity,
-        buffer,
-        last_seq,
-    })
+    Ok(session)
 }

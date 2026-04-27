@@ -105,23 +105,15 @@ pub async fn api_terminal_sessions_create(
         return StatusCode::UNAUTHORIZED.into_response();
     };
 
-    let existing: anyhow::Result<i64> = (|| {
-        let conn = Connection::open(&state.db_path)?;
-        conn.query_row(
-            "SELECT COUNT(*) FROM terminal_sessions WHERE owner_session_id=?1 AND status='running'",
-            params![owner_session_id],
-            |row| row.get(0),
-        )
-        .map_err(Into::into)
-    })();
-
-    let existing = match existing {
-        Ok(count) => count as usize,
-        Err(err) => {
-            warn!(error=%err, "count terminal sessions failed");
-            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-        }
-    };
+    // In-memory map is the source of truth: a PTY that died after spawn but
+    // before the DB row was marked `dead` would let the DB-count gate stay
+    // above the cap forever. The reader thread auto-removes from this map on
+    // PTY exit (see `spawn_terminal_session`), so this count tracks reality.
+    let existing = state
+        .terminal_sessions
+        .iter()
+        .filter(|s| s.value().owner_session_id == owner_session_id)
+        .count();
 
     if existing >= MAX_TERMINAL_SESSIONS_PER_USER {
         return StatusCode::TOO_MANY_REQUESTS.into_response();
@@ -161,6 +153,8 @@ pub async fn api_terminal_sessions_create(
     let shell_cmd = build_default_command(req.command.as_deref());
     let cwd = req.cwd.clone();
 
+    // spawn_terminal_session inserts into terminal_sessions itself so the
+    // PTY's reader thread can self-remove on exit without a TOCTOU window.
     match spawn_terminal_session(
         &id,
         &owner_session_id,
@@ -169,11 +163,9 @@ pub async fn api_terminal_sessions_create(
         req.cols,
         req.rows,
         state.db_path.clone(),
+        state.terminal_sessions.clone(),
     ) {
-        Ok(sess) => {
-            state
-                .terminal_sessions
-                .insert(id.clone(), Arc::new(sess));
+        Ok(_sess) => {
             (StatusCode::OK, Json(CreateTerminalSessionResponse { id })).into_response()
         }
         Err(err) => {
