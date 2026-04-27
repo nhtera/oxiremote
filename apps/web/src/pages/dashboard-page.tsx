@@ -22,7 +22,7 @@ type Device = {
 }
 type DesktopCaps = { available: boolean }
 
-export default function HomePage() {
+export default function DashboardPage() {
   const location = useLocation()
   const { currentHostId } = useHostStore()
   const [sessions, setSessions] = useState<SessionSummary>({ total: 0, running: 0, latestId: null })

@@ -131,6 +131,12 @@ export const EyeIcon = ({ size = 16, ...rest }: IconProps) => (
   </svg>
 )
 
+export const ChevronDownIcon = ({ size = 16, ...rest }: IconProps) => (
+  <svg {...base(size)} {...rest}>
+    <polyline points="6 9 12 15 18 9" />
+  </svg>
+)
+
 export const EyeOffIcon = ({ size = 16, ...rest }: IconProps) => (
   <svg {...base(size)} {...rest}>
     <path d="M17.94 17.94A10.94 10.94 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94" />

@@ -2,11 +2,12 @@ import { lazy, Suspense, useEffect } from 'react'
 import { Navigate, Route, Routes, useNavigate, useParams } from 'react-router-dom'
 import AppLayout from './components/app-layout'
 import AgentLayout from './components/agent-layout'
-import HomePage from './pages/home-page'
+import DashboardPage from './pages/dashboard-page'
 import LoginPage from './pages/login-page'
 import ApprovalWaitingPage from './pages/approval-waiting-page'
 import WelcomePage from './pages/welcome-page'
 import TerminalPage from './pages/terminal-page'
+import WorkspacePage from './pages/workspace-page'
 import GitPage from './pages/git-page'
 import FilesPage from './pages/files-page'
 import WorkspacePickerPage from './pages/workspace-picker-page'
@@ -51,6 +52,12 @@ function LegacyRedirect({ page }: { page: string }) {
   }
 
   return <Navigate to={`/h/${currentHostId}/${page}`} replace />
+}
+
+// Bare /h/:hostId → workspace landing.
+function WorkspaceRedirect() {
+  const { hostId } = useParams<{ hostId: string }>()
+  return <Navigate to={`/h/${hostId}/workspace`} replace />
 }
 
 // Wrapper that validates :hostId against the currently-paired host. Deep links
@@ -121,8 +128,8 @@ function App() {
   )
 }
 
-// Renders the welcome screen for unpaired devices and the home dashboard for
-// paired ones. Avoids a flash of "Loading…" by waiting for the host store.
+// Paired devices land on the workspace shell; unpaired devices go to welcome.
+// Avoids a flash of "Loading…" by waiting for the host store.
 function RootRoute() {
   const { currentHostId, loading } = useHostStore()
   if (loading) {
@@ -132,7 +139,9 @@ function RootRoute() {
       </div>
     )
   }
-  return currentHostId ? <HomePage /> : <Navigate to="/welcome" replace />
+  return currentHostId
+    ? <Navigate to={`/h/${currentHostId}/workspace`} replace />
+    : <Navigate to="/welcome" replace />
 }
 
 function AppRoutes() {
@@ -182,7 +191,11 @@ function AppRoutes() {
       <Route element={<AppLayout />}>
         <Route path="/" element={<RootRoute />} />
 
-        <Route path="/h/:hostId" element={<HostRoute><TerminalPage /></HostRoute>} />
+        <Route path="/h/:hostId" element={<HostRoute><WorkspaceRedirect /></HostRoute>} />
+        <Route path="/h/:hostId/workspace" element={<HostRoute><WorkspacePage /></HostRoute>} />
+        <Route path="/h/:hostId/workspace/:sessionId" element={<HostRoute><WorkspacePage /></HostRoute>} />
+        <Route path="/h/:hostId/dashboard" element={<HostRoute><DashboardPage /></HostRoute>} />
+        {/* Legacy terminal routes — preserved so notification deep-links keep working */}
         <Route path="/h/:hostId/terminal" element={<HostRoute><TerminalPage /></HostRoute>} />
         <Route path="/h/:hostId/terminal/:sessionId" element={<HostRoute><TerminalPage /></HostRoute>} />
         <Route path="/h/:hostId/git" element={<HostRoute><GitPage /></HostRoute>} />
