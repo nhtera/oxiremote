@@ -33,9 +33,14 @@ pub async fn api_terminal_sessions_list(
 
     let res: anyhow::Result<Vec<TerminalSessionMeta>> = (|| {
         let conn = Connection::open(&state.db_path)?;
+        // Hide administratively closed sessions ('closed' = user clicked close,
+        // 'dead' = WS evicted). 'exited' (process died naturally) stays visible
+        // so the user sees the red dot before deciding whether to close the tab.
         let mut stmt = conn.prepare(
             "SELECT terminal_session_id, name, created_at, last_seen_at, cols, rows, status, exit_code \
-             FROM terminal_sessions WHERE owner_session_id=?1 ORDER BY created_at DESC",
+             FROM terminal_sessions \
+             WHERE owner_session_id=?1 AND status NOT IN ('closed','dead') \
+             ORDER BY created_at DESC",
         )?;
         let rows = stmt.query_map(params![owner_session_id], |row| {
             let id: String = row.get(0)?;

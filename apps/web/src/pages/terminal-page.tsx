@@ -15,7 +15,7 @@ import {
   SCROLLBACK_OPTIONS,
   type TerminalPrefs,
 } from '../lib/terminal-prefs'
-import { useTerminalWs, destroyHandle, MAX_RECONNECT_ATTEMPTS, type SessionHandle } from '../lib/terminal-ws-hook'
+import { useTerminalWs, destroyHandle, MAX_RECONNECT_ATTEMPTS, backoffMsForAttempt, type SessionHandle } from '../lib/terminal-ws-hook'
 import TerminalTabBar from '../components/terminal-tab-bar'
 import TerminalKeybar from '../components/terminal-keybar'
 import TerminalSendComposer from '../components/terminal-send-composer'
@@ -128,7 +128,7 @@ function Section({ label, children }: { label: string; children: React.ReactNode
 export default function TerminalPage() {
   const [searchParams, setSearchParams] = useSearchParams()
   const { sessionId: sessionIdParam } = useParams<{ sessionId?: string }>()
-  const { sessions, activeId, setActive, setSessions, rename, setState } = useTerminalStore()
+  const { sessions, activeId, setActive, setSessions, rename, setState, remove } = useTerminalStore()
   const [err, setErr] = useState<string | null>(null)
   const [isConnected, setIsConnected] = useState(false)
   const [reconnectNonce, setReconnectNonce] = useState(0)
@@ -259,9 +259,16 @@ export default function TerminalPage() {
   async function createSession() {
     setErr(null)
     const h = activeId ? handlesRef.current.get(activeId) : null
-    // Friendly default name so the tab bar reads "Terminal 1, Terminal 2…"
-    // instead of opaque UUID slices. The user can still rename via dblclick.
-    const nextN = sessions.length + 1
+    // Pick the smallest unused "Terminal N" index. Using sessions.length+1
+    // collides after closes — e.g. close Terminal 1, length=3 → "Terminal 4"
+    // works, but close Terminal 4, length=3 → "Terminal 4" duplicates.
+    const usedNumbers = new Set<number>()
+    for (const s of sessions) {
+      const m = s.name?.match(/^Terminal (\d+)$/)
+      if (m) usedNumbers.add(Number(m[1]))
+    }
+    let nextN = 1
+    while (usedNumbers.has(nextN)) nextN++
     const body: CreateSessionReq = {
       cols: h?.term.cols ?? 80,
       rows: h?.term.rows ?? 24,
@@ -279,9 +286,15 @@ export default function TerminalPage() {
   }
 
   async function closeSession(id: string) {
-    const res = await fetch(`/api/terminal/sessions/${id}/close`, { method: 'POST', credentials: 'include' })
-    if (!res.ok) { setErr('Failed to close session'); return }
+    // Optimistic removal — drop the tab and tear down the WS immediately so
+    // the click feels instant. If the server rejects we'll re-sync from
+    // refreshSessions and the tab reappears.
     destroyHandle(handlesRef, id)
+    remove(id)
+    const res = await fetch(`/api/terminal/sessions/${id}/close`, { method: 'POST', credentials: 'include' })
+    if (!res.ok && res.status !== 410) {
+      setErr('Failed to close session')
+    }
     await refreshSessions()
   }
 
@@ -315,6 +328,7 @@ export default function TerminalPage() {
         <TerminalTabBar
           sessions={sessions}
           activeId={activeId}
+          isActiveConnected={isConnected}
           onSelect={(id) => { setActive(id); localStorage.setItem('oxi:last-terminal-session', id) }}
           onClose={closeSession}
           onNew={createSession}
@@ -330,14 +344,49 @@ export default function TerminalPage() {
         )}
       </div>
 
-      {hasSessions && (
+      {hasSessions && (() => {
+        const isExited = active?.state === 'exited'
+        const pillClass = isExited
+          ? 'text-danger border-danger/30 bg-danger/10'
+          : isConnected
+            ? 'text-success border-success/30 bg-success/10'
+            : 'text-warning border-warning/30 bg-warning/10'
+        const pillLabel = !activeId
+          ? 'No session'
+          : isExited
+            ? 'Exited'
+            : isConnected ? 'Connected' : 'Disconnected'
+        return (
         <div className="flex items-center gap-2 px-3 py-1 shrink-0 border-b border-border bg-surface/95 backdrop-blur">
-          <span className={`text-[11px] px-2 py-0.5 rounded-full border ${isConnected ? 'text-success border-success/30 bg-success/10' : 'text-warning border-warning/30 bg-warning/10'}`}>
-            {activeId ? (isConnected ? 'Connected' : 'Disconnected') : 'No session'}
+          <span className={`text-[11px] px-2 py-0.5 rounded-full border ${pillClass}`}>
+            {pillLabel}
           </span>
-          {!isConnected && activeId && (
-            <button onClick={() => setReconnectNonce((n) => n + 1)} className="btn-secondary text-xs py-0.5 px-2 text-warning">
+          {!isConnected && activeId && !isExited && (
+            <button
+              onClick={() => {
+                // Manual reconnect — clear the give-up flags the auto-reconnect
+                // path may have set, otherwise connect()'s onclose bails.
+                const h = handlesRef.current.get(activeId)
+                if (h) {
+                  h.closedByUser = false
+                  h.reconnectAttempt = 0
+                }
+                setReconnectExhausted(false)
+                setReconnectAttempt(0)
+                setReconnectNonce((n) => n + 1)
+              }}
+              className="btn-secondary text-xs py-0.5 px-2 text-warning"
+            >
               Reconnect
+            </button>
+          )}
+          {isExited && activeId && (
+            <button
+              onClick={() => closeSession(activeId)}
+              className="btn-secondary text-xs py-0.5 px-2"
+              title="The PTY has exited — close this tab"
+            >
+              Close tab
             </button>
           )}
           {active && (
@@ -347,7 +396,8 @@ export default function TerminalPage() {
           )}
           {err && <span className="text-danger text-xs ml-auto truncate max-w-50">{err}</span>}
         </div>
-      )}
+        )
+      })()}
 
       {hasSessions ? (
         <div
@@ -382,18 +432,22 @@ export default function TerminalPage() {
       {hasSessions && <TerminalSendComposer onSend={sendInput} />}
 
       <ReconnectModal
-        open={!isConnected && (reconnectAttempt > 0 || reconnectExhausted)}
+        open={active?.state !== 'exited' && !isConnected && (reconnectAttempt > 0 || reconnectExhausted)}
         attempt={reconnectAttempt}
         maxAttempts={MAX_RECONNECT_ATTEMPTS}
         exhausted={reconnectExhausted}
+        countdownMs={backoffMsForAttempt(reconnectAttempt)}
         onCancel={() => {
-          // User gave up — destroy the active handle so we don't keep a
-          // stale WS slot around. Refresh the list so the UI shows the
-          // session as exited (or removed).
-          if (activeId) destroyHandle(handlesRef, activeId)
+          // User gave up — close the session entirely so the tab disappears
+          // instead of leaving a black pane the user has no obvious way to
+          // recover from. closeSession also tears down the handle.
           setReconnectExhausted(false)
           setReconnectAttempt(0)
-          refreshSessions()
+          if (activeId) {
+            closeSession(activeId)
+          } else {
+            refreshSessions()
+          }
         }}
         onRetry={
           reconnectExhausted

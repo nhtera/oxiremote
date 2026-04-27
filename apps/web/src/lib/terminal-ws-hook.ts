@@ -20,7 +20,14 @@ function wsUrl(path: string) {
 }
 
 // Exponential-ish backoff capped at 5s, matches "reconnect within 3s" success criterion.
-const BACKOFF_MS = [500, 1000, 2000, 3000, 5000]
+export const BACKOFF_MS = [500, 1000, 2000, 3000, 5000]
+
+/** Backoff (in ms) the hook will wait before attempt N (1-indexed). UI uses
+ *  this to keep the reconnect modal's countdown / progress bar in sync. */
+export function backoffMsForAttempt(attempt: number): number {
+  const idx = Math.max(0, Math.min(attempt - 1, BACKOFF_MS.length - 1))
+  return BACKOFF_MS[idx]
+}
 // Stop trying after 8 attempts (~21s of cumulative back-off + the WS handshake
 // time-out). Past this the disconnect is almost always permanent — agent
 // crash, device revoke, network split — and silently retrying forever both
@@ -73,6 +80,16 @@ export function useTerminalWs(
     if (!handle) return
 
     const sessionId = activeId
+    // If the session is already exited, don't open a WS — the server will
+    // immediately close it (no PTY) and we'd loop on reconnect, then surface
+    // the "Connection lost" modal over a tab the user already knows is dead.
+    const sess = useTerminalStore.getState().sessions.find((s) => s.id === sessionId)
+    if (sess?.state === 'exited') {
+      handle.closedByUser = true
+      handle.connected = false
+      onConnected(false)
+      return
+    }
     handle.closedByUser = false
     handle.reconnectAttempt = 0
     connect(handle, sessionId, onConnected, activeIdRef, onReconnectExhausted, onReconnectAttempt)

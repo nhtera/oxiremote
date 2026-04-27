@@ -16,8 +16,9 @@ interface Props {
   onCancel: () => void
   /** Optional: trigger a manual retry now. When unset, only Cancel is shown. */
   onRetry?: () => void
-  /** Seconds shown in the countdown. Defaults to 3. */
-  countdownSeconds?: number
+  /** Real backoff (ms) the hook will wait before the next attempt. Drives both
+   *  the seconds label and the progress bar so the UI matches reality. */
+  countdownMs?: number
 }
 
 export default function ReconnectModal({
@@ -27,19 +28,28 @@ export default function ReconnectModal({
   exhausted,
   onCancel,
   onRetry,
-  countdownSeconds = 3,
+  countdownMs = 3000,
 }: Props) {
-  const [secondsLeft, setSecondsLeft] = useState(countdownSeconds)
+  const totalMs = Math.max(countdownMs, 250)
+  const [msLeft, setMsLeft] = useState(totalMs)
 
-  // Reset the visible countdown each time a new attempt begins or the modal opens.
+  // Reset the countdown each time a new attempt begins or the modal opens. We
+  // tick at 100ms for a smooth bar; the label rounds to whole seconds.
   useEffect(() => {
     if (!open || exhausted) return
-    setSecondsLeft(countdownSeconds)
+    setMsLeft(totalMs)
+    const tickMs = 100
     const id = window.setInterval(() => {
-      setSecondsLeft((s) => (s > 0 ? s - 1 : 0))
-    }, 1000)
+      setMsLeft((ms) => (ms > tickMs ? ms - tickMs : 0))
+    }, tickMs)
     return () => window.clearInterval(id)
-  }, [open, exhausted, attempt, countdownSeconds])
+  }, [open, exhausted, attempt, totalMs])
+
+  const secondsLeft = Math.ceil(msLeft / 1000)
+  // Bar reflects how far we are through the retry budget (attempt N of M),
+  // not the per-attempt countdown — the user wants a sense of "running out
+  // of tries", not "next tick is X% away".
+  const pct = Math.min(100, Math.round((attempt / Math.max(maxAttempts, 1)) * 100))
 
   return (
     <Dialog
@@ -70,14 +80,17 @@ export default function ReconnectModal({
       </div>
 
       {/* Orange progress bar — visible only while retrying. Width reflects
-          the countdown as a fraction of countdownSeconds so the user can
-          see how long until the next attempt. */}
+          attempts used out of the retry budget (e.g. 5/8 → 62%). */}
       {!exhausted && (
         <div className="mt-4 h-1.5 w-full rounded-full bg-surface-alt overflow-hidden">
           <div
-            className="h-full bg-orange-500 transition-all duration-1000 ease-linear"
-            style={{ width: `${Math.round((secondsLeft / countdownSeconds) * 100)}%` }}
-            aria-hidden="true"
+            className="h-full bg-orange-500 transition-[width] duration-300 ease-out"
+            style={{ width: `${pct}%` }}
+            role="progressbar"
+            aria-valuenow={attempt}
+            aria-valuemin={0}
+            aria-valuemax={maxAttempts}
+            aria-label={`Reconnect attempt ${attempt} of ${maxAttempts}`}
           />
         </div>
       )}
