@@ -317,8 +317,14 @@ impl State {
             AgentEvent::OtkIssued { .. } | AgentEvent::OtkUsed { .. } | AgentEvent::OtkExpired { .. } => {
                 self.refresh_otk_from_db();
             }
-            AgentEvent::TunnelDown { reason } => {
-                self.tunnel_down = Some(reason.clone());
+            AgentEvent::TunnelDown { reason, recovery_hint } => {
+                // Surface the recovery hint as the tunnel-down message when
+                // present; falls back to the raw `reason` so the dashboard
+                // never shows an empty "tunnel down" overlay.
+                self.tunnel_down = Some(match recovery_hint {
+                    Some(h) => format!("{reason} — {h}"),
+                    None => reason.clone(),
+                });
                 // Mark the currently-active tunnel step with a "down" sub-text.
                 // The Tunneling step is the most appropriate anchor.
                 if let Some(s) = self.steps.iter_mut().find(|s| s.name == "Tunneling") {
@@ -370,7 +376,7 @@ pub fn run_dashboard(term: &mut Term, event_bus: Arc<EventBus>, db_path: PathBuf
         state.apply(&step_ev);
     }
     if let Some(reason) = snap.down_reason {
-        state.apply(&AgentEvent::TunnelDown { reason });
+        state.apply(&AgentEvent::TunnelDown { reason, recovery_hint: None });
     }
 
     loop {
@@ -974,6 +980,7 @@ mod tests {
         // Cloudflared crashes post-Ready.
         state.apply(&AgentEvent::TunnelDown {
             reason: "exit code 1".into(),
+            recovery_hint: None,
         });
         assert!(!state.is_ready(), "TunnelDown must defeat is_ready()");
         assert!(state.tunnel_down.is_some());

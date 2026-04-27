@@ -111,8 +111,15 @@ pub enum AgentEvent {
     /// (which has one-shot URL semantics). Consumers must handle this to surface
     /// a dead-tunnel indicator; no auto-restart is performed — quick-tunnel URLs
     /// rotate on each spawn, which would silently invalidate active QR codes.
+    ///
+    /// `recovery_hint` is a short, user-actionable string ("Run …", "Check …")
+    /// that the TUI / WebUI can render directly so a dead tunnel is not a
+    /// terminal state with no next step. Optional so older serialized events
+    /// (mid-rolling-deploy) deserialize cleanly on the SPA.
     TunnelDown {
         reason: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        recovery_hint: Option<String>,
     },
     /// Granular tunnel progress — emitted at each lifecycle step so the TUI
     /// and WebUI can render a 5-row checklist with live sub-text.
@@ -172,7 +179,7 @@ impl EventBus {
                 AgentEvent::TunnelStepChanged { .. } => {
                     snap.latest_step = Some(event.clone());
                 }
-                AgentEvent::TunnelDown { reason } => {
+                AgentEvent::TunnelDown { reason, .. } => {
                     snap.down_reason = Some(reason.clone());
                 }
                 _ => {}
@@ -228,6 +235,7 @@ mod tests {
         let bus = EventBus::new();
         bus.send(AgentEvent::TunnelDown {
             reason: "exit code 1".into(),
+            recovery_hint: None,
         });
         assert_eq!(bus.snapshot().down_reason.as_deref(), Some("exit code 1"));
 

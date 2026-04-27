@@ -361,6 +361,11 @@ pub async fn ensure_quick_tunnel(
                         let status = child.wait().await;
                         bus_for_wait.send(AgentEvent::TunnelDown {
                             reason: format!("{status:?}"),
+                            recovery_hint: Some(
+                                "Restart the agent to spin up a fresh tunnel. \
+                                 Quick-tunnel URLs rotate per-spawn; share the new one once the agent is back up."
+                                    .into(),
+                            ),
                         });
                     });
                     Ok(u)
@@ -401,7 +406,7 @@ pub async fn ensure_named_tunnel(
     cloudflared: PathBuf,
     cfg: crate::tunnel_named::NamedTunnelConfig,
     bus: Arc<EventBus>,
-) -> anyhow::Result<String> {
+) -> anyhow::Result<Option<String>> {
     bus.send(AgentEvent::TunnelStepChanged {
         step: TunnelStep::Preparing,
         attempt: 1,
@@ -534,12 +539,20 @@ pub async fn ensure_named_tunnel(
         let status = child.wait().await;
         bus_for_wait.send(AgentEvent::TunnelDown {
             reason: format!("{status:?}"),
+            recovery_hint: Some(
+                "Check `cloudflared` logs and the named-tunnel credentials in \
+                 ~/.config/oxiremote/tunnel.toml, then restart the agent."
+                    .into(),
+            ),
         });
     });
 
-    Ok(cfg
-        .hostname
-        .unwrap_or_else(|| format!("named://{}", cfg.tunnel_name)))
+    // Suppress the historical `named://<tunnel_name>` placeholder when the
+    // operator hasn't configured a public hostname — it surfaced as a fake
+    // URL in the dashboard and nobody could open it. Returning Ok(None) lets
+    // the caller render a clearer "Named tunnel active (no public hostname)"
+    // state instead of dangling a non-clickable string.
+    Ok(cfg.hostname)
 }
 
 #[cfg(test)]
@@ -569,6 +582,7 @@ mod tests {
             let status = child.wait().await;
             bus_clone.send(AgentEvent::TunnelDown {
                 reason: format!("{status:?}"),
+                recovery_hint: None,
             });
         });
 

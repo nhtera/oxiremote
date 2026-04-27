@@ -9,7 +9,7 @@ interface Props {
 
 interface AgentEventTunnelUrlChanged { type: 'tunnel_url_changed'; url: string }
 interface AgentEventHealthProbe { type: 'health_probe'; ok: boolean }
-interface AgentEventTunnelDown { type: 'tunnel_down'; reason: string }
+interface AgentEventTunnelDown { type: 'tunnel_down'; reason: string; recovery_hint?: string }
 interface AgentEventTunnelStep {
   type: 'tunnel_step_changed'
   step: 'preparing' | 'connecting' | 'tunneling' | 'verifying' | 'ready' | 'failed'
@@ -200,6 +200,7 @@ function StatusBadge({ status }: { status: StepState['status'] }) {
 // tunnel_step_changed { step: 'ready' } event arrives the parent can hide us.
 export function TunnelProgressCard() {
   const [steps, setSteps] = useState<StepState[]>(buildInitialSteps)
+  const [downHint, setDownHint] = useState<string | null>(null)
 
   useEffect(() => {
     let cancelled = false
@@ -227,12 +228,14 @@ export function TunnelProgressCard() {
           setSteps((prev) => applyStepEvent(prev, ev as AgentEventTunnelStep))
         } else if (ev.type === 'tunnel_down') {
           // Show tunnel down as a failed active step.
+          const td = ev as AgentEventTunnelDown
+          setDownHint(td.recovery_hint ?? td.reason)
           setSteps((prev) => {
             const next = prev.map((s) => ({ ...s }))
             const active = next.find((s) => s.status === 'active' || s.status === 'done' && s.name === 'Tunneling')
             if (active) {
               active.status = 'failed'
-              active.info = 'tunnel process exited'
+              active.info = td.recovery_hint ?? 'tunnel process exited'
             }
             return next
           })
@@ -256,6 +259,12 @@ export function TunnelProgressCard() {
           Live
         </span>
       </div>
+      {downHint && (
+        <div className="mb-4 rounded-lg border border-danger/40 bg-danger/10 p-3 text-xs text-danger">
+          <div className="font-semibold mb-1">Tunnel down</div>
+          <div className="text-danger/85 leading-relaxed">{downHint}</div>
+        </div>
+      )}
       <ol className="space-y-3">
         {steps.map((step) => {
           const sub = step.info ?? defaultSub(step.name, step.status)
@@ -306,7 +315,7 @@ export function TunnelProgressCard() {
 export function TunnelStatusPill() {
   const [tunnelUrl, setTunnelUrl] = useState<string | null>(null)
   const [healthy, setHealthy] = useState(false)
-  const [down, setDown] = useState(false)
+  const [down, setDown] = useState<{ reason: string; hint?: string } | null>(null)
 
   useEffect(() => {
     let cancelled = false
@@ -334,7 +343,7 @@ export function TunnelStatusPill() {
         if (ev.type === 'tunnel_url_changed') {
           setTunnelUrl((ev as AgentEventTunnelUrlChanged).url)
           setHealthy(false)
-          setDown(false)
+          setDown(null)
         } else if (ev.type === 'health_probe' && (ev as AgentEventHealthProbe).ok) {
           setHealthy(true)
         } else if (
@@ -345,7 +354,8 @@ export function TunnelStatusPill() {
           // probe succeeds. Surface it on the pill too.
           setHealthy(true)
         } else if (ev.type === 'tunnel_down') {
-          setDown(true)
+          const td = ev as AgentEventTunnelDown
+          setDown({ reason: td.reason, hint: td.recovery_hint })
           setHealthy(false)
         }
       } catch {
@@ -366,7 +376,10 @@ export function TunnelStatusPill() {
       : healthy
         ? 'Reachable'
         : 'Probing'
-  return <StatusChip variant={variant}>{label}</StatusChip>
+  // Hover tooltip carries the recovery hint when present so the operator
+  // sees what to do next without leaving the layout header.
+  const title = down ? (down.hint ?? down.reason) : undefined
+  return <span title={title}><StatusChip variant={variant}>{label}</StatusChip></span>
 }
 
 // Tunnel status banner — second-most-prominent element on /agent (after the
