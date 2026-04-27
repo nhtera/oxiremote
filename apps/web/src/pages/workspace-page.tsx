@@ -319,6 +319,16 @@ export default function WorkspacePage() {
 
   const focusedAttempt = focusedSessionId ? (reconnectAttemptById[focusedSessionId] ?? 0) : 0
   const focusedExhausted = focusedSessionId ? !!reconnectExhaustedById[focusedSessionId] : false
+  // A session is "reconnecting" if its WS-hook reported an attempt and it
+  // hasn't reconnected yet. Drives the orange tab dot for non-focused panes
+  // too — useful when a pane on the side drops while you're typing in another.
+  const reconnectingById = useMemo(() => {
+    const m: Record<string, boolean> = {}
+    for (const [id, n] of Object.entries(reconnectAttemptById)) {
+      if (n > 0 && !connectedById[id]) m[id] = true
+    }
+    return m
+  }, [reconnectAttemptById, connectedById])
 
   const hasSessions = sessions.length > 0
   const anyAssigned = paneAssignments.some((s) => s !== null)
@@ -330,6 +340,8 @@ export default function WorkspacePage() {
           sessions={sessions}
           activeId={focusedSessionId}
           isActiveConnected={isFocusedConnected}
+          connectedById={connectedById}
+          reconnectingById={reconnectingById}
           onSelect={selectSession}
           onClose={closeSession}
           onNew={() => void createSession()}

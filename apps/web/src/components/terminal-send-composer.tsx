@@ -66,7 +66,10 @@ export default function TerminalSendComposer({ onSend }: Props) {
 
   return (
     <>
-      <div className="flex gap-2 shrink-0 px-2 py-1.5 border-t border-border bg-surface-alt">
+      <div
+        className="flex gap-2 shrink-0 px-2 py-1.5 border-t border-border bg-surface-alt"
+        style={{ paddingBottom: 'calc(env(safe-area-inset-bottom) + 0.375rem)' }}
+      >
         <button
           type="button"
           onClick={() => setShowAttach(true)}

@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import type { TerminalPrefs } from '../../lib/terminal-prefs'
 import type { PaneAssignments, PaneCount, PaneIndex } from '../../state/terminal-store'
 import XtermPane from './xterm-pane'
@@ -17,13 +17,19 @@ type Props = {
   registerSend: (sessionId: string, sendFn: ((data: string) => void) | null) => void
 }
 
+// Smallest pane width that still feels usable for a shell. Drag-resize
+// clamps below this and a viewport narrower than 768px collapses to 1 pane.
+const MIN_PANE_PCT = 15
+
+function evenSizes(n: PaneCount): number[] {
+  const each = 100 / n
+  return Array.from({ length: n }, () => each)
+}
+
 export default function MultiPaneGrid({
   paneCount, paneAssignments, focusedPane, prefs, reconnectNonce,
   onFocusPane, onConnectedChange, onReconnectAttempt, onReconnectExhausted, onError, registerSend,
 }: Props) {
-  // Each pane needs ~280px to feel like a real terminal; below that the user
-  // is better off with a single pane. We watch the viewport so /workspace on
-  // mobile collapses to 1 pane regardless of the user's last desktop choice.
   const [isNarrow, setIsNarrow] = useState(() => window.matchMedia('(max-width: 768px)').matches)
   useEffect(() => {
     const mq = window.matchMedia('(max-width: 768px)')
@@ -33,43 +39,136 @@ export default function MultiPaneGrid({
   }, [])
   const effectiveCount: PaneCount = isNarrow ? 1 : paneCount
 
+  // Pane sizes as percentages summing to 100. Recomputed when the grid
+  // shape changes; the user's drag adjustments are local to the current shape.
+  const [sizes, setSizes] = useState<number[]>(() => evenSizes(effectiveCount))
+  useEffect(() => { setSizes(evenSizes(effectiveCount)) }, [effectiveCount])
+
+  const containerRef = useRef<HTMLDivElement | null>(null)
+
+  const onDragHandle = useCallback((handleIdx: number, startX: number) => {
+    // Convert the pixel delta into a percentage of the container width and
+    // shift it from the right neighbour into the left. Clamping keeps both
+    // sides above MIN_PANE_PCT.
+    const el = containerRef.current
+    if (!el) return
+    const widthPx = el.getBoundingClientRect().width
+    if (widthPx <= 0) return
+    const startSizes = [...sizes]
+
+    const onMove = (e: PointerEvent) => {
+      const dxPct = ((e.clientX - startX) / widthPx) * 100
+      const left = startSizes[handleIdx] + dxPct
+      const right = startSizes[handleIdx + 1] - dxPct
+      if (left < MIN_PANE_PCT || right < MIN_PANE_PCT) return
+      setSizes((prev) => {
+        const next = [...prev]
+        next[handleIdx] = left
+        next[handleIdx + 1] = right
+        return next
+      })
+    }
+    const onUp = () => {
+      window.removeEventListener('pointermove', onMove)
+      window.removeEventListener('pointerup', onUp)
+      document.body.style.cursor = ''
+      document.body.style.userSelect = ''
+    }
+    document.body.style.cursor = 'col-resize'
+    document.body.style.userSelect = 'none'
+    window.addEventListener('pointermove', onMove)
+    window.addEventListener('pointerup', onUp)
+  }, [sizes])
+
   const indices: PaneIndex[] = Array.from({ length: effectiveCount }, (_, i) => i as PaneIndex)
   const effectiveFocus: PaneIndex = focusedPane >= effectiveCount ? 0 : focusedPane
 
   return (
-    <div className="flex flex-1 min-h-0 min-w-0">
+    <div ref={containerRef} className="flex flex-1 min-h-0 min-w-0">
       {indices.map((idx) => {
         const sid = paneAssignments[idx]
         const isFocused = idx === effectiveFocus
+        const basis = sizes[idx] ?? 100 / effectiveCount
         return (
-          <div
+          <Pane
             key={idx}
-            className={`flex flex-1 min-w-0 min-h-0 ${
-              idx > 0 ? 'border-l border-border' : ''
-            }`}
-            onClick={() => onFocusPane(idx)}
-          >
-            {sid ? (
-              <XtermPane
-                key={sid}
-                sessionId={sid}
-                prefs={prefs}
-                isFocused={isFocused}
-                onFocus={() => onFocusPane(idx)}
-                onConnectedChange={onConnectedChange}
-                onReconnectAttempt={onReconnectAttempt}
-                onReconnectExhausted={onReconnectExhausted}
-                onError={onError}
-                registerSend={registerSend}
-                reconnectNonce={reconnectNonce}
-              />
-            ) : (
-              <EmptyPane focused={isFocused} />
-            )}
-          </div>
+            paneIdx={idx}
+            sessionId={sid}
+            basis={basis}
+            isFocused={isFocused}
+            prefs={prefs}
+            reconnectNonce={reconnectNonce}
+            onFocus={() => onFocusPane(idx)}
+            onConnectedChange={onConnectedChange}
+            onReconnectAttempt={onReconnectAttempt}
+            onReconnectExhausted={onReconnectExhausted}
+            onError={onError}
+            registerSend={registerSend}
+            // The handle on the LEFT edge resizes between (idx-1, idx).
+            onDragLeftHandle={idx > 0 ? (e) => onDragHandle(idx - 1, e.clientX) : null}
+          />
         )
       })}
     </div>
+  )
+}
+
+type PaneProps = {
+  paneIdx: PaneIndex
+  sessionId: string | null
+  basis: number
+  isFocused: boolean
+  prefs: TerminalPrefs
+  reconnectNonce: number
+  onFocus: () => void
+  onConnectedChange: (sessionId: string, connected: boolean) => void
+  onReconnectAttempt: (sessionId: string, attempt: number) => void
+  onReconnectExhausted: (sessionId: string) => void
+  onError: (msg: string) => void
+  registerSend: (sessionId: string, sendFn: ((data: string) => void) | null) => void
+  onDragLeftHandle: ((e: React.PointerEvent) => void) | null
+}
+
+function Pane({
+  paneIdx, sessionId, basis, isFocused, prefs, reconnectNonce,
+  onFocus, onConnectedChange, onReconnectAttempt, onReconnectExhausted, onError, registerSend,
+  onDragLeftHandle,
+}: PaneProps) {
+  return (
+    <>
+      {onDragLeftHandle && (
+        <div
+          role="separator"
+          aria-orientation="vertical"
+          aria-label={`Resize pane ${paneIdx}`}
+          onPointerDown={(e) => { e.preventDefault(); onDragLeftHandle(e) }}
+          className="w-1 cursor-col-resize bg-border hover:bg-accent/50 transition-colors shrink-0"
+        />
+      )}
+      <div
+        className="flex flex-col min-w-0 min-h-0 overflow-hidden"
+        style={{ flexBasis: `${basis}%`, flexGrow: 0, flexShrink: 0 }}
+        onClick={onFocus}
+      >
+        {sessionId ? (
+          <XtermPane
+            key={sessionId}
+            sessionId={sessionId}
+            prefs={prefs}
+            isFocused={isFocused}
+            onFocus={onFocus}
+            onConnectedChange={onConnectedChange}
+            onReconnectAttempt={onReconnectAttempt}
+            onReconnectExhausted={onReconnectExhausted}
+            onError={onError}
+            registerSend={registerSend}
+            reconnectNonce={reconnectNonce}
+          />
+        ) : (
+          <EmptyPane focused={isFocused} />
+        )}
+      </div>
+    </>
   )
 }
 

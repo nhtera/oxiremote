@@ -5,6 +5,12 @@ type Props = {
   sessions: Session[]
   activeId: string | null
   isActiveConnected?: boolean
+  /** Per-session WS connection state — overrides server `state` for tabs whose
+   *  session is mounted in a pane. Lets the dot turn green the moment the WS
+   *  opens instead of waiting for the server's "active on output" heuristic. */
+  connectedById?: Record<string, boolean>
+  /** Per-session reconnect-in-progress flag. Drives the orange dot. */
+  reconnectingById?: Record<string, boolean>
   onSelect: (id: string) => void
   onClose: (id: string) => void
   onNew: () => void
@@ -12,22 +18,37 @@ type Props = {
   onOpenSettings: () => void
 }
 
-function statusDot(state: Session['state']): string {
-  // Conventional traffic-light mapping: active=green (running), exited=red
-  // (process gone), idle=muted (alive but not currently focused).
-  if (state === 'active') return 'bg-success'
-  if (state === 'exited') return 'bg-danger'
+type DotKind = 'connected' | 'reconnecting' | 'exited' | 'idle'
+
+function dotClass(kind: DotKind): string {
+  if (kind === 'connected') return 'bg-success'
+  if (kind === 'reconnecting') return 'bg-warning'
+  if (kind === 'exited') return 'bg-danger'
   return 'bg-text-muted'
 }
 
-function statusLabel(state: Session['state']): string {
-  if (state === 'active') return 'Running'
-  if (state === 'exited') return 'Exited'
+function dotLabel(kind: DotKind): string {
+  if (kind === 'connected') return 'Connected'
+  if (kind === 'reconnecting') return 'Reconnecting'
+  if (kind === 'exited') return 'Exited'
   return 'Idle'
 }
 
+function resolveDot(
+  s: Session,
+  connectedById: Record<string, boolean> | undefined,
+  reconnectingById: Record<string, boolean> | undefined,
+): DotKind {
+  if (s.state === 'exited') return 'exited'
+  if (reconnectingById?.[s.id]) return 'reconnecting'
+  if (connectedById?.[s.id]) return 'connected'
+  // No WS for this tab (not mounted in any pane) — fall back to server state.
+  return s.state === 'active' ? 'connected' : 'idle'
+}
+
 export default function TerminalTabBar({
-  sessions, activeId, isActiveConnected, onSelect, onClose, onNew, onRename, onOpenSettings,
+  sessions, activeId, isActiveConnected, connectedById, reconnectingById,
+  onSelect, onClose, onNew, onRename, onOpenSettings,
 }: Props) {
   const [editingId, setEditingId] = useState<string | null>(null)
   const [editValue, setEditValue] = useState('')
@@ -55,12 +76,13 @@ export default function TerminalTabBar({
     <div className="flex items-center gap-0.5 overflow-x-auto border-b border-border bg-surface-alt shrink-0 min-h-[36px]">
       {sessions.map((s) => {
         const isActive = s.id === activeId
-        // The server flips state→"active" only on recent PTY output, so an
-        // attached-but-quiet shell shows "idle". For the focused tab we treat
-        // a live WS as the source of truth so the dot matches the Connected
-        // pill below.
-        const effectiveState: Session['state'] =
-          isActive && isActiveConnected && s.state !== 'exited' ? 'active' : s.state
+        let dot = resolveDot(s, connectedById, reconnectingById)
+        // Focused-tab back-compat: when callers pass only isActiveConnected
+        // (slice 1 callers), still upgrade the dot to green/orange so the
+        // pill above and the dot agree.
+        if (isActive && !connectedById && !reconnectingById && isActiveConnected && s.state !== 'exited') {
+          dot = 'connected'
+        }
         return (
         <div
           key={s.id}
@@ -74,9 +96,9 @@ export default function TerminalTabBar({
         >
           {/* Status dot */}
           <span
-            className={`w-1.5 h-1.5 rounded-full shrink-0 ${statusDot(effectiveState)}`}
-            title={statusLabel(effectiveState)}
-            aria-label={statusLabel(effectiveState)}
+            className={`w-1.5 h-1.5 rounded-full shrink-0 ${dotClass(dot)}`}
+            title={dotLabel(dot)}
+            aria-label={dotLabel(dot)}
           />
 
           {/* Tab name or inline rename input */}
