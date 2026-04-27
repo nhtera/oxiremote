@@ -24,7 +24,12 @@ impl InstanceLock {
         if let Ok(contents) = std::fs::read_to_string(&pid_path)
             && let Ok(pid) = contents.trim().parse::<i32>() {
                 let me = std::process::id() as i32;
-                if pid != me && process_alive(pid) {
+                // Ownership check: PIDs are recycled on busy systems, so the
+                // PID we wrote on the last shutdown may now belong to an
+                // unrelated process (sshd, a build job, the user's editor).
+                // Killing it would be a serious foot-gun — verify that the
+                // process is actually our own binary before sending signals.
+                if pid != me && process_alive(pid) && pid_is_oxiremote(pid) {
                     let _ = kill_process(pid, false);
                     std::thread::sleep(Duration::from_millis(800));
                     if process_alive(pid) {
@@ -43,6 +48,64 @@ impl InstanceLock {
 impl Drop for InstanceLock {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.pid_path);
+    }
+}
+
+/// Verify the named PID is actually an oxiremote process. Belt-and-braces
+/// against PID reuse: the agent's `agent.pid` file may point at a recycled
+/// PID owned by an unrelated process after a crash + reboot. Conservative on
+/// failure — if we can't determine the binary name, return `false` and skip
+/// the kill rather than risk hitting an innocent process.
+///
+/// Linux: read `/proc/{pid}/comm`.
+/// macOS: invoke `ps -p {pid} -o comm=` (libproc would need a C dep).
+/// Windows: handled in the windows-cfg block; tasklist already filters by PID
+/// so the kill path is naturally narrower.
+#[cfg(target_os = "linux")]
+fn pid_is_oxiremote(pid: i32) -> bool {
+    std::fs::read_to_string(format!("/proc/{pid}/comm"))
+        .map(|s| s.trim() == "oxiremote")
+        .unwrap_or(false)
+}
+
+#[cfg(target_os = "macos")]
+fn pid_is_oxiremote(pid: i32) -> bool {
+    std::process::Command::new("ps")
+        .args(["-p", &pid.to_string(), "-o", "comm="])
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| {
+            // ps prints the full path on macOS; match on the basename only so
+            // running from `~/.cargo/bin/oxiremote` and `target/release/oxiremote`
+            // both verify cleanly.
+            s.trim()
+                .rsplit('/')
+                .next()
+                .map(|n| n == "oxiremote")
+                .unwrap_or(false)
+        })
+        .unwrap_or(false)
+}
+
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
+fn pid_is_oxiremote(_pid: i32) -> bool {
+    // Other Unix targets — we can't introspect cheaply without a C dep, so
+    // skip the kill rather than risk hitting the wrong process.
+    false
+}
+
+#[cfg(windows)]
+fn pid_is_oxiremote(pid: i32) -> bool {
+    let out = std::process::Command::new("tasklist")
+        .args(["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"])
+        .output();
+    match out {
+        Ok(o) => {
+            let s = String::from_utf8_lossy(&o.stdout);
+            s.to_ascii_lowercase().contains("oxiremote")
+        }
+        Err(_) => false,
     }
 }
 
