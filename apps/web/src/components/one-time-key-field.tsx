@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react'
 import { CopyIcon, EyeIcon, EyeOffIcon, RefreshIcon } from './icons'
+import Button from './ui/button'
 
 interface Props {
   token: string | null
@@ -96,13 +97,15 @@ export default function OneTimeKeyField({ token, expiresAt, onRegenerate }: Prop
           )}
         </div>
       ) : (
-        <button
+        <Button
+          variant="accent-glow"
+          size="sm"
           onClick={handleRegen}
-          disabled={regenerating}
-          className="self-start px-3 py-1.5 text-xs font-medium bg-accent/15 text-accent border border-accent/30 rounded-md hover:bg-accent/25 transition-colors disabled:opacity-40"
+          loading={regenerating}
+          className="self-start"
         >
           {regenerating ? 'Generating…' : 'Generate Key'}
-        </button>
+        </Button>
       )}
     </div>
   )

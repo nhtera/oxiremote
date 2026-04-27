@@ -9,6 +9,7 @@ import {
   removeSavedHost,
   type SavedHost,
 } from '../lib/saved-hosts'
+import Button from '../components/ui/button'
 
 // Pairing entry point. Single access-key field accepts both OTK (16-hex) and
 // pairing codes (6-16 alnum). Submit tries OTK endpoint first; on non-200/202
@@ -377,13 +378,16 @@ function AccessKeyForm({ value, onChange, valid, onSubmit, loading }: AccessKeyF
           </span>
         )}
       </div>
-      <button
+      <Button
+        variant="accent-glow"
+        size="lg"
         onClick={onSubmit}
-        disabled={loading || !valid}
-        className="w-full mt-3 py-3 text-sm font-medium bg-accent/15 text-accent border border-accent/30 rounded-lg hover:bg-accent/25 transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
+        disabled={!valid}
+        loading={loading}
+        className="w-full mt-3"
       >
         {loading ? 'Connecting…' : 'Pair this device'}
-      </button>
+      </Button>
     </div>
   )
 }

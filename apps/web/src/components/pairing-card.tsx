@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from 'react'
 import QrPanel from './pairing/qr-panel'
 import OtkRow from './pairing/otk-row'
 import PermanentRow from './pairing/permanent-row'
+import Button from './ui/button'
 
 // Hero pairing card: composes the QR panel, OTK row, and permanent-key row.
 // Logic-heavy bits (countdown tick, QR payload assembly, key formatting) live
@@ -67,16 +68,20 @@ export default function PairingCard({
             Scan the QR with your camera, or open the link below and paste the
             one-time key.
           </p>
-          <button
+          <Button
+            variant="accent-glow"
+            size="sm"
             onClick={onRegenerate}
-            className="mt-3 inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium bg-accent/15 text-accent border border-accent/40 rounded-md hover:bg-accent/25 transition-colors"
+            className="mt-3"
+            leftIcon={
+              <svg viewBox="0 0 24 24" className="w-3.5 h-3.5" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <path d="M21 12a9 9 0 1 1-3-6.7L21 8" />
+                <path d="M21 3v5h-5" />
+              </svg>
+            }
           >
-            <svg viewBox="0 0 24 24" className="w-3.5 h-3.5" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-              <path d="M21 12a9 9 0 1 1-3-6.7L21 8" />
-              <path d="M21 3v5h-5" />
-            </svg>
             New key
-          </button>
+          </Button>
         </div>
         <div className="shrink-0 self-center sm:self-start">
           <QrPanel
