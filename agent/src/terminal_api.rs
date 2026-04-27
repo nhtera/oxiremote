@@ -295,7 +295,23 @@ pub async fn api_terminal_session_close(
         return StatusCode::FORBIDDEN.into_response();
     };
 
-    if status == "closed" || status == "exited" || status == "dead" {
+    if status == "closed" || status == "dead" {
+        // Already gone from the user's perspective — nothing to update.
+        return StatusCode::OK.into_response();
+    }
+    if status == "exited" {
+        // PTY died naturally; user is now actively dismissing the tab. Flip
+        // the row to 'closed' so the list query filters it out and the tab
+        // disappears on the next refresh.
+        let _ = (|| -> anyhow::Result<()> {
+            let conn = Connection::open(&state.db_path)?;
+            let now = now_ts();
+            conn.execute(
+                "UPDATE terminal_sessions SET status='closed', last_seen_at=?2 WHERE terminal_session_id=?1 AND owner_session_id=?3",
+                params![id, now, owner_session_id],
+            )?;
+            Ok(())
+        })();
         return StatusCode::OK.into_response();
     }
 

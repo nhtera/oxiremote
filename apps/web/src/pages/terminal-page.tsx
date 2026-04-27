@@ -20,7 +20,7 @@ import TerminalTabBar from '../components/terminal-tab-bar'
 import TerminalKeybar from '../components/terminal-keybar'
 import TerminalSendComposer from '../components/terminal-send-composer'
 import ReconnectModal from '../components/reconnect-modal'
-import { Button, StateView } from '../components/ui'
+import { Button, StateView, useConfirm } from '../components/ui'
 
 function debounce<F extends (...args: unknown[]) => void>(fn: F, ms: number) {
   let t: number | undefined
@@ -129,6 +129,7 @@ export default function TerminalPage() {
   const [searchParams, setSearchParams] = useSearchParams()
   const { sessionId: sessionIdParam } = useParams<{ sessionId?: string }>()
   const { sessions, activeId, setActive, setSessions, rename, setState, remove } = useTerminalStore()
+  const confirm = useConfirm()
   const [err, setErr] = useState<string | null>(null)
   const [isConnected, setIsConnected] = useState(false)
   const [reconnectNonce, setReconnectNonce] = useState(0)
@@ -140,6 +141,11 @@ export default function TerminalPage() {
   const containerRef = useRef<HTMLDivElement | null>(null)
   const handlesRef = useRef<Map<string, SessionHandle>>(new Map())
   const activeIdRef = useRef<string | null>(null)
+  // Client-side tombstone for sessions the user just closed. Older agent
+  // builds left exited rows in the list response, so refreshSessions would
+  // resurrect the tab right after the optimistic remove. We filter them out
+  // here so the close feels final regardless of server build.
+  const closedIdsRef = useRef<Set<string>>(new Set())
   const prefsRef = useRef(prefs)
   useEffect(() => {
     prefsRef.current = prefs
@@ -285,17 +291,53 @@ export default function TerminalPage() {
     localStorage.setItem('oxi:last-terminal-session', data.id)
   }
 
-  async function closeSession(id: string) {
+  async function closeSession(id: string, opts: { skipConfirm?: boolean } = {}) {
+    if (!opts.skipConfirm) {
+      const target = sessions.find((s) => s.id === id)
+      const label = target?.name ?? `session ${id.slice(0, 8)}`
+      const ok = await confirm({
+        title: 'Close session',
+        message: `Close "${label}"? The shell process will be terminated and any unsaved work in it will be lost.`,
+        confirmText: 'Close',
+        cancelText: 'Cancel',
+        danger: true,
+      })
+      if (!ok) return
+    }
+    // Pick a sibling to auto-focus so closing the active tab doesn't leave
+    // the user on a "No session" empty pane while 3 other tabs sit right
+    // there. Prefer the right neighbour, fall back to the left.
+    let nextActive: string | null = null
+    if (activeId === id) {
+      const idx = sessions.findIndex((s) => s.id === id)
+      const sibling = sessions[idx + 1] ?? sessions[idx - 1] ?? null
+      nextActive = sibling?.id ?? null
+    }
+
     // Optimistic removal — drop the tab and tear down the WS immediately so
-    // the click feels instant. If the server rejects we'll re-sync from
-    // refreshSessions and the tab reappears.
+    // the click feels instant. We also tombstone the id so an older agent
+    // build (which doesn't filter exited rows) can't resurrect the tab on
+    // the next refreshSessions.
+    closedIdsRef.current.add(id)
     destroyHandle(handlesRef, id)
     remove(id)
+    if (nextActive) {
+      setActive(nextActive)
+      localStorage.setItem('oxi:last-terminal-session', nextActive)
+    }
     const res = await fetch(`/api/terminal/sessions/${id}/close`, { method: 'POST', credentials: 'include' })
     if (!res.ok && res.status !== 410) {
       setErr('Failed to close session')
     }
     await refreshSessions()
+    // Re-apply tombstones in case the server returned the row anyway (older
+    // build, race, etc.). Keeps the UI consistent with the user's intent.
+    const tombstones = closedIdsRef.current
+    if (tombstones.size > 0) {
+      const current = useTerminalStore.getState().sessions
+      const filtered = current.filter((s) => !tombstones.has(s.id))
+      if (filtered.length !== current.length) setSessions(filtered)
+    }
   }
 
   async function handleRename(id: string, name: string) {
@@ -444,7 +486,7 @@ export default function TerminalPage() {
           setReconnectExhausted(false)
           setReconnectAttempt(0)
           if (activeId) {
-            closeSession(activeId)
+            closeSession(activeId, { skipConfirm: true })
           } else {
             refreshSessions()
           }
