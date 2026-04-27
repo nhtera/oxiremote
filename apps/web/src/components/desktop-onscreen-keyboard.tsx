@@ -219,12 +219,15 @@ interface KeyButtonProps {
 function KeyButton({ label, active, onClick, className }: KeyButtonProps) {
   const base =
     'py-2 text-[length:var(--text-meta)] font-medium rounded-md border transition-colors select-none active:scale-95'
+  // Active modifier = filled coral. Previously a faint /20 tint that was
+  // easy to miss on small screens; the operator needs an unambiguous "this
+  // mod will fire on the next key" signal so they don't double-tap by accident.
   const tone = active
-    ? 'bg-accent/20 text-accent border-accent/40'
+    ? 'bg-[hsl(var(--accent-primary))] text-white border-[hsl(var(--accent-primary))] shadow-sm'
     : 'bg-surface-alt text-text-secondary border-border hover:bg-surface-hover hover:text-text-primary'
   const cls = [base, tone, className ?? ''].filter(Boolean).join(' ')
   return (
-    <button onClick={onClick} className={cls}>
+    <button onClick={onClick} className={cls} aria-pressed={active ? true : undefined}>
       {label}
     </button>
   )
