@@ -145,7 +145,7 @@ export default function ApprovalWaitingPage() {
   }
 
   return (
-    <div className="min-h-dvh flex items-center justify-center px-6 py-10">
+    <div className="min-h-dvh bg-dot-grid flex items-center justify-center px-6 py-10">
       <div className="w-full max-w-sm">
         <DeviceCard
           deviceLabel={routerState.device_label}
@@ -186,7 +186,7 @@ function DeviceCard({ deviceLabel, sessionTag }: DeviceCardProps) {
   const ua = typeof navigator !== 'undefined' ? navigator.userAgent : ''
   const browserHint = inferBrowserHint(ua)
   return (
-    <div className="rounded-lg border border-border bg-surface-alt p-4">
+    <div className="rounded-xl border border-border bg-surface-alt p-4">
       <div className="text-xs uppercase tracking-wide text-text-muted mb-2">
         This device
       </div>

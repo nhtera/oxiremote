@@ -1,7 +1,7 @@
 import type { ButtonHTMLAttributes, ReactNode } from 'react'
 import { forwardRef } from 'react'
 
-type Variant = 'primary' | 'secondary' | 'danger' | 'ghost' | 'accent-primary'
+type Variant = 'primary' | 'secondary' | 'danger' | 'ghost' | 'accent-primary' | 'accent-glow'
 type Size = 'sm' | 'md' | 'lg'
 
 export interface ButtonProps extends Omit<ButtonHTMLAttributes<HTMLButtonElement>, 'children'> {
@@ -38,6 +38,12 @@ const VARIANT: Record<Variant, string> = {
   'accent-primary':
     'bg-[hsl(var(--accent-primary)/0.18)] text-[hsl(var(--accent-primary))] ' +
     'border-[hsl(var(--accent-primary)/0.4)] hover:bg-[hsl(var(--accent-primary)/0.28)]',
+  // Filled coral with a soft glow shadow — reserve for the *one* primary CTA
+  // on a screen (login Connect, OTK Generate, "+ New" empty-state button).
+  'accent-glow':
+    'bg-[hsl(var(--accent-primary))] text-white border-[hsl(var(--accent-primary))] ' +
+    'shadow-[0_4px_14px_-6px_rgba(255,122,64,0.55)] ' +
+    'hover:bg-[hsl(var(--accent-primary)/0.9)] hover:shadow-[0_6px_20px_-6px_rgba(255,122,64,0.7)]',
 }
 
 function Spinner() {

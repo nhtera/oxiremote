@@ -256,7 +256,7 @@ export default function LoginPage() {
   const keyValid = cleanedKey.length >= 6
 
   return (
-    <div className="min-h-dvh flex items-center justify-center px-6 py-10">
+    <div className="min-h-dvh bg-dot-grid flex items-center justify-center px-6 py-10">
       <div className="w-full max-w-sm">
         <header className="mb-6">
           <h1 className="text-2xl font-semibold tracking-tight text-text-primary">

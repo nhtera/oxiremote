@@ -35,7 +35,7 @@ export default function InlineLogsPanel() {
   }
 
   return (
-    <div className="rounded-lg border border-border bg-surface p-3 flex flex-col gap-2">
+    <div className="rounded-xl border border-border bg-surface p-3 flex flex-col gap-2">
       <div className="flex items-center gap-2 flex-wrap">
         {(['info', 'warn', 'error'] as LogLevel[]).map((l) => {
           const active = levels.has(l)

@@ -35,7 +35,7 @@ export default function TunnelStatusCard({ tunnelUrl, healthy }: Props) {
   const label = !tunnelUrl ? 'Starting tunnel' : healthy ? 'Reachable' : 'Probing'
 
   return (
-    <section className="rounded-lg border border-border bg-surface p-4">
+    <section className="rounded-xl border border-border bg-surface p-4">
       <div className="flex items-center justify-between gap-3 mb-2">
         <div className="text-[length:var(--text-h3)] uppercase tracking-wide text-text-muted">
           Tunnel

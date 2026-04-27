@@ -419,7 +419,7 @@ export default function WorkspacePage() {
           registerSend={registerSend}
         />
       ) : (
-        <div className="flex-1 min-h-0 flex flex-col items-center justify-center gap-6 px-4">
+        <div className="flex-1 min-h-0 bg-dot-grid flex flex-col items-center justify-center gap-6 px-4">
           <StateView
             icon={
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.75" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">

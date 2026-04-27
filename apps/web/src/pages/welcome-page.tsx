@@ -6,7 +6,7 @@ import { Link } from 'react-router-dom'
 // pairing flow with a clear primary CTA.
 export default function WelcomePage() {
   return (
-    <div className="min-h-dvh flex items-center justify-center px-6 py-10">
+    <div className="min-h-dvh bg-dot-grid flex items-center justify-center px-6 py-10">
       <div className="w-full max-w-md">
         <header className="mb-8 text-center">
           <div className="inline-flex items-center justify-center w-14 h-14 rounded-2xl bg-accent text-white mb-5 shadow-[0_10px_30px_-10px_rgba(255,122,64,0.55)]">

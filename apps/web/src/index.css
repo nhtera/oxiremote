@@ -77,6 +77,20 @@ body {
 
 @layer utilities {
   .pb-safe { padding-bottom: env(safe-area-inset-bottom, 0px); }
+
+  /* Warm dot-grid background — coral dots at low opacity over surface.
+     Used on calm/empty surfaces (login, welcome, approval-waiting,
+     workspace empty state) to nod to the brand without distracting. */
+  .bg-dot-grid {
+    background-color: var(--color-surface);
+    background-image: radial-gradient(
+      circle,
+      color-mix(in srgb, var(--color-accent) 8%, transparent) 1px,
+      transparent 1px
+    );
+    background-size: 24px 24px;
+    background-attachment: fixed;
+  }
 }
 
 /* Normalize scrollbars to neutral dark tones — Safari otherwise paints them

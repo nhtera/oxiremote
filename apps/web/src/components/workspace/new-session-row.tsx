@@ -46,7 +46,7 @@ export default function NewSessionRow({ onCreate, disabled, compact }: Props) {
         aria-label="New terminal name"
       />
       <Button
-        variant="accent-primary"
+        variant="accent-glow"
         size={compact ? 'sm' : 'md'}
         onClick={() => void submit()}
         loading={busy}

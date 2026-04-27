@@ -99,7 +99,7 @@ function Card({
   children: React.ReactNode
 }) {
   return (
-    <div className="rounded-lg border border-border bg-surface p-4">
+    <div className="rounded-xl border border-border bg-surface p-4">
       <div className="flex items-center justify-between gap-3 mb-3">
         <div className="text-xs uppercase tracking-wide text-text-muted">{title}</div>
         {action}
