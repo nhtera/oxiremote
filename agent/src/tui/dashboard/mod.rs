@@ -3,6 +3,7 @@
 // hotkey panel. Subscribes to the event bus so tunnel/device/OTK state updates
 // live-refresh without polling.
 
+pub(super) mod render_device_list;
 pub(super) mod render_footer;
 pub(super) mod render_header;
 pub(super) mod render_info;
@@ -12,7 +13,7 @@ pub(super) mod render_qr;
 use std::io;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
@@ -28,6 +29,7 @@ use super::approval;
 use crate::events::{AgentEvent, EventBus, StepStatus, TunnelStep};
 use crate::{approval as approval_db, one_time_keys};
 
+use render_device_list::render_device_list;
 use render_footer::{render_footer, render_onboarding_hint};
 use render_header::{render_compact_header, render_header};
 use render_info::render_info_panel;
@@ -35,6 +37,15 @@ use render_logs::render_logs;
 use render_qr::render_qr_panel;
 
 type Term = Terminal<CrosstermBackend<io::Stdout>>;
+
+/// Which sub-view the dashboard is showing.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) enum ViewState {
+    /// Normal dashboard (QR + info / logs).
+    Dashboard,
+    /// Device manager submenu with cursor index.
+    DeviceList { selected: usize },
+}
 
 pub(super) struct State {
     pub(super) db_path: PathBuf,
@@ -59,6 +70,12 @@ pub(super) struct State {
     /// Transient one-line status message — rendered in the footer for ~3 s
     /// after a hotkey action like "Copied URL" or "OTK regenerated".
     pub(super) flash: Option<(String, SystemTime)>,
+    /// Active sub-view (dashboard, device list, …).
+    pub(super) view_state: ViewState,
+    /// When the Verifying step became active — used for elapsed-time display.
+    pub(super) verifying_started: Option<Instant>,
+    /// True while the `?` help overlay is shown.
+    pub(super) help_overlay: bool,
 }
 
 #[derive(Clone)]
@@ -108,6 +125,9 @@ impl State {
             log_history: Vec::new(),
             flash: None,
             spinner_frame: 0,
+            view_state: ViewState::Dashboard,
+            verifying_started: None,
+            help_overlay: false,
         }
     }
 
@@ -242,6 +262,15 @@ impl State {
                     }
                 };
 
+                // Record when Verifying becomes active so elapsed display works.
+                if step_name == "Verifying" && self.verifying_started.is_none() {
+                    self.verifying_started = Some(Instant::now());
+                }
+                // Once Ready, we no longer need the elapsed timer.
+                if step_name == "Ready" {
+                    self.verifying_started = None;
+                }
+
                 // Mark all steps before this one as Done, this one as Active,
                 // and all after as Pending. Also clear stale sub-text on
                 // non-active rows so the previous step's "starting cloudflared…"
@@ -280,6 +309,10 @@ impl State {
                     s.status = StepStatus::Active;
                     s.sub = Some("verifying…".into());
                 }
+                // Start elapsed timer for the Verifying step.
+                if self.verifying_started.is_none() {
+                    self.verifying_started = Some(Instant::now());
+                }
             }
             AgentEvent::HealthProbe { attempt, status, ok, elapsed_ms } => {
                 self.probe_log.push(ProbeEntry {
@@ -308,6 +341,7 @@ impl State {
                 {
                     s.status = StepStatus::Done;
                     s.sub = Some("waiting for devices".into());
+                    self.verifying_started = None;
                 }
             }
             AgentEvent::DeviceConnected { .. } => {
@@ -323,10 +357,17 @@ impl State {
                     self.log_history.remove(0);
                 }
             }
-            AgentEvent::OtkIssued { .. }
-            | AgentEvent::OtkUsed { .. }
-            | AgentEvent::OtkExpired { .. } => {
+            AgentEvent::OtkIssued { .. } | AgentEvent::OtkUsed { .. } => {
                 self.refresh_otk_from_db();
+            }
+            AgentEvent::OtkExpired { .. } => {
+                self.refresh_otk_from_db();
+                // 5-second prominent flash — longer than the normal 3-second TTL
+                // so the operator has time to read it.
+                self.flash = Some((
+                    "OTK expired — press r to regenerate".into(),
+                    SystemTime::now(),
+                ));
             }
             AgentEvent::TunnelDown { reason, recovery_hint } => {
                 // Surface the recovery hint as the tunnel-down message when
@@ -412,8 +453,39 @@ pub fn run_dashboard(term: &mut Term, event_bus: Arc<EventBus>, db_path: PathBuf
             if key.kind != KeyEventKind::Press {
                 continue;
             }
+            // Route keys differently depending on active sub-view.
+            match &state.view_state.clone() {
+                ViewState::DeviceList { selected } => {
+                    handle_device_list_key(
+                        key.code,
+                        *selected,
+                        &mut state,
+                        &event_bus,
+                    );
+                    continue;
+                }
+                ViewState::Dashboard => {}
+            }
+            // Dashboard-level keys.
             match key.code {
-                KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
+                KeyCode::Char('q') => return Ok(()),
+                KeyCode::Esc => {
+                    if state.help_overlay {
+                        state.help_overlay = false;
+                    } else {
+                        return Ok(());
+                    }
+                }
+                KeyCode::Char('b') => {
+                    // Return to splash menu without killing the process.
+                    return Ok(());
+                }
+                KeyCode::Char('?') => {
+                    state.help_overlay = !state.help_overlay;
+                }
+                KeyCode::Char('d') => {
+                    state.view_state = ViewState::DeviceList { selected: 0 };
+                }
                 KeyCode::Char('o') => {
                     if let Some(url) = &state.tunnel_url {
                         let _ = open::that(url.as_str());
@@ -484,6 +556,73 @@ fn short_id(id: &str) -> String {
     id.chars().take(8).collect()
 }
 
+/// Handle keyboard input when `ViewState::DeviceList` is active.
+fn handle_device_list_key(
+    code: crossterm::event::KeyCode,
+    selected: usize,
+    state: &mut State,
+    event_bus: &crate::events::EventBus,
+) {
+    use render_device_list::list_devices;
+    match code {
+        KeyCode::Char('b') | KeyCode::Esc => {
+            state.view_state = ViewState::Dashboard;
+        }
+        KeyCode::Up | KeyCode::Char('k') => {
+            if let ViewState::DeviceList { selected: ref mut sel } = state.view_state {
+                *sel = sel.saturating_sub(1);
+            }
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            let devices = list_devices(&state.db_path);
+            let total = devices.len();
+            if let ViewState::DeviceList { selected: ref mut sel } = state.view_state
+                && *sel + 1 < total
+            {
+                *sel += 1;
+            }
+        }
+        KeyCode::Enter => {
+            let devices = list_devices(&state.db_path);
+            if let Some(dev) = devices.get(selected) {
+                let device_id = dev.device_id.clone();
+                let status = dev.approval_status.clone();
+                match status.as_str() {
+                    "pending" => {
+                        // Approve pending devices directly.
+                        match approval_db::approve_device(&state.db_path, &device_id) {
+                            Ok(()) => {
+                                event_bus.send(AgentEvent::DeviceApproved {
+                                    device_id: device_id.clone(),
+                                });
+                                state.set_flash(format!("Approved {}", short_id(&device_id)));
+                            }
+                            Err(err) => state.set_flash(format!("Approve failed: {err}")),
+                        }
+                    }
+                    "approved" => {
+                        // Revoke approved devices via localhost endpoint.
+                        let url = format!(
+                            "http://localhost:8787/api/agent/devices/{}/revoke",
+                            device_id
+                        );
+                        let did = device_id.clone();
+                        std::thread::spawn(move || {
+                            let _ = reqwest::blocking::Client::builder()
+                                .timeout(Duration::from_secs(2))
+                                .build()
+                                .and_then(|c| c.post(&url).send());
+                        });
+                        state.set_flash(format!("Revoke requested for {}", short_id(&did)));
+                    }
+                    _ => {}
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Pluck the first `https://...` token from free-form text. Used to recover
 /// the tunnel URL from a TunnelStepChanged event's `info` field when the TUI
 /// missed the original `TunnelUrlChanged` event (subscription happens after
@@ -545,10 +684,19 @@ pub(super) fn action_line<'a>(key: &'a str, label: &'a str) -> Line<'a> {
 // --- Draw dispatch ---
 
 fn draw(f: &mut ratatui::Frame<'_>, state: &State) {
+    // Device list overrides the normal dashboard entirely.
+    if let ViewState::DeviceList { selected } = state.view_state {
+        render_device_list(f, f.area(), state, selected);
+        return;
+    }
     if state.is_ready() {
         draw_dashboard(f, state);
     } else {
         draw_onboarding(f, state);
+    }
+    // Help overlay rendered on top of whatever view is active.
+    if state.help_overlay {
+        render_device_list::render_help_overlay(f, f.area());
     }
 }
 

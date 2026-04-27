@@ -139,25 +139,23 @@ pub fn init_db(db_path: &Path) -> anyhow::Result<()> {
         "INSERT OR IGNORE INTO settings(key, value) VALUES ('tunnel_mode', 'quick')",
         [],
     );
-    // Phase 04: operator can toggle remote desktop off so the WS upgrade
-    // returns 503 even when the binary was built with the desktop feature.
+    // Operator can toggle remote desktop off so the WS upgrade returns 503
+    // even when the binary was built with the desktop feature.
     let _ = conn.execute(
         "INSERT OR IGNORE INTO settings(key, value) VALUES ('desktop_enabled', 'true')",
         [],
     );
-    // Phase 02: per-port opt-in for the local sites reverse proxy. Empty by default.
+    // Per-port opt-in allowlist for the local-sites reverse proxy. Empty by default.
     let _ = conn.execute(
         "INSERT OR IGNORE INTO settings(key, value) VALUES ('proxy_allowed_ports', '[]')",
         [],
     );
 
-    // Migration 006: permanent dashboard API key stored in the settings table.
-    // Three settings rows:
-    //   permanent_key_hash       — Argon2id PHC string, NULL until first generation
-    //   permanent_key_last4      — cosmetic last-4 chars; lets the UI show "••••abcd"
+    // Permanent dashboard API key, seeded empty so the row always exists;
+    // callers treat an empty hash as "not yet generated".
+    //   permanent_key_hash       — Argon2id PHC string
+    //   permanent_key_last4      — cosmetic last-4 for the "••••abcd" mask
     //   permanent_key_created_at — Unix timestamp of last rotation
-    // These are seeded as empty strings so the row always exists; callers treat
-    // an empty hash as "not yet generated".
     let _ = conn.execute(
         "INSERT OR IGNORE INTO settings(key, value) VALUES ('permanent_key_hash', '')",
         [],
@@ -168,6 +166,18 @@ pub fn init_db(db_path: &Path) -> anyhow::Result<()> {
     );
     let _ = conn.execute(
         "INSERT OR IGNORE INTO settings(key, value) VALUES ('permanent_key_created_at', '0')",
+        [],
+    );
+
+    // Device identity columns for the TUI device manager and web dashboard.
+    // NULL for pre-migration rows. `platform` is written at pairing time
+    // (TUI/web fall back to parsing user_agent if NULL); `device_name` is
+    // user-editable via PATCH /api/devices/{id}; `last_active_at` is touched
+    // by api_key_guard on every Bearer request, debounced to 60s.
+    let _ = conn.execute("ALTER TABLE trusted_devices ADD COLUMN device_name TEXT", []);
+    let _ = conn.execute("ALTER TABLE trusted_devices ADD COLUMN platform TEXT", []);
+    let _ = conn.execute(
+        "ALTER TABLE trusted_devices ADD COLUMN last_active_at INTEGER",
         [],
     );
 

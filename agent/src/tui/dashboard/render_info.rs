@@ -10,6 +10,20 @@ use ratatui::{
 
 use super::{State, action_line, kv, kv_styled, now_secs};
 
+/// Format an OTK token as groups of 4 chars separated by hyphens.
+/// A 16-char token → `XXXX-XXXX-XXXX-XXXX`. Shorter tokens are output as-is.
+pub(super) fn format_otk_grouped(token: &str) -> String {
+    let chars: Vec<char> = token.chars().collect();
+    if chars.len() < 8 {
+        return token.to_string();
+    }
+    chars
+        .chunks(4)
+        .map(|c| c.iter().collect::<String>())
+        .collect::<Vec<_>>()
+        .join("-")
+}
+
 pub(super) fn render_info_panel(f: &mut ratatui::Frame<'_>, area: Rect, state: &State) {
     use ratatui::widgets::{Block, Borders};
     let block = Block::default()
@@ -56,8 +70,10 @@ pub(super) fn render_info_panel(f: &mut ratatui::Frame<'_>, area: Rect, state: &
 
     if state.ready_verifying() && !state.probe_log.is_empty() {
         lines.push(Line::from(""));
+        // Show verifying elapsed time with reassurance copy.
+        let elapsed_line = format_verifying_elapsed(state);
         lines.push(Line::from(Span::styled(
-            "Verifying tunnel…",
+            elapsed_line,
             Style::default()
                 .fg(super::super::step_progress::BRAND)
                 .add_modifier(Modifier::BOLD),
@@ -82,6 +98,19 @@ pub(super) fn render_info_panel(f: &mut ratatui::Frame<'_>, area: Rect, state: &
         }
     }
 
+    // Verifying elapsed timer when we have a start timestamp.
+    if let Some(started) = state.verifying_started {
+        let secs = started.elapsed().as_secs();
+        if secs > 0 {
+            lines.push(Line::from(""));
+            let hint = verifying_hint(secs);
+            lines.push(Line::from(Span::styled(
+                hint,
+                Style::default().fg(Color::DarkGray),
+            )));
+        }
+    }
+
     let log_action_label = format_log_action_label(state.log_history.len());
     lines.extend(vec![
         Line::from(""),
@@ -95,9 +124,12 @@ pub(super) fn render_info_panel(f: &mut ratatui::Frame<'_>, area: Rect, state: &
         action_line("k", "Copy one-time key"),
         action_line("r", "Regenerate one-time key"),
         action_line("a", "Approve next pending device"),
+        action_line("d", "Device manager"),
         action_line("l", &log_action_label),
         action_line("o", "Open tunnel URL in browser"),
         action_line("h", "Open host dashboard (/agent)"),
+        action_line("?", "Help / hotkey legend"),
+        action_line("b", "Back to menu"),
         action_line("q", "Exit TUI"),
     ]);
     f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), inner);
@@ -123,14 +155,37 @@ pub(super) fn format_otk_status(state: &State) -> String {
                 .into_iter()
                 .rev()
                 .collect();
+            // Show full token grouped for plain-text readability (SSH operators
+            // can read it without clipboard access).
+            let grouped = format_otk_grouped(token);
             if remaining <= 0 {
-                format!("····{last4}  expired (press r)")
+                format!("{grouped}  (····{last4}, expired — press r)")
             } else {
                 let mins = remaining / 60;
                 let secs = remaining % 60;
-                format!("····{last4}  expires in {mins:02}:{secs:02}")
+                format!("{grouped}  expires in {mins:02}:{secs:02}")
             }
         }
         _ => "— (press r to generate)".to_string(),
+    }
+}
+
+/// Verifying elapsed header line for the probe log section.
+pub(super) fn format_verifying_elapsed(state: &State) -> String {
+    if let Some(started) = state.verifying_started {
+        let secs = started.elapsed().as_secs();
+        return format!("Verifying… {}s elapsed", secs);
+    }
+    "Verifying tunnel…".to_string()
+}
+
+/// Reassurance copy shown below the probe log while Verifying is in progress.
+pub(super) fn verifying_hint(secs: u64) -> String {
+    if secs >= 90 {
+        "still connecting, Cloudflare DNS propagating".to_string()
+    } else if secs >= 30 {
+        "usually 30–90 s, nothing is wrong".to_string()
+    } else {
+        String::new()
     }
 }
