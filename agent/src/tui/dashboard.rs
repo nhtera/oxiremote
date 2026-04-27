@@ -709,6 +709,17 @@ fn render_qr_panel(f: &mut ratatui::Frame<'_>, area: Rect, state: &State) {
         return;
     }
 
+    // Reserve 3 rows at the bottom for the App URL + Key sidecar so users
+    // without a QR scanner can still read the URL/token directly. QR sits
+    // above; sidecar below. 3 rows = blank separator + URL + Key lines.
+    let sidecar_h: u16 = 3;
+    let layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(0), Constraint::Length(sidecar_h)])
+        .split(inner);
+    let qr_area = layout[0];
+    let sidecar_area = layout[1];
+
     let payload = state.qr_payload();
     let body = match QrCode::new(payload.as_bytes()) {
         Ok(code) => code
@@ -727,7 +738,47 @@ fn render_qr_panel(f: &mut ratatui::Frame<'_>, area: Rect, state: &State) {
         Style::default()
     };
     let para = Paragraph::new(body).alignment(Alignment::Center).style(qr_style);
-    f.render_widget(para, inner);
+    f.render_widget(para, qr_area);
+
+    render_qr_sidecar(f, sidecar_area, state, otk_expired);
+}
+
+/// Plain-text App URL + Key + expiry under the QR. Lets users without a
+/// scanner read the values directly (matches 9remote's onboarding pane).
+fn render_qr_sidecar(f: &mut ratatui::Frame<'_>, area: Rect, state: &State, otk_expired: bool) {
+    let url = state.tunnel_url.as_deref().unwrap_or("—");
+    let key_line = match (&state.otk_token, state.otk_expires_at) {
+        (Some(token), Some(expires_at)) => {
+            let remaining = expires_at - now_secs();
+            if remaining <= 0 {
+                format!("Key: {token}  (expired)")
+            } else {
+                let mins = remaining / 60;
+                let secs = remaining % 60;
+                format!("Key: {token}  (expires {mins:02}:{secs:02})")
+            }
+        }
+        _ => "Key: — (press r to generate)".into(),
+    };
+    let key_style = if otk_expired || state.otk_token.is_none() {
+        Style::default().fg(Color::DarkGray)
+    } else {
+        Style::default()
+            .fg(super::step_progress::BRAND)
+            .add_modifier(Modifier::BOLD)
+    };
+    let lines = vec![
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("App URL: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(url, Style::default().fg(super::step_progress::BRAND)),
+        ]),
+        Line::from(Span::styled(key_line, key_style)),
+    ];
+    f.render_widget(
+        Paragraph::new(lines).alignment(Alignment::Center).wrap(Wrap { trim: true }),
+        area,
+    );
 }
 
 fn render_info_panel(f: &mut ratatui::Frame<'_>, area: Rect, state: &State) {
@@ -756,6 +807,23 @@ fn render_info_panel(f: &mut ratatui::Frame<'_>, area: Rect, state: &State) {
         kv("Connected Devices", &devices_str),
     ];
 
+    // Surface the recovery hint (carried on TunnelDown event payload, baked
+    // into `tunnel_down` by State::apply) so the operator sees the actionable
+    // next step right where the failure is — not buried in the log view.
+    if let Some(reason) = &state.tunnel_down {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "Recovery",
+            Style::default()
+                .fg(super::step_progress::BRAND)
+                .add_modifier(Modifier::BOLD),
+        )));
+        lines.push(Line::from(Span::styled(
+            reason.clone(),
+            Style::default().fg(super::step_progress::BRAND),
+        )));
+    }
+
     if state.ready_verifying() && !state.probe_log.is_empty() {
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
@@ -778,6 +846,7 @@ fn render_info_panel(f: &mut ratatui::Frame<'_>, area: Rect, state: &State) {
         }
     }
 
+    let log_action_label = format!("Toggle log view ({} entries)", state.log_history.len());
     lines.extend(vec![
         Line::from(""),
         Line::from(Span::styled(
@@ -790,7 +859,7 @@ fn render_info_panel(f: &mut ratatui::Frame<'_>, area: Rect, state: &State) {
         action_line("k", "Copy one-time key"),
         action_line("r", "Regenerate one-time key"),
         action_line("a", "Approve next pending device"),
-        action_line("l", "Toggle log view"),
+        action_line("l", &log_action_label),
         action_line("o", "Open tunnel URL in browser"),
         action_line("h", "Open host dashboard (/agent)"),
         action_line("q", "Exit TUI"),

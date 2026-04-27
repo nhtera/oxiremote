@@ -120,7 +120,11 @@ fn draw(f: &mut ratatui::Frame<'_>, items: &[MenuItem], selected: usize) {
         .borders(Borders::ALL)
         .border_style(Style::default().fg(super::step_progress::BRAND_DIM))
         .title(Span::styled(
-            "  OxiRemote  ",
+            // Version stamp lives in the title so users can confirm at a
+            // glance which build they're on (matters for paired devices that
+            // bug-report a flaky tunnel — first question is always "what
+            // version?"). env! is compile-time so a rebuild ships the bump.
+            format!("  OxiRemote v{}  ", env!("CARGO_PKG_VERSION")),
             Style::default()
                 .fg(super::step_progress::BRAND)
                 .add_modifier(Modifier::BOLD),

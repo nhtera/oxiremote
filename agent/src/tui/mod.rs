@@ -22,7 +22,6 @@ use crate::events::EventBus;
 
 pub mod approval;
 pub mod dashboard;
-pub mod logs;
 pub mod menu;
 pub mod step_progress;
 
