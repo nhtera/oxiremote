@@ -495,12 +495,28 @@ mod inner {
 
         // DC-open signal for the 5-s fallback race below. The on_open callback
         // can't pass the DC Arc directly, so we gate a oneshot.
+        //
+        // sink_chosen: 0=racing, 1=DC, 2=WS. Set by the race winner. The
+        // on_open callback consults it so a DC that opens *after* the timer
+        // already chose WS-fallback is closed immediately — leaving it open
+        // would let SCTP buffers grow on a channel nothing ever drains.
+        let sink_chosen = Arc::new(std::sync::atomic::AtomicU8::new(0));
         let (dc_open_tx, mut dc_open_rx) = tokio::sync::oneshot::channel::<()>();
         {
             let tx = Arc::new(std::sync::Mutex::new(Some(dc_open_tx)));
+            let chosen = Arc::clone(&sink_chosen);
+            let dc_for_close = Arc::clone(&desktop_dc);
             desktop_dc.on_open(Box::new(move || {
                 let tx = Arc::clone(&tx);
+                let chosen = Arc::clone(&chosen);
+                let dc_for_close = Arc::clone(&dc_for_close);
                 Box::pin(async move {
+                    use std::sync::atomic::Ordering;
+                    if chosen.load(Ordering::Acquire) == 2 {
+                        // WS fallback already chosen — orphan DC, close it.
+                        let _ = dc_for_close.close().await;
+                        return;
+                    }
                     if let Ok(mut guard) = tx.lock()
                         && let Some(s) = guard.take()
                     {
@@ -528,15 +544,20 @@ mod inner {
                 }
 
                 Ok(()) = &mut dc_open_rx => {
+                    sink_chosen.store(1, std::sync::atomic::Ordering::Release);
                     info!(device = %device_id, "desktop DC open — DataChannel path");
                     break Sink::DataChannel(Arc::clone(&desktop_dc));
                 }
 
                 _ = &mut timer => {
+                    sink_chosen.store(2, std::sync::atomic::Ordering::Release);
                     info!(device = %device_id, "desktop DC timeout — WS fallback");
                     if let Ok(msg) = serde_json::to_string(&SignalOut::Fallback) {
                         let _ = socket.send(Message::Text(msg.into())).await;
                     }
+                    // Best-effort close in case DC is already mid-handshake;
+                    // on_open also guards against the post-timeout open race.
+                    let _ = desktop_dc.close().await;
                     break Sink::WsBinary(ws_bin_tx);
                 }
 
