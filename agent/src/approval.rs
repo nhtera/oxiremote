@@ -104,11 +104,10 @@ pub fn set_auto_approve(db_path: &PathBuf, enabled: bool) -> anyhow::Result<()> 
     Ok(())
 }
 
-/// Insert a new trusted device with the given approval_status, ip, and ua.
-/// Used by the OTK login path.
-/// Insert (or update) a trusted device with the given approval_status, ip, ua.
-/// Caller owns the connection — wrap in `conn.transaction()` to participate
-/// in the multi-step pairing/OTK atomicity flow (see http_pages.rs).
+/// Insert a new trusted device with the given approval_status, ip, ua, and
+/// optional platform string.  Caller owns the connection — wrap in
+/// `conn.transaction()` to participate in the multi-step pairing/OTK
+/// atomicity flow (see http_pages.rs).
 pub fn insert_device_with_approval_tx(
     conn: &Connection,
     device_id: &str,
@@ -116,18 +115,20 @@ pub fn insert_device_with_approval_tx(
     user_agent: Option<&str>,
     ip: &str,
     approval_status: &str,
+    platform: Option<&str>,
 ) -> anyhow::Result<()> {
     let now = now_ts();
     conn.execute(
         "INSERT INTO trusted_devices(
              device_id, label, user_agent, created_at, last_seen_at,
-             revoked_at, approval_status, first_seen_ip, first_seen_ua
-         ) VALUES (?1, ?2, ?3, ?4, ?4, NULL, ?5, ?6, ?3)
+             revoked_at, approval_status, first_seen_ip, first_seen_ua, platform
+         ) VALUES (?1, ?2, ?3, ?4, ?4, NULL, ?5, ?6, ?3, ?7)
          ON CONFLICT(device_id) DO UPDATE SET
              label=excluded.label,
              user_agent=excluded.user_agent,
+             platform=COALESCE(excluded.platform, trusted_devices.platform),
              last_seen_at=excluded.last_seen_at",
-        params![device_id, label, user_agent, now, approval_status, ip],
+        params![device_id, label, user_agent, now, approval_status, ip, platform],
     )
     .context("insert device with approval")?;
     Ok(())

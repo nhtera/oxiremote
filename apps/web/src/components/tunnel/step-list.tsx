@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { StatusBadge, StepIcon } from './step-row'
 import { defaultSub, TUNNEL_STEPS, type StepName, type StepState } from './step-types'
 
@@ -58,12 +58,22 @@ function applyStepEvent(steps: StepState[], ev: AgentEventTunnelStep): StepState
   return next
 }
 
+/** Format an elapsed-seconds value into the Verifying ETA copy string. */
+function verifyingSubLabel(elapsedSec: number): string {
+  if (elapsedSec >= 90) return `Still connecting, ${elapsedSec}s elapsed — Cloudflare DNS propagating`
+  if (elapsedSec >= 30) return `Verifying… ${elapsedSec}s elapsed — usually 30–90 s, nothing is wrong`
+  return `Verifying… ${elapsedSec}s elapsed`
+}
+
 // 5-row checklist with live SSE updates. Shown only while the tunnel hasn't
 // passed a health probe yet — parent (or the home page's onboarding gate)
 // hides this once `tunnel_step_changed { step: 'ready' }` fires.
 export default function TunnelStepList() {
   const [steps, setSteps] = useState<StepState[]>(buildInitialSteps)
   const [downHint, setDownHint] = useState<string | null>(null)
+  // Track when the Verifying step became active for the elapsed timer.
+  const verifyingStartRef = useRef<number | null>(null)
+  const [verifyingElapsed, setVerifyingElapsed] = useState(0)
 
   useEffect(() => {
     let cancelled = false
@@ -105,6 +115,27 @@ export default function TunnelStepList() {
     return () => { cancelled = true; es.close() }
   }, [])
 
+  // Start / stop a 1-second ticker while Verifying is the active step.
+  useEffect(() => {
+    const verifyingStep = steps.find((s) => s.name === 'Verifying')
+    if (verifyingStep?.status === 'active') {
+      if (verifyingStartRef.current === null) {
+        verifyingStartRef.current = Date.now()
+      }
+      const id = window.setInterval(() => {
+        const start = verifyingStartRef.current
+        if (start !== null) {
+          setVerifyingElapsed(Math.floor((Date.now() - start) / 1000))
+        }
+      }, 1000)
+      return () => window.clearInterval(id)
+    } else {
+      // Reset when leaving Verifying (either done or failed).
+      verifyingStartRef.current = null
+      setVerifyingElapsed(0)
+    }
+  }, [steps])
+
   return (
     <div className="rounded-2xl border border-border bg-surface-alt/60 backdrop-blur-sm shadow-[0_1px_0_rgba(255,255,255,0.02)_inset,0_8px_28px_-12px_rgba(0,0,0,0.6)] p-5 md:p-6">
       <div className="flex items-center justify-between gap-3 mb-5">
@@ -124,7 +155,11 @@ export default function TunnelStepList() {
       )}
       <ol className="space-y-3">
         {steps.map((step) => {
-          const sub = step.info ?? defaultSub(step.name, step.status)
+          // Override sub-label for Verifying active state with elapsed ETA.
+          const sub =
+            step.name === 'Verifying' && step.status === 'active'
+              ? verifyingSubLabel(verifyingElapsed)
+              : (step.info ?? defaultSub(step.name, step.status))
           const titleTone =
             step.status === 'done' || step.status === 'active'
               ? 'text-text-primary'

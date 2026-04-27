@@ -4,6 +4,12 @@ import AutoApproveToggle from '../../components/auto-approve-toggle'
 import ProxyPortsCard from '../../components/proxy-ports-card'
 import { PushStatusRow } from '../../components/push-permission-banner'
 
+interface AutostartStatus {
+  enabled: boolean
+  supported: boolean
+  mechanism: string | null
+}
+
 // Host-side configuration. Persists where the underlying control persists —
 // auto-approve goes to the agent SQLite; quality/HiDPI defaults are per-device
 // localStorage; proxy ports go to the agent. Each card calls out its scope so
@@ -35,6 +41,8 @@ export default function AgentSettingsPage() {
   const [hidpi, setHidpi] = useState<boolean>(
     () => localStorage.getItem(HIDPI_KEY) === '1',
   )
+  const [autostart, setAutostart] = useState<AutostartStatus | null>(null)
+  const [autostartBusy, setAutostartBusy] = useState(false)
 
   useEffect(() => {
     let cancelled = false
@@ -49,10 +57,34 @@ export default function AgentSettingsPage() {
       .catch((e: unknown) =>
         setError(e instanceof Error ? e.message : 'Failed to load state'),
       )
+
+    fetch('/api/agent/autostart')
+      .then((r) => (r.ok ? r.json() : null))
+      .then((data: AutostartStatus | null) => {
+        if (!cancelled && data) setAutostart(data)
+      })
+      .catch(() => { /* non-critical; autostart section renders disabled */ })
+
     return () => {
       cancelled = true
     }
   }, [])
+
+  async function toggleAutostart(next: boolean) {
+    setAutostartBusy(true)
+    try {
+      const res = await fetch('/api/agent/autostart', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ enabled: next }),
+      })
+      if (res.ok) {
+        setAutostart((s) => (s ? { ...s, enabled: next } : s))
+      }
+    } finally {
+      setAutostartBusy(false)
+    }
+  }
 
   function setQualityPersist(next: string) {
     setQuality(next)
@@ -175,6 +207,35 @@ export default function AgentSettingsPage() {
       </Section>
 
       <Section
+        title="Autostart"
+        scope="Host-wide"
+        description="Start the agent automatically at login. Uses launchd on macOS, systemd user unit on Linux, or the Windows registry."
+      >
+        <Row label="Start at login">
+          {autostart === null ? (
+            <span className="text-text-muted text-[length:var(--text-meta)]">Loading…</span>
+          ) : autostart.supported ? (
+            <div className="flex items-center gap-2">
+              <SwitchButton
+                checked={autostart.enabled}
+                disabled={autostartBusy}
+                onToggle={() => toggleAutostart(!autostart.enabled)}
+              />
+              {autostart.mechanism && (
+                <span className="text-text-muted text-[length:var(--text-meta)]">
+                  {autostart.mechanism}
+                </span>
+              )}
+            </div>
+          ) : (
+            <span className="text-text-muted text-[length:var(--text-meta)]">
+              Not supported on this platform
+            </span>
+          )}
+        </Row>
+      </Section>
+
+      <Section
         title="About"
         scope="Read-only"
         description="Run oxiremote --version in your terminal to print the binary version. Self-update via oxiremote update."
@@ -226,17 +287,20 @@ function Row({ label, children }: { label: string; children: ReactNode }) {
 function SwitchButton({
   checked,
   onToggle,
+  disabled,
 }: {
   checked: boolean
   onToggle: () => void
+  disabled?: boolean
 }) {
   return (
     <button
       type="button"
       role="switch"
       aria-checked={checked}
+      disabled={disabled}
       onClick={onToggle}
-      className={`relative inline-flex h-5 w-9 items-center rounded-full border transition-colors ${
+      className={`relative inline-flex h-5 w-9 items-center rounded-full border transition-colors disabled:opacity-50 disabled:cursor-not-allowed ${
         checked ? 'bg-accent/30 border-accent/60' : 'bg-surface-alt border-border'
       }`}
     >

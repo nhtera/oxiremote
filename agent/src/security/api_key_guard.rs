@@ -21,7 +21,7 @@ use axum::{
     response::Response,
 };
 
-use crate::auth::verify_api_key_async;
+use crate::auth::{touch_device_last_active, verify_api_key_async};
 use crate::AppState;
 
 use super::route_scope::is_tunnel_request;
@@ -106,11 +106,25 @@ pub async fn api_key_guard(
             .unwrap();
     };
 
-    if verify_api_key_async(state.db_path.clone(), key).await.is_none() {
+    let device_id = verify_api_key_async(state.db_path.clone(), key).await;
+    let Some(device_id) = device_id else {
         return Response::builder()
             .status(StatusCode::UNAUTHORIZED)
             .body(Body::from("invalid api key"))
             .unwrap();
+    };
+
+    // Fire-and-forget: update last_active_at with 60s debounce. Errors are
+    // silently dropped — this is telemetry only, never on the critical path.
+    {
+        let db_path = state.db_path.clone();
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        tokio::spawn(async move {
+            let _ = tokio::task::spawn_blocking(move || {
+                touch_device_last_active(&db_path, &device_id, now_ms)
+            })
+            .await;
+        });
     }
 
     next.run(req).await

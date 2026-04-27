@@ -1,6 +1,7 @@
 mod agent_api;
 mod approval;
 mod auth;
+mod autostart;
 mod db;
 mod events;
 mod files;
@@ -32,11 +33,11 @@ mod desktop_service;
 mod desktop_ws;
 #[cfg(feature = "desktop")]
 mod desktop_ws_capture;
-// Phase 03 pipeline selection — operator env flag + client capability AND.
+// Pipeline selection — operator env flag + client capability AND.
 #[cfg(feature = "desktop")]
 mod pipeline_selection;
-// Phase 03 H.264 pipeline — gated so the JPEG default build doesn't depend
-// on the VT/OpenH264 toolchain.
+// H.264 pipeline — gated so the JPEG default build doesn't depend on the
+// VT/OpenH264 toolchain.
 #[cfg(feature = "h264")]
 mod video_pipeline;
 mod terminal_api;
@@ -93,7 +94,7 @@ pub struct AppState {
     pub preview_targets: DashMap<String, PreviewTarget>,
     pub preview_health: DashMap<String, PreviewHealth>,
     pub local_sites: LocalSitesCache,
-    /// Phase 02 — set of localhost ports operators have opted into for the
+    /// Set of localhost ports operators have opted into for the
     /// `/proxy/<port>/*` reverse proxy. Mirrored to the `proxy_allowed_ports`
     /// settings row so toggles survive restarts.
     pub proxy_allowed_ports: Arc<StdRwLock<HashSet<u16>>>,
@@ -503,8 +504,8 @@ async fn server_main(event_bus: Arc<EventBus>) -> anyhow::Result<()> {
     }
 
     // Desktop notifications (no-op when no notification daemon — headless,
-    // sandboxed, Codespaces). Tray runtime is dead code until Phase 06; this
-    // keeps device-pending toasts working in TUI/headless modes today.
+    // sandboxed, Codespaces). Tray runtime is not yet wired; this keeps
+    // device-pending toasts working in TUI/headless modes.
     notifier::spawn_event_notifier(state.event_bus.clone());
 
     let app = Router::new()
@@ -583,9 +584,9 @@ async fn server_main(event_bus: Arc<EventBus>) -> anyhow::Result<()> {
         .route("/api/local-sites", get(local_sites::api_local_sites))
         .route("/preview/{id}", axum::routing::any(preview::preview_proxy_root_handler))
         .route("/preview/{id}/{*rest}", axum::routing::any(preview::preview_proxy_handler))
-        // Local-sites reverse proxy (Phase 02). Default-deny allowlist is
-        // checked inside the handler; bare `/proxy/<port>` redirects to the
-        // trailing-slash form so relative paths in upstream HTML resolve.
+        // Local-sites reverse proxy. Default-deny allowlist is checked inside
+        // the handler; bare `/proxy/<port>` redirects to the trailing-slash
+        // form so relative paths in upstream HTML resolve.
         .route("/proxy/{port}", axum::routing::any(proxy::proxy_root_redirect))
         .route("/proxy/{port}/", axum::routing::any(proxy::proxy_root_handler))
         .route("/proxy/{port}/{*rest}", axum::routing::any(proxy::proxy_handler));

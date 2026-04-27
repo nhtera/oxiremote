@@ -159,6 +159,59 @@ pub fn revoke_device(db_path: &PathBuf, device_id: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Rename a device. Sanitizes input: strips control chars, truncates to 64
+/// chars, treats empty/whitespace as NULL (clears the name).
+/// Only updates non-revoked devices.
+pub fn rename_device(db_path: &PathBuf, device_id: &str, name: Option<&str>) -> anyhow::Result<()> {
+    let sanitized: Option<String> = name.and_then(|s| {
+        // Strip control characters (U+0000–U+001F and U+007F).
+        let clean: String = s.chars()
+            .filter(|c| !c.is_control())
+            .collect::<String>()
+            .trim()
+            .chars()
+            .take(64)
+            .collect();
+        if clean.is_empty() { None } else { Some(clean) }
+    });
+
+    let conn = Connection::open(db_path)?;
+    conn.execute(
+        "UPDATE trusted_devices SET device_name=?2 WHERE device_id=?1 AND revoked_at IS NULL",
+        params![device_id, sanitized],
+    )?;
+    Ok(())
+}
+
+/// Update `last_active_at` for a device with a 60-second debounce. SELECT
+/// before UPDATE — skip if the stored value is within 60 000 ms of `now_ms`.
+/// Intended to be called fire-and-forget; errors are silently dropped by the
+/// caller.
+pub fn touch_device_last_active(db_path: &PathBuf, device_id: &str, now_ms: i64) -> anyhow::Result<()> {
+    let conn = Connection::open(db_path)?;
+
+    let last: Option<i64> = conn
+        .query_row(
+            "SELECT last_active_at FROM trusted_devices WHERE device_id=?1 AND revoked_at IS NULL",
+            params![device_id],
+            |row| row.get(0),
+        )
+        .ok()
+        .flatten();
+
+    if let Some(ts) = last
+        && now_ms - ts < 60_000
+    {
+        return Ok(());
+    }
+
+    conn.execute(
+        "UPDATE trusted_devices SET last_active_at=?2 WHERE device_id=?1 AND revoked_at IS NULL",
+        params![device_id, now_ms],
+    )?;
+    Ok(())
+}
+
 // Used in preview.rs integration tests which are cfg(test)-only.
 #[allow(dead_code)]
 pub fn insert_or_update_device(
@@ -203,12 +256,20 @@ pub struct TrustedDevice {
     /// NULL in pre-migration rows is surfaced as `None`; the SPA treats it as
     /// `'approved'` to preserve backward compatibility with legacy devices.
     pub approval_status: Option<String>,
+    /// User-supplied display name. NULL until the user renames the device.
+    pub device_name: Option<String>,
+    /// Coarse OS/platform string captured at pairing time.
+    pub platform: Option<String>,
+    /// Unix-ms timestamp of the last authenticated request, debounced to 60s
+    /// in `api_key_guard`. NULL until the device sends its first request.
+    pub last_active_at: Option<i64>,
 }
 
 pub fn list_trusted_devices(db_path: &PathBuf) -> anyhow::Result<Vec<TrustedDevice>> {
     let conn = Connection::open(db_path)?;
     let mut stmt = conn.prepare(
-        "SELECT device_id, label, user_agent, created_at, last_seen_at, revoked_at, approval_status
+        "SELECT device_id, label, user_agent, created_at, last_seen_at, revoked_at,
+                approval_status, device_name, platform, last_active_at
          FROM trusted_devices
          WHERE revoked_at IS NULL
          ORDER BY last_seen_at DESC, created_at DESC",
@@ -223,6 +284,9 @@ pub fn list_trusted_devices(db_path: &PathBuf) -> anyhow::Result<Vec<TrustedDevi
             last_seen_at: row.get(4)?,
             revoked_at: row.get(5)?,
             approval_status: row.get(6)?,
+            device_name: row.get(7)?,
+            platform: row.get(8)?,
+            last_active_at: row.get(9)?,
         })
     })?;
 
@@ -409,8 +473,6 @@ pub fn get_permanent_key_meta(db_path: &PathBuf) -> anyhow::Result<Option<(Strin
 /// Verify the permanent dashboard key against the stored Argon2id hash.
 /// Returns `true` when the presented key matches.  Blocking — call from
 /// `spawn_blocking` in async contexts.
-/// Used in tests and available for future operator-authentication use cases.
-#[allow(dead_code)]
 pub fn verify_permanent_key(db_path: &PathBuf, presented: &str) -> bool {
     let conn = match Connection::open(db_path) {
         Ok(c) => c,
@@ -434,6 +496,26 @@ pub fn verify_permanent_key(db_path: &PathBuf, presented: &str) -> bool {
 pub fn is_valid_pairing_attempt(code: &str) -> bool {
     let trimmed = code.trim();
     trimmed.len() >= 6 && trimmed.len() <= 16
+}
+
+/// Derive a coarse platform string from a User-Agent header value.
+/// Returns one of: "ios", "macos", "windows", "android", "linux", or None.
+/// Matches the same heuristics used in the SPA's `parsePlatformBadge`.
+pub fn platform_from_ua(ua: &str) -> Option<String> {
+    let s = ua.to_lowercase();
+    if s.contains("iphone") || s.contains("ipad") {
+        Some("ios".into())
+    } else if s.contains("android") {
+        Some("android".into())
+    } else if s.contains("mac") {
+        Some("macos".into())
+    } else if s.contains("windows") {
+        Some("windows".into())
+    } else if s.contains("linux") {
+        Some("linux".into())
+    } else {
+        None
+    }
 }
 
 pub fn client_ip_key(headers: &axum::http::HeaderMap) -> String {
@@ -594,6 +676,48 @@ mod tests {
         assert_eq!(find("dev-approved"), "approved");
         assert_eq!(find("dev-pending"), "pending");
         assert_eq!(find("dev-rejected"), "rejected");
+    }
+
+    #[test]
+    fn rename_device_sanitizes_input() {
+        let state = test_state("rename-sanitize");
+        let conn = Connection::open(&state.db_path).unwrap();
+        let now = now_ts();
+
+        conn.execute(
+            "INSERT INTO trusted_devices(device_id, label, user_agent, created_at, last_seen_at, revoked_at)
+             VALUES (?1, ?2, NULL, ?3, ?3, NULL)",
+            params!["dev-rename", "Old Name", now],
+        ).unwrap();
+
+        // Empty string → NULL (clears name).
+        rename_device(&state.db_path, "dev-rename", Some("")).unwrap();
+        let name: Option<String> = conn
+            .query_row("SELECT device_name FROM trusted_devices WHERE device_id='dev-rename'", [], |r| r.get(0))
+            .unwrap();
+        assert!(name.is_none(), "empty string should produce NULL device_name");
+
+        // Normal name stored as-is (up to 64 chars).
+        rename_device(&state.db_path, "dev-rename", Some("My Phone")).unwrap();
+        let name: Option<String> = conn
+            .query_row("SELECT device_name FROM trusted_devices WHERE device_id='dev-rename'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(name.as_deref(), Some("My Phone"));
+
+        // 65-char input truncated to 64.
+        let long_name = "A".repeat(65);
+        rename_device(&state.db_path, "dev-rename", Some(&long_name)).unwrap();
+        let name: Option<String> = conn
+            .query_row("SELECT device_name FROM trusted_devices WHERE device_id='dev-rename'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(name.as_deref().map(|s| s.len()), Some(64));
+
+        // Control chars stripped.
+        rename_device(&state.db_path, "dev-rename", Some("Hello\x01\x1fWorld")).unwrap();
+        let name: Option<String> = conn
+            .query_row("SELECT device_name FROM trusted_devices WHERE device_id='dev-rename'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(name.as_deref(), Some("HelloWorld"));
     }
 
     #[test]

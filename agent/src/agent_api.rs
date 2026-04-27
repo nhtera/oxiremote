@@ -9,10 +9,11 @@ use axum::{
     extract::{Path, State},
     http::StatusCode,
     response::{IntoResponse, Sse, sse::{Event, KeepAlive}},
-    routing::{get, post},
+    routing::{get, patch, post},
 };
 use futures_util::stream::Stream;
 use qrcode::{QrCode, render::svg};
+use rusqlite::Connection;
 use serde::Deserialize;
 use serde_json::json;
 use tokio_stream::{StreamExt, wrappers::BroadcastStream};
@@ -20,7 +21,7 @@ use tracing::{info, warn};
 
 use crate::AppState;
 use crate::events::AgentEvent;
-use crate::{approval, one_time_keys, settings};
+use crate::{approval, autostart, one_time_keys, settings};
 
 pub fn router() -> Router<Arc<AppState>> {
     Router::new()
@@ -44,6 +45,12 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/api/agent/permissions", get(api_agent_permissions))
         .route("/api/agent/permissions/grant", post(api_agent_permissions_grant))
         .route("/api/agent/devices", get(api_agent_devices))
+        .route("/api/agent/devices/{id}", patch(api_agent_device_patch))
+        .route("/api/agent/devices/{id}/revoke", post(api_agent_device_revoke))
+        .route(
+            "/api/agent/autostart",
+            get(api_agent_autostart_get).post(api_agent_autostart_post),
+        )
         .route("/api/agent/services/desktop", post(api_agent_services_desktop))
         .route("/api/agent/shutdown", post(api_agent_shutdown))
 }
@@ -80,6 +87,11 @@ async fn api_agent_state(State(state): State<Arc<AppState>>) -> Json<serde_json:
         .ok()
         .and_then(|g| g.clone())
         .map(|ev| serde_json::to_value(&ev).unwrap_or(serde_json::Value::Null));
+
+    // Active clients: devices with last_active_at within the last 5 minutes.
+    // Used by the stop-agent confirm dialog to list connected clients.
+    let active_clients = query_active_clients(&state.db_path);
+
     Json(json!({
         "tunnel_url": tunnel_url,
         "tunnel_step": tunnel_step,
@@ -90,7 +102,45 @@ async fn api_agent_state(State(state): State<Arc<AppState>>) -> Json<serde_json:
         "auto_approve": auto_approve,
         "desktop_enabled": desktop_enabled,
         "version": env!("CARGO_PKG_VERSION"),
+        "active_clients": active_clients,
     }))
+}
+
+/// Query devices active in the last 5 minutes (300 000 ms). Returns an empty
+/// vec on DB error — the stop-agent dialog degrades gracefully with count = 0.
+fn query_active_clients(db_path: &std::path::PathBuf) -> Vec<serde_json::Value> {
+    let five_min_ago_ms = chrono::Utc::now().timestamp_millis() - 300_000;
+    Connection::open(db_path)
+        .ok()
+        .and_then(|conn| {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT device_id, device_name, label FROM trusted_devices
+                     WHERE revoked_at IS NULL
+                       AND last_active_at IS NOT NULL
+                       AND last_active_at > ?1
+                     ORDER BY last_active_at DESC",
+                )
+                .ok()?;
+            let rows = stmt
+                .query_map(rusqlite::params![five_min_ago_ms], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                })
+                .ok()?;
+            let mut out = Vec::new();
+            for r in rows.flatten() {
+                let (device_id, device_name, label) = r;
+                // Prefer custom device_name, fall back to label.
+                let display_name = device_name.unwrap_or(label);
+                out.push(json!({ "device_id": device_id, "device_name": display_name }));
+            }
+            Some(out)
+        })
+        .unwrap_or_default()
 }
 
 #[derive(Deserialize)]
@@ -503,6 +553,105 @@ async fn api_agent_settings_auto_approve(
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }
+}
+
+/// GET /api/agent/autostart — detect current autostart state for the agent process.
+async fn api_agent_autostart_get() -> impl IntoResponse {
+    match autostart::detect() {
+        Ok(status) => (StatusCode::OK, Json(status)).into_response(),
+        Err(err) => {
+            warn!(error=%err, "autostart detect failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": err.to_string() })),
+            )
+                .into_response()
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct AutostartBody {
+    enabled: bool,
+}
+
+/// POST /api/agent/autostart — enable or disable autostart.
+async fn api_agent_autostart_post(Json(body): Json<AutostartBody>) -> impl IntoResponse {
+    match autostart::set_enabled(body.enabled) {
+        Ok(()) => {
+            info!(enabled = body.enabled, "autostart toggled");
+            (StatusCode::OK, Json(json!({ "ok": true }))).into_response()
+        }
+        Err(err) => {
+            warn!(error=%err, "autostart set failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": err.to_string() })),
+            )
+                .into_response()
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct DevicePatchBody {
+    name: Option<String>,
+}
+
+/// PATCH /api/agent/devices/{id} — rename a device. Body: `{ "name": "..." | null }`.
+/// Emits DeviceApproved event so the Devices page refreshes the row.
+async fn api_agent_device_patch(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(body): Json<DevicePatchBody>,
+) -> impl IntoResponse {
+    let name_ref: Option<&str> = body.name.as_deref();
+    match crate::auth::rename_device(&state.db_path, &id, name_ref) {
+        Ok(()) => {
+            info!(device_id = %id, "device renamed via agent api");
+            // DeviceApproved is the closest existing event that causes the SPA
+            // Devices page to refresh a device row. No new variant is invented.
+            state.event_bus.send(AgentEvent::DeviceApproved { device_id: id });
+            (StatusCode::OK, Json(json!({ "ok": true }))).into_response()
+        }
+        Err(err) => {
+            warn!(error=%err, device_id=%id, "rename device failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": err.to_string() })),
+            )
+                .into_response()
+        }
+    }
+}
+
+/// POST /api/agent/devices/{id}/revoke — revoke a device from the agent dashboard.
+/// Drops push subscriptions and emits DeviceRejected to refresh the Devices page.
+async fn api_agent_device_revoke(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    if let Err(err) = crate::auth::revoke_device(&state.db_path, &id) {
+        warn!(error=%err, device_id=%id, "agent revoke device failed");
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": err.to_string() })),
+        )
+            .into_response();
+    }
+
+    // Drop push subscriptions for the revoked device.
+    if let Ok(conn) = Connection::open(&state.db_path) {
+        let _ = conn.execute(
+            "DELETE FROM push_subscriptions WHERE device_id = ?1",
+            rusqlite::params![id],
+        );
+    }
+
+    info!(device_id = %id, "device revoked via agent api");
+    // DeviceRejected is the closest existing event variant for removal of a device.
+    state.event_bus.send(AgentEvent::DeviceRejected { device_id: id });
+    (StatusCode::OK, Json(json!({ "ok": true }))).into_response()
 }
 
 #[cfg(test)]

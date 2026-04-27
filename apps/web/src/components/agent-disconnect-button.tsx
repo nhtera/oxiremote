@@ -3,15 +3,49 @@ import { useConfirm } from './ui'
 
 type Phase = 'idle' | 'stopping' | 'stopped'
 
+interface ActiveClient {
+  device_id: string
+  device_name: string
+}
+
 export default function AgentDisconnectButton() {
   const confirm = useConfirm()
   const [phase, setPhase] = useState<Phase>('idle')
 
   const handleClick = async () => {
+    // Fetch active clients to show in confirm dialog.
+    let activeClients: ActiveClient[] = []
+    try {
+      const res = await fetch('/api/agent/state', { cache: 'no-store' })
+      if (res.ok) {
+        const data: { active_clients?: ActiveClient[] } = await res.json()
+        activeClients = data.active_clients ?? []
+      }
+    } catch {
+      // Non-critical; proceed with count = 0.
+    }
+
+    const count = activeClients.length
+    const nameList = activeClients.map((c) => c.device_name).slice(0, 5)
+    const namesStr = nameList.length > 0 ? `: ${nameList.join(', ')}` : ''
+    const extra =
+      activeClients.length > 5
+        ? ` and ${activeClients.length - 5} more`
+        : ''
+
+    const clientMsg =
+      count > 0
+        ? `${count} active client${count !== 1 ? 's' : ''} will be disconnected${namesStr}${extra}.`
+        : ''
+
     const ok = await confirm({
       title: 'Stop the agent?',
-      message:
+      message: [
         'The tunnel will close and all connected devices will disconnect. Restart the agent in your terminal to bring it back.',
+        clientMsg,
+      ]
+        .filter(Boolean)
+        .join(' '),
       confirmText: 'Stop agent',
       danger: true,
     })
@@ -24,8 +58,7 @@ export default function AgentDisconnectButton() {
     }
   }
 
-  // Once stopping, poll /api/agent/state until the agent stops responding,
-  // then transition to the full-page "stopped" overlay.
+  // Poll /api/agent/state until the agent stops responding, then show overlay.
   useEffect(() => {
     if (phase !== 'stopping') return
     let cancelled = false
@@ -51,8 +84,6 @@ export default function AgentDisconnectButton() {
         }
       }
       if (elapsed >= TIMEOUT_MS && !cancelled) {
-        // Server didn't go down in 8s — assume it did anyway and surface the
-        // overlay so the operator gets feedback.
         setPhase('stopped')
         window.clearInterval(interval)
       }

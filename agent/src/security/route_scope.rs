@@ -101,6 +101,9 @@ mod tests {
         assert_eq!(scope_for_path("/api/agent/state"), RouteScope::Localhost);
         assert_eq!(scope_for_path("/agent"), RouteScope::Localhost);
         assert_eq!(scope_for_path("/agent/devices"), RouteScope::Localhost);
+        assert_eq!(scope_for_path("/api/agent/autostart"), RouteScope::Localhost);
+        assert_eq!(scope_for_path("/api/agent/devices/abc/revoke"), RouteScope::Localhost);
+        assert_eq!(scope_for_path("/api/agent/devices/abc-123-xyz"), RouteScope::Localhost);
     }
 
     #[test]

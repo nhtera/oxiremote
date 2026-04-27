@@ -9,6 +9,8 @@ interface Props {
   expiringSoon: boolean
   hasKey: boolean
   otkActive: boolean
+  /** Called when the user clicks "Generate new OTK" from the expiry CTA. */
+  onRegenerate?: () => void
 }
 
 export default function OtkRow({
@@ -19,6 +21,7 @@ export default function OtkRow({
   expiringSoon,
   hasKey,
   otkActive,
+  onRegenerate,
 }: Props) {
   const [copied, setCopied] = useState(false)
 
@@ -61,6 +64,7 @@ export default function OtkRow({
         expired={expired}
         expiringSoon={expiringSoon}
         hasKey={hasKey}
+        onRegenerate={onRegenerate}
       />
     </div>
   )
@@ -71,9 +75,10 @@ interface CountdownProps {
   expired: boolean
   expiringSoon: boolean
   hasKey: boolean
+  onRegenerate?: () => void
 }
 
-function Countdown({ remaining, expired, expiringSoon, hasKey }: CountdownProps) {
+function Countdown({ remaining, expired, expiringSoon, hasKey, onRegenerate }: CountdownProps) {
   if (!hasKey) {
     return (
       <div className="text-xs text-text-muted">
@@ -85,10 +90,21 @@ function Countdown({ remaining, expired, expiringSoon, hasKey }: CountdownProps)
   }
   if (expired) {
     return (
-      <span className="inline-flex items-center gap-1.5 text-xs font-medium text-danger bg-danger/10 border border-danger/30 rounded-full px-2.5 py-1">
-        <span className="w-2 h-2 rounded-full bg-danger" />
-        Expired
-      </span>
+      <div className="flex items-center gap-2 flex-wrap">
+        <span className="inline-flex items-center gap-1.5 text-xs font-medium text-warning bg-warning/10 border border-warning/30 rounded-full px-2.5 py-1">
+          <span className="w-2 h-2 rounded-full bg-warning" />
+          OTK expired
+        </span>
+        {onRegenerate && (
+          <button
+            type="button"
+            onClick={onRegenerate}
+            className="text-xs font-medium text-accent hover:text-accent-hover transition-colors"
+          >
+            Generate new OTK →
+          </button>
+        )}
+      </div>
     )
   }
   const m = Math.floor(remaining / 60)
