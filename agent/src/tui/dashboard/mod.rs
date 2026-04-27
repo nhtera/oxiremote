@@ -3,6 +3,12 @@
 // hotkey panel. Subscribes to the event bus so tunnel/device/OTK state updates
 // live-refresh without polling.
 
+pub(super) mod render_footer;
+pub(super) mod render_header;
+pub(super) mod render_info;
+pub(super) mod render_logs;
+pub(super) mod render_qr;
+
 use std::io;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -10,53 +16,57 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
-use qrcode::{QrCode, render::unicode};
 use ratatui::{
     Terminal,
     backend::CrosstermBackend,
-    layout::{Alignment, Constraint, Direction, Layout, Rect},
+    layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Paragraph, Wrap},
 };
 
 use super::approval;
 use crate::events::{AgentEvent, EventBus, StepStatus, TunnelStep};
 use crate::{approval as approval_db, one_time_keys};
 
+use render_footer::{render_footer, render_onboarding_hint};
+use render_header::{render_compact_header, render_header};
+use render_info::render_info_panel;
+use render_logs::render_logs;
+use render_qr::render_qr_panel;
+
 type Term = Terminal<CrosstermBackend<io::Stdout>>;
 
-struct State {
-    db_path: PathBuf,
-    tunnel_url: Option<String>,
+pub(super) struct State {
+    pub(super) db_path: PathBuf,
+    pub(super) tunnel_url: Option<String>,
     /// Set to `Some(reason)` when `TunnelDown` fires; renders the tunnel step
     /// red and shows "tunnel down" instead of the URL.
-    tunnel_down: Option<String>,
-    steps: Vec<super::step_progress::Step>,
-    connected_devices: usize,
-    last_log: Option<String>,
+    pub(super) tunnel_down: Option<String>,
+    pub(super) steps: Vec<super::step_progress::Step>,
+    pub(super) connected_devices: usize,
+    pub(super) last_log: Option<String>,
     /// Last few HEAD-probe attempts; rendered as a tiny streaming console
     /// while the tunnel is up but health-check hasn't passed yet.
-    probe_log: Vec<ProbeEntry>,
-    otk_token: Option<String>,
-    otk_expires_at: Option<i64>,
+    pub(super) probe_log: Vec<ProbeEntry>,
+    pub(super) otk_token: Option<String>,
+    pub(super) otk_expires_at: Option<i64>,
     /// Toggles whether the body shows the QR + info panel or the recent log
     /// stream. `l` keypress flips it.
-    show_logs: bool,
-    log_history: Vec<String>,
+    pub(super) show_logs: bool,
+    pub(super) log_history: Vec<String>,
     /// Braille spinner frame index (0..=9), advanced once per redraw tick.
-    spinner_frame: u8,
+    pub(super) spinner_frame: u8,
     /// Transient one-line status message — rendered in the footer for ~3 s
     /// after a hotkey action like "Copied URL" or "OTK regenerated".
-    flash: Option<(String, SystemTime)>,
+    pub(super) flash: Option<(String, SystemTime)>,
 }
 
 #[derive(Clone)]
-struct ProbeEntry {
-    attempt: u32,
-    status: String,
-    ok: bool,
-    elapsed_ms: u64,
+pub(super) struct ProbeEntry {
+    pub(super) attempt: u32,
+    pub(super) status: String,
+    pub(super) ok: bool,
+    pub(super) elapsed_ms: u64,
 }
 
 const PROBE_LOG_MAX: usize = 6;
@@ -106,7 +116,7 @@ impl State {
     /// (HealthProbe → we're already past Tunneling) so a TUI that joined the
     /// bus mid-startup recovers consistent state instead of leaving earlier
     /// rows visually stuck on whatever they were initialized to.
-    fn cascade_done_through(&mut self, last_done_name: &str) {
+    pub(super) fn cascade_done_through(&mut self, last_done_name: &str) {
         let names = ["Preparing", "Connecting", "Tunneling", "Verifying", "Ready"];
         let upto = match names.iter().position(|&n| n == last_done_name) {
             Some(i) => i,
@@ -120,7 +130,7 @@ impl State {
         }
     }
 
-    fn ready_verifying(&self) -> bool {
+    pub(super) fn ready_verifying(&self) -> bool {
         self.steps
             .iter()
             .find(|s| s.name == "Ready")
@@ -133,7 +143,7 @@ impl State {
     /// onboarding view (step checklist only). A post-Ready `TunnelDown`
     /// flips this back to false so the onboarding view re-renders with the
     /// failure surfaced inline on the checklist.
-    fn is_ready(&self) -> bool {
+    pub(super) fn is_ready(&self) -> bool {
         self.tunnel_down.is_none()
             && self
                 .steps
@@ -145,7 +155,7 @@ impl State {
     /// step's sub-text or, if everything is Pending, a generic hint. Rendered
     /// in the onboarding footer so the operator sees live progress without
     /// the QR pane (QR is unscannable until Ready).
-    fn onboarding_hint(&self) -> String {
+    pub(super) fn onboarding_hint(&self) -> String {
         if let Some(reason) = &self.tunnel_down {
             return format!("tunnel down: {}", reason.chars().take(60).collect::<String>());
         }
@@ -173,11 +183,11 @@ impl State {
         }
     }
 
-    fn set_flash(&mut self, msg: impl Into<String>) {
+    pub(super) fn set_flash(&mut self, msg: impl Into<String>) {
         self.flash = Some((msg.into(), SystemTime::now()));
     }
 
-    fn current_flash(&self) -> Option<&str> {
+    pub(super) fn current_flash(&self) -> Option<&str> {
         self.flash.as_ref().and_then(|(msg, ts)| {
             let elapsed = SystemTime::now().duration_since(*ts).unwrap_or_default();
             if elapsed < FLASH_TTL { Some(msg.as_str()) } else { None }
@@ -222,9 +232,7 @@ impl State {
                     ),
                     TunnelStep::Failed => {
                         // Mark the currently-active step as failed by setting sub text.
-                        let why = reason
-                            .clone()
-                            .unwrap_or_else(|| "unknown error".into());
+                        let why = reason.clone().unwrap_or_else(|| "unknown error".into());
                         for s in &mut self.steps {
                             if matches!(s.status, StepStatus::Active) {
                                 s.sub = Some(format!("failed: {why}"));
@@ -296,7 +304,8 @@ impl State {
                     }
                 }
                 if *ok
-                    && let Some(s) = self.steps.iter_mut().find(|s| s.name == "Ready") {
+                    && let Some(s) = self.steps.iter_mut().find(|s| s.name == "Ready")
+                {
                     s.status = StepStatus::Done;
                     s.sub = Some("waiting for devices".into());
                 }
@@ -314,7 +323,9 @@ impl State {
                     self.log_history.remove(0);
                 }
             }
-            AgentEvent::OtkIssued { .. } | AgentEvent::OtkUsed { .. } | AgentEvent::OtkExpired { .. } => {
+            AgentEvent::OtkIssued { .. }
+            | AgentEvent::OtkUsed { .. }
+            | AgentEvent::OtkExpired { .. } => {
                 self.refresh_otk_from_db();
             }
             AgentEvent::TunnelDown { reason, recovery_hint } => {
@@ -329,7 +340,10 @@ impl State {
                 // The Tunneling step is the most appropriate anchor.
                 if let Some(s) = self.steps.iter_mut().find(|s| s.name == "Tunneling") {
                     s.status = StepStatus::Active; // reuse Active coloring for dead state
-                    s.sub = Some(format!("tunnel down: {}", reason.chars().take(40).collect::<String>()));
+                    s.sub = Some(format!(
+                        "tunnel down: {}",
+                        reason.chars().take(40).collect::<String>()
+                    ));
                 }
                 // Reset downstream steps to Pending so the checklist looks consistent.
                 for name in ["Verifying", "Ready"] {
@@ -346,7 +360,7 @@ impl State {
     /// Combine tunnel URL + active OTK into the deep-link the QR encodes.
     /// Mirrors `pairing-card.tsx` so a phone scan reaches /login with `k=`
     /// pre-filled and submits without keyboard typing.
-    fn qr_payload(&self) -> String {
+    pub(super) fn qr_payload(&self) -> String {
         match (&self.tunnel_url, &self.otk_token) {
             (Some(url), Some(otk)) => {
                 format!("{}/login?k={}", url.trim_end_matches('/'), otk)
@@ -425,27 +439,34 @@ pub fn run_dashboard(term: &mut Term, event_bus: Arc<EventBus>, db_path: PathBuf
                     },
                     None => state.set_flash("No active key — press r to generate"),
                 },
-                KeyCode::Char('r') => match one_time_keys::generate_otk(&state.db_path, None) {
-                    Ok(rec) => {
-                        let prefix: String = rec.token.chars().take(4).collect();
-                        event_bus.send(AgentEvent::OtkIssued { token_prefix: prefix });
-                        state.otk_token = Some(rec.token);
-                        state.otk_expires_at = Some(rec.expires_at);
-                        state.set_flash("Regenerated one-time key");
+                KeyCode::Char('r') => {
+                    match one_time_keys::generate_otk(&state.db_path, None) {
+                        Ok(rec) => {
+                            let prefix: String = rec.token.chars().take(4).collect();
+                            event_bus.send(AgentEvent::OtkIssued { token_prefix: prefix });
+                            state.otk_token = Some(rec.token);
+                            state.otk_expires_at = Some(rec.expires_at);
+                            state.set_flash("Regenerated one-time key");
+                        }
+                        Err(err) => state.set_flash(format!("OTK error: {err}")),
                     }
-                    Err(err) => state.set_flash(format!("OTK error: {err}")),
-                },
+                }
                 KeyCode::Char('a') => match approval_db::list_pending(&state.db_path) {
                     Ok(devices) => match devices.first() {
-                        Some(dev) => match approval_db::approve_device(&state.db_path, &dev.device_id) {
-                            Ok(()) => {
-                                event_bus.send(AgentEvent::DeviceApproved {
-                                    device_id: dev.device_id.clone(),
-                                });
-                                state.set_flash(format!("Approved {}", short_id(&dev.device_id)));
+                        Some(dev) => {
+                            match approval_db::approve_device(&state.db_path, &dev.device_id) {
+                                Ok(()) => {
+                                    event_bus.send(AgentEvent::DeviceApproved {
+                                        device_id: dev.device_id.clone(),
+                                    });
+                                    state.set_flash(format!(
+                                        "Approved {}",
+                                        short_id(&dev.device_id)
+                                    ));
+                                }
+                                Err(err) => state.set_flash(format!("Approve failed: {err}")),
                             }
-                            Err(err) => state.set_flash(format!("Approve failed: {err}")),
-                        },
+                        }
                         None => state.set_flash("No pending devices"),
                     },
                     Err(err) => state.set_flash(format!("List failed: {err}")),
@@ -469,7 +490,7 @@ fn short_id(id: &str) -> String {
 /// the menu, so early events go to /dev/null). Stops at the first
 /// whitespace, paren, or quote so suffixes like "(probe inconclusive)"
 /// don't end up in the URL.
-fn extract_tunnel_url(info: &str) -> Option<String> {
+pub(super) fn extract_tunnel_url(info: &str) -> Option<String> {
     let start = info.find("https://")?;
     let tail = &info[start..];
     let end = tail
@@ -488,6 +509,40 @@ fn copy_to_clipboard(value: &str) -> Result<()> {
     cb.set_text(value.to_string())?;
     Ok(())
 }
+
+// --- Shared helpers used by multiple render submodules ---
+
+pub(super) fn now_secs() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+pub(super) fn kv<'a>(k: &'a str, v: &'a str) -> Line<'a> {
+    kv_styled(k, v, Style::default().fg(Color::White))
+}
+
+pub(super) fn kv_styled<'a>(k: &'a str, v: &'a str, value_style: Style) -> Line<'a> {
+    Line::from(vec![
+        Span::styled(format!("  {:<20}", k), Style::default().fg(Color::DarkGray)),
+        Span::styled(v, value_style),
+    ])
+}
+
+pub(super) fn action_line<'a>(key: &'a str, label: &'a str) -> Line<'a> {
+    Line::from(vec![
+        Span::styled(
+            format!("  {key}  "),
+            Style::default()
+                .fg(super::step_progress::BRAND)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(label, Style::default().fg(Color::Gray)),
+    ])
+}
+
+// --- Draw dispatch ---
 
 fn draw(f: &mut ratatui::Frame<'_>, state: &State) {
     if state.is_ready() {
@@ -576,102 +631,14 @@ fn draw_onboarding(f: &mut ratatui::Frame<'_>, state: &State) {
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(header_h), // step checklist
-            Constraint::Min(0),            // hint area (large spacer; centers the message)
-            Constraint::Length(2),         // probe-info / hint footer
-            Constraint::Length(2),         // bottom spacer
+            Constraint::Min(0),           // hint area (large spacer; centers the message)
+            Constraint::Length(2),        // probe-info / hint footer
+            Constraint::Length(2),        // bottom spacer
         ])
         .split(area);
 
     render_header(f, outer[0], state, wide);
     render_onboarding_hint(f, outer[2], state);
-}
-
-fn render_onboarding_hint(f: &mut ratatui::Frame<'_>, area: Rect, state: &State) {
-    let hint = state.onboarding_hint();
-    let color = if state.tunnel_down.is_some() {
-        Color::Red
-    } else {
-        super::step_progress::BRAND
-    };
-    let para = Paragraph::new(Line::from(Span::styled(
-        hint,
-        Style::default().fg(color).add_modifier(Modifier::BOLD),
-    )))
-    .alignment(Alignment::Center)
-    .wrap(Wrap { trim: true });
-    f.render_widget(para, area);
-}
-
-fn render_header(f: &mut ratatui::Frame<'_>, area: Rect, state: &State, wide: bool) {
-    let block = Block::default()
-        .borders(Borders::BOTTOM)
-        .border_style(Style::default().fg(Color::DarkGray))
-        .title(Line::from(vec![
-            Span::styled("  ", Style::default()),
-            Span::styled(
-                "OxiRemote",
-                Style::default()
-                    .fg(super::step_progress::BRAND)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled("  ", Style::default()),
-            Span::styled(
-                if state.is_ready() { "host" } else { "setting up connection" },
-                Style::default().fg(Color::DarkGray),
-            ),
-            Span::raw("  "),
-        ]));
-    f.render_widget(block, area);
-
-    let inner = Rect {
-        x: area.x + 1,
-        y: area.y + 1,
-        width: area.width.saturating_sub(2),
-        height: area.height.saturating_sub(2),
-    };
-
-    if wide {
-        // Full 5-step checklist.
-        super::step_progress::render_steps(f, inner, &state.steps, state.spinner_frame);
-    } else {
-        // Narrow terminal — compact 3-row summary: Server | Tunnel | Ready.
-        let compact: Vec<_> = state
-            .steps
-            .iter()
-            .filter(|s| matches!(s.name.as_str(), "Preparing" | "Tunneling" | "Ready"))
-            .collect();
-        super::step_progress::render_steps_refs(f, inner, &compact, state.spinner_frame);
-    }
-}
-
-/// Single-line header shown once the tunnel is Ready.
-/// Format: `● OxiRemote  ·  <url>` where URL is truncated with ellipsis if needed.
-fn render_compact_header(f: &mut ratatui::Frame<'_>, area: Rect, state: &State) {
-    let url_raw = state
-        .tunnel_url
-        .as_deref()
-        .unwrap_or("—");
-
-    // Prefix spans: green dot + brand name + dim separator
-    let prefix_spans = vec![
-        Span::styled("● ", Style::default().fg(Color::Rgb(74, 222, 128)).add_modifier(Modifier::BOLD)),
-        Span::styled("OxiRemote", Style::default().fg(super::step_progress::BRAND).add_modifier(Modifier::BOLD)),
-        Span::styled("  ·  ", Style::default().fg(Color::DarkGray).add_modifier(Modifier::DIM)),
-    ];
-    // "● " (2) + "OxiRemote" (9) + "  ·  " (5) = 16 chars prefix width
-    let prefix_w: usize = 16;
-    let avail = (area.width as usize).saturating_sub(prefix_w);
-
-    let url_display = if url_raw.len() > avail && avail > 3 {
-        format!("{}…", &url_raw[..avail.saturating_sub(1)])
-    } else {
-        url_raw.to_string()
-    };
-
-    let mut spans = prefix_spans;
-    spans.push(Span::styled(url_display, Style::default().fg(Color::White)));
-
-    f.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
 fn render_body(f: &mut ratatui::Frame<'_>, area: Rect, state: &State) {
@@ -682,275 +649,6 @@ fn render_body(f: &mut ratatui::Frame<'_>, area: Rect, state: &State) {
 
     render_qr_panel(f, halves[0], state);
     render_info_panel(f, halves[1], state);
-}
-
-fn render_qr_panel(f: &mut ratatui::Frame<'_>, area: Rect, state: &State) {
-    // Determine OTK expiry for dim styling.
-    let otk_expired = match state.otk_expires_at {
-        Some(exp) => now_secs() >= exp,
-        None => false,
-    };
-
-    let title = if otk_expired { " Pair a device (key expired — press r) " } else { " Pair a device " };
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::DarkGray))
-        .title(title);
-    let inner = block.inner(area);
-    f.render_widget(block, area);
-
-    if state.tunnel_url.is_none() {
-        // Tunnel not yet ready — show a placeholder instead of passing the
-        // fallback string into QrCode::new(), which would render garbage.
-        let placeholder = Paragraph::new("Tunnel not ready yet\u{2026}")
-            .alignment(Alignment::Center)
-            .style(Style::default().fg(Color::DarkGray));
-        f.render_widget(placeholder, inner);
-        return;
-    }
-
-    // Reserve 3 rows at the bottom for the App URL + Key sidecar so users
-    // without a QR scanner can still read the URL/token directly. QR sits
-    // above; sidecar below. 3 rows = blank separator + URL + Key lines.
-    let sidecar_h: u16 = 3;
-    let layout = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Min(0), Constraint::Length(sidecar_h)])
-        .split(inner);
-    let qr_area = layout[0];
-    let sidecar_area = layout[1];
-
-    let payload = state.qr_payload();
-    let body = match QrCode::new(payload.as_bytes()) {
-        Ok(code) => code
-            .render::<unicode::Dense1x2>()
-            .dark_color(unicode::Dense1x2::Light)
-            .light_color(unicode::Dense1x2::Dark)
-            .quiet_zone(false)
-            .build(),
-        Err(_) => payload,
-    };
-
-    // Dim the QR when the OTK has expired — scanning it will fail anyway.
-    let qr_style = if otk_expired {
-        Style::default().add_modifier(Modifier::DIM)
-    } else {
-        Style::default()
-    };
-    let para = Paragraph::new(body).alignment(Alignment::Center).style(qr_style);
-    f.render_widget(para, qr_area);
-
-    render_qr_sidecar(f, sidecar_area, state, otk_expired);
-}
-
-/// Plain-text App URL + Key + expiry under the QR. Lets users without a
-/// scanner read the values directly (matches 9remote's onboarding pane).
-fn render_qr_sidecar(f: &mut ratatui::Frame<'_>, area: Rect, state: &State, otk_expired: bool) {
-    let url = state.tunnel_url.as_deref().unwrap_or("—");
-    let key_line = match (&state.otk_token, state.otk_expires_at) {
-        (Some(token), Some(expires_at)) => {
-            let remaining = expires_at - now_secs();
-            if remaining <= 0 {
-                format!("Key: {token}  (expired)")
-            } else {
-                let mins = remaining / 60;
-                let secs = remaining % 60;
-                format!("Key: {token}  (expires {mins:02}:{secs:02})")
-            }
-        }
-        _ => "Key: — (press r to generate)".into(),
-    };
-    let key_style = if otk_expired || state.otk_token.is_none() {
-        Style::default().fg(Color::DarkGray)
-    } else {
-        Style::default()
-            .fg(super::step_progress::BRAND)
-            .add_modifier(Modifier::BOLD)
-    };
-    let lines = vec![
-        Line::from(""),
-        Line::from(vec![
-            Span::styled("App URL: ", Style::default().fg(Color::DarkGray)),
-            Span::styled(url, Style::default().fg(super::step_progress::BRAND)),
-        ]),
-        Line::from(Span::styled(key_line, key_style)),
-    ];
-    f.render_widget(
-        Paragraph::new(lines).alignment(Alignment::Center).wrap(Wrap { trim: true }),
-        area,
-    );
-}
-
-fn render_info_panel(f: &mut ratatui::Frame<'_>, area: Rect, state: &State) {
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::DarkGray))
-        .title(" Host Info ");
-    let inner = block.inner(area);
-    f.render_widget(block, area);
-
-    let url = if state.tunnel_down.is_some() {
-        "tunnel down — connections will fail".to_string()
-    } else {
-        state.tunnel_url.clone().unwrap_or_else(|| "—".to_string())
-    };
-    let url_style = if state.tunnel_down.is_some() {
-        Style::default().fg(Color::Red)
-    } else {
-        Style::default().fg(Color::White)
-    };
-    let devices_str = state.connected_devices.to_string();
-    let otk_display = format_otk_status(state);
-    let mut lines = vec![
-        kv_styled("App URL", &url, url_style),
-        kv("One-Time Key", &otk_display),
-        kv("Connected Devices", &devices_str),
-    ];
-
-    // Surface the recovery hint (carried on TunnelDown event payload, baked
-    // into `tunnel_down` by State::apply) so the operator sees the actionable
-    // next step right where the failure is — not buried in the log view.
-    if let Some(reason) = &state.tunnel_down {
-        lines.push(Line::from(""));
-        lines.push(Line::from(Span::styled(
-            "Recovery",
-            Style::default()
-                .fg(super::step_progress::BRAND)
-                .add_modifier(Modifier::BOLD),
-        )));
-        lines.push(Line::from(Span::styled(
-            reason.clone(),
-            Style::default().fg(super::step_progress::BRAND),
-        )));
-    }
-
-    if state.ready_verifying() && !state.probe_log.is_empty() {
-        lines.push(Line::from(""));
-        lines.push(Line::from(Span::styled(
-            "Verifying tunnel…",
-            Style::default()
-                .fg(super::step_progress::BRAND)
-                .add_modifier(Modifier::BOLD),
-        )));
-        for entry in &state.probe_log {
-            let mark = if entry.ok { "✓" } else { " " };
-            let color = if entry.ok { Color::Green } else { Color::DarkGray };
-            lines.push(Line::from(vec![
-                Span::styled(format!("  {mark} #{:<3}", entry.attempt),
-                    Style::default().fg(color)),
-                Span::styled(format!("→ {} ", entry.status),
-                    Style::default().fg(Color::White)),
-                Span::styled(format!("({}ms)", entry.elapsed_ms),
-                    Style::default().fg(Color::DarkGray)),
-            ]));
-        }
-    }
-
-    let log_action_label = format!("Toggle log view ({} entries)", state.log_history.len());
-    lines.extend(vec![
-        Line::from(""),
-        Line::from(Span::styled(
-            "Actions",
-            Style::default()
-                .fg(super::step_progress::BRAND)
-                .add_modifier(Modifier::BOLD),
-        )),
-        action_line("c", "Copy tunnel URL"),
-        action_line("k", "Copy one-time key"),
-        action_line("r", "Regenerate one-time key"),
-        action_line("a", "Approve next pending device"),
-        action_line("l", &log_action_label),
-        action_line("o", "Open tunnel URL in browser"),
-        action_line("h", "Open host dashboard (/agent)"),
-        action_line("q", "Exit TUI"),
-    ]);
-    f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), inner);
-}
-
-fn render_logs(f: &mut ratatui::Frame<'_>, area: Rect, state: &State) {
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::DarkGray))
-        .title(" Recent logs (l to hide) ");
-    let inner = block.inner(area);
-    f.render_widget(block, area);
-
-    let lines: Vec<Line<'_>> = if state.log_history.is_empty() {
-        vec![Line::from(Span::styled(
-            "No log entries yet.",
-            Style::default().fg(Color::DarkGray),
-        ))]
-    } else {
-        state
-            .log_history
-            .iter()
-            .map(|m| Line::from(Span::styled(m.clone(), Style::default().fg(Color::White))))
-            .collect()
-    };
-    f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), inner);
-}
-
-fn format_otk_status(state: &State) -> String {
-    match (&state.otk_token, state.otk_expires_at) {
-        (Some(token), Some(expires_at)) => {
-            let now = now_secs();
-            let remaining = expires_at - now;
-            let last4: String = token.chars().rev().take(4).collect::<Vec<_>>().into_iter().rev().collect();
-            if remaining <= 0 {
-                format!("····{last4}  expired (press r)")
-            } else {
-                let mins = remaining / 60;
-                let secs = remaining % 60;
-                format!("····{last4}  expires in {mins:02}:{secs:02}")
-            }
-        }
-        _ => "— (press r to generate)".to_string(),
-    }
-}
-
-fn now_secs() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
-}
-
-fn render_footer(f: &mut ratatui::Frame<'_>, area: Rect, state: &State) {
-    // Flash takes precedence so the operator sees confirmation of their last
-    // hotkey press; falls back to the most recent log entry.
-    let text = match (state.current_flash(), state.last_log.as_ref()) {
-        (Some(flash), _) => format!(" {flash}"),
-        (None, Some(msg)) => format!(" {msg}"),
-        (None, None) => " OxiRemote is running. Keep this terminal open.".into(),
-    };
-    let para = Paragraph::new(text).style(Style::default().fg(Color::DarkGray));
-    f.render_widget(para, area);
-}
-
-fn kv<'a>(k: &'a str, v: &'a str) -> Line<'a> {
-    kv_styled(k, v, Style::default().fg(Color::White))
-}
-
-fn kv_styled<'a>(k: &'a str, v: &'a str, value_style: Style) -> Line<'a> {
-    Line::from(vec![
-        Span::styled(
-            format!("  {:<20}", k),
-            Style::default().fg(Color::DarkGray),
-        ),
-        Span::styled(v, value_style),
-    ])
-}
-
-fn action_line<'a>(key: &'a str, label: &'a str) -> Line<'a> {
-    Line::from(vec![
-        Span::styled(
-            format!("  {key}  "),
-            Style::default()
-                .fg(super::step_progress::BRAND)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(label, Style::default().fg(Color::Gray)),
-    ])
 }
 
 #[cfg(test)]
