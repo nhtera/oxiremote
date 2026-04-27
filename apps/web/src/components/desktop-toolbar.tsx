@@ -7,7 +7,7 @@ import { useEffect, useRef, useState } from 'react'
 import type { QualityTier, DesktopInputEvent } from '../hooks/use-desktop-session'
 import type { InputMode } from '../hooks/use-desktop-input'
 import DesktopSettingsPopover from './desktop-settings-popover'
-import StatusChip from './ui/status-chip'
+import { SettingsIcon } from './icons'
 
 interface Props {
   quality: QualityTier
@@ -50,19 +50,6 @@ const KEYS: KeyDef[] = [
   { label: '⌘', code: '', mod: 'meta' },
   { label: '✓', code: 'Enter' },    // green send button
 ]
-
-// Wire values stay low/med/high; copy uses the friendlier Smooth/Balanced/Crisp
-// labels so the user picks based on the trade-off, not the technical tier name.
-const QUALITY_OPTIONS: { value: QualityTier; label: string }[] = [
-  { value: 'low', label: 'Smooth' },
-  { value: 'med', label: 'Balanced' },
-  { value: 'high', label: 'Crisp' },
-]
-
-const PIPELINE_TOOLTIP: Record<'h264' | 'jpeg', string> = {
-  h264: 'H.264 video stream — smaller bandwidth, hardware-decoded when available.',
-  jpeg: 'JPEG tile stream — broader compatibility, more bandwidth.',
-}
 
 export default function DesktopToolbar({
   quality,
@@ -153,61 +140,10 @@ export default function DesktopToolbar({
 
   return (
     <div className="flex flex-col gap-2 p-2 bg-surface border-t border-border lg:border-t-0 lg:border-l lg:h-full lg:w-60 lg:p-3">
-      {/* Pipeline chip — tells the user which video path is active. */}
-      <div className="flex items-center justify-between gap-2">
-        <span className="text-xs text-text-muted">Pipeline</span>
-        <StatusChip
-          variant={pipeline === 'h264' ? 'info' : 'offline'}
-          noDot
-          title={PIPELINE_TOOLTIP[pipeline]}
-        >
-          {pipeline === 'h264' ? 'H.264' : 'JPEG'}
-        </StatusChip>
-      </div>
-
-      {/* Quality + display settings row — both about render output */}
-      <div className="flex items-center gap-2 min-w-0">
-        <label className="text-xs text-text-muted shrink-0">Quality</label>
-        <select
-          value={quality}
-          onChange={(e) => onQualityChange(e.target.value as QualityTier)}
-          className="flex-1 min-w-0 text-xs bg-surface border border-border rounded-md px-2 py-1 text-text-primary outline-none focus:border-accent/50"
-        >
-          {QUALITY_OPTIONS.map((o) => (
-            <option key={o.value} value={o.value}>
-              {o.label}
-            </option>
-          ))}
-        </select>
-
-        <div className="relative shrink-0" ref={settingsContainerRef}>
-          <button
-            onClick={() => setSettingsOpen((v) => !v)}
-            title="Display settings"
-            aria-label="Display settings"
-            aria-expanded={settingsOpen}
-            className={`text-xs px-2 py-1 border border-border rounded-md transition-colors ${
-              settingsOpen
-                ? 'bg-surface-hover text-text-primary'
-                : 'bg-surface-alt text-text-muted hover:text-text-primary hover:bg-surface-hover'
-            }`}
-          >
-            ⚙
-          </button>
-          {settingsOpen && (
-            <DesktopSettingsPopover
-              hidpi={hidpi}
-              smoothScaling={smoothScaling}
-              onChange={onSettingsChange}
-            />
-          )}
-        </div>
-      </div>
-
-      {/* Input mode + Aa text-batch + gesture help row.
-          Layout: [Touch/Trackpad toggle] [Aa] [?]
+      {/* Input mode + Aa text-batch + gesture help + display gear row.
+          Layout: [Touch/Trackpad toggle] [Aa] [?] [⚙]
           Aa is orange when the text-batch sheet is open.
-          ? is always rightmost. */}
+          ⚙ opens the Display popover (quality, pipeline, hidpi, scaling). */}
       <div className="flex items-center gap-2 min-w-0">
         <button
           onClick={onInputModeToggle}
@@ -246,6 +182,32 @@ export default function DesktopToolbar({
         >
           ?
         </button>
+
+        <div className="relative shrink-0" ref={settingsContainerRef}>
+          <button
+            onClick={() => setSettingsOpen((v) => !v)}
+            title="Display settings (quality, pipeline)"
+            aria-label="Display settings"
+            aria-expanded={settingsOpen}
+            className={`inline-flex items-center justify-center w-8 h-7 border border-border rounded-md transition-colors ${
+              settingsOpen
+                ? 'bg-surface-hover text-text-primary'
+                : 'bg-surface-alt text-text-muted hover:text-text-primary hover:bg-surface-hover'
+            }`}
+          >
+            <SettingsIcon size={14} />
+          </button>
+          {settingsOpen && (
+            <DesktopSettingsPopover
+              hidpi={hidpi}
+              smoothScaling={smoothScaling}
+              onChange={onSettingsChange}
+              quality={quality}
+              onQualityChange={onQualityChange}
+              pipeline={pipeline}
+            />
+          )}
+        </div>
       </div>
 
       {/* 8-button key row */}
