@@ -16,10 +16,10 @@ use uuid::Uuid;
 
 use crate::auth::{
     bind_session_to_device_tx, clear_stale_pairing_attempts, client_ip_key,
-    is_valid_pairing_attempt, issue_api_key_tx, list_trusted_devices, random_device_id, rate_limit_key,
-    require_active_auth, require_auth, revoke_device, sanitize_device_label,
-    should_allow_pairing_attempt, sign_session, touch_session_and_device, new_pairing_code,
-    PAIRING_TTL_SECS, SESSION_TTL_SECS,
+    is_valid_pairing_attempt, issue_api_key_tx, list_trusted_devices, platform_from_ua,
+    random_device_id, rate_limit_key, require_active_auth, require_auth, revoke_device,
+    sanitize_device_label, should_allow_pairing_attempt, sign_session, touch_session_and_device,
+    new_pairing_code, verify_permanent_key, PAIRING_TTL_SECS, SESSION_TTL_SECS,
 };
 use crate::db::now_ts;
 use crate::{approval, one_time_keys};
@@ -48,9 +48,21 @@ pub fn create_pairing_code(state: &AppState) -> anyhow::Result<StartPairingRespo
 }
 
 
+/// Request body for POST /api/pairing/exchange.
+///
+/// Exactly one of `code` or `permanent_key` must be present and non-empty.
+/// Supplying both or neither returns 400.
+///
+/// Schema:
+/// ```json
+/// { "code": "ABCDEFGH", "device_label": "iPhone 15" }
+/// // OR
+/// { "permanent_key": "sk-...", "device_label": "iPhone 15" }
+/// ```
 #[derive(Deserialize)]
 pub struct ExchangePairingRequest {
-    code: String,
+    code: Option<String>,
+    permanent_key: Option<String>,
     device_label: Option<String>,
 }
 
@@ -60,23 +72,75 @@ pub async fn api_pairing_exchange(
     jar: CookieJar,
     Json(req): Json<ExchangePairingRequest>,
 ) -> impl IntoResponse {
-    let code = req.code.trim().to_uppercase();
+    let code_val = req.code.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    let pkey_val = req.permanent_key.as_deref().map(str::trim).filter(|s| !s.is_empty());
+
+    // Exactly one credential must be provided.
+    match (code_val, pkey_val) {
+        (Some(_), Some(_)) | (None, None) => {
+            return StatusCode::BAD_REQUEST.into_response();
+        }
+        _ => {}
+    }
+
+    let user_agent = headers.get("user-agent").and_then(|v| v.to_str().ok());
+    let platform = user_agent.and_then(platform_from_ua);
+    let label = sanitize_device_label(req.device_label.as_deref(), user_agent);
+    let ip = client_ip_key(&headers);
+    let auto_approve = approval::get_auto_approve(&state.db_path);
+    let approval_status = if auto_approve { "approved" } else { "pending" };
+
+    if let Some(pkey) = pkey_val {
+        // --- Permanent-key path ---
+        let pkey_owned = pkey.to_string();
+        let db_path = state.db_path.clone();
+        // Argon2id is CPU-intensive; run on the blocking thread pool.
+        let valid = tokio::task::spawn_blocking(move || verify_permanent_key(&db_path, &pkey_owned))
+            .await
+            .unwrap_or(false);
+        if !valid {
+            return StatusCode::UNAUTHORIZED.into_response();
+        }
+
+        let res: anyhow::Result<(String, String, String, String)> = (|| {
+            let mut conn = Connection::open(&state.db_path)?;
+            let tx = conn.transaction()?;
+            let now = now_ts();
+            let session_id = Uuid::new_v4().to_string();
+            let device_id = random_device_id();
+            tx.execute(
+                "INSERT INTO sessions(session_id, created_at, last_seen_at, device_id) VALUES (?1, ?2, ?2, ?3)",
+                params![session_id, now, device_id],
+            )?;
+            approval::insert_device_with_approval_tx(
+                &tx,
+                &device_id,
+                &label,
+                user_agent,
+                &ip,
+                approval_status,
+                platform.as_deref(),
+            )?;
+            bind_session_to_device_tx(&tx, &session_id, &device_id)?;
+            let (api_key, api_key_last4) = issue_api_key_tx(&tx, &device_id)?;
+            tx.commit()?;
+            Ok((session_id, device_id, api_key, api_key_last4))
+        })();
+
+        return build_pairing_response(res, &state, jar, auto_approve, approval_status, &ip, user_agent);
+    }
+
+    // --- OTK / pairing-code path (unchanged) ---
+    let code = code_val.unwrap().to_uppercase();
     if !is_valid_pairing_attempt(&code) {
         return StatusCode::BAD_REQUEST.into_response();
     }
 
     clear_stale_pairing_attempts(&state.pairing_attempts, 60);
-    let ip = client_ip_key(&headers);
     let rate_key = rate_limit_key(&ip, &code);
     if !should_allow_pairing_attempt(&state.pairing_attempts, &rate_key, 5, 60) {
         return (StatusCode::TOO_MANY_REQUESTS, "too many pairing attempts").into_response();
     }
-
-    let user_agent = headers.get("user-agent").and_then(|v| v.to_str().ok());
-    let label = sanitize_device_label(req.device_label.as_deref(), user_agent);
-    let ip = client_ip_key(&headers);
-    let auto_approve = approval::get_auto_approve(&state.db_path);
-    let approval_status = if auto_approve { "approved" } else { "pending" };
 
     // Atomic pairing exchange. All five writes (consume code, insert device,
     // insert session, bind session, issue api key) live inside one txn so a
@@ -127,6 +191,7 @@ pub async fn api_pairing_exchange(
             user_agent,
             &ip,
             approval_status,
+            platform.as_deref(),
         )?;
         bind_session_to_device_tx(&tx, &session_id, &device_id)?;
         let (api_key, api_key_last4) = issue_api_key_tx(&tx, &device_id)?;
@@ -135,6 +200,19 @@ pub async fn api_pairing_exchange(
         Ok((session_id, device_id, api_key, api_key_last4))
     })();
 
+    build_pairing_response(res, &state, jar, auto_approve, approval_status, &ip, user_agent)
+}
+
+/// Shared response builder for both the pairing-code and permanent-key paths.
+fn build_pairing_response(
+    res: anyhow::Result<(String, String, String, String)>,
+    state: &crate::AppState,
+    jar: CookieJar,
+    auto_approve: bool,
+    approval_status: &str,
+    ip: &str,
+    user_agent: Option<&str>,
+) -> axum::response::Response {
     match res {
         Ok((session_id, device_id, api_key, api_key_last4)) => {
             let cookie_value = sign_session(&state.signing_key, &session_id);
@@ -147,12 +225,12 @@ pub async fn api_pairing_exchange(
                 .build();
 
             // When pending, emit DevicePending so the TUI/dashboard approval
-            // queue shows the code-paired device alongside OTK-paired ones.
+            // queue shows the paired device.
             if !auto_approve {
                 let first_seen = crate::db::now_ts();
                 state.event_bus.send(crate::events::AgentEvent::DevicePending {
                     device_id: device_id.clone(),
-                    ip: ip.clone(),
+                    ip: ip.to_string(),
                     ua_parsed: user_agent.unwrap_or("").to_string(),
                     first_seen,
                 });
@@ -178,10 +256,9 @@ pub async fn api_pairing_exchange(
                 .into_response()
         }
         Err(err) => {
-            // Code-validation failures (not found / used / expired) stay 401
-            // so the SPA shows the same "invalid code" message as before.
-            // Insert/hash failures inside the txn surface as 500 — txn rolled
-            // back, code is still consumable for retry.
+            // Code-validation failures (not found / used / expired) stay 401.
+            // Insert/hash failures surface as 500 — txn rolled back, credential
+            // is still usable for retry.
             let msg = err.to_string();
             let code_invalid = msg.contains("code");
             warn!(error=%err, "pairing exchange failed");
@@ -324,6 +401,7 @@ pub async fn api_login_one_time(
     let ip = client_ip_key(&headers);
     let ua_str = user_agent.unwrap_or("").to_string();
     let label = sanitize_device_label(None, user_agent);
+    let platform = user_agent.and_then(platform_from_ua);
     let auto_approve = approval::get_auto_approve(&state.db_path);
     let approval_status = if auto_approve { "approved" } else { "pending" };
 
@@ -357,6 +435,7 @@ pub async fn api_login_one_time(
             user_agent,
             &ip,
             approval_status,
+            platform.as_deref(),
         ).map_err(OtkErr::Other)?;
 
         bind_session_to_device_tx(&tx, &session_id, &device_id).map_err(OtkErr::Other)?;
@@ -649,10 +728,11 @@ mod tests {
     #[test]
     fn exchange_request_accepts_optional_label() {
         let req = ExchangePairingRequest {
-            code: "ABC123".into(),
+            code: Some("ABC123".into()),
+            permanent_key: None,
             device_label: Some("My iPhone".into()),
         };
-        assert_eq!(req.code, "ABC123");
+        assert_eq!(req.code.as_deref(), Some("ABC123"));
         assert_eq!(req.device_label.as_deref(), Some("My iPhone"));
     }
 
@@ -679,7 +759,8 @@ mod tests {
             headers.clone(),
             CookieJar::new(),
             Json(ExchangePairingRequest {
-                code: pairing.code.clone(),
+                code: Some(pairing.code.clone()),
+                permanent_key: None,
                 device_label: Some("My Phone".into()),
             }),
         )
@@ -694,7 +775,8 @@ mod tests {
             headers,
             CookieJar::new(),
             Json(ExchangePairingRequest {
-                code: pairing.code,
+                code: Some(pairing.code),
+                permanent_key: None,
                 device_label: None,
             }),
         )
@@ -720,7 +802,8 @@ mod tests {
             HeaderMap::new(),
             CookieJar::new(),
             Json(ExchangePairingRequest {
-                code: "EXPIRED1".into(),
+                code: Some("EXPIRED1".into()),
+                permanent_key: None,
                 device_label: None,
             }),
         )
@@ -755,7 +838,8 @@ mod tests {
             headers,
             CookieJar::new(),
             Json(ExchangePairingRequest {
-                code: pairing.code,
+                code: Some(pairing.code),
+                permanent_key: None,
                 device_label: Some("Test Phone".into()),
             }),
         )
@@ -805,7 +889,8 @@ mod tests {
             HeaderMap::new(),
             CookieJar::new(),
             Json(ExchangePairingRequest {
-                code: pairing.code,
+                code: Some(pairing.code),
+                permanent_key: None,
                 device_label: None,
             }),
         )
@@ -891,7 +976,8 @@ mod tests {
             HeaderMap::new(),
             CookieJar::new(),
             Json(ExchangePairingRequest {
-                code: pairing.code,
+                code: Some(pairing.code),
+                permanent_key: None,
                 device_label: None,
             }),
         )
@@ -926,7 +1012,7 @@ mod tests {
                     State(s1),
                     HeaderMap::new(),
                     CookieJar::new(),
-                    Json(ExchangePairingRequest { code: code1, device_label: None }),
+                    Json(ExchangePairingRequest { code: Some(code1), permanent_key: None, device_label: None }),
                 )
                 .await
                 .into_response()
@@ -937,7 +1023,7 @@ mod tests {
                     State(s2),
                     HeaderMap::new(),
                     CookieJar::new(),
-                    Json(ExchangePairingRequest { code: code2, device_label: None }),
+                    Json(ExchangePairingRequest { code: Some(code2), permanent_key: None, device_label: None }),
                 )
                 .await
                 .into_response()
@@ -947,6 +1033,143 @@ mod tests {
 
         let successes = [r1, r2].iter().filter(|s| s.is_success()).count();
         assert_eq!(successes, 1, "exactly one concurrent exchange must succeed; got r1={r1}, r2={r2}");
+    }
+
+    // ── Permanent-key pairing tests ──────────────────────────────────────────
+
+    /// Helper: mint a permanent key and store it in the given test DB.
+    fn setup_permanent_key(db_path: &std::path::PathBuf) -> String {
+        let (key, _last4, _created_at) = crate::auth::rotate_permanent_key(db_path).unwrap();
+        key
+    }
+
+    #[tokio::test]
+    async fn pairing_exchange_with_permanent_key_succeeds() {
+        let state = test_state("pkey-success");
+        // Enable auto_approve for a clean 200 path.
+        let conn = Connection::open(&state.db_path).unwrap();
+        conn.execute(
+            "INSERT INTO settings(key, value) VALUES ('auto_approve', 'true')
+             ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        let pkey = setup_permanent_key(&state.db_path);
+
+        let resp = api_pairing_exchange(
+            State(state.clone()),
+            HeaderMap::new(),
+            CookieJar::new(),
+            Json(ExchangePairingRequest {
+                code: None,
+                permanent_key: Some(pkey),
+                device_label: Some("Permanent Key Device".into()),
+            }),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+        assert_eq!(body["ok"], true);
+        assert!(body["api_key"].is_string());
+        assert!(body["device_id"].is_string());
+        assert_eq!(body["approval_status"], "approved");
+    }
+
+    #[tokio::test]
+    async fn pairing_exchange_with_wrong_permanent_key_rejected() {
+        let state = test_state("pkey-reject");
+        // Mint a real key so there is a hash in the DB — wrong key should still fail.
+        let _ = setup_permanent_key(&state.db_path);
+
+        let resp = api_pairing_exchange(
+            State(state),
+            HeaderMap::new(),
+            CookieJar::new(),
+            Json(ExchangePairingRequest {
+                code: None,
+                permanent_key: Some("sk-wrongkeyvalue".into()),
+                device_label: None,
+            }),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn pairing_exchange_with_both_code_and_permanent_key_rejected_400() {
+        let state = test_state("pkey-both");
+        let pairing = create_pairing_code(state.as_ref()).unwrap();
+
+        let resp = api_pairing_exchange(
+            State(state),
+            HeaderMap::new(),
+            CookieJar::new(),
+            Json(ExchangePairingRequest {
+                code: Some(pairing.code),
+                permanent_key: Some("sk-something".into()),
+                device_label: None,
+            }),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn pairing_exchange_with_permanent_key_populates_platform_from_ua() {
+        let state = test_state("pkey-platform");
+        let conn = Connection::open(&state.db_path).unwrap();
+        conn.execute(
+            "INSERT INTO settings(key, value) VALUES ('auto_approve', 'true')
+             ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        let pkey = setup_permanent_key(&state.db_path);
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "user-agent",
+            HeaderValue::from_static("Mozilla/5.0 (iPhone; CPU iPhone OS 17_0)"),
+        );
+
+        let resp = api_pairing_exchange(
+            State(state.clone()),
+            headers,
+            CookieJar::new(),
+            Json(ExchangePairingRequest {
+                code: None,
+                permanent_key: Some(pkey),
+                device_label: None,
+            }),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+        let device_id = body["device_id"].as_str().unwrap();
+
+        let conn = Connection::open(&state.db_path).unwrap();
+        let platform: Option<String> = conn
+            .query_row(
+                "SELECT platform FROM trusted_devices WHERE device_id=?1",
+                params![device_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(platform.as_deref(), Some("ios"));
     }
 }
 
