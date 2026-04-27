@@ -78,3 +78,31 @@ body {
 @layer utilities {
   .pb-safe { padding-bottom: env(safe-area-inset-bottom, 0px); }
 }
+
+/* Normalize scrollbars to neutral dark tones — Safari otherwise paints them
+   in the user's accent color (often pink/magenta), which clashes with the
+   coral brand. Firefox uses the standard `scrollbar-color` property; WebKit
+   needs the `::-webkit-scrollbar*` pseudos. */
+* {
+  scrollbar-color: #2c2e38 transparent;
+  scrollbar-width: thin;
+}
+
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: #2c2e38;
+  border-radius: 8px;
+  border: 2px solid transparent;
+  background-clip: padding-box;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #3a3c47;
+  background-clip: padding-box;
+  border: 2px solid transparent;
+}

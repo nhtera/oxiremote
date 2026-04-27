@@ -14,7 +14,7 @@ export default function QrPanel({ tunnelUrl, qrPayload, otkActive, otkExpired }:
   const loginUrl = tunnelUrl ? `${tunnelUrl.replace(/\/$/, '')}/login` : null
 
   return (
-    <div className="flex flex-col items-center gap-3">
+    <div className="flex flex-col items-center gap-3 w-48 min-w-0">
       {!tunnelUrl ? (
         <div className="w-48 h-48 rounded-md border border-border bg-surface-alt flex items-center justify-center text-xs text-text-muted text-center px-3">
           Waiting for tunnel…
