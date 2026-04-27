@@ -161,3 +161,44 @@ fn kill_process(pid: i32, force: bool) -> bool {
         .map(|s| s.success())
         .unwrap_or(false)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Belt-and-braces against PID reuse: after a crash + reboot the agent's
+    /// pid file may point at a recycled PID owned by sshd / a build job /
+    /// the user's editor. `pid_is_oxiremote` MUST return false for those so
+    /// the kill path skips them.
+    #[test]
+    fn skips_kill_when_pid_belongs_to_other_process() {
+        // PID 1 is init/launchd — never our binary. The guard MUST reject
+        // it regardless of liveness check (on macOS unprivileged `kill -0 1`
+        // returns failure, but a privileged or recycled probe could pass).
+        assert!(
+            !pid_is_oxiremote(1),
+            "init/launchd must not be misidentified as oxiremote — \
+             would cause kill -TERM 1 attempts in the wild"
+        );
+
+        // The test harness binary is called `oxiremote-<hash>` (not bare
+        // `oxiremote`), so the guard correctly rejects our own PID too.
+        // Pinning this protects cargo tests from killing themselves on a
+        // hypothetical stale pid file pointing at the harness PID.
+        let me = std::process::id() as i32;
+        assert!(process_alive(me), "the test harness should see itself as alive");
+        assert!(
+            !pid_is_oxiremote(me),
+            "test harness binary should not match the bare `oxiremote` name"
+        );
+    }
+
+    /// A plainly-bogus PID must report as not-alive. Defensive — `kill -0` on
+    /// a free PID returns failure, so the guard short-circuits before
+    /// pid_is_oxiremote ever runs.
+    #[test]
+    fn process_alive_false_for_unused_pid() {
+        // 2^31 - 1 is the kernel max PID; no process should hold it.
+        assert!(!process_alive(i32::MAX));
+    }
+}

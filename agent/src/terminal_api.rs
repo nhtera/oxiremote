@@ -110,15 +110,10 @@ pub async fn api_terminal_sessions_create(
         return StatusCode::UNAUTHORIZED.into_response();
     };
 
-    // In-memory map is the source of truth: a PTY that died after spawn but
-    // before the DB row was marked `dead` would let the DB-count gate stay
-    // above the cap forever. The reader thread auto-removes from this map on
-    // PTY exit (see `spawn_terminal_session`), so this count tracks reality.
-    let existing = state
-        .terminal_sessions
-        .iter()
-        .filter(|s| s.value().owner_session_id == owner_session_id)
-        .count();
+    let existing = count_owned_sessions(
+        state.terminal_sessions.iter().map(|s| s.value().owner_session_id.clone()),
+        &owner_session_id,
+    );
 
     if existing >= MAX_TERMINAL_SESSIONS_PER_USER {
         return StatusCode::TOO_MANY_REQUESTS.into_response();
@@ -402,6 +397,20 @@ pub async fn api_terminal_session_rename(
 
 /// On agent boot, any DB row still marked `running` must be orphaned — the PTY
 /// process died with the previous agent. Mark them `dead` so the list endpoint
+/// Count live PTY sessions owned by `target`. Caller projects an iterator of
+/// owner ids from the in-memory `terminal_sessions` DashMap — that map is the
+/// source of truth (a PTY that died after spawn but before the DB row was
+/// marked `dead` would otherwise leave the DB count permanently over the
+/// cap). The reader thread auto-removes from this map on PTY exit (see
+/// `spawn_terminal_session`), so this count tracks reality.
+pub fn count_owned_sessions<S, I>(owner_ids: I, target: &str) -> usize
+where
+    S: AsRef<str>,
+    I: IntoIterator<Item = S>,
+{
+    owner_ids.into_iter().filter(|o| o.as_ref() == target).count()
+}
+
 /// and WS handler stay consistent without waiting for a subscriber to notice.
 pub fn reconcile_orphan_sessions(db_path: &Path) -> anyhow::Result<usize> {
     let conn = Connection::open(db_path)?;
@@ -411,4 +420,24 @@ pub fn reconcile_orphan_sessions(db_path: &Path) -> anyhow::Result<usize> {
         params![now],
     )?;
     Ok(n)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Pin: per-user cap gate counts from the iterator the caller supplies.
+    /// Production code wires that iterator to the in-memory DashMap, NOT a DB
+    /// query — a stale DB row from a crashed PTY would otherwise wedge a user
+    /// at the cap until manual cleanup.
+    #[test]
+    fn session_count_uses_inmemory_map() {
+        let owners = ["alice", "bob", "alice", "carol", "alice"];
+        assert_eq!(count_owned_sessions(owners.iter().copied(), "alice"), 3);
+        assert_eq!(count_owned_sessions(owners.iter().copied(), "bob"), 1);
+        assert_eq!(count_owned_sessions(owners.iter().copied(), "dave"), 0);
+        // Empty input — fresh process, no live PTYs yet.
+        let empty: [&str; 0] = [];
+        assert_eq!(count_owned_sessions(empty.iter().copied(), "alice"), 0);
+    }
 }
