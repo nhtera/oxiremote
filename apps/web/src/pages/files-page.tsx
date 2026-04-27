@@ -49,7 +49,7 @@ export default function FilesPage() {
       params.set('ws_id', String(wsId))
       if (path) params.set('path', path)
       // Opt in to the git-status overlay; agent skips it in non-git workspaces.
-      params.set('with_git', '1')
+      params.set('with_git', 'true')
       const res = await fetch(`/api/files/list?${params}`, { credentials: 'include' })
       if (!res.ok) {
         setError(await res.text())

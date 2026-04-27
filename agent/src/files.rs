@@ -136,7 +136,7 @@ struct FileEntry {
     size: u64,
     modified: i64,
     /// Single-letter porcelain status when the workspace is a git repo and
-    /// the client opted in via `with_git=1`. None when no overlay applies so
+    /// the client opted in via `with_git=true`. None when no overlay applies so
     /// non-git workspaces stay zero-cost.
     #[serde(skip_serializing_if = "Option::is_none")]
     git_status: Option<char>,
