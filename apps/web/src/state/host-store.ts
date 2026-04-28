@@ -1,4 +1,5 @@
 import { create } from 'zustand'
+import { isDiscoveryMode } from '../lib/discovery-client'
 
 type HostState = {
   currentHostId: string | null
@@ -17,6 +18,14 @@ export const useHostStore = create<HostState>((set) => ({
   error: null,
 
   fetchHost: async () => {
+    // In discovery mode the SPA origin (Pages) has no /api/host. The agent
+    // lives on the tunnel and Phase 4.5 will wire fetchHost to the saved
+    // tunnel base. Until then, no-op pre-pair so we don't trigger router
+    // redirect-loops via the 200-with-HTML SPA fallback.
+    if (isDiscoveryMode()) {
+      set({ loading: false })
+      return
+    }
     set({ loading: true, error: null })
     try {
       const res = await fetch('/api/host', { credentials: 'include' })

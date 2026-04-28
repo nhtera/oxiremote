@@ -45,8 +45,16 @@ export default function LoginPage() {
       ? 'The host declined this device. You can try again with a fresh key.'
       : null
 
-  // Skip the form entirely if the session cookie is already valid.
+  // Skip the form entirely if the session cookie is already valid. In
+  // discovery mode the SPA's own origin (Pages) has no /api/me — the agent
+  // is on a separate tunnel origin and we don't know it pre-pair, so probing
+  // here would just hit the SPA fallback. Skip the probe entirely when the
+  // build is configured for discovery; the QR-deep-link path takes over.
   useEffect(() => {
+    if (isDiscoveryMode()) {
+      setCheckingAuth(false)
+      return
+    }
     let cancelled = false
     fetch('/api/me', { credentials: 'include' })
       .then(async (res) => {

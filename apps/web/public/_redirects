@@ -1,1 +1,11 @@
+# /api/* must NOT fall through to index.html — the agent lives on the tunnel
+# origin, not on Pages. Returning a real 404 here surfaces misrouted SPA
+# fetches loudly instead of letting them silently parse HTML as JSON.
+/api/*       /404   404
+/preview/*   /404   404
+/h/*         /404   404
+/ws          /404   404
+
+# Everything else is a single-page app; serve index.html and let the router
+# match the path client-side.
 /*    /index.html   200
