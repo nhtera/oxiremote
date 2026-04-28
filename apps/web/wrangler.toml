@@ -1,0 +1,7 @@
+name = "oxiremote-web"
+compatibility_date = "2026-01-01"
+pages_build_output_dir = "dist"
+
+# `VITE_DISCOVERY_URL` is a build-time Vite env (baked into the bundle by
+# `import.meta.env`); set it from the Cloudflare Pages dashboard, not here.
+# Local dev uses `apps/web/.env` (gitignored). Empty value = embedded mode.

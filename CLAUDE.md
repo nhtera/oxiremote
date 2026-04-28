@@ -53,6 +53,10 @@ Tunnel-origin is detected by the presence of a non-empty `cf-connecting-ip` head
 3. Tunnel requests carry `Authorization: Bearer <api_key>` + `X-OXI-CSRF: <oxi_csrf cookie>` (state-changing methods only). `api_key_last4` is the pre-filter so verification hashes at most one row.
 4. Devices land in approval state `pending` (or `approved` if `settings.auto_approve=true`); `api_key_guard` rejects non-approved devices.
 
+### Discovery worker (optional)
+
+When `OXI_DISCOVERY_URL` is set, the agent posts `{apiKey: discovery_id, tunnelUrl}` to the worker after each `TunnelUrlChanged` and mints a 30-min temp key. The TUI QR then encodes `<discovery_url>/login?k=<tempKey>&otk=<otk>` so a standalone SPA on Cloudflare Pages can resolve the tunnel URL before initiating the pairing exchange — no manual tunnel-URL entry required when the tunnel rotates between sessions. `discovery_id` is a stable 32-byte random hex seeded once into `settings` on first boot, independent of `permanent_key_hash` so a key rotation does not invalidate the discovery mapping. Cross-origin POST `/api/login/one-time` is exempt from CSRF (single-use OTK is itself proof of presence) and now returns `api_key + host_id` so the SPA can Bearer-auth subsequent calls without a follow-up `/api/host` round-trip. Worker source: `apps/discovery-worker/`. Deploy: `wrangler deploy`. Embedded mode (env unset) is preserved exactly.
+
 ### Remote desktop pipeline selection
 
 `OXI_VIDEO_PIPELINE=h264|jpeg` (operator preference) AND-merges with client `capabilitiesClient` codec list in `pipeline_selection::choose()` — both must agree on H.264 or the session falls back to JPEG. Wire format and SPA branch logic split across:
@@ -95,6 +99,7 @@ Quick Tunnel (default) spawns `cloudflared --url localhost:<port>`; URL is captu
 | `OXI_WORKSPACE=/path` | Workspace root exposed by the file browser (defaults to CWD). |
 | `OXI_HEADLESS=1` | Force headless server even with a TTY. |
 | `OXI_VIDEO_PIPELINE=h264\|jpeg` | Operator preference for remote desktop pipeline. |
+| `OXI_DISCOVERY_URL` | Cloudflare discovery-worker base URL (e.g. `https://oxiremote-discovery.<account>.workers.dev`). When set, the agent registers `discovery_id → tunnelUrl` after every `TunnelUrlChanged` and the QR encodes a cross-origin form. Unset = embedded-SPA mode (no behaviour change). |
 | `OXIREMOTE_INSTALL_DIR` | Override install target dir for `scripts/install.sh`. |
 | `OXIREMOTE_BINARY_URL` | npm-wrapper download base URL (corp proxies / mirrors). |
 | `OXIREMOTE_VERSION` | Pin a specific release tag in the install script (`oxiremote update` always tracks `latest`). |
