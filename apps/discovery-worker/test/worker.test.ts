@@ -147,4 +147,55 @@ describe('discovery worker', () => {
     const r = await worker.fetch(makeReq('GET', '/api/nope'), env)
     expect(r.status).toBe(404)
   })
+
+  it('code/register: round-trip lookup resolves to the agent tunnel', async () => {
+    await worker.fetch(makeReq('POST', '/api/session/create', { apiKey: HASH }), env)
+    await worker.fetch(makeReq('POST', '/api/session/update', { apiKey: HASH, tunnelUrl: TUNNEL_URL }), env)
+
+    const reg = await worker.fetch(
+      makeReq('POST', '/api/code/register', { apiKey: HASH, code: 'ABCD1234' }),
+      env,
+    )
+    expect(reg.status).toBe(200)
+
+    const lookup = await worker.fetch(makeReq('GET', '/api/session/lookup?k=ABCD1234'), env)
+    expect(lookup.status).toBe(200)
+    const body = (await lookup.json()) as { tunnelUrl: string }
+    expect(body.tunnelUrl).toBe(TUNNEL_URL)
+  })
+
+  it('code/register: rejects invalid code shape', async () => {
+    await worker.fetch(makeReq('POST', '/api/session/create', { apiKey: HASH }), env)
+    for (const bad of ['abcd1234', 'TOO', 'WAY-TOO-LONG-CODE-VALUE', 'has space', '!!@@##']) {
+      const r = await worker.fetch(
+        makeReq('POST', '/api/code/register', { apiKey: HASH, code: bad }),
+        env,
+      )
+      expect(r.status, `expected 400 for ${JSON.stringify(bad)}`).toBe(400)
+    }
+  })
+
+  it('code/register: 404 when no prior session', async () => {
+    const r = await worker.fetch(
+      makeReq('POST', '/api/code/register', { apiKey: HASH, code: 'XYZ12345' }),
+      env,
+    )
+    expect(r.status).toBe(404)
+  })
+
+  it('code/register: enforces TTL upper bound (rejects >10 min)', async () => {
+    await worker.fetch(makeReq('POST', '/api/session/create', { apiKey: HASH }), env)
+    await worker.fetch(makeReq('POST', '/api/session/update', { apiKey: HASH, tunnelUrl: TUNNEL_URL }), env)
+
+    // 99 minutes -> falls back to default 5 mins instead of trusting caller.
+    const r = await worker.fetch(
+      makeReq('POST', '/api/code/register', { apiKey: HASH, code: 'CODE5678', expiryMinutes: 99 }),
+      env,
+    )
+    expect(r.status).toBe(200)
+    const body = (await r.json()) as { expiresAt: number }
+    const ttlSecs = Math.round((body.expiresAt - Date.now()) / 1000)
+    expect(ttlSecs).toBeGreaterThan(0)
+    expect(ttlSecs).toBeLessThanOrEqual(5 * 60 + 5) // tolerate +5s clock skew
+  })
 })

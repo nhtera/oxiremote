@@ -557,11 +557,18 @@ async fn server_main(
                 let bus = state.event_bus.clone();
                 let client = state.http_client.clone();
                 let slot = discovery_temp_key.clone();
+                let db_path = state.db_path.clone();
                 let mut rx = state.event_bus.subscribe();
                 tokio::spawn(async move {
                     loop {
                         match rx.recv().await {
                             Ok(AgentEvent::TunnelUrlChanged { url: tunnel_url }) => {
+                                // Read the active pairing code per-event — the agent rotates
+                                // it every 5 min, and we want the latest valid one each time
+                                // we re-publish (e.g. on tunnel reconnect).
+                                let code = discovery::active_pairing_code(&db_path)
+                                    .ok()
+                                    .flatten();
                                 discovery::spawn_register(
                                     client.clone(),
                                     url.clone(),
@@ -569,6 +576,7 @@ async fn server_main(
                                     tunnel_url,
                                     slot.clone(),
                                     bus.clone(),
+                                    code,
                                 );
                             }
                             Ok(_) => continue,

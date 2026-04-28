@@ -17,10 +17,18 @@ const STATE_CHANGING_PATHS = new Set<string>([
   '/api/session/create',
   '/api/session/update',
   '/api/temp-key/create',
+  '/api/code/register',
 ])
 
 const HEX64 = /^[a-f0-9]{64}$/
+// Pairing codes are user-typed: short, all uppercase alnum (see
+// auth::PAIRING_CODE_LEN). Allow 6-16 to keep room for future tweaks.
+const PAIRING_CODE = /^[A-Z0-9]{6,16}$/
 const TEMP_KEY_BYTES = 16
+// Pairing codes on the agent are 5-min lived; allow up to 10 here as the
+// upper bound the agent may request.
+const CODE_MAX_TTL_MIN = 10
+const CODE_DEFAULT_TTL_MIN = 5
 
 function jsonResponse(body: unknown, status: number, origin: string | null): Response {
   return new Response(JSON.stringify(body), {
@@ -104,6 +112,36 @@ async function handleTempKeyCreate(req: Request, env: Env, origin: string | null
   return jsonResponse({ tempKey, expiresAt: Date.now() + ttlSecs * 1000 }, 200, origin)
 }
 
+async function handleCodeRegister(req: Request, env: Env, origin: string | null): Promise<Response> {
+  // Agent registers a user-facing pairing code (typed by the human into the
+  // SPA login form) so the SPA can resolve which tunnel a given code belongs
+  // to, then forward the code to that tunnel for the actual exchange. Without
+  // this the cross-origin SPA has no way to route a manually-typed code.
+  const body = await readJson<{ apiKey?: unknown; code?: unknown; expiryMinutes?: unknown }>(req)
+  if (!body || !isHexHash(body.apiKey)) {
+    return jsonResponse({ error: 'invalid apiKey' }, 400, origin)
+  }
+  if (typeof body.code !== 'string' || !PAIRING_CODE.test(body.code)) {
+    return jsonResponse({ error: 'invalid code shape' }, 400, origin)
+  }
+  const expiryMins =
+    typeof body.expiryMinutes === 'number' &&
+    body.expiryMinutes > 0 &&
+    body.expiryMinutes <= CODE_MAX_TTL_MIN
+      ? Math.floor(body.expiryMinutes)
+      : CODE_DEFAULT_TTL_MIN
+  const ttlSecs = expiryMins * 60
+  const session = await getSession(env.DISCOVERY, body.apiKey)
+  if (!session) {
+    return jsonResponse({ error: 'session not found' }, 404, origin)
+  }
+  // Reuse the temp-key index — codes are just human-friendly temp keys with
+  // a tighter shape gate. Lookup via /api/session/lookup?k=<code> works
+  // unchanged.
+  await putTempKey(env.DISCOVERY, body.code, body.apiKey, ttlSecs)
+  return jsonResponse({ ok: true, expiresAt: Date.now() + ttlSecs * 1000 }, 200, origin)
+}
+
 async function handleSessionLookup(req: Request, env: Env, origin: string | null): Promise<Response> {
   const url = new URL(req.url)
   const k = url.searchParams.get('k')
@@ -143,6 +181,9 @@ export default {
     }
     if (req.method === 'POST' && url.pathname === '/api/temp-key/create') {
       return handleTempKeyCreate(req, env, origin)
+    }
+    if (req.method === 'POST' && url.pathname === '/api/code/register') {
+      return handleCodeRegister(req, env, origin)
     }
     if (req.method === 'GET' && url.pathname === '/api/session/lookup') {
       return handleSessionLookup(req, env, origin)

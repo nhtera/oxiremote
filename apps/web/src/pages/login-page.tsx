@@ -4,7 +4,9 @@ import { useHostStore } from '../state/host-store'
 import { loadApiKey, makeRemoteClient, storeApiKey } from '../lib/api-client'
 import {
   isDiscoveryMode,
+  isLikelyPairingCode,
   isLikelyTempKey,
+  lookupPairingCode,
   lookupSession,
 } from '../lib/discovery-client'
 import {
@@ -233,6 +235,68 @@ export default function LoginPage() {
     }
   }
 
+  // Cross-origin manual pair via the discovery worker. Mirrors the QR flow
+  // but uses a user-typed code instead of the temp_key embedded in a QR:
+  //   1. SPA → worker: GET /api/session/lookup?k=<code>  → tunnelUrl
+  //   2. SPA → tunnel: POST /api/pairing/exchange { code }
+  // The agent registered the code with the worker after its session was
+  // established (see `discovery::spawn_register`). The worker is discovery-
+  // only — bandwidth stays peer-to-peer once the SPA has the tunnel URL.
+  const submitDiscoveryCode = async (raw: string) => {
+    const cleaned = sanitizeAccessKey(raw).toUpperCase()
+    if (!isLikelyPairingCode(cleaned)) {
+      throw new Error(
+        'Manual entry needs a pairing code (8 chars, e.g. ABCD1234). One-time keys only work via QR scan from this remote SPA.',
+      )
+    }
+    const session = await lookupPairingCode(cleaned)
+    if (!session) {
+      throw new Error('That code is unknown or expired. Generate a fresh one on your computer.')
+    }
+    const res = await fetch(`${session.tunnelUrl}/api/pairing/exchange`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      credentials: 'omit',
+      body: JSON.stringify({
+        code: cleaned,
+        device_label: deviceLabel.trim() || undefined,
+      }),
+    })
+    if (!res.ok) {
+      throw new Error('That code is invalid or already used.')
+    }
+    const body = (await res.json().catch(() => ({}))) as {
+      api_key?: string
+      api_key_last4?: string
+      device_id?: string
+      host_id?: string
+      approval_status?: string
+    }
+    if (!body.api_key || !body.host_id) {
+      throw new Error('Pairing succeeded but response is missing key/host id.')
+    }
+    if (deviceLabel.trim()) {
+      window.localStorage.setItem('oxi:device-label', deviceLabel.trim())
+    }
+    storeApiKey(body.host_id, body.api_key)
+    recordSavedHost({
+      host_id: body.host_id,
+      label: deviceLabel.trim() || body.host_id.slice(0, 8),
+      api_key_last4: body.api_key_last4 ?? body.api_key.slice(-4),
+    })
+    if (body.approval_status === 'pending') {
+      navigate('/approval-waiting', {
+        state: {
+          device_id: body.device_id,
+          device_label: deviceLabel.trim() || undefined,
+          tunnel_base: session.tunnelUrl,
+        },
+      })
+      return
+    }
+    navigate('/', { state: { tunnel_base: session.tunnelUrl } })
+  }
+
   // Single submit path. Auto-detects by `sk-` prefix:
   //   - permanent key   → /api/pairing/exchange { permanent_key }
   //   - everything else → try /api/login/one-time, fall back to /api/pairing/exchange { code }
@@ -240,6 +304,13 @@ export default function LoginPage() {
     setError('')
     setLoading(true)
     try {
+      // Cross-origin SPA can't reach same-origin /api/* — route through the
+      // discovery worker. Permanent-key entry still goes through the same
+      // path: shape it to its uppercase form and the worker resolves the
+      // tunnel just like a pairing code (the agent registers both).
+      if (isDiscoveryMode()) {
+        return await submitDiscoveryCode(raw)
+      }
       if (isPermanentKey(raw)) {
         const res = await fetch('/api/pairing/exchange', {
           method: 'POST',

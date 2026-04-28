@@ -13,6 +13,9 @@
  */
 
 const TEMP_KEY_PATTERN = /^[a-f0-9]{32}$/
+// Pairing codes (8-16 alnum, uppercase): match agent-side
+// `auth::PAIRING_CODE_LEN` and the worker's `/api/code/register` shape gate.
+const PAIRING_CODE_PATTERN = /^[A-Z0-9]{6,16}$/
 
 export type LookupResult = {
   tunnelUrl: string
@@ -38,16 +41,35 @@ export function isLikelyTempKey(value: string): boolean {
   return TEMP_KEY_PATTERN.test(value)
 }
 
+/** Pairing codes are 6-16 uppercase alnum (the agent issues 8 chars). The
+ *  worker accepts the same shape on `/api/code/register`; returning false
+ *  here lets the SPA short-circuit before a round-trip. */
+export function isLikelyPairingCode(value: string): boolean {
+  return PAIRING_CODE_PATTERN.test(value)
+}
+
 /** Resolves a temp key to the agent's tunnel URL. Returns null when the key
  *  is unknown or the worker is unreachable — callers should surface an
  *  "expired QR, regenerate from the host" error. No retry: a stale key will
  *  not become valid by waiting. */
 export async function lookupSession(tempKey: string): Promise<LookupResult | null> {
+  if (!isLikelyTempKey(tempKey)) return null
+  return rawLookup(tempKey)
+}
+
+/** Resolves a user-typed pairing code to the agent's tunnel URL. Same wire
+ *  contract as `lookupSession` (worker stores pairing codes in the same
+ *  temp-key index) but with a different shape gate. */
+export async function lookupPairingCode(code: string): Promise<LookupResult | null> {
+  if (!isLikelyPairingCode(code)) return null
+  return rawLookup(code)
+}
+
+async function rawLookup(key: string): Promise<LookupResult | null> {
   const base = discoveryBaseUrl()
   if (!base) return null
-  if (!isLikelyTempKey(tempKey)) return null
   try {
-    const res = await fetch(`${base}/api/session/lookup?k=${encodeURIComponent(tempKey)}`, {
+    const res = await fetch(`${base}/api/session/lookup?k=${encodeURIComponent(key)}`, {
       method: 'GET',
       credentials: 'omit',
     })

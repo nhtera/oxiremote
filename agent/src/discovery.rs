@@ -51,6 +51,15 @@ struct TempKeyBody<'a> {
     expiry_minutes: u32,
 }
 
+#[derive(Serialize)]
+struct CodeRegisterBody<'a> {
+    #[serde(rename = "apiKey")]
+    api_key: &'a str,
+    code: &'a str,
+    #[serde(rename = "expiryMinutes")]
+    expiry_minutes: u32,
+}
+
 #[derive(Deserialize)]
 struct TempKeyResponse {
     #[serde(rename = "tempKey")]
@@ -74,10 +83,39 @@ pub fn load_discovery_id(db_path: &Path) -> Result<String> {
     Ok(val)
 }
 
+/// Latest unused, unexpired pairing code paired with its remaining lifetime
+/// (minutes, rounded up, clamped to >= 1). Returns None when no valid code is
+/// available — fresh boots always have one but a 5-minute-old code that has
+/// already lapsed should not be re-registered.
+pub fn active_pairing_code(db_path: &Path) -> Result<Option<(String, u32)>> {
+    let now = crate::db::now_ts();
+    let conn = rusqlite::Connection::open(db_path).context("open db for pairing_code")?;
+    let row: rusqlite::Result<(String, i64)> = conn.query_row(
+        "SELECT code, expires_at FROM pairing_codes
+         WHERE used_at IS NULL AND expires_at > ?1
+         ORDER BY expires_at DESC LIMIT 1",
+        [now],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    );
+    match row {
+        Ok((code, expires_at)) => {
+            let secs_left = (expires_at - now).max(0);
+            let mins = ((secs_left + 59) / 60).max(1) as u32;
+            Ok(Some((code, mins)))
+        }
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(anyhow!(e)),
+    }
+}
+
 /// Spawn a non-blocking task that registers the agent's session with the
 /// worker and writes the issued temp key into `temp_key_slot`. Retries with
 /// exponential backoff + jitter; emits `DiscoveryTempKeyIssued` on success or
 /// `DiscoveryUnavailable` after all retries are exhausted.
+///
+/// `pairing_code` is optionally registered with the worker after the session
+/// is established so the SPA can resolve `?code=ABCD1234` → tunnelUrl for
+/// the manual-entry flow. Failure here is non-fatal — QR-scan still works.
 pub fn spawn_register(
     client: Client,
     discovery_url: String,
@@ -85,6 +123,7 @@ pub fn spawn_register(
     tunnel_url: String,
     temp_key_slot: Arc<StdRwLock<Option<String>>>,
     event_bus: Arc<EventBus>,
+    pairing_code: Option<(String, u32)>,
 ) {
     tokio::spawn(async move {
         match register_with_retry(&client, &discovery_url, &discovery_id, &tunnel_url).await {
@@ -95,6 +134,13 @@ pub fn spawn_register(
                 }
                 info!(prefix = %prefix, "discovery temp key issued");
                 event_bus.send(AgentEvent::DiscoveryTempKeyIssued { key_prefix: prefix });
+
+                if let Some((code, mins)) = pairing_code {
+                    match register_code(&client, &discovery_url, &discovery_id, &code, mins).await {
+                        Ok(()) => debug!(mins, "pairing code registered with discovery worker"),
+                        Err(e) => warn!(error = %e, "code/register failed (manual code-entry will fall back to QR)"),
+                    }
+                }
             }
             Err(err) => {
                 warn!(error = %err, "discovery registration failed after retries");
@@ -102,6 +148,33 @@ pub fn spawn_register(
             }
         }
     });
+}
+
+/// Register a user-typed pairing code with the worker so the cross-origin
+/// SPA can resolve it without needing the QR's temp_key. Single attempt,
+/// best-effort: agents always rebroadcast on TunnelUrlChanged anyway.
+async fn register_code(
+    client: &Client,
+    base: &str,
+    discovery_id: &str,
+    code: &str,
+    expiry_minutes: u32,
+) -> Result<()> {
+    let base = base.trim_end_matches('/');
+    let res = client
+        .post(format!("{base}/api/code/register"))
+        .json(&CodeRegisterBody {
+            api_key: discovery_id,
+            code,
+            expiry_minutes,
+        })
+        .send()
+        .await
+        .context("code/register POST")?;
+    if !res.status().is_success() {
+        return Err(anyhow!("code/register -> {}", res.status()));
+    }
+    Ok(())
 }
 
 async fn register_with_retry(
@@ -255,6 +328,10 @@ mod tests {
                 "/api/temp-key/create",
                 post(|s, b| record(s, "/api/temp-key/create", b)),
             )
+            .route(
+                "/api/code/register",
+                post(|s, b| record(s, "/api/code/register", b)),
+            )
             .with_state(state)
     }
 
@@ -342,6 +419,33 @@ mod tests {
 
         let result = register_with_retry(&client, &url, "id", "https://t").await;
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn register_code_posts_to_code_register_endpoint() {
+        let mock = MockState::default();
+        let url = spawn_mock(mock.clone()).await;
+        let client = Client::new();
+
+        register_code(&client, &url, "deadbeef", "ABCD1234", 5).await.unwrap();
+
+        let bodies = mock.bodies.lock().unwrap().clone();
+        assert_eq!(bodies.len(), 1);
+        assert_eq!(bodies[0].0, "/api/code/register");
+        assert_eq!(bodies[0].1["apiKey"], "deadbeef");
+        assert_eq!(bodies[0].1["code"], "ABCD1234");
+        assert_eq!(bodies[0].1["expiryMinutes"], 5);
+    }
+
+    #[tokio::test]
+    async fn register_code_propagates_non_success() {
+        let mock = MockState::default();
+        *mock.fail_seq.lock().unwrap() = vec![true];
+        let url = spawn_mock(mock).await;
+        let client = Client::new();
+
+        let r = register_code(&client, &url, "id", "ABCD1234", 5).await;
+        assert!(r.is_err());
     }
 
     #[tokio::test]
