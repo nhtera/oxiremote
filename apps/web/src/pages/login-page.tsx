@@ -208,6 +208,17 @@ export default function LoginPage() {
         label: deviceLabel.trim() || body.host_id.slice(0, 8),
         api_key_last4: body.api_key_last4 ?? body.api_key.slice(-4),
       })
+      // RootRoute ('/') redirects to /welcome when currentHostId is null.
+      // In discovery mode fetchHost is a no-op (Phase 4.5), so seed the
+      // store directly from the pair response — otherwise the SPA bounces
+      // back to /welcome despite a successful pair.
+      useHostStore.setState({
+        currentHostId: body.host_id,
+        label: deviceLabel.trim() || null,
+        platform: null,
+        loading: false,
+        error: null,
+      })
 
       // Bind a `RemoteClient` to the tunnel URL so /approval-waiting + the
       // workspace can issue cross-origin Bearer requests once Phase 4 lands.
@@ -295,6 +306,17 @@ export default function LoginPage() {
         host_id: body.host_id,
         label: deviceLabel.trim() || body.host_id.slice(0, 8),
         api_key_last4: body.api_key_last4 ?? body.api_key.slice(-4),
+      })
+      // RootRoute ('/') redirects to /welcome when currentHostId is null.
+      // In discovery mode fetchHost is a no-op (Phase 4.5), so seed the
+      // store directly from the pair response — otherwise the SPA bounces
+      // back to /welcome despite a successful pair.
+      useHostStore.setState({
+        currentHostId: body.host_id,
+        label: deviceLabel.trim() || null,
+        platform: null,
+        loading: false,
+        error: null,
       })
       if (res.status === 202 || body.status === 'pending') {
         navigate('/approval-waiting', {
