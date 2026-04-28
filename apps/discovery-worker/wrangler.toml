@@ -1,0 +1,16 @@
+name = "oxiremote-discovery"
+main = "src/worker.ts"
+compatibility_date = "2026-01-01"
+
+# Backing namespace title is "OXIREMOTE_DISCOVERY" in the Cloudflare dashboard;
+# `binding = "DISCOVERY"` is the local code name (env.DISCOVERY) — kept short.
+# For local `wrangler dev`, also run:
+#   wrangler kv namespace create OXIREMOTE_DISCOVERY --preview
+# and paste the preview id below.
+[[kv_namespaces]]
+binding = "DISCOVERY"
+id = "55dac6e2fcb54e2bb3a5d641fe0ad767"
+preview_id = "68ec5cd43eba473ea72017d7daa103c2"
+
+# Custom-domain routing is wired in Phase 5. Until then, the worker is
+# reachable at https://oxiremote-discovery.<account>.workers.dev.
