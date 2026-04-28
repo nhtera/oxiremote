@@ -166,12 +166,28 @@ describe('discovery worker', () => {
 
   it('code/register: rejects invalid code shape', async () => {
     await worker.fetch(makeReq('POST', '/api/session/create', { apiKey: HASH }), env)
-    for (const bad of ['abcd1234', 'TOO', 'WAY-TOO-LONG-CODE-VALUE', 'has space', '!!@@##']) {
+    await worker.fetch(makeReq('POST', '/api/session/update', { apiKey: HASH, tunnelUrl: TUNNEL_URL }), env)
+    // Reject: too-short, contains punctuation, contains whitespace, > 32 chars.
+    for (const bad of ['TOO', 'has-dash', 'has space', '!!@@##', 'a'.repeat(33)]) {
       const r = await worker.fetch(
         makeReq('POST', '/api/code/register', { apiKey: HASH, code: bad }),
         env,
       )
       expect(r.status, `expected 400 for ${JSON.stringify(bad)}`).toBe(400)
+    }
+  })
+
+  it('code/register: accepts both pairing codes and OTKs (case-mixed alnum 6-32)', async () => {
+    await worker.fetch(makeReq('POST', '/api/session/create', { apiKey: HASH }), env)
+    await worker.fetch(makeReq('POST', '/api/session/update', { apiKey: HASH, tunnelUrl: TUNNEL_URL }), env)
+    for (const ok of ['ABCD1234', 'racuro4t3e6sgqy6', 'Mixed123Case', 'aaaaaaaa']) {
+      const r = await worker.fetch(
+        makeReq('POST', '/api/code/register', { apiKey: HASH, code: ok }),
+        env,
+      )
+      expect(r.status, `expected 200 for ${JSON.stringify(ok)}`).toBe(200)
+      const lookup = await worker.fetch(makeReq('GET', `/api/session/lookup?k=${ok}`), env)
+      expect(lookup.status).toBe(200)
     }
   })
 

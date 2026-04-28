@@ -4,9 +4,10 @@ import { useHostStore } from '../state/host-store'
 import { loadApiKey, makeRemoteClient, storeApiKey } from '../lib/api-client'
 import {
   isDiscoveryMode,
+  isLikelyOtk,
   isLikelyPairingCode,
   isLikelyTempKey,
-  lookupPairingCode,
+  lookupAny,
   lookupSession,
 } from '../lib/discovery-client'
 import {
@@ -238,27 +239,85 @@ export default function LoginPage() {
   // Cross-origin manual pair via the discovery worker. Mirrors the QR flow
   // but uses a user-typed code instead of the temp_key embedded in a QR:
   //   1. SPA → worker: GET /api/session/lookup?k=<code>  → tunnelUrl
-  //   2. SPA → tunnel: POST /api/pairing/exchange { code }
-  // The agent registered the code with the worker after its session was
-  // established (see `discovery::spawn_register`). The worker is discovery-
-  // only — bandwidth stays peer-to-peer once the SPA has the tunnel URL.
+  //   2. SPA → tunnel: POST /api/{login/one-time | pairing/exchange} { … }
+  // Shape decides the agent endpoint:
+  //   - 16 lowercase base32 → OTK   → /api/login/one-time { token }
+  //   - 8+ uppercase alnum  → code  → /api/pairing/exchange { code }
+  // Both kinds are registered with the worker by the agent on issuance.
   const submitDiscoveryCode = async (raw: string) => {
-    const cleaned = sanitizeAccessKey(raw).toUpperCase()
-    if (!isLikelyPairingCode(cleaned)) {
+    const cleaned = sanitizeAccessKey(raw)
+    const otkAttempt = cleaned.toLowerCase()
+    const codeAttempt = cleaned.toUpperCase()
+    let kind: 'otk' | 'code'
+    let lookupKey: string
+    if (isLikelyOtk(otkAttempt)) {
+      kind = 'otk'
+      lookupKey = otkAttempt
+    } else if (isLikelyPairingCode(codeAttempt)) {
+      kind = 'code'
+      lookupKey = codeAttempt
+    } else {
       throw new Error(
-        'Manual entry needs a pairing code (8 chars, e.g. ABCD1234). One-time keys only work via QR scan from this remote SPA.',
+        'Enter a one-time key (16 chars) or pairing code (8 chars) shown on your computer.',
       )
     }
-    const session = await lookupPairingCode(cleaned)
+    const session = await lookupAny(lookupKey)
     if (!session) {
       throw new Error('That code is unknown or expired. Generate a fresh one on your computer.')
     }
+
+    if (kind === 'otk') {
+      const res = await fetch(`${session.tunnelUrl}/api/login/one-time`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        credentials: 'omit',
+        body: JSON.stringify({ token: lookupKey }),
+      })
+      if (res.status !== 200 && res.status !== 202) {
+        throw new Error('That key is invalid or expired.')
+      }
+      const body = (await res.json().catch(() => ({}))) as {
+        api_key?: string
+        api_key_last4?: string
+        device_id?: string
+        host_id?: string
+        session_id?: string
+        status?: string
+      }
+      if (!body.api_key || !body.host_id) {
+        throw new Error('Pairing succeeded but response is missing key/host id.')
+      }
+      if (deviceLabel.trim()) {
+        window.localStorage.setItem('oxi:device-label', deviceLabel.trim())
+      }
+      storeApiKey(body.host_id, body.api_key)
+      recordSavedHost({
+        host_id: body.host_id,
+        label: deviceLabel.trim() || body.host_id.slice(0, 8),
+        api_key_last4: body.api_key_last4 ?? body.api_key.slice(-4),
+      })
+      if (res.status === 202 || body.status === 'pending') {
+        navigate('/approval-waiting', {
+          state: {
+            session_id: body.session_id,
+            device_id: body.device_id,
+            device_label: deviceLabel.trim() || undefined,
+            tunnel_base: session.tunnelUrl,
+          },
+        })
+        return
+      }
+      navigate('/', { state: { tunnel_base: session.tunnelUrl } })
+      return
+    }
+
+    // kind === 'code'
     const res = await fetch(`${session.tunnelUrl}/api/pairing/exchange`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       credentials: 'omit',
       body: JSON.stringify({
-        code: cleaned,
+        code: lookupKey,
         device_label: deviceLabel.trim() || undefined,
       }),
     })

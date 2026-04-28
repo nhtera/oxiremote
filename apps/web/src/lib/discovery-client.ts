@@ -13,9 +13,13 @@
  */
 
 const TEMP_KEY_PATTERN = /^[a-f0-9]{32}$/
-// Pairing codes (8-16 alnum, uppercase): match agent-side
+// Pairing codes: 8-16 uppercase alnum (agent issues 8). Match the agent-side
 // `auth::PAIRING_CODE_LEN` and the worker's `/api/code/register` shape gate.
 const PAIRING_CODE_PATTERN = /^[A-Z0-9]{6,16}$/
+// One-time keys: 16 chars lowercase RFC4648 base32 (a-z + 2-7) — see
+// `agent/src/one_time_keys.rs`. Strict shape lets the SPA disambiguate from
+// pairing codes before the worker round-trip.
+const OTK_PATTERN = /^[a-z2-7]{16}$/
 
 export type LookupResult = {
   tunnelUrl: string
@@ -46,6 +50,20 @@ export function isLikelyTempKey(value: string): boolean {
  *  here lets the SPA short-circuit before a round-trip. */
 export function isLikelyPairingCode(value: string): boolean {
   return PAIRING_CODE_PATTERN.test(value)
+}
+
+/** One-time keys are 16 chars lowercase base32 (RFC 4648). The agent
+ *  registers them with the worker on issuance so cross-origin manual entry
+ *  can resolve `?code=<otk>` -> tunnelUrl just like pairing codes. */
+export function isLikelyOtk(value: string): boolean {
+  return OTK_PATTERN.test(value)
+}
+
+/** Generic worker lookup — used when the caller has already shape-checked
+ *  the value (e.g. the login form which accepts both OTK and pairing code).
+ *  Returns null on 404 / unreachable. */
+export async function lookupAny(key: string): Promise<LookupResult | null> {
+  return rawLookup(key)
 }
 
 /** Resolves a temp key to the agent's tunnel URL. Returns null when the key

@@ -247,6 +247,24 @@ async fn api_agent_keys_one_time(State(state): State<Arc<AppState>>) -> impl Int
             info!(token_prefix = %prefix, "OTK issued");
             state.event_bus.send(AgentEvent::OtkIssued { token_prefix: prefix });
 
+            // Register the OTK with the discovery worker so the cross-origin
+            // SPA can resolve it via /api/session/lookup?k=<otk>. No-op in
+            // embedded mode (discovery_url unset). Best-effort; failure here
+            // doesn't block the OTK response.
+            if let (Some(durl), Ok(disc_id)) = (
+                state.discovery_url.clone(),
+                crate::discovery::load_discovery_id(&state.db_path),
+            ) {
+                crate::discovery::spawn_register_code(
+                    state.http_client.clone(),
+                    durl,
+                    disc_id,
+                    rec.token.clone(),
+                    // OTK_TTL_SECS = 1800 = 30 min — matches worker upper bound.
+                    30,
+                );
+            }
+
             let tunnel_url = state.tunnel_url.read().ok().and_then(|g| g.clone());
             let qr_url = match tunnel_url {
                 Some(ref host) => format!("https://{host}/login?k={}", rec.token),

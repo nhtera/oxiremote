@@ -150,6 +150,24 @@ pub fn spawn_register(
     });
 }
 
+/// Fire-and-forget code registration. Use when an OTK or pairing code is
+/// minted on a code path that already runs inside the tokio runtime — keeps
+/// callers free of async error handling for a non-critical side effect.
+pub fn spawn_register_code(
+    client: Client,
+    discovery_url: String,
+    discovery_id: String,
+    code: String,
+    expiry_minutes: u32,
+) {
+    tokio::spawn(async move {
+        match register_code(&client, &discovery_url, &discovery_id, &code, expiry_minutes).await {
+            Ok(()) => debug!(expiry_minutes, "lookup code registered with discovery worker"),
+            Err(e) => warn!(error = %e, "discovery code/register failed (cross-origin manual entry will fail until next rotation)"),
+        }
+    });
+}
+
 /// Register a user-typed pairing code with the worker so the cross-origin
 /// SPA can resolve it without needing the QR's temp_key. Single attempt,
 /// best-effort: agents always rebroadcast on TunnelUrlChanged anyway.

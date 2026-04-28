@@ -21,13 +21,18 @@ const STATE_CHANGING_PATHS = new Set<string>([
 ])
 
 const HEX64 = /^[a-f0-9]{64}$/
-// Pairing codes are user-typed: short, all uppercase alnum (see
-// auth::PAIRING_CODE_LEN). Allow 6-16 to keep room for future tweaks.
-const PAIRING_CODE = /^[A-Z0-9]{6,16}$/
+// User-typed lookup keys span two shapes today:
+//   - Pairing codes  : 8 chars uppercase alnum   (auth::PAIRING_CODE_LEN)
+//   - One-time keys  : 16 chars lowercase alnum  (one_time_keys.rs)
+// Worker is shape-agnostic — the agent is the trust anchor and registers
+// only values it issued. Allow either case across 6-32 alnum to leave room
+// for future formats. No special chars (whitespace, hyphens) — the SPA
+// strips them client-side.
+const LOOKUP_KEY = /^[A-Za-z0-9]{6,32}$/
 const TEMP_KEY_BYTES = 16
-// Pairing codes on the agent are 5-min lived; allow up to 10 here as the
-// upper bound the agent may request.
-const CODE_MAX_TTL_MIN = 10
+// Worker accepts up to 30 min — matches the OTK lifetime on the agent
+// (one_time_keys::DEFAULT_TTL). Pairing codes will use the agent's 5 min.
+const CODE_MAX_TTL_MIN = 30
 const CODE_DEFAULT_TTL_MIN = 5
 
 function jsonResponse(body: unknown, status: number, origin: string | null): Response {
@@ -121,7 +126,7 @@ async function handleCodeRegister(req: Request, env: Env, origin: string | null)
   if (!body || !isHexHash(body.apiKey)) {
     return jsonResponse({ error: 'invalid apiKey' }, 400, origin)
   }
-  if (typeof body.code !== 'string' || !PAIRING_CODE.test(body.code)) {
+  if (typeof body.code !== 'string' || !LOOKUP_KEY.test(body.code)) {
     return jsonResponse({ error: 'invalid code shape' }, 400, origin)
   }
   const expiryMins =
