@@ -381,9 +381,19 @@ struct MeResponse {
     device_id: String,
 }
 
-pub async fn api_me(State(state): State<Arc<AppState>>, jar: CookieJar) -> impl IntoResponse {
-    let Some((session_id, device_id)) =
-        crate::auth::require_active_auth_with_device(&state.db_path, &state.signing_key, &jar)
+pub async fn api_me(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    jar: CookieJar,
+) -> impl IntoResponse {
+    let bearer = crate::auth::extract_bearer(&headers);
+    let Some((session_id, device_id)) = crate::auth::require_owner_session_with_device_dual(
+        &state.db_path,
+        &state.signing_key,
+        &jar,
+        bearer.as_deref(),
+    )
+    .await
     else {
         return StatusCode::UNAUTHORIZED.into_response();
     };

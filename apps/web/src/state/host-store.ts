@@ -1,5 +1,6 @@
 import { create } from 'zustand'
 import { isDiscoveryMode } from '../lib/discovery-client'
+import { loadTunnelBase } from '../lib/api-client'
 
 type HostState = {
   currentHostId: string | null
@@ -18,11 +19,12 @@ export const useHostStore = create<HostState>((set) => ({
   error: null,
 
   fetchHost: async () => {
-    // In discovery mode the SPA origin (Pages) has no /api/host. The agent
-    // lives on the tunnel and Phase 4.5 will wire fetchHost to the saved
-    // tunnel base. Until then, no-op pre-pair so we don't trigger router
-    // redirect-loops via the 200-with-HTML SPA fallback.
-    if (isDiscoveryMode()) {
+    // In discovery mode without a paired host, /api/host has nowhere to go
+    // (the SPA origin has no API). Skip the probe to avoid the router
+    // redirect-loop via the SPA fallback. Once a pair completes the
+    // interceptor rewrites /api/host to the tunnel base — this branch
+    // unblocks itself naturally.
+    if (isDiscoveryMode() && !loadTunnelBase()) {
       set({ loading: false })
       return
     }

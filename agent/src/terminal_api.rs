@@ -3,7 +3,7 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use axum::extract::{Path as AxumPath, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use axum::Json;
 use axum_extra::extract::cookie::CookieJar;
@@ -12,7 +12,7 @@ use rusqlite::{params, Connection, OptionalExtension};
 use tracing::warn;
 use uuid::Uuid;
 
-use crate::auth::require_active_auth;
+use crate::auth::{extract_bearer, require_owner_session_dual};
 use crate::db::now_ts;
 use crate::terminal_pty::{
     build_default_command, spawn_terminal_session, CreateTerminalSessionRequest,
@@ -23,9 +23,13 @@ use crate::AppState;
 
 pub async fn api_terminal_sessions_list(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     jar: CookieJar,
 ) -> impl IntoResponse {
-    let Some(owner_session_id) = require_active_auth(&state.db_path, &state.signing_key, &jar) else {
+    let bearer = extract_bearer(&headers);
+    let Some(owner_session_id) =
+        require_owner_session_dual(&state.db_path, &state.signing_key, &jar, bearer.as_deref()).await
+    else {
         return StatusCode::UNAUTHORIZED.into_response();
     };
 
@@ -103,10 +107,14 @@ pub async fn api_terminal_sessions_list(
 
 pub async fn api_terminal_sessions_create(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     jar: CookieJar,
     Json(req): Json<CreateTerminalSessionRequest>,
 ) -> impl IntoResponse {
-    let Some(owner_session_id) = require_active_auth(&state.db_path, &state.signing_key, &jar) else {
+    let bearer = extract_bearer(&headers);
+    let Some(owner_session_id) =
+        require_owner_session_dual(&state.db_path, &state.signing_key, &jar, bearer.as_deref()).await
+    else {
         return StatusCode::UNAUTHORIZED.into_response();
     };
 
@@ -186,11 +194,15 @@ pub async fn api_terminal_sessions_create(
 
 pub async fn api_terminal_session_resize(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     jar: CookieJar,
     AxumPath(id): AxumPath<String>,
     Json(req): Json<ResizeTerminalRequest>,
 ) -> impl IntoResponse {
-    let Some(owner_session_id) = require_active_auth(&state.db_path, &state.signing_key, &jar) else {
+    let bearer = extract_bearer(&headers);
+    let Some(owner_session_id) =
+        require_owner_session_dual(&state.db_path, &state.signing_key, &jar, bearer.as_deref()).await
+    else {
         return StatusCode::UNAUTHORIZED.into_response();
     };
 
@@ -260,10 +272,14 @@ pub async fn api_terminal_session_resize(
 
 pub async fn api_terminal_session_close(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     jar: CookieJar,
     AxumPath(id): AxumPath<String>,
 ) -> impl IntoResponse {
-    let Some(owner_session_id) = require_active_auth(&state.db_path, &state.signing_key, &jar) else {
+    let bearer = extract_bearer(&headers);
+    let Some(owner_session_id) =
+        require_owner_session_dual(&state.db_path, &state.signing_key, &jar, bearer.as_deref()).await
+    else {
         return StatusCode::UNAUTHORIZED.into_response();
     };
 
@@ -352,11 +368,15 @@ pub async fn api_terminal_session_close(
 
 pub async fn api_terminal_session_rename(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     jar: CookieJar,
     AxumPath(id): AxumPath<String>,
     Json(req): Json<RenameTerminalRequest>,
 ) -> impl IntoResponse {
-    let Some(owner_session_id) = require_active_auth(&state.db_path, &state.signing_key, &jar) else {
+    let bearer = extract_bearer(&headers);
+    let Some(owner_session_id) =
+        require_owner_session_dual(&state.db_path, &state.signing_key, &jar, bearer.as_deref()).await
+    else {
         return StatusCode::UNAUTHORIZED.into_response();
     };
 

@@ -115,6 +115,53 @@ pub async fn require_tunnel_auth(
     require_active_auth_with_device(db_path, signing_key, jar).map(|(_, device_id)| device_id)
 }
 
+/// Dual-auth variant returning `(session_id, device_id)` for handlers that
+/// need both. Bearer path resolves the device's most recent session row
+/// created at OTK/pairing time — both `api_login_one_time` and
+/// `api_pairing_exchange` insert into `sessions` before returning the
+/// api_key, so a freshly-paired Bearer always has one. Bearer takes
+/// precedence + fails closed (same stance as `require_tunnel_auth`).
+pub async fn require_owner_session_with_device_dual(
+    db_path: &PathBuf,
+    signing_key: &[u8],
+    jar: &axum_extra::extract::cookie::CookieJar,
+    bearer: Option<&str>,
+) -> Option<(String, String)> {
+    if let Some(key) = bearer {
+        let device_id = verify_api_key_async(db_path.clone(), key.to_string()).await?;
+        let db_path_clone = db_path.clone();
+        let dev = device_id.clone();
+        let session_id = tokio::task::spawn_blocking(move || {
+            let conn = Connection::open(&db_path_clone).ok()?;
+            conn.query_row(
+                "SELECT session_id FROM sessions WHERE device_id = ?1 ORDER BY created_at DESC LIMIT 1",
+                params![dev],
+                |r| r.get::<_, String>(0),
+            )
+            .ok()
+        })
+        .await
+        .ok()
+        .flatten()?;
+        return Some((session_id, device_id));
+    }
+    require_active_auth_with_device(db_path, signing_key, jar)
+}
+
+/// Convenience wrapper around `require_owner_session_with_device_dual` for
+/// handlers that only need the session_id (e.g. `terminal_sessions` queries
+/// scoped by `owner_session_id`).
+pub async fn require_owner_session_dual(
+    db_path: &PathBuf,
+    signing_key: &[u8],
+    jar: &axum_extra::extract::cookie::CookieJar,
+    bearer: Option<&str>,
+) -> Option<String> {
+    require_owner_session_with_device_dual(db_path, signing_key, jar, bearer)
+        .await
+        .map(|(s, _)| s)
+}
+
 /// Like `require_active_auth` but also returns the session's bound `device_id`.
 /// Callers that authorise per-device resources (e.g. `/ws/desktop/{device_id}`)
 /// must compare this against the caller-supplied identifier.

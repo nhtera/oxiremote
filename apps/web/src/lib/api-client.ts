@@ -175,6 +175,8 @@ export function makeRemoteClient(baseUrl: string, apiKey: string): RemoteClient 
   }
 }
 
+let warnedMissingTunnelBase = false
+
 /**
  * Build a same-origin /api/<path> URL relative to the active tunnel base.
  * Returns null in embedded mode or when no tunnel base is known yet.
@@ -182,7 +184,20 @@ export function makeRemoteClient(baseUrl: string, apiKey: string): RemoteClient 
 function rewriteToTunnel(url: string): string | null {
   if (!isDiscoveryMode()) return null
   const base = loadTunnelBase()
-  if (!base) return null
+  if (!base) {
+    // Discovery mode is on but the SPA has no tunnel for the active host —
+    // happens when the user paired with an old build (pre-tunnel-base
+    // persistence) or wiped only some localStorage keys. Loud one-shot
+    // warning so a stuck tab is debuggable from the console.
+    if (!warnedMissingTunnelBase && typeof console !== 'undefined') {
+      warnedMissingTunnelBase = true
+      console.warn(
+        '[oxiremote] discovery mode is active but no tunnel base is stored for the active host. ' +
+          'Same-origin /api/* requests will hit Pages and fail. Re-pair from /login to refresh.',
+      )
+    }
+    return null
+  }
   let pathname: string
   if (url.startsWith('/')) {
     pathname = url
