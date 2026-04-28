@@ -121,6 +121,17 @@ pub enum AgentEvent {
         #[serde(skip_serializing_if = "Option::is_none")]
         recovery_hint: Option<String>,
     },
+    /// Discovery worker (Phase 02) issued a fresh temp key after a successful
+    /// `apiKey -> tunnelUrl` upsert. Carries only the first 4 chars so log
+    /// streams and SSE clients never see the full key. The QR pane reads the
+    /// canonical value from `AppState::discovery_temp_key`.
+    DiscoveryTempKeyIssued {
+        key_prefix: String,
+    },
+    /// Discovery worker exhausted all retry attempts. The QR falls back to
+    /// the embedded-tunnel form; the operator can retry by rotating the OTK
+    /// (which re-enters the spawn path on next `TunnelUrlChanged`).
+    DiscoveryUnavailable,
     /// Granular tunnel progress — emitted at each lifecycle step so the TUI
     /// and WebUI can render a 5-row checklist with live sub-text.
     TunnelStepChanged {

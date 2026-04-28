@@ -181,6 +181,16 @@ pub fn init_db(db_path: &Path) -> anyhow::Result<()> {
         [],
     );
 
+    // Stable agent identity for the discovery worker (Phase 02).
+    // 32-byte random hex generated once on first boot — independent of
+    // permanent_key_hash so a key rotation does not invalidate the existing
+    // discovery session. The worker stores `discovery_id -> tunnelUrl`; the
+    // SPA never sees this value.
+    let _ = conn.execute(
+        "INSERT OR IGNORE INTO settings(key, value) VALUES ('discovery_id', lower(hex(randomblob(32))))",
+        [],
+    );
+
     Ok(())
 }
 

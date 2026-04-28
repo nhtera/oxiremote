@@ -3,6 +3,7 @@ mod approval;
 mod auth;
 mod autostart;
 mod db;
+mod discovery;
 mod events;
 mod files;
 mod files_search;
@@ -125,6 +126,14 @@ pub struct AppState {
     /// Stub field so non-desktop builds compile without the feature flag.
     #[cfg(not(feature = "desktop"))]
     pub desktop_service: Option<()>,
+    /// Cloudflare discovery worker base URL (`OXI_DISCOVERY_URL`). When unset,
+    /// the agent runs in single-binary embedded mode and emits `<tunnel>/login`
+    /// QR payloads exactly as before.
+    pub discovery_url: Option<String>,
+    /// Latest temp key issued by the discovery worker — populated after every
+    /// `TunnelUrlChanged` when discovery is enabled. Read by the TUI QR pane
+    /// (and Phase 3 will surface it to the SPA bootstrap).
+    pub discovery_temp_key: Arc<StdRwLock<Option<String>>>,
 }
 
 fn default_data_dir() -> anyhow::Result<PathBuf> {
@@ -269,11 +278,28 @@ fn run_server_headless() -> anyhow::Result<()> {
     let _lock = instance_lock::InstanceLock::acquire(&data_dir)
         .context("acquire instance lock")?;
 
+    let discovery_url = read_discovery_url();
+    let discovery_temp_key: Arc<StdRwLock<Option<String>>> = Arc::new(StdRwLock::new(None));
+
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .context("build tokio runtime")?;
-    rt.block_on(async move { server_main(bus).await })
+    rt.block_on(async move { server_main(bus, discovery_url, discovery_temp_key).await })
+}
+
+/// Read `OXI_DISCOVERY_URL`, treating empty / whitespace-only values as unset.
+/// Trailing slashes are stripped so callers can `format!("{base}/api/...")`
+/// without double-slash guards. Returns None when the agent runs in embedded
+/// mode (single-binary, no Cloudflare discovery worker).
+fn read_discovery_url() -> Option<String> {
+    let raw = std::env::var("OXI_DISCOVERY_URL").ok()?;
+    let trimmed = raw.trim().trim_end_matches('/');
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
 }
 
 /// TUI path: tokio runtime on a sibling thread, TUI event loop on main.
@@ -288,7 +314,15 @@ fn run_with_tui() -> anyhow::Result<()> {
 
     let db_path = data_dir.join("oxiremote.sqlite");
 
+    // Build the discovery handle before spawning either thread so server +
+    // TUI share the same `discovery_temp_key` slot — the listener writes,
+    // the TUI reads, no synchronization beyond the RwLock.
+    let discovery_url = read_discovery_url();
+    let discovery_temp_key: Arc<StdRwLock<Option<String>>> = Arc::new(StdRwLock::new(None));
+
     let bus_for_server = bus.clone();
+    let discovery_url_srv = discovery_url.clone();
+    let discovery_temp_key_srv = discovery_temp_key.clone();
     std::thread::Builder::new()
         .name("oxiremote-server".into())
         .spawn(move || {
@@ -308,7 +342,11 @@ fn run_with_tui() -> anyhow::Result<()> {
                     return;
                 }
             };
-            if let Err(err) = rt.block_on(server_main(bus_for_server.clone())) {
+            if let Err(err) = rt.block_on(server_main(
+                bus_for_server.clone(),
+                discovery_url_srv,
+                discovery_temp_key_srv,
+            )) {
                 bus_for_server.send(crate::events::AgentEvent::LogEntry {
                     level: crate::events::LogLevel::Error,
                     module: "agent".into(),
@@ -319,7 +357,7 @@ fn run_with_tui() -> anyhow::Result<()> {
         })
         .context("spawn server thread")?;
 
-    let result = tui::run_tui(bus, db_path);
+    let result = tui::run_tui(bus, db_path, discovery_url, discovery_temp_key);
     // Explicit drop — process::exit skips destructors so we'd otherwise leak
     // the PID file and lock out the next start.
     drop(lock);
@@ -332,7 +370,11 @@ fn run_with_tui() -> anyhow::Result<()> {
     }
 }
 
-async fn server_main(event_bus: Arc<EventBus>) -> anyhow::Result<()> {
+async fn server_main(
+    event_bus: Arc<EventBus>,
+    discovery_url: Option<String>,
+    discovery_temp_key: Arc<StdRwLock<Option<String>>>,
+) -> anyhow::Result<()> {
     let data_dir = default_data_dir()?;
     std::fs::create_dir_all(&data_dir).context("create data dir")?;
 
@@ -459,6 +501,8 @@ async fn server_main(event_bus: Arc<EventBus>) -> anyhow::Result<()> {
         recent_logs: Arc::new(StdMutex::new(VecDeque::with_capacity(LOG_RING_CAP))),
         desktop_available: desktop_avail,
         desktop_service: desktop_svc,
+        discovery_url: discovery_url.clone(),
+        discovery_temp_key: discovery_temp_key.clone(),
     });
 
     // Background: periodic listening-port discovery + preview health checks.
@@ -501,6 +545,44 @@ async fn server_main(event_bus: Arc<EventBus>) -> anyhow::Result<()> {
                 }
             }
         });
+    }
+
+    // Discovery client — when `OXI_DISCOVERY_URL` is set, subscribe to the bus
+    // and re-register with the worker on every `TunnelUrlChanged`. Subscribed
+    // BEFORE the tunnel task spawns below so the first URL emit is not missed
+    // (tokio broadcast has no replay).
+    if let Some(url) = discovery_url.clone() {
+        match discovery::load_discovery_id(&state.db_path) {
+            Ok(discovery_id) => {
+                let bus = state.event_bus.clone();
+                let client = state.http_client.clone();
+                let slot = discovery_temp_key.clone();
+                let mut rx = state.event_bus.subscribe();
+                tokio::spawn(async move {
+                    loop {
+                        match rx.recv().await {
+                            Ok(AgentEvent::TunnelUrlChanged { url: tunnel_url }) => {
+                                discovery::spawn_register(
+                                    client.clone(),
+                                    url.clone(),
+                                    discovery_id.clone(),
+                                    tunnel_url,
+                                    slot.clone(),
+                                    bus.clone(),
+                                );
+                            }
+                            Ok(_) => continue,
+                            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                        }
+                    }
+                });
+                info!("discovery client enabled (worker URL configured)");
+            }
+            Err(err) => {
+                warn!(error=%err, "discovery_id load failed; discovery client disabled");
+            }
+        }
     }
 
     // Desktop notifications (no-op when no notification daemon — headless,

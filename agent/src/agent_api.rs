@@ -711,6 +711,8 @@ mod tests {
             )),
             desktop_available: false,
             desktop_service: None,
+            discovery_url: None,
+            discovery_temp_key: std::sync::Arc::new(std::sync::RwLock::new(None)),
         })
     }
 

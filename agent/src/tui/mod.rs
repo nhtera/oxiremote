@@ -102,7 +102,15 @@ fn new_terminal() -> Result<Term> {
 /// Main entry. Owns the terminal lifecycle; returns on "Exit" menu selection
 /// or Ctrl+C. `db_path` is threaded through so the dashboard can read/refresh
 /// the active OTK directly (server thread shares the same SQLite file).
-pub fn run_tui(event_bus: Arc<EventBus>, db_path: PathBuf) -> Result<()> {
+/// `discovery_url` + `discovery_temp_key` are populated when
+/// `OXI_DISCOVERY_URL` is set; the dashboard uses them to switch the QR
+/// payload to the cross-origin discovery form.
+pub fn run_tui(
+    event_bus: Arc<EventBus>,
+    db_path: PathBuf,
+    discovery_url: Option<String>,
+    discovery_temp_key: Arc<std::sync::RwLock<Option<String>>>,
+) -> Result<()> {
     let mut _guard = TerminalGuard::enter()?;
     let mut term = new_terminal()?;
 
@@ -133,7 +141,13 @@ pub fn run_tui(event_bus: Arc<EventBus>, db_path: PathBuf) -> Result<()> {
                 return Ok(());
             }
             MenuChoice::TerminalUi => {
-                dashboard::run_dashboard(&mut term, event_bus.clone(), db_path.clone())?;
+                dashboard::run_dashboard(
+                    &mut term,
+                    event_bus.clone(),
+                    db_path.clone(),
+                    discovery_url.clone(),
+                    discovery_temp_key.clone(),
+                )?;
             }
             MenuChoice::UpdateAvailable(_ver) => {
                 // Temporarily leave alternate screen so the update output is

@@ -722,6 +722,8 @@ mod tests {
             recent_logs: Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new())),
             desktop_available: false,
             desktop_service: None,
+            discovery_url: None,
+            discovery_temp_key: Arc::new(std::sync::RwLock::new(None)),
         })
     }
 

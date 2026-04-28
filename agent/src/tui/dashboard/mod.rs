@@ -12,7 +12,7 @@ pub(super) mod render_qr;
 
 use std::io;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock as StdRwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
@@ -76,6 +76,15 @@ pub(super) struct State {
     pub(super) verifying_started: Option<Instant>,
     /// True while the `?` help overlay is shown.
     pub(super) help_overlay: bool,
+    /// Cloudflare discovery worker base URL (`OXI_DISCOVERY_URL`). When set,
+    /// the QR payload becomes `<discovery_url>/login?k=<temp_key>&otk=<otk>`
+    /// so a phone scan reaches a standalone SPA that resolves the tunnel URL
+    /// without manual entry.
+    pub(super) discovery_url: Option<String>,
+    /// Latest temp key issued by the discovery worker. Shared Arc with the
+    /// discovery client running on the server thread — written there, read
+    /// here on every draw.
+    pub(super) discovery_temp_key: Arc<StdRwLock<Option<String>>>,
 }
 
 #[derive(Clone)]
@@ -91,7 +100,11 @@ const LOG_HISTORY_MAX: usize = 50;
 const FLASH_TTL: Duration = Duration::from_secs(3);
 
 impl State {
-    fn new(db_path: PathBuf) -> Self {
+    fn new(
+        db_path: PathBuf,
+        discovery_url: Option<String>,
+        discovery_temp_key: Arc<StdRwLock<Option<String>>>,
+    ) -> Self {
         use super::step_progress::Step;
         let initial_otk = one_time_keys::active_otk(&db_path).ok().flatten();
         let (otk_token, otk_expires_at) = match initial_otk {
@@ -128,6 +141,8 @@ impl State {
             view_state: ViewState::Dashboard,
             verifying_started: None,
             help_overlay: false,
+            discovery_url,
+            discovery_temp_key,
         }
     }
 
@@ -360,6 +375,14 @@ impl State {
             AgentEvent::OtkIssued { .. } | AgentEvent::OtkUsed { .. } => {
                 self.refresh_otk_from_db();
             }
+            AgentEvent::DiscoveryTempKeyIssued { .. } => {
+                // Slot has already been written by the discovery client; flash
+                // is purely a "you can scan now" cue for the operator.
+                self.set_flash("Discovery key issued");
+            }
+            AgentEvent::DiscoveryUnavailable => {
+                self.set_flash("Discovery unavailable — falling back to tunnel QR");
+            }
             AgentEvent::OtkExpired { .. } => {
                 self.refresh_otk_from_db();
                 // 5-second prominent flash — longer than the normal 3-second TTL
@@ -398,10 +421,33 @@ impl State {
         }
     }
 
+    /// Snapshot the latest temp key written by the discovery client. Returns
+    /// `None` when discovery is disabled or no key has been issued yet.
+    pub(super) fn current_discovery_temp_key(&self) -> Option<String> {
+        self.discovery_temp_key
+            .read()
+            .ok()
+            .and_then(|g| g.clone())
+    }
+
     /// Combine tunnel URL + active OTK into the deep-link the QR encodes.
-    /// Mirrors `pairing-card.tsx` so a phone scan reaches /login with `k=`
-    /// pre-filled and submits without keyboard typing.
+    /// In discovery mode (env `OXI_DISCOVERY_URL` set + temp key issued + OTK
+    /// present) the payload becomes `<discovery_url>/login?k=<temp_key>&otk=<otk>`
+    /// so a single QR scan completes pairing across origins. Otherwise mirrors
+    /// `pairing-card.tsx` with the original embedded form.
     pub(super) fn qr_payload(&self) -> String {
+        if let (Some(durl), Some(tk), Some(otk)) = (
+            self.discovery_url.as_deref(),
+            self.current_discovery_temp_key(),
+            self.otk_token.as_deref(),
+        ) {
+            return format!(
+                "{}/login?k={}&otk={}",
+                durl.trim_end_matches('/'),
+                tk,
+                otk
+            );
+        }
         match (&self.tunnel_url, &self.otk_token) {
             (Some(url), Some(otk)) => {
                 format!("{}/login?k={}", url.trim_end_matches('/'), otk)
@@ -412,9 +458,15 @@ impl State {
     }
 }
 
-pub fn run_dashboard(term: &mut Term, event_bus: Arc<EventBus>, db_path: PathBuf) -> Result<()> {
+pub fn run_dashboard(
+    term: &mut Term,
+    event_bus: Arc<EventBus>,
+    db_path: PathBuf,
+    discovery_url: Option<String>,
+    discovery_temp_key: Arc<StdRwLock<Option<String>>>,
+) -> Result<()> {
     let mut rx = event_bus.subscribe();
-    let mut state = State::new(db_path);
+    let mut state = State::new(db_path, discovery_url, discovery_temp_key);
 
     // Hydrate from the bus's tunnel snapshot before starting the event loop.
     // The TUI subscribes lazily (after the menu picks "Terminal UI"), so events
@@ -813,6 +865,55 @@ mod tests {
             .unwrap_or(StepStatus::Pending)
     }
 
+    fn make_test_state() -> State {
+        State::new(
+            PathBuf::from("/tmp/dummy.sqlite"),
+            None,
+            Arc::new(StdRwLock::new(None)),
+        )
+    }
+
+    /// Discovery mode: when `OXI_DISCOVERY_URL` + temp key + OTK are all
+    /// present, the QR encodes the cross-origin discovery form so a phone
+    /// scan reaches the standalone SPA which then resolves the tunnel URL.
+    #[test]
+    fn qr_payload_uses_discovery_form_when_temp_key_and_otk_present() {
+        let slot = Arc::new(StdRwLock::new(Some("temp1234".to_string())));
+        let mut state = State::new(
+            PathBuf::from("/tmp/dummy.sqlite"),
+            Some("https://oxiremote.app/".into()),
+            slot,
+        );
+        state.tunnel_url = Some("https://example.trycloudflare.com".into());
+        state.otk_token = Some("OTK_VAL".into());
+
+        assert_eq!(
+            state.qr_payload(),
+            "https://oxiremote.app/login?k=temp1234&otk=OTK_VAL",
+            "discovery URL must take precedence and trim trailing slash"
+        );
+    }
+
+    /// Discovery mode falls back to the embedded tunnel QR while the discovery
+    /// client is still racing to fetch the temp key (slot empty).
+    #[test]
+    fn qr_payload_falls_back_when_temp_key_missing() {
+        let slot: Arc<StdRwLock<Option<String>>> = Arc::new(StdRwLock::new(None));
+        let mut state = State::new(
+            PathBuf::from("/tmp/dummy.sqlite"),
+            Some("https://oxiremote.app".into()),
+            slot,
+        );
+        state.tunnel_url = Some("https://example.trycloudflare.com".into());
+        state.otk_token = Some("OTK_VAL".into());
+
+        assert_eq!(
+            state.qr_payload(),
+            "https://example.trycloudflare.com/login?k=OTK_VAL",
+            "missing temp key must fall back to embedded form, not produce bad URLs"
+        );
+    }
+
     /// Late-joiner recovery: TUI subscribes to the bus AFTER the menu, so
     /// quick-tunnel paths emit Connecting/Tunneling before we listen. Only
     /// HealthProbe events arrive at the TUI in that case. Verify that an
@@ -820,7 +921,7 @@ mod tests {
     /// the checklist doesn't show two simultaneous Active steps.
     #[test]
     fn health_probe_cascades_earlier_steps_to_done() {
-        let mut state = State::new(PathBuf::from("/tmp/dummy.sqlite"));
+        let mut state = make_test_state();
         // Default: every step Pending. Simulate the "TUI joined late" case
         // where Connecting/Tunneling events were lost.
         state.apply(&AgentEvent::HealthProbe {
@@ -841,7 +942,7 @@ mod tests {
     /// transport is up.
     #[test]
     fn tunnel_url_changed_cascades_earlier_steps_to_done() {
-        let mut state = State::new(PathBuf::from("/tmp/dummy.sqlite"));
+        let mut state = make_test_state();
         state.apply(&AgentEvent::TunnelUrlChanged {
             url: "https://test.trycloudflare.com".into(),
         });
@@ -855,7 +956,7 @@ mod tests {
     /// the original "two-active-step" rendering bug when events were missed.
     #[test]
     fn default_state_has_no_active_steps() {
-        let state = State::new(PathBuf::from("/tmp/dummy.sqlite"));
+        let state = make_test_state();
         assert!(
             state.steps.iter().all(|s| !matches!(s.status, StepStatus::Active)),
             "no step should default to Active"
@@ -866,7 +967,7 @@ mod tests {
     /// `if *ok && let Some(s) = ...` chain that's otherwise untested.
     #[test]
     fn health_probe_ok_promotes_ready_to_done() {
-        let mut state = State::new(PathBuf::from("/tmp/dummy.sqlite"));
+        let mut state = make_test_state();
         state.apply(&AgentEvent::HealthProbe {
             attempt: 5,
             status: "200 OK".into(),
@@ -882,7 +983,7 @@ mod tests {
     /// so the dashboard re-enters the onboarding view to surface the failure.
     #[test]
     fn tunnel_down_after_ready_flips_is_ready_false() {
-        let mut state = State::new(PathBuf::from("/tmp/dummy.sqlite"));
+        let mut state = make_test_state();
         // Reach Ready via successful probe.
         state.apply(&AgentEvent::HealthProbe {
             attempt: 1,
@@ -907,7 +1008,7 @@ mod tests {
     /// Info pane render "—" forever even after Ready=Done.
     #[test]
     fn step_event_hydrates_tunnel_url_from_info() {
-        let mut state = State::new(PathBuf::from("/tmp/dummy.sqlite"));
+        let mut state = make_test_state();
         assert!(state.tunnel_url.is_none());
 
         // Bare URL (matches what ensure_quick_tunnel emits for Tunneling).
@@ -943,7 +1044,7 @@ mod tests {
 
         // Now run the same hydration the dashboard does on entry.
         let snap = bus.snapshot();
-        let mut state = State::new(PathBuf::from("/tmp/dummy.sqlite"));
+        let mut state = make_test_state();
         if let Some(url) = snap.url {
             state.tunnel_url = Some(url);
             state.cascade_done_through("Tunneling");
@@ -982,7 +1083,7 @@ mod tests {
     /// at most one row, not two like before.
     #[test]
     fn failed_event_annotates_only_active_step() {
-        let mut state = State::new(PathBuf::from("/tmp/dummy.sqlite"));
+        let mut state = make_test_state();
         // Move into Verifying via cascade, simulating mid-startup failure.
         state.apply(&AgentEvent::HealthProbe {
             attempt: 12,
@@ -1026,7 +1127,7 @@ mod tests {
     /// trailing slash on the URL even when one was passed in.
     #[test]
     fn render_qr_shows_app_url_and_otk_and_expiry() {
-        let mut state = State::new(PathBuf::from("/tmp/dummy.sqlite"));
+        let mut state = make_test_state();
         state.tunnel_url = Some("https://example.trycloudflare.com/".into());
         state.otk_token = Some("ABCDEF1234567890".into());
         state.otk_expires_at = Some(now_secs() + 600);
