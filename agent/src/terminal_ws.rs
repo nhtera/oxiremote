@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use axum::extract::ws::{Message, WebSocket};
 use axum::extract::{Path as AxumPath, State, WebSocketUpgrade};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use axum::Json;
 use axum_extra::extract::cookie::CookieJar;
@@ -10,7 +10,9 @@ use rusqlite::{params, Connection};
 use tokio::sync::broadcast::error::RecvError;
 use tracing::warn;
 
-use crate::auth::require_active_auth;
+use crate::auth::{
+    extract_bearer_from_ws_protocols, require_owner_session_dual, WS_BEARER_PROTOCOL,
+};
 use crate::db::now_ts;
 use crate::terminal_pty::{WsIn, WsOut, WS_MAX_TEXT_BYTES};
 use crate::AppState;
@@ -18,10 +20,19 @@ use crate::AppState;
 pub async fn api_terminal_session_ws(
     State(state): State<Arc<AppState>>,
     jar: CookieJar,
+    headers: HeaderMap,
     AxumPath(id): AxumPath<String>,
     ws: WebSocketUpgrade,
 ) -> impl IntoResponse {
-    let Some(owner_session_id) = require_active_auth(&state.db_path, &state.signing_key, &jar) else {
+    let bearer = extract_bearer_from_ws_protocols(&headers);
+    let Some(owner_session_id) = require_owner_session_dual(
+        &state.db_path,
+        &state.signing_key,
+        &jar,
+        bearer.as_deref(),
+    )
+    .await
+    else {
         return StatusCode::UNAUTHORIZED.into_response();
     };
 
@@ -54,7 +65,16 @@ pub async fn api_terminal_session_ws(
             }
 
             let state2 = state.clone();
-            ws.on_upgrade(move |socket| handle_terminal_ws(state2, id, owner_session_id, socket))
+            // If the client offered the bearer subprotocol, echo the marker
+            // back so the browser accepts the upgrade. Browsers close the WS
+            // when the negotiated subprotocol isn't in the offered list, so
+            // we only set this when bearer auth was actually used.
+            let upgrade = if bearer.is_some() {
+                ws.protocols([WS_BEARER_PROTOCOL])
+            } else {
+                ws
+            };
+            upgrade.on_upgrade(move |socket| handle_terminal_ws(state2, id, owner_session_id, socket))
         }
         Ok(false) => StatusCode::FORBIDDEN.into_response(),
         Err(err) => {
@@ -144,3 +164,4 @@ async fn handle_terminal_ws(
         }
     }
 }
+

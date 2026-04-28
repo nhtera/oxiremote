@@ -51,6 +51,19 @@ fn is_state_changing(method: &Method) -> bool {
     !matches!(*method, Method::GET | Method::HEAD | Method::OPTIONS)
 }
 
+/// Bearer auth is immune to CSRF — the browser never auto-attaches an
+/// Authorization header, so a cross-site form/img/script tag cannot forge
+/// the credential the way it can with cookies. Cross-origin discovery-mode
+/// SPAs use `credentials: 'omit' + Bearer`; without this exemption every
+/// state-changing call would 403 because `SameSite=Lax` blocks the cookie.
+fn has_bearer_auth(headers: &HeaderMap) -> bool {
+    headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.starts_with("Bearer ") || s.starts_with("bearer "))
+        .unwrap_or(false)
+}
+
 fn cookie_value<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
     let raw = headers.get(axum::http::header::COOKIE)?.to_str().ok()?;
     for part in raw.split(';') {
@@ -80,7 +93,11 @@ pub async fn csrf_guard(
     let tunnel = is_tunnel_request(headers);
     let existing = cookie_value(headers, CSRF_COOKIE).map(str::to_string);
 
-    if tunnel && is_state_changing(req.method()) && !is_csrf_exempt(req.uri().path()) {
+    if tunnel
+        && is_state_changing(req.method())
+        && !is_csrf_exempt(req.uri().path())
+        && !has_bearer_auth(headers)
+    {
         let cookie_tok = existing.as_deref();
         let header_tok = header_value(headers, CSRF_HEADER);
         match (cookie_tok, header_tok) {
@@ -159,6 +176,34 @@ mod tests {
         // Bootstraps — caller has no oxi_csrf cookie yet by definition.
         assert!(is_csrf_exempt("/api/pairing/exchange"));
         assert!(is_csrf_exempt("/api/login/one-time"));
+    }
+
+    #[test]
+    fn bearer_auth_bypasses_csrf() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            "Bearer abc123".parse().unwrap(),
+        );
+        assert!(has_bearer_auth(&headers));
+
+        // Lowercase variant (RFC says case-insensitive scheme)
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            "bearer abc123".parse().unwrap(),
+        );
+        assert!(has_bearer_auth(&headers));
+
+        // No Authorization header at all
+        headers.remove(axum::http::header::AUTHORIZATION);
+        assert!(!has_bearer_auth(&headers));
+
+        // Wrong scheme
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            "Basic dXNlcjpwYXNz".parse().unwrap(),
+        );
+        assert!(!has_bearer_auth(&headers));
     }
 
     #[test]

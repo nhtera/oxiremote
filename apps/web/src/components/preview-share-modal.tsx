@@ -1,4 +1,6 @@
 import { useEffect, useState } from 'react'
+import { isDiscoveryMode } from '../lib/discovery-client'
+import { loadTunnelBase } from '../lib/api-client'
 
 interface ShareInfo {
   url: string
@@ -12,7 +14,14 @@ interface Props {
 
 export default function PreviewShareModal({ info, onClose }: Props) {
   const [copied, setCopied] = useState(false)
-  const fullUrl = new URL(info.url, window.location.origin).toString()
+  // The agent returns the share URL as a relative path (`/preview/{id}?t=…`).
+  // In embedded mode the SPA is served by the agent so resolving against
+  // `window.location.origin` is correct; in discovery mode the SPA lives on
+  // Pages while the preview proxy lives on the tunnel — resolve against the
+  // saved tunnel base instead so the link actually reaches the agent.
+  const baseOrigin =
+    (isDiscoveryMode() ? loadTunnelBase() : null) ?? window.location.origin
+  const fullUrl = new URL(info.url, baseOrigin).toString()
 
   // auto-close the "copied" hint
   useEffect(() => {
@@ -70,6 +79,14 @@ export default function PreviewShareModal({ info, onClose }: Props) {
             Expires in ~{expiresInMin} min
           </span>
           <div className="flex gap-2">
+            <a
+              href={fullUrl}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="btn-secondary text-xs"
+            >
+              Open
+            </a>
             <button onClick={copy} className="btn-primary text-xs">
               {copied ? 'Copied!' : 'Copy'}
             </button>

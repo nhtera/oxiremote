@@ -19,6 +19,10 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 
 import type { DesktopInputEvent, DesktopStatus, QualityTier } from './use-desktop-session'
+import { isDiscoveryMode } from '../lib/discovery-client'
+import { loadApiKey, loadTunnelBase } from '../lib/api-client'
+
+const WS_BEARER_PROTOCOL = 'oxi-bearer-v1'
 
 interface VideoSessionApi {
   status: DesktopStatus
@@ -41,8 +45,23 @@ const RECONNECT_DELAY_MS = 1500
 const MAX_ATTEMPTS = 3
 
 function wsUrl(deviceId: string): string {
+  const path = `/ws/desktop/${encodeURIComponent(deviceId)}`
+  if (isDiscoveryMode()) {
+    const base = loadTunnelBase()
+    if (base) {
+      const wsBase = base.replace(/^http:/, 'ws:').replace(/^https:/, 'wss:')
+      return `${wsBase}${path}`
+    }
+  }
   const proto = location.protocol === 'https:' ? 'wss:' : 'ws:'
-  return `${proto}//${location.host}/ws/desktop/${encodeURIComponent(deviceId)}`
+  return `${proto}//${location.host}${path}`
+}
+
+function wsProtocols(): string[] | undefined {
+  if (!isDiscoveryMode()) return undefined
+  const key = loadApiKey()
+  if (!key) return undefined
+  return [WS_BEARER_PROTOCOL, key]
 }
 
 /** Feature-detection: phase-03 needs WebRTC + H.264 receive support. All
@@ -174,7 +193,10 @@ export function useDesktopVideoSession(
     teardown()
 
     setStatus('connecting')
-    const ws = new WebSocket(wsUrl(deviceId))
+    const protocols = wsProtocols()
+    const ws = protocols
+      ? new WebSocket(wsUrl(deviceId), protocols)
+      : new WebSocket(wsUrl(deviceId))
     ws.binaryType = 'arraybuffer'
     wsRef.current = ws
 

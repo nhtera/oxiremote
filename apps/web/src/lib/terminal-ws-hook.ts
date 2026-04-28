@@ -2,6 +2,8 @@ import { useEffect, useRef } from 'react'
 import { Terminal } from 'xterm'
 import { FitAddon } from 'xterm-addon-fit'
 import { useTerminalStore, type Session } from '../state/terminal-store'
+import { isDiscoveryMode } from './discovery-client'
+import { loadApiKey, loadTunnelBase } from './api-client'
 
 export type SessionHandle = {
   term: Terminal
@@ -14,9 +16,30 @@ export type SessionHandle = {
   closedByUser: boolean
 }
 
-function wsUrl(path: string) {
+/// Subprotocol marker used to carry a Bearer api_key on WS upgrade in
+/// discovery (cross-origin) mode. Browsers can't set `Authorization` on
+/// the WS handshake, but they can offer subprotocols. The agent picks the
+/// marker (response header) and reads the api_key from the second value.
+/// Same pattern Kubernetes uses for `kubectl exec`.
+const WS_BEARER_PROTOCOL = 'oxi-bearer-v1'
+
+function wsUrl(path: string): string {
+  if (isDiscoveryMode()) {
+    const base = loadTunnelBase()
+    if (base) {
+      const wsBase = base.replace(/^http:/, 'ws:').replace(/^https:/, 'wss:')
+      return `${wsBase}${path}`
+    }
+  }
   const proto = location.protocol === 'https:' ? 'wss:' : 'ws:'
   return `${proto}//${location.host}${path}`
+}
+
+function wsProtocols(): string[] | undefined {
+  if (!isDiscoveryMode()) return undefined
+  const key = loadApiKey()
+  if (!key) return undefined
+  return [WS_BEARER_PROTOCOL, key]
 }
 
 // Exponential-ish backoff capped at 5s, matches "reconnect within 3s" success criterion.
@@ -125,7 +148,10 @@ function connect(
     return
   }
 
-  const ws = new WebSocket(wsUrl(`/api/terminal/sessions/${sessionId}/ws`))
+  const protocols = wsProtocols()
+  const ws = protocols
+    ? new WebSocket(wsUrl(`/api/terminal/sessions/${sessionId}/ws`), protocols)
+    : new WebSocket(wsUrl(`/api/terminal/sessions/${sessionId}/ws`))
   handle.ws = ws
 
   ws.onopen = () => {

@@ -1,6 +1,8 @@
 const STATIC_ALLOWED = new Set<string>([
   'https://oxiremote.app',
   'https://www.oxiremote.app',
+  'https://remote.erai.dev',
+  'https://www.remote.erai.dev',
   'http://localhost:5173',
   'http://localhost:4173',
 ])

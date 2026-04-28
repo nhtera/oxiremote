@@ -15,7 +15,7 @@ mod inner {
 
     use axum::extract::ws::{Message, WebSocket};
     use axum::extract::{Path, State, WebSocketUpgrade};
-    use axum::http::StatusCode;
+    use axum::http::{HeaderMap, StatusCode};
     use axum::response::IntoResponse;
     use axum_extra::extract::cookie::CookieJar;
     use bytes::Bytes;
@@ -37,7 +37,10 @@ mod inner {
     use webrtc::rtp_transceiver::RTCRtpTransceiverInit;
     use webrtc::track::track_local::TrackLocal;
 
-    use crate::auth::require_active_auth_with_device;
+    use crate::auth::{
+        extract_bearer_from_ws_protocols, require_owner_session_with_device_dual,
+        WS_BEARER_PROTOCOL,
+    };
     use crate::desktop_service::DesktopService;
     use crate::desktop_ws_capture::{spawn_capture_pipeline, Sink};
     use crate::pipeline_selection::{
@@ -231,9 +234,21 @@ mod inner {
         Path(device_id): Path<String>,
         State(state): State<Arc<AppState>>,
         jar: CookieJar,
+        headers: HeaderMap,
     ) -> impl IntoResponse {
-        let Some((_session_id, session_device_id)) =
-            require_active_auth_with_device(&state.db_path, &state.signing_key, &jar)
+        // Browsers can't set `Authorization` on a WS upgrade, so the
+        // cross-origin discovery SPA carries the api_key via subprotocols
+        // (`["oxi-bearer-v1", <key>]`). Same-origin embedded mode keeps
+        // using the cookie path — `bearer` is None there and dual-auth
+        // falls through to the cookie session.
+        let bearer = extract_bearer_from_ws_protocols(&headers);
+        let Some((_session_id, session_device_id)) = require_owner_session_with_device_dual(
+            &state.db_path,
+            &state.signing_key,
+            &jar,
+            bearer.as_deref(),
+        )
+        .await
         else {
             return StatusCode::UNAUTHORIZED.into_response();
         };
@@ -268,7 +283,15 @@ mod inner {
         let close_rx = svc.register(&device_id);
         let svc = Arc::clone(svc);
 
-        ws.on_upgrade(move |socket| desktop_session(socket, device_id, state, svc, close_rx))
+        // Echo the marker subprotocol so the browser accepts the upgrade
+        // when bearer auth was used. Browsers close the WS if the negotiated
+        // subprotocol isn't in the offered list, so only set it for bearer.
+        let upgrade = if bearer.is_some() {
+            ws.protocols([WS_BEARER_PROTOCOL])
+        } else {
+            ws
+        };
+        upgrade.on_upgrade(move |socket| desktop_session(socket, device_id, state, svc, close_rx))
     }
 
     // ── Session entry ─────────────────────────────────────────────────────────

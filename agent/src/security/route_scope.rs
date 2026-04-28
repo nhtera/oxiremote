@@ -28,11 +28,17 @@ pub enum RouteScope {
 }
 
 /// Path prefixes that are loopback-only.
+//
+// `/api/local-sites` was previously listed here as defence-in-depth against
+// listening-port enumeration. The handler already gates on `require_tunnel_auth`
+// (Bearer or cookie), so a paired device authenticated by the operator can see
+// exactly what they would see in embedded mode — the localhost-only flag added
+// no real protection but broke discovery-mode auto-discovery on the SPA. Kept
+// public so cross-origin SPAs work the same as the embedded one.
 const LOCALHOST_PREFIXES: &[&str] = &[
-    "/api/notify",       // CLI-driven push fan-out (shared-secret bearer)
-    "/api/local-sites",  // leaks listening-port enumeration on the host
-    "/api/agent",        // agent dashboard API — host-only (events SSE, state)
-    "/agent",            // agent dashboard SPA pages — host-only
+    "/api/notify", // CLI-driven push fan-out (shared-secret bearer)
+    "/api/agent",  // agent dashboard API — host-only (events SSE, state)
+    "/agent",      // agent dashboard SPA pages — host-only
 ];
 
 pub fn scope_for_path(path: &str) -> RouteScope {
@@ -88,6 +94,9 @@ mod tests {
         assert_eq!(scope_for_path("/api/files/list"), RouteScope::Public);
         assert_eq!(scope_for_path("/api/previews"), RouteScope::Public);
         assert_eq!(scope_for_path("/preview/abc"), RouteScope::Public);
+        // `/api/local-sites` is auth-gated by the handler itself; no need to
+        // also wall it off at the tunnel-guard layer.
+        assert_eq!(scope_for_path("/api/local-sites"), RouteScope::Public);
         assert_eq!(scope_for_path("/"), RouteScope::Public);
     }
 
@@ -95,7 +104,6 @@ mod tests {
     fn localhost_only_routes_are_classified() {
         assert_eq!(scope_for_path("/api/notify"), RouteScope::Localhost);
         assert_eq!(scope_for_path("/api/notify/extra"), RouteScope::Localhost);
-        assert_eq!(scope_for_path("/api/local-sites"), RouteScope::Localhost);
         assert_eq!(scope_for_path("/api/agent"), RouteScope::Localhost);
         assert_eq!(scope_for_path("/api/agent/events"), RouteScope::Localhost);
         assert_eq!(scope_for_path("/api/agent/state"), RouteScope::Localhost);
@@ -111,7 +119,6 @@ mod tests {
         // `/api/notifycheater` must not be classified as Localhost — the
         // match has to respect segment boundaries.
         assert_eq!(scope_for_path("/api/notifycheater"), RouteScope::Public);
-        assert_eq!(scope_for_path("/api/local-sites-public"), RouteScope::Public);
         assert_eq!(scope_for_path("/api/agentless"), RouteScope::Public);
         assert_eq!(scope_for_path("/agent-about"), RouteScope::Public);
     }

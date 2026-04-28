@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useState } from 'react'
 
 import PreviewShareModal from '../components/preview-share-modal'
 import { apiFetch } from '../lib/transport'
+import { isDiscoveryMode } from '../lib/discovery-client'
 import { StateView } from '../components/ui'
 
 type Health = 'ok' | 'down' | 'unknown'
@@ -199,14 +200,22 @@ export default function PreviewPage() {
                   {p.label}{' '}
                   <span className="text-text-muted text-xs">:{p.port}</span>
                 </span>
-                <a
-                  href={`/preview/${p.id}/`}
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  className="text-accent hover:text-accent-hover text-xs"
-                >
-                  Open
-                </a>
+                {/* "Open" navigates the tab directly to /preview/{id}/, which
+                    carries no Authorization header — only same-origin cookie
+                    auth works there. In discovery mode the SPA is on Pages
+                    while the proxy is on the tunnel; the navigation would
+                    401. Use "Share" instead — that route accepts a `?t=`
+                    token that survives cross-origin navigation. */}
+                {!isDiscoveryMode() && (
+                  <a
+                    href={`/preview/${p.id}/`}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="text-accent hover:text-accent-hover text-xs"
+                  >
+                    Open
+                  </a>
+                )}
                 <button
                   onClick={() => share(p.id)}
                   className="btn-secondary text-xs py-0.5 px-2"

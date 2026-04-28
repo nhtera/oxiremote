@@ -97,6 +97,35 @@ pub fn extract_bearer(headers: &axum::http::HeaderMap) -> Option<String> {
     raw.strip_prefix("Bearer ").map(|s| s.trim().to_string())
 }
 
+/// WebSocket subprotocol marker for Bearer-via-subprotocol auth. Browsers
+/// can't set `Authorization` on the WS upgrade request; the cross-origin
+/// discovery SPA offers `["oxi-bearer-v1", <api_key>]` as subprotocols.
+/// The agent picks the marker (so the response header doesn't leak the
+/// token) and reads the api_key from the *other* offered value. Same
+/// pattern Kubernetes uses for `kubectl exec` over the apiserver.
+pub const WS_BEARER_PROTOCOL: &str = "oxi-bearer-v1";
+
+/// Extract a bearer token from `Sec-WebSocket-Protocol` when the client
+/// offered `["oxi-bearer-v1", <token>]`. Returns the first non-marker value
+/// when the marker is present.
+pub fn extract_bearer_from_ws_protocols(headers: &axum::http::HeaderMap) -> Option<String> {
+    let raw = headers.get("sec-websocket-protocol")?.to_str().ok()?;
+    let mut saw_marker = false;
+    let mut other: Option<String> = None;
+    for part in raw.split(',') {
+        let p = part.trim();
+        if p.is_empty() {
+            continue;
+        }
+        if p == WS_BEARER_PROTOCOL {
+            saw_marker = true;
+        } else if other.is_none() {
+            other = Some(p.to_string());
+        }
+    }
+    if saw_marker { other } else { None }
+}
+
 /// Dual-auth gate for tunnel-reachable handlers. When `Authorization: Bearer`
 /// is present we verify the api_key (Argon2id) and return the bound
 /// `device_id`. Otherwise we fall through to the cookie-session path. Bearer
@@ -653,12 +682,56 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::Arc;
 
+    use axum::http::HeaderMap;
     use axum_extra::extract::cookie::{Cookie, CookieJar};
     use dashmap::DashMap;
     use rusqlite::{params, Connection};
 
     use super::*;
     use crate::{db::init_db, local_sites, AppState};
+
+    fn ws_protocol_hdrs(value: &str) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        h.insert("sec-websocket-protocol", value.parse().unwrap());
+        h
+    }
+
+    #[test]
+    fn ws_bearer_extracted_with_marker_first() {
+        let h = ws_protocol_hdrs("oxi-bearer-v1, abcDEF123_token");
+        assert_eq!(
+            extract_bearer_from_ws_protocols(&h).as_deref(),
+            Some("abcDEF123_token")
+        );
+    }
+
+    #[test]
+    fn ws_bearer_extracted_with_marker_second() {
+        // Browsers may reorder; tolerate either position.
+        let h = ws_protocol_hdrs("abcDEF123_token, oxi-bearer-v1");
+        assert_eq!(
+            extract_bearer_from_ws_protocols(&h).as_deref(),
+            Some("abcDEF123_token")
+        );
+    }
+
+    #[test]
+    fn ws_bearer_none_without_marker() {
+        let h = ws_protocol_hdrs("some-other-protocol, another");
+        assert!(extract_bearer_from_ws_protocols(&h).is_none());
+    }
+
+    #[test]
+    fn ws_bearer_none_with_only_marker() {
+        let h = ws_protocol_hdrs("oxi-bearer-v1");
+        assert!(extract_bearer_from_ws_protocols(&h).is_none());
+    }
+
+    #[test]
+    fn ws_bearer_none_when_header_missing() {
+        let h = HeaderMap::new();
+        assert!(extract_bearer_from_ws_protocols(&h).is_none());
+    }
 
     fn test_state(name: &str) -> AppState {
         let db_path = std::env::temp_dir().join(format!(

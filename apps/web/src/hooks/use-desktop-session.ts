@@ -5,6 +5,14 @@
 // as WS binary messages. Client detects via {"type":"fallback"} JSON message.
 
 import { useCallback, useEffect, useRef, useState } from 'react'
+import { isDiscoveryMode } from '../lib/discovery-client'
+import { loadApiKey, loadTunnelBase } from '../lib/api-client'
+
+/// Subprotocol marker used to carry a Bearer api_key on WS upgrade in
+/// discovery (cross-origin) mode. Browsers can't set `Authorization` on
+/// the WS handshake, but they can offer subprotocols. The agent picks the
+/// marker (response header) and reads the api_key from the second value.
+const WS_BEARER_PROTOCOL = 'oxi-bearer-v1'
 
 export type DesktopStatus =
   | 'idle'
@@ -48,10 +56,28 @@ const MAX_ATTEMPTS = 3
 
 // Build the WS URL. The path segment is the authenticated device's ID —
 // the agent cross-checks it against the session cookie's bound device and
-// rejects (403) any mismatch, preventing cross-session hijack.
+// rejects (403) any mismatch, preventing cross-session hijack. In discovery
+// (cross-origin) mode the SPA lives on Pages but the agent's WS lives on
+// the per-host tunnel — rewrite to the saved tunnel base so the upgrade
+// hits the right origin.
 function wsUrl(deviceId: string): string {
+  const path = `/ws/desktop/${encodeURIComponent(deviceId)}`
+  if (isDiscoveryMode()) {
+    const base = loadTunnelBase()
+    if (base) {
+      const wsBase = base.replace(/^http:/, 'ws:').replace(/^https:/, 'wss:')
+      return `${wsBase}${path}`
+    }
+  }
   const proto = location.protocol === 'https:' ? 'wss:' : 'ws:'
-  return `${proto}//${location.host}/ws/desktop/${encodeURIComponent(deviceId)}`
+  return `${proto}//${location.host}${path}`
+}
+
+function wsProtocols(): string[] | undefined {
+  if (!isDiscoveryMode()) return undefined
+  const key = loadApiKey()
+  if (!key) return undefined
+  return [WS_BEARER_PROTOCOL, key]
 }
 
 export function useDesktopSession(
@@ -115,7 +141,10 @@ export function useDesktopSession(
 
     setStatus('connecting')
 
-    const ws = new WebSocket(wsUrl(deviceId))
+    const protocols = wsProtocols()
+    const ws = protocols
+      ? new WebSocket(wsUrl(deviceId), protocols)
+      : new WebSocket(wsUrl(deviceId))
     ws.binaryType = 'arraybuffer'
     wsRef.current = ws
 
