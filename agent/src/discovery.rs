@@ -128,6 +128,20 @@ async fn register_with_retry(
     Err(last_err.unwrap_or_else(|| anyhow!("discovery failed (no error captured)")))
 }
 
+/// Cloudflare tunnels (quick + named) terminate HTTPS, but the published URL
+/// shape differs: quick tunnel emits `https://abc.trycloudflare.com`, named
+/// tunnel emits the bare hostname `oxiremote.example.com`. The SPA does
+/// `${tunnelUrl}/api/...` and only works with full URLs, so normalize before
+/// the worker sees the value.
+fn normalize_tunnel_url(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.starts_with("https://") || trimmed.starts_with("http://") {
+        trimmed.to_string()
+    } else {
+        format!("https://{trimmed}")
+    }
+}
+
 async fn register_session(
     client: &Client,
     base: &str,
@@ -135,6 +149,8 @@ async fn register_session(
     tunnel_url: &str,
 ) -> Result<String> {
     let base = base.trim_end_matches('/');
+    let normalized = normalize_tunnel_url(tunnel_url);
+    let tunnel_url = normalized.as_str();
 
     // 1) session/create — idempotent upsert.
     let res = client
@@ -250,6 +266,38 @@ mod tests {
             let _ = axum::serve(listener, router(state)).await;
         });
         format!("http://{bound}")
+    }
+
+    #[test]
+    fn normalize_tunnel_url_adds_scheme_when_missing() {
+        assert_eq!(
+            normalize_tunnel_url("oxiremote.erai.dev"),
+            "https://oxiremote.erai.dev"
+        );
+        assert_eq!(
+            normalize_tunnel_url("https://abc.trycloudflare.com"),
+            "https://abc.trycloudflare.com"
+        );
+        assert_eq!(
+            normalize_tunnel_url("http://localhost:8787"),
+            "http://localhost:8787"
+        );
+        assert_eq!(
+            normalize_tunnel_url("  oxiremote.erai.dev  "),
+            "https://oxiremote.erai.dev"
+        );
+    }
+
+    #[tokio::test]
+    async fn register_session_normalizes_bare_hostname() {
+        let mock = MockState::default();
+        let url = spawn_mock(mock.clone()).await;
+        let client = Client::new();
+
+        register_session(&client, &url, "id", "oxiremote.erai.dev").await.unwrap();
+
+        let bodies = mock.bodies.lock().unwrap().clone();
+        assert_eq!(bodies[1].1["tunnelUrl"], "https://oxiremote.erai.dev");
     }
 
     #[tokio::test]

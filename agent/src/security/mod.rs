@@ -1,4 +1,5 @@
 pub mod api_key_guard;
+pub mod cors;
 pub mod csrf;
 pub mod rate_limit;
 pub mod route_scope;

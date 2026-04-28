@@ -711,6 +711,18 @@ async fn server_main(
         .with_state(state.clone())
         .layer(TraceLayer::new_for_http());
 
+    // CORS sits OUTSIDE the security chain so OPTIONS preflights — which
+    // arrive without Bearer / cookie / CSRF — get an early answer instead of
+    // hitting `tunnel_guard` / `api_key_guard`. No-op in embedded mode where
+    // OXI_CORS_ORIGINS is unset; same-origin requests have no Origin header,
+    // so the layer is invisible to that flow.
+    let app = if let Some(cors) = security::cors::build_layer() {
+        info!("CORS allowlist active");
+        app.layer(cors)
+    } else {
+        app
+    };
+
     let addr: SocketAddr = SocketAddr::from(([127, 0, 0, 1], AGENT_PORT));
     // The tunnel-origin detection in route_scope relies on the agent binding
     // loopback-only. If this assert fires the threat model breaks.
