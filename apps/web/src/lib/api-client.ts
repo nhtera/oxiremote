@@ -16,8 +16,10 @@
  *     attach on outgoing calls — matches how multi-host routing works in UI.
  */
 import { apiFetch } from './transport'
+import { isDiscoveryMode } from './discovery-client'
 
 const API_KEY_PREFIX = 'oxi_api_key_'
+const TUNNEL_BASE_PREFIX = 'oxi_tunnel_base_'
 const ACTIVE_HOST_KEY = 'oxi_active_host'
 const CSRF_COOKIE = 'oxi_csrf'
 
@@ -81,6 +83,31 @@ export function clearApiKey(hostId?: string) {
     }
   } catch {
     /* ignore */
+  }
+}
+
+/**
+ * Cross-origin tunnel base storage. In discovery mode the SPA lives on
+ * Pages but the agent's API lives on the per-host tunnel — the base is
+ * resolved once at pairing time (via the discovery worker) and reused for
+ * every subsequent /api/* fetch. Embedded mode never writes these keys.
+ */
+export function storeTunnelBase(hostId: string, baseUrl: string) {
+  try {
+    localStorage.setItem(TUNNEL_BASE_PREFIX + hostId, baseUrl.replace(/\/$/, ''))
+  } catch {
+    /* quota / private mode */
+  }
+}
+
+export function loadTunnelBase(hostId?: string): string | null {
+  const id = hostId ?? getActiveHost()
+  if (!id) return null
+  try {
+    const v = localStorage.getItem(TUNNEL_BASE_PREFIX + id)
+    return v && v.length > 0 ? v : null
+  } catch {
+    return null
   }
 }
 
@@ -149,9 +176,37 @@ export function makeRemoteClient(baseUrl: string, apiKey: string): RemoteClient 
 }
 
 /**
+ * Build a same-origin /api/<path> URL relative to the active tunnel base.
+ * Returns null in embedded mode or when no tunnel base is known yet.
+ */
+function rewriteToTunnel(url: string): string | null {
+  if (!isDiscoveryMode()) return null
+  const base = loadTunnelBase()
+  if (!base) return null
+  let pathname: string
+  if (url.startsWith('/')) {
+    pathname = url
+  } else {
+    try {
+      const u = new URL(url, window.location.origin)
+      if (u.origin !== window.location.origin) return null
+      pathname = u.pathname + u.search + u.hash
+    } catch {
+      return null
+    }
+  }
+  return base + pathname
+}
+
+/**
  * Install a `window.fetch` interceptor that attaches auth headers to
  * same-origin `/api/*` and `/preview/*` requests. Idempotent; safe to call
  * multiple times (later calls no-op).
+ *
+ * Discovery mode (cross-origin SPA on Pages): same-origin /api/* requests
+ * are rewritten to the saved tunnel base — the agent's API never lived on
+ * Pages and we want all the existing call sites to keep using bare paths.
+ * No cookies cross-origin; Bearer + omit credentials.
  */
 let installed = false
 export function installFetchInterceptor() {
@@ -162,9 +217,36 @@ export function installFetchInterceptor() {
     const url = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url
     if (!isApiPath(url)) return original(input, init)
 
-    // If the caller passed a Request object, headers already live on it.
-    // Preserve them — `withAuthHeaders(init)` only sees `init.headers` and
-    // would otherwise throw away the Request's own headers.
+    // Cross-origin discovery mode: rewrite to the per-host tunnel base
+    // and force credentials:'omit' (cookies don't apply cross-origin).
+    const remoteUrl = rewriteToTunnel(url)
+    if (remoteUrl !== null) {
+      const headers = new Headers(input instanceof Request ? input.headers : init.headers ?? {})
+      const key = loadApiKey()
+      if (key && !headers.has('Authorization')) {
+        headers.set('Authorization', `Bearer ${key}`)
+      }
+      // Build a fresh init from either Request or the supplied init —
+      // never carry credentials:'include' across origins, that would
+      // get rejected by the browser anyway.
+      const baseInit: RequestInit =
+        input instanceof Request
+          ? {
+              method: input.method,
+              body:
+                input.method && input.method !== 'GET' && input.method !== 'HEAD'
+                  ? await input.clone().arrayBuffer()
+                  : undefined,
+              cache: input.cache,
+              redirect: input.redirect,
+              referrer: input.referrer,
+              integrity: input.integrity,
+            }
+          : { ...init }
+      return original(remoteUrl, { ...baseInit, credentials: 'omit', headers })
+    }
+
+    // Embedded mode: original cookie-based same-origin path.
     if (input instanceof Request) {
       const headers = new Headers(input.headers)
       const key = loadApiKey()

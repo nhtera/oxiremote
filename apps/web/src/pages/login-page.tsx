@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react'
 import { useNavigate, useSearchParams } from 'react-router-dom'
 import { useHostStore } from '../state/host-store'
-import { loadApiKey, makeRemoteClient, storeApiKey } from '../lib/api-client'
+import { loadApiKey, makeRemoteClient, storeApiKey, storeTunnelBase } from '../lib/api-client'
 import {
   isDiscoveryMode,
   isLikelyOtk,
@@ -203,6 +203,7 @@ export default function LoginPage() {
       // Stash before navigation — every subsequent tunnel request needs
       // Bearer; cross-origin can't use cookies.
       storeApiKey(body.host_id, body.api_key)
+      storeTunnelBase(body.host_id, session.tunnelUrl)
       recordSavedHost({
         host_id: body.host_id,
         label: deviceLabel.trim() || body.host_id.slice(0, 8),
@@ -302,6 +303,7 @@ export default function LoginPage() {
         window.localStorage.setItem('oxi:device-label', deviceLabel.trim())
       }
       storeApiKey(body.host_id, body.api_key)
+      storeTunnelBase(body.host_id, session.tunnelUrl)
       recordSavedHost({
         host_id: body.host_id,
         label: deviceLabel.trim() || body.host_id.slice(0, 8),
