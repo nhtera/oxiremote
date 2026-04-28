@@ -86,6 +86,35 @@ pub fn require_active_auth(
     require_active_auth_with_device(db_path, signing_key, jar).map(|(s, _)| s)
 }
 
+/// Pluck `Authorization: Bearer <token>` out of an axum HeaderMap. Tunnel-side
+/// dual-auth handlers call this once per request; the existing
+/// `api_key_guard` middleware uses the same parse so we keep one source of truth.
+pub fn extract_bearer(headers: &axum::http::HeaderMap) -> Option<String> {
+    let raw = headers
+        .get(axum::http::header::AUTHORIZATION)?
+        .to_str()
+        .ok()?;
+    raw.strip_prefix("Bearer ").map(|s| s.trim().to_string())
+}
+
+/// Dual-auth gate for tunnel-reachable handlers. When `Authorization: Bearer`
+/// is present we verify the api_key (Argon2id) and return the bound
+/// `device_id`. Otherwise we fall through to the cookie-session path. Bearer
+/// **takes precedence**: an invalid Bearer fails closed even if a valid
+/// session cookie is also present, so cross-origin callers can't get
+/// auto-promoted to a same-origin session by accident.
+pub async fn require_tunnel_auth(
+    db_path: &PathBuf,
+    signing_key: &[u8],
+    jar: &axum_extra::extract::cookie::CookieJar,
+    bearer: Option<&str>,
+) -> Option<String> {
+    if let Some(key) = bearer {
+        return verify_api_key_async(db_path.clone(), key.to_string()).await;
+    }
+    require_active_auth_with_device(db_path, signing_key, jar).map(|(_, device_id)| device_id)
+}
+
 /// Like `require_active_auth` but also returns the session's bound `device_id`.
 /// Callers that authorise per-device resources (e.g. `/ws/desktop/{device_id}`)
 /// must compare this against the caller-supplied identifier.
@@ -639,6 +668,91 @@ mod tests {
         assert!(is_valid_pairing_attempt("ABC123"));
         assert!(!is_valid_pairing_attempt("A"));
         assert!(!is_valid_pairing_attempt("12345678901234567"));
+    }
+
+    #[test]
+    fn extract_bearer_pulls_authorization_header() {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            "Bearer abc123".parse().unwrap(),
+        );
+        assert_eq!(extract_bearer(&headers), Some("abc123".to_string()));
+
+        // Missing header → None.
+        assert_eq!(extract_bearer(&axum::http::HeaderMap::new()), None);
+
+        // Wrong scheme (not Bearer) → None — strip_prefix fails.
+        let mut wrong = axum::http::HeaderMap::new();
+        wrong.insert(
+            axum::http::header::AUTHORIZATION,
+            "Basic dXNlcjpwYXNz".parse().unwrap(),
+        );
+        assert_eq!(extract_bearer(&wrong), None);
+    }
+
+    #[tokio::test]
+    async fn require_tunnel_auth_with_valid_bearer_returns_device_id() {
+        let state = test_state("dual_auth_bearer_ok");
+        // Provision an approved device and issue an api_key.
+        let device_id = random_device_id();
+        let api_key = {
+            let mut conn = Connection::open(&state.db_path).unwrap();
+            let tx = conn.transaction().unwrap();
+            crate::approval::insert_device_with_approval_tx(
+                &tx,
+                &device_id,
+                "Test Device",
+                Some("test-ua"),
+                "127.0.0.1",
+                "approved",
+                Some("linux"),
+            )
+            .unwrap();
+            let (api_key, _last4) = issue_api_key_tx(&tx, &device_id).unwrap();
+            tx.commit().unwrap();
+            api_key
+        };
+
+        let jar = CookieJar::new();
+        let result = require_tunnel_auth(
+            &state.db_path,
+            &state.signing_key,
+            &jar,
+            Some(&api_key),
+        )
+        .await;
+        assert_eq!(result.as_deref(), Some(device_id.as_str()));
+    }
+
+    #[tokio::test]
+    async fn require_tunnel_auth_with_invalid_bearer_fails_closed() {
+        // Bearer takes precedence — even a valid session cookie cannot promote
+        // an invalid Bearer to a successful auth. Otherwise an attacker could
+        // append a junk Bearer header to a stolen cookie request and silently
+        // get cookie-path semantics; we want fail-closed instead.
+        let state = test_state("dual_auth_bearer_invalid");
+        let session_id = "00000000-0000-0000-0000-000000000001";
+        let signed = sign_session(&state.signing_key, session_id);
+        let jar = CookieJar::new().add(Cookie::new("oxiremote_session", signed));
+
+        let result = require_tunnel_auth(
+            &state.db_path,
+            &state.signing_key,
+            &jar,
+            Some("not-a-valid-key"),
+        )
+        .await;
+        assert!(result.is_none(), "invalid Bearer must fail even if cookie is valid");
+    }
+
+    #[tokio::test]
+    async fn require_tunnel_auth_with_no_credentials_returns_none() {
+        let state = test_state("dual_auth_none");
+        let jar = CookieJar::new();
+        let result =
+            require_tunnel_auth(&state.db_path, &state.signing_key, &jar, None).await;
+        assert!(result.is_none());
     }
 
     #[test]

@@ -25,7 +25,6 @@ use axum::response::IntoResponse;
 use axum_extra::extract::cookie::CookieJar;
 use tracing::warn;
 
-use crate::auth::require_active_auth;
 use crate::security::route_scope::is_tunnel_request;
 use crate::AppState;
 
@@ -80,10 +79,11 @@ async fn proxy_dispatch(
         return (StatusCode::FORBIDDEN, "port not enabled").into_response();
     }
 
-    // Tunnel-side callers must have a valid session cookie. Loopback callers
-    // are trusted (they're already on the host).
+    // Tunnel-side callers must have a valid session cookie or Bearer api_key.
+    // Loopback callers are trusted (they're already on the host).
+    let bearer = crate::auth::extract_bearer(req.headers());
     if is_tunnel_request(req.headers())
-        && require_active_auth(&state.db_path, &state.signing_key, &jar).is_none()
+        && crate::auth::require_tunnel_auth(&state.db_path, &state.signing_key, &jar, bearer.as_deref()).await.is_none()
     {
         return (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
     }

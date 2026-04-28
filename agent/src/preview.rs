@@ -13,7 +13,6 @@ use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use tracing::warn;
 
-use crate::auth::require_active_auth;
 use crate::db::now_ts;
 use crate::preview_token::{sign_share_token, verify_share_token, DEFAULT_SHARE_TTL_SECS};
 use crate::AppState;
@@ -119,9 +118,11 @@ fn delete_preview(db_path: &StdPath, host_id: &str, id: &str) -> anyhow::Result<
 pub async fn api_previews_create(
     State(state): State<Arc<AppState>>,
     jar: CookieJar,
+    headers: axum::http::HeaderMap,
     Json(body): Json<CreatePreviewReq>,
 ) -> impl IntoResponse {
-    if require_active_auth(&state.db_path, &state.signing_key, &jar).is_none() {
+    let bearer = crate::auth::extract_bearer(&headers);
+    if crate::auth::require_tunnel_auth(&state.db_path, &state.signing_key, &jar, bearer.as_deref()).await.is_none() {
         return (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
     }
     if body.port == 0 {
@@ -158,8 +159,10 @@ pub async fn api_previews_create(
 pub async fn api_previews_list(
     State(state): State<Arc<AppState>>,
     jar: CookieJar,
+    headers: axum::http::HeaderMap,
 ) -> impl IntoResponse {
-    if require_active_auth(&state.db_path, &state.signing_key, &jar).is_none() {
+    let bearer = crate::auth::extract_bearer(&headers);
+    if crate::auth::require_tunnel_auth(&state.db_path, &state.signing_key, &jar, bearer.as_deref()).await.is_none() {
         return (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
     }
     let host_id = state.host_info.host_id.clone();
@@ -191,9 +194,11 @@ pub async fn api_previews_list(
 pub async fn api_previews_delete(
     State(state): State<Arc<AppState>>,
     jar: CookieJar,
+    headers: axum::http::HeaderMap,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
-    if require_active_auth(&state.db_path, &state.signing_key, &jar).is_none() {
+    let bearer = crate::auth::extract_bearer(&headers);
+    if crate::auth::require_tunnel_auth(&state.db_path, &state.signing_key, &jar, bearer.as_deref()).await.is_none() {
         return (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
     }
     let host_id = &state.host_info.host_id;
@@ -209,9 +214,11 @@ pub async fn api_previews_delete(
 pub async fn api_previews_share(
     State(state): State<Arc<AppState>>,
     jar: CookieJar,
+    headers: axum::http::HeaderMap,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
-    if require_active_auth(&state.db_path, &state.signing_key, &jar).is_none() {
+    let bearer = crate::auth::extract_bearer(&headers);
+    if crate::auth::require_tunnel_auth(&state.db_path, &state.signing_key, &jar, bearer.as_deref()).await.is_none() {
         return (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
     }
     let target = match state.preview_targets.get(&id) {
@@ -267,8 +274,9 @@ async fn preview_proxy_inner(
         None => return (StatusCode::NOT_FOUND, "preview not found").into_response(),
     };
 
-    // Auth: accept a valid session cookie OR a `?t=` share token bound to (host_id, id).
-    let session_ok = require_active_auth(&state.db_path, &state.signing_key, &jar).is_some();
+    // Auth: accept a valid session cookie, a Bearer api_key, OR a `?t=` share token bound to (host_id, id).
+    let bearer = crate::auth::extract_bearer(req.headers());
+    let session_ok = crate::auth::require_tunnel_auth(&state.db_path, &state.signing_key, &jar, bearer.as_deref()).await.is_some();
     let token_ok = q
         .t
         .as_deref()
@@ -555,7 +563,7 @@ mod tests {
     #[tokio::test]
     async fn preview_list_requires_auth() {
         let state = test_state("unauth");
-        let response = api_previews_list(State(state), CookieJar::new())
+        let response = api_previews_list(State(state), CookieJar::new(), axum::http::HeaderMap::new())
             .await
             .into_response();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
@@ -567,6 +575,7 @@ mod tests {
         let response = api_previews_create(
             State(state.clone()),
             authed_jar(state.as_ref()),
+            axum::http::HeaderMap::new(),
             Json(CreatePreviewReq {
                 port: 3000,
                 label: Some("dev server".into()),
@@ -585,6 +594,7 @@ mod tests {
         let _ = api_previews_create(
             State(state.clone()),
             authed_jar(state.as_ref()),
+            axum::http::HeaderMap::new(),
             Json(CreatePreviewReq {
                 port: 5173,
                 label: None,
@@ -606,6 +616,7 @@ mod tests {
         let _ = api_previews_create(
             State(state.clone()),
             jar.clone(),
+            axum::http::HeaderMap::new(),
             Json(CreatePreviewReq { port: 4000, label: None }),
         )
         .await
@@ -614,7 +625,7 @@ mod tests {
             .id
             .clone();
 
-        let resp = api_previews_delete(State(state.clone()), jar, Path(id))
+        let resp = api_previews_delete(State(state.clone()), jar, axum::http::HeaderMap::new(), Path(id))
             .await
             .into_response();
         assert_eq!(resp.status(), StatusCode::NO_CONTENT);

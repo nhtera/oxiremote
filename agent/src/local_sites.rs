@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use axum::extract::State;
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use axum::Json;
 use axum_extra::extract::cookie::CookieJar;
@@ -11,7 +11,6 @@ use tokio::sync::RwLock;
 use tokio::time::timeout;
 use tracing::debug;
 
-use crate::auth::require_active_auth;
 use crate::{AppState, AGENT_PORT};
 
 pub type LocalSitesCache = Arc<RwLock<Vec<u16>>>;
@@ -136,8 +135,10 @@ pub fn parse_netstat_output(text: &str) -> Vec<u16> {
 pub async fn api_local_sites(
     State(state): State<Arc<AppState>>,
     jar: CookieJar,
+    headers: HeaderMap,
 ) -> impl IntoResponse {
-    if require_active_auth(&state.db_path, &state.signing_key, &jar).is_none() {
+    let bearer = crate::auth::extract_bearer(&headers);
+    if crate::auth::require_tunnel_auth(&state.db_path, &state.signing_key, &jar, bearer.as_deref()).await.is_none() {
         return (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
     }
     let read = state.local_sites.read().await;

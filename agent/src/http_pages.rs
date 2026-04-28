@@ -281,8 +281,9 @@ struct DeviceListResponse {
     devices: Vec<crate::auth::TrustedDevice>,
 }
 
-pub async fn api_devices_list(State(state): State<Arc<AppState>>, jar: CookieJar) -> impl IntoResponse {
-    let Some(_session_id) = require_active_auth(&state.db_path, &state.signing_key, &jar) else {
+pub async fn api_devices_list(State(state): State<Arc<AppState>>, jar: CookieJar, headers: HeaderMap) -> impl IntoResponse {
+    let bearer = crate::auth::extract_bearer(&headers);
+    let Some(_device_id) = crate::auth::require_tunnel_auth(&state.db_path, &state.signing_key, &jar, bearer.as_deref()).await else {
         return StatusCode::UNAUTHORIZED.into_response();
     };
 
@@ -298,11 +299,24 @@ pub async fn api_devices_list(State(state): State<Arc<AppState>>, jar: CookieJar
 pub async fn api_device_revoke(
     State(state): State<Arc<AppState>>,
     jar: CookieJar,
+    headers: HeaderMap,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
-    let Some(session_id) = require_active_auth(&state.db_path, &state.signing_key, &jar) else {
-        return StatusCode::UNAUTHORIZED.into_response();
+    let bearer = crate::auth::extract_bearer(&headers);
+    // session_id is used for self-revoke cookie-clear; only available on cookie path.
+    let session_id_opt = if bearer.is_none() {
+        require_active_auth(&state.db_path, &state.signing_key, &jar)
+    } else {
+        None
     };
+    let authed = if let Some(ref b) = bearer {
+        crate::auth::require_tunnel_auth(&state.db_path, &state.signing_key, &jar, Some(b.as_str())).await.is_some()
+    } else {
+        session_id_opt.is_some()
+    };
+    if !authed {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
 
     if let Err(err) = revoke_device(&state.db_path, &id) {
         warn!(error=%err, "revoke device failed");
@@ -317,25 +331,29 @@ pub async fn api_device_revoke(
         );
     }
 
-    let current_device: anyhow::Result<Option<String>> = (|| {
-        let conn = Connection::open(&state.db_path)?;
-        conn.query_row(
-            "SELECT device_id FROM sessions WHERE session_id=?1",
-            params![session_id],
-            |row| row.get(0),
-        ).optional().map_err(Into::into)
-    })();
+    // Self-revoke: clear the session cookie when the caller revokes their own device.
+    // Only possible on the cookie path (Bearer callers have no session cookie).
+    if let Some(session_id) = session_id_opt {
+        let current_device: anyhow::Result<Option<String>> = (|| {
+            let conn = Connection::open(&state.db_path)?;
+            conn.query_row(
+                "SELECT device_id FROM sessions WHERE session_id=?1",
+                params![session_id],
+                |row| row.get(0),
+            ).optional().map_err(Into::into)
+        })();
 
-    let should_clear_cookie = matches!(current_device, Ok(Some(device_id)) if device_id == id);
-    if should_clear_cookie {
-        let cookie = Cookie::build(("oxiremote_session", ""))
-            .http_only(true)
-            .secure(state.secure_cookies)
-            .same_site(SameSite::Lax)
-            .path("/")
-            .max_age(TimeDuration::seconds(0))
-            .build();
-        return (StatusCode::OK, jar.add(cookie), Json(serde_json::json!({"ok": true}))).into_response();
+        let should_clear_cookie = matches!(current_device, Ok(Some(device_id)) if device_id == id);
+        if should_clear_cookie {
+            let cookie = Cookie::build(("oxiremote_session", ""))
+                .http_only(true)
+                .secure(state.secure_cookies)
+                .same_site(SameSite::Lax)
+                .path("/")
+                .max_age(TimeDuration::seconds(0))
+                .build();
+            return (StatusCode::OK, jar.add(cookie), Json(serde_json::json!({"ok": true}))).into_response();
+        }
     }
 
     (StatusCode::OK, Json(serde_json::json!({"ok": true}))).into_response()

@@ -18,7 +18,6 @@ use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
-use crate::auth::require_active_auth;
 use crate::db::now_ts;
 use crate::push::{self, PushSubscription};
 use crate::AppState;
@@ -66,13 +65,25 @@ fn device_id_for_session(db_path: &std::path::PathBuf, session_id: &str) -> Opti
 async fn subscribe(
     State(state): State<Arc<AppState>>,
     jar: CookieJar,
+    headers: HeaderMap,
     Json(body): Json<SubscribeRequest>,
 ) -> impl IntoResponse {
-    let Some(session_id) = require_active_auth(&state.db_path, &state.signing_key, &jar) else {
-        return StatusCode::UNAUTHORIZED.into_response();
-    };
-    let Some(device_id) = device_id_for_session(&state.db_path, &session_id) else {
-        return StatusCode::UNAUTHORIZED.into_response();
+    // For Bearer path, require_tunnel_auth returns device_id directly.
+    // For cookie path, resolve device_id via session_id lookup.
+    let bearer = crate::auth::extract_bearer(&headers);
+    let device_id = if let Some(ref b) = bearer {
+        match crate::auth::require_tunnel_auth(&state.db_path, &state.signing_key, &jar, Some(b.as_str())).await {
+            Some(did) => did,
+            None => return StatusCode::UNAUTHORIZED.into_response(),
+        }
+    } else {
+        let Some(session_id) = crate::auth::require_active_auth(&state.db_path, &state.signing_key, &jar) else {
+            return StatusCode::UNAUTHORIZED.into_response();
+        };
+        let Some(did) = device_id_for_session(&state.db_path, &session_id) else {
+            return StatusCode::UNAUTHORIZED.into_response();
+        };
+        did
     };
 
     if body.endpoint.is_empty() || body.p256dh.is_empty() || body.auth.is_empty() {
@@ -127,12 +138,24 @@ async fn subscribe(
 async fn unsubscribe(
     State(state): State<Arc<AppState>>,
     jar: CookieJar,
+    headers: HeaderMap,
 ) -> impl IntoResponse {
-    let Some(session_id) = require_active_auth(&state.db_path, &state.signing_key, &jar) else {
-        return StatusCode::UNAUTHORIZED.into_response();
-    };
-    let Some(device_id) = device_id_for_session(&state.db_path, &session_id) else {
-        return StatusCode::UNAUTHORIZED.into_response();
+    // For Bearer path, require_tunnel_auth returns device_id directly.
+    // For cookie path, resolve device_id via session_id lookup.
+    let bearer = crate::auth::extract_bearer(&headers);
+    let device_id = if let Some(ref b) = bearer {
+        match crate::auth::require_tunnel_auth(&state.db_path, &state.signing_key, &jar, Some(b.as_str())).await {
+            Some(did) => did,
+            None => return StatusCode::UNAUTHORIZED.into_response(),
+        }
+    } else {
+        let Some(session_id) = crate::auth::require_active_auth(&state.db_path, &state.signing_key, &jar) else {
+            return StatusCode::UNAUTHORIZED.into_response();
+        };
+        let Some(did) = device_id_for_session(&state.db_path, &session_id) else {
+            return StatusCode::UNAUTHORIZED.into_response();
+        };
+        did
     };
 
     let Ok(conn) = Connection::open(&state.db_path) else {

@@ -11,7 +11,6 @@ use serde::Deserialize;
 use serde_json::json;
 use tracing::{info, warn};
 
-use crate::auth::require_active_auth;
 use crate::events::AgentEvent;
 use crate::AppState;
 
@@ -31,10 +30,12 @@ struct DeviceRenameBody {
 async fn api_device_rename(
     State(state): State<Arc<AppState>>,
     jar: CookieJar,
+    headers: axum::http::HeaderMap,
     Path(device_id): Path<String>,
     Json(body): Json<DeviceRenameBody>,
 ) -> impl IntoResponse {
-    if require_active_auth(&state.db_path, &state.signing_key, &jar).is_none() {
+    let bearer = crate::auth::extract_bearer(&headers);
+    if crate::auth::require_tunnel_auth(&state.db_path, &state.signing_key, &jar, bearer.as_deref()).await.is_none() {
         return StatusCode::UNAUTHORIZED.into_response();
     }
 
@@ -61,8 +62,10 @@ async fn api_device_rename(
 async fn api_host_info(
     State(state): State<Arc<AppState>>,
     jar: CookieJar,
+    headers: axum::http::HeaderMap,
 ) -> impl IntoResponse {
-    if require_active_auth(&state.db_path, &state.signing_key, &jar).is_none() {
+    let bearer = crate::auth::extract_bearer(&headers);
+    if crate::auth::require_tunnel_auth(&state.db_path, &state.signing_key, &jar, bearer.as_deref()).await.is_none() {
         return StatusCode::UNAUTHORIZED.into_response();
     }
     (StatusCode::OK, Json(state.host_info.clone())).into_response()
@@ -74,10 +77,12 @@ async fn api_host_info(
 /// Response is safe to call at any time — no capture is performed.
 pub async fn api_desktop_capabilities(
     State(state): State<Arc<AppState>>,
-    Path(host_id): Path<String>,
     jar: CookieJar,
+    headers: axum::http::HeaderMap,
+    Path(host_id): Path<String>,
 ) -> impl IntoResponse {
-    if require_active_auth(&state.db_path, &state.signing_key, &jar).is_none() {
+    let bearer = crate::auth::extract_bearer(&headers);
+    if crate::auth::require_tunnel_auth(&state.db_path, &state.signing_key, &jar, bearer.as_deref()).await.is_none() {
         return StatusCode::UNAUTHORIZED.into_response();
     }
     // Guard against future multi-host routing: only serve this agent's own id.

@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use axum::extract::{Multipart, Query, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use axum_extra::extract::cookie::CookieJar;
@@ -10,7 +10,6 @@ use tokio::fs;
 use tokio::io::AsyncWriteExt;
 use tracing::warn;
 
-use crate::auth::require_active_auth;
 use crate::files::{active_root, resolve_existing, resolve_new, validate_rel_path};
 use crate::AppState;
 
@@ -36,10 +35,12 @@ struct UploadResponse {
 pub async fn api_files_upload(
     State(state): State<Arc<AppState>>,
     jar: CookieJar,
+    headers: HeaderMap,
     Query(q): Query<UploadQuery>,
     mut multipart: Multipart,
 ) -> Response {
-    if require_active_auth(&state.db_path, &state.signing_key, &jar).is_none() {
+    let bearer = crate::auth::extract_bearer(&headers);
+    if crate::auth::require_tunnel_auth(&state.db_path, &state.signing_key, &jar, bearer.as_deref()).await.is_none() {
         return StatusCode::UNAUTHORIZED.into_response();
     }
 

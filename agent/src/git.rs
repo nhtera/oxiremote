@@ -11,7 +11,6 @@ use serde::{Deserialize, Serialize};
 use tokio::process::Command;
 use tracing::warn;
 
-use crate::auth::require_active_auth;
 use crate::AppState;
 
 fn workspace_root(state: &AppState) -> &Path {
@@ -185,8 +184,10 @@ struct GitStatusEntry {
 pub async fn api_git_status(
     State(state): State<Arc<AppState>>,
     jar: CookieJar,
+    headers: axum::http::HeaderMap,
 ) -> impl IntoResponse {
-    let Some(_) = require_active_auth(&state.db_path, &state.signing_key, &jar) else {
+    let bearer = crate::auth::extract_bearer(&headers);
+    let Some(_) = crate::auth::require_tunnel_auth(&state.db_path, &state.signing_key, &jar, bearer.as_deref()).await else {
         return StatusCode::UNAUTHORIZED.into_response();
     };
 
@@ -220,9 +221,11 @@ pub struct DiffQuery {
 pub async fn api_git_diff(
     State(state): State<Arc<AppState>>,
     jar: CookieJar,
+    headers: axum::http::HeaderMap,
     Query(q): Query<DiffQuery>,
 ) -> impl IntoResponse {
-    let Some(_) = require_active_auth(&state.db_path, &state.signing_key, &jar) else {
+    let bearer = crate::auth::extract_bearer(&headers);
+    let Some(_) = crate::auth::require_tunnel_auth(&state.db_path, &state.signing_key, &jar, bearer.as_deref()).await else {
         return StatusCode::UNAUTHORIZED.into_response();
     };
 
@@ -258,9 +261,11 @@ pub struct StageRequest {
 pub async fn api_git_stage(
     State(state): State<Arc<AppState>>,
     jar: CookieJar,
+    headers: axum::http::HeaderMap,
     Json(req): Json<StageRequest>,
 ) -> impl IntoResponse {
-    let Some(_) = require_active_auth(&state.db_path, &state.signing_key, &jar) else {
+    let bearer = crate::auth::extract_bearer(&headers);
+    let Some(_) = crate::auth::require_tunnel_auth(&state.db_path, &state.signing_key, &jar, bearer.as_deref()).await else {
         return StatusCode::UNAUTHORIZED.into_response();
     };
 
@@ -282,9 +287,11 @@ pub async fn api_git_stage(
 pub async fn api_git_unstage(
     State(state): State<Arc<AppState>>,
     jar: CookieJar,
+    headers: axum::http::HeaderMap,
     Json(req): Json<StageRequest>,
 ) -> impl IntoResponse {
-    let Some(_) = require_active_auth(&state.db_path, &state.signing_key, &jar) else {
+    let bearer = crate::auth::extract_bearer(&headers);
+    let Some(_) = crate::auth::require_tunnel_auth(&state.db_path, &state.signing_key, &jar, bearer.as_deref()).await else {
         return StatusCode::UNAUTHORIZED.into_response();
     };
 
@@ -311,9 +318,11 @@ pub struct CommitRequest {
 pub async fn api_git_commit(
     State(state): State<Arc<AppState>>,
     jar: CookieJar,
+    headers: axum::http::HeaderMap,
     Json(req): Json<CommitRequest>,
 ) -> impl IntoResponse {
-    let Some(_) = require_active_auth(&state.db_path, &state.signing_key, &jar) else {
+    let bearer = crate::auth::extract_bearer(&headers);
+    let Some(_) = crate::auth::require_tunnel_auth(&state.db_path, &state.signing_key, &jar, bearer.as_deref()).await else {
         return StatusCode::UNAUTHORIZED.into_response();
     };
 

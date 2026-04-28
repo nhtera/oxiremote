@@ -21,7 +21,7 @@ use axum::{
     response::Response,
 };
 
-use crate::auth::{touch_device_last_active, verify_api_key_async};
+use crate::auth::{extract_bearer, touch_device_last_active, verify_api_key_async};
 use crate::AppState;
 
 use super::route_scope::is_tunnel_request;
@@ -81,15 +81,6 @@ fn is_exempt(path: &str) -> bool {
     EXEMPT_WS_SUFFIXES.iter().any(|s| path.ends_with(s))
 }
 
-fn bearer(req: &Request) -> Option<String> {
-    let raw = req
-        .headers()
-        .get(axum::http::header::AUTHORIZATION)?
-        .to_str()
-        .ok()?;
-    raw.strip_prefix("Bearer ").map(|s| s.trim().to_string())
-}
-
 pub async fn api_key_guard(
     State(state): State<Arc<AppState>>,
     req: Request,
@@ -99,7 +90,7 @@ pub async fn api_key_guard(
         return next.run(req).await;
     }
 
-    let Some(key) = bearer(&req) else {
+    let Some(key) = extract_bearer(req.headers()) else {
         return Response::builder()
             .status(StatusCode::UNAUTHORIZED)
             .body(Body::from("missing api key"))

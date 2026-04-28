@@ -14,7 +14,6 @@ use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio_util::io::ReaderStream;
 use tracing::warn;
 
-use crate::auth::require_active_auth;
 use crate::workspaces;
 use crate::AppState;
 
@@ -160,9 +159,11 @@ pub struct ListQuery {
 pub async fn api_files_list(
     State(state): State<Arc<AppState>>,
     jar: CookieJar,
+    headers: HeaderMap,
     Query(q): Query<ListQuery>,
 ) -> Response {
-    if require_active_auth(&state.db_path, &state.signing_key, &jar).is_none() {
+    let bearer = crate::auth::extract_bearer(&headers);
+    if crate::auth::require_tunnel_auth(&state.db_path, &state.signing_key, &jar, bearer.as_deref()).await.is_none() {
         return unauthed();
     }
 
@@ -249,9 +250,11 @@ struct StatResponse {
 pub async fn api_files_stat(
     State(state): State<Arc<AppState>>,
     jar: CookieJar,
+    headers: HeaderMap,
     Query(q): Query<PathQuery>,
 ) -> Response {
-    if require_active_auth(&state.db_path, &state.signing_key, &jar).is_none() {
+    let bearer = crate::auth::extract_bearer(&headers);
+    if crate::auth::require_tunnel_auth(&state.db_path, &state.signing_key, &jar, bearer.as_deref()).await.is_none() {
         return unauthed();
     }
     let root = match active_root(&state, q.ws_id) {
@@ -303,9 +306,11 @@ struct ReadResponse {
 pub async fn api_files_read(
     State(state): State<Arc<AppState>>,
     jar: CookieJar,
+    headers: HeaderMap,
     Query(q): Query<PathQuery>,
 ) -> Response {
-    if require_active_auth(&state.db_path, &state.signing_key, &jar).is_none() {
+    let bearer = crate::auth::extract_bearer(&headers);
+    if crate::auth::require_tunnel_auth(&state.db_path, &state.signing_key, &jar, bearer.as_deref()).await.is_none() {
         return unauthed();
     }
     let root = match active_root(&state, q.ws_id) {
@@ -385,9 +390,11 @@ struct StaleError {
 pub async fn api_files_write(
     State(state): State<Arc<AppState>>,
     jar: CookieJar,
+    headers: HeaderMap,
     Json(req): Json<WriteRequest>,
 ) -> Response {
-    if require_active_auth(&state.db_path, &state.signing_key, &jar).is_none() {
+    let bearer = crate::auth::extract_bearer(&headers);
+    if crate::auth::require_tunnel_auth(&state.db_path, &state.signing_key, &jar, bearer.as_deref()).await.is_none() {
         return unauthed();
     }
     if req.content.len() as u64 > MAX_TEXT_OPEN_BYTES {
@@ -447,9 +454,11 @@ pub struct CreateRequest {
 pub async fn api_files_create(
     State(state): State<Arc<AppState>>,
     jar: CookieJar,
+    headers: HeaderMap,
     Json(req): Json<CreateRequest>,
 ) -> Response {
-    if require_active_auth(&state.db_path, &state.signing_key, &jar).is_none() {
+    let bearer = crate::auth::extract_bearer(&headers);
+    if crate::auth::require_tunnel_auth(&state.db_path, &state.signing_key, &jar, bearer.as_deref()).await.is_none() {
         return unauthed();
     }
     let root = match active_root(&state, req.ws_id) {
@@ -490,9 +499,11 @@ pub struct RenameRequest {
 pub async fn api_files_rename(
     State(state): State<Arc<AppState>>,
     jar: CookieJar,
+    headers: HeaderMap,
     Json(req): Json<RenameRequest>,
 ) -> Response {
-    if require_active_auth(&state.db_path, &state.signing_key, &jar).is_none() {
+    let bearer = crate::auth::extract_bearer(&headers);
+    if crate::auth::require_tunnel_auth(&state.db_path, &state.signing_key, &jar, bearer.as_deref()).await.is_none() {
         return unauthed();
     }
     let root = match active_root(&state, req.ws_id) {
@@ -524,9 +535,11 @@ pub async fn api_files_rename(
 pub async fn api_files_delete(
     State(state): State<Arc<AppState>>,
     jar: CookieJar,
+    headers: HeaderMap,
     Json(req): Json<PathQuery>,
 ) -> Response {
-    if require_active_auth(&state.db_path, &state.signing_key, &jar).is_none() {
+    let bearer = crate::auth::extract_bearer(&headers);
+    if crate::auth::require_tunnel_auth(&state.db_path, &state.signing_key, &jar, bearer.as_deref()).await.is_none() {
         return unauthed();
     }
     let root = match active_root(&state, req.ws_id) {
@@ -563,7 +576,8 @@ pub async fn api_files_download(
     headers: HeaderMap,
     Query(q): Query<PathQuery>,
 ) -> Response {
-    if require_active_auth(&state.db_path, &state.signing_key, &jar).is_none() {
+    let bearer = crate::auth::extract_bearer(&headers);
+    if crate::auth::require_tunnel_auth(&state.db_path, &state.signing_key, &jar, bearer.as_deref()).await.is_none() {
         return unauthed();
     }
     let root = match active_root(&state, q.ws_id) {

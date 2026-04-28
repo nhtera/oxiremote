@@ -8,13 +8,12 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use axum::extract::{Query, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use axum_extra::extract::cookie::CookieJar;
 use serde::{Deserialize, Serialize};
 
-use crate::auth::require_active_auth;
 use crate::files::active_root;
 use crate::AppState;
 
@@ -76,9 +75,11 @@ pub fn search(workspace: &Path, query: &str) -> Vec<SearchHit> {
 pub async fn api_files_search(
     State(state): State<Arc<AppState>>,
     jar: CookieJar,
+    headers: HeaderMap,
     Query(q): Query<SearchQuery>,
 ) -> Response {
-    if require_active_auth(&state.db_path, &state.signing_key, &jar).is_none() {
+    let bearer = crate::auth::extract_bearer(&headers);
+    if crate::auth::require_tunnel_auth(&state.db_path, &state.signing_key, &jar, bearer.as_deref()).await.is_none() {
         return StatusCode::UNAUTHORIZED.into_response();
     }
     let root: PathBuf = match active_root(&state, q.ws_id) {

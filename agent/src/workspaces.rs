@@ -10,7 +10,6 @@ use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use tracing::warn;
 
-use crate::auth::require_active_auth;
 use crate::db::now_ts;
 use crate::AppState;
 
@@ -94,8 +93,10 @@ fn list_for_host(db_path: &Path, host_id: &str) -> anyhow::Result<Vec<Workspace>
 pub async fn api_workspaces_list(
     State(state): State<Arc<AppState>>,
     jar: CookieJar,
+    headers: axum::http::HeaderMap,
 ) -> Response {
-    if require_active_auth(&state.db_path, &state.signing_key, &jar).is_none() {
+    let bearer = crate::auth::extract_bearer(&headers);
+    if crate::auth::require_tunnel_auth(&state.db_path, &state.signing_key, &jar, bearer.as_deref()).await.is_none() {
         return StatusCode::UNAUTHORIZED.into_response();
     }
     match list_for_host(&state.db_path, &state.host_info.host_id) {
@@ -117,9 +118,11 @@ pub struct CreateWorkspace {
 pub async fn api_workspaces_create(
     State(state): State<Arc<AppState>>,
     jar: CookieJar,
+    headers: axum::http::HeaderMap,
     Json(req): Json<CreateWorkspace>,
 ) -> Response {
-    if require_active_auth(&state.db_path, &state.signing_key, &jar).is_none() {
+    let bearer = crate::auth::extract_bearer(&headers);
+    if crate::auth::require_tunnel_auth(&state.db_path, &state.signing_key, &jar, bearer.as_deref()).await.is_none() {
         return StatusCode::UNAUTHORIZED.into_response();
     }
 
@@ -179,9 +182,11 @@ pub async fn api_workspaces_create(
 pub async fn api_workspaces_delete(
     State(state): State<Arc<AppState>>,
     jar: CookieJar,
+    headers: axum::http::HeaderMap,
     AxumPath(id): AxumPath<i64>,
 ) -> Response {
-    if require_active_auth(&state.db_path, &state.signing_key, &jar).is_none() {
+    let bearer = crate::auth::extract_bearer(&headers);
+    if crate::auth::require_tunnel_auth(&state.db_path, &state.signing_key, &jar, bearer.as_deref()).await.is_none() {
         return StatusCode::UNAUTHORIZED.into_response();
     }
     let conn = match Connection::open(&state.db_path) {
@@ -219,9 +224,11 @@ pub struct ValidateWorkspaceResponse {
 pub async fn api_workspace_validate(
     State(state): State<Arc<AppState>>,
     jar: CookieJar,
+    headers: axum::http::HeaderMap,
     Json(req): Json<ValidateWorkspace>,
 ) -> Response {
-    if require_active_auth(&state.db_path, &state.signing_key, &jar).is_none() {
+    let bearer = crate::auth::extract_bearer(&headers);
+    if crate::auth::require_tunnel_auth(&state.db_path, &state.signing_key, &jar, bearer.as_deref()).await.is_none() {
         return StatusCode::UNAUTHORIZED.into_response();
     }
 
@@ -274,9 +281,11 @@ pub async fn api_workspace_validate(
 pub async fn api_workspaces_touch(
     State(state): State<Arc<AppState>>,
     jar: CookieJar,
+    headers: axum::http::HeaderMap,
     AxumPath(id): AxumPath<i64>,
 ) -> Response {
-    if require_active_auth(&state.db_path, &state.signing_key, &jar).is_none() {
+    let bearer = crate::auth::extract_bearer(&headers);
+    if crate::auth::require_tunnel_auth(&state.db_path, &state.signing_key, &jar, bearer.as_deref()).await.is_none() {
         return StatusCode::UNAUTHORIZED.into_response();
     }
     let conn = match Connection::open(&state.db_path) {
