@@ -251,6 +251,11 @@ fn build_pairing_response(
                     "api_key": api_key,
                     "api_key_last4": api_key_last4,
                     "approval_status": approval_status,
+                    // host_id is included so a cross-origin SPA (Cloudflare
+                    // Pages) can stash the Bearer key without a follow-up
+                    // /api/host call — that endpoint still needs cookie auth
+                    // which doesn't survive cross-origin.
+                    "host_id": state.host_info.host_id,
                 })),
             )
                 .into_response()
@@ -416,7 +421,11 @@ pub async fn api_login_one_time(
     }
 
     let token_for_event = token.clone();
-    let res: Result<(), OtkErr> = (|| {
+    // OTK login also issues a per-device api_key so a cross-origin SPA can
+    // Bearer-auth subsequent requests — same primitive used by pairing
+    // exchange. Returning the plaintext exactly once mirrors the existing
+    // exchange contract.
+    let res: Result<(String, String), OtkErr> = (|| {
         let mut conn = Connection::open(&state.db_path).map_err(|e| OtkErr::Other(e.into()))?;
         let tx = conn.transaction().map_err(|e| OtkErr::Other(e.into()))?;
 
@@ -439,15 +448,17 @@ pub async fn api_login_one_time(
         ).map_err(OtkErr::Other)?;
 
         bind_session_to_device_tx(&tx, &session_id, &device_id).map_err(OtkErr::Other)?;
+        let api_key_pair = issue_api_key_tx(&tx, &device_id).map_err(OtkErr::Other)?;
 
         tx.commit().map_err(|e| OtkErr::Other(e.into()))?;
-        Ok(())
+        Ok(api_key_pair)
     })();
 
-    match res {
-        Ok(()) => {
+    let (api_key, api_key_last4) = match res {
+        Ok(pair) => {
             let prefix: String = token.chars().take(4).collect();
             state.event_bus.send(crate::events::AgentEvent::OtkUsed { token_prefix: prefix });
+            pair
         }
         Err(OtkErr::Consume(err)) => {
             warn!(error=%err, "OTK consume failed");
@@ -461,7 +472,7 @@ pub async fn api_login_one_time(
             warn!(error=%err, "OTK login failed mid-txn — rolled back; token still valid");
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
-    }
+    };
 
     let cookie_value = sign_session(&state.signing_key, &session_id);
     let cookie = Cookie::build(("oxiremote_session", cookie_value))
@@ -476,7 +487,16 @@ pub async fn api_login_one_time(
         return (
             StatusCode::OK,
             jar.add(cookie),
-            Json(serde_json::json!({ "status": "approved" })),
+            Json(serde_json::json!({
+                "status": "approved",
+                "device_id": device_id,
+                "api_key": api_key,
+                "api_key_last4": api_key_last4,
+                // host_id lets cross-origin SPAs (Cloudflare Pages) stash the
+                // Bearer key under the right host scope without a follow-up
+                // /api/host call.
+                "host_id": state.host_info.host_id,
+            })),
         )
             .into_response();
     }
@@ -496,6 +516,9 @@ pub async fn api_login_one_time(
         Json(serde_json::json!({
             "session_id": session_id,
             "device_id": device_id,
+            "api_key": api_key,
+            "api_key_last4": api_key_last4,
+            "host_id": state.host_info.host_id,
             "status": "pending",
         })),
     )

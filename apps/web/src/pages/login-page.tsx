@@ -1,7 +1,12 @@
 import { useEffect, useState } from 'react'
 import { useNavigate, useSearchParams } from 'react-router-dom'
 import { useHostStore } from '../state/host-store'
-import { loadApiKey, storeApiKey } from '../lib/api-client'
+import { loadApiKey, makeRemoteClient, storeApiKey } from '../lib/api-client'
+import {
+  isDiscoveryMode,
+  isLikelyTempKey,
+  lookupSession,
+} from '../lib/discovery-client'
 import {
   formatRelative,
   listSavedHosts,
@@ -145,6 +150,81 @@ export default function LoginPage() {
     navigate('/')
   }
 
+  // Cross-origin pairing through the discovery worker. The QR encoded
+  //   <discoveryUrl>/login?k=<tempKey>&otk=<otkToken>
+  // — `tempKey` resolves to the agent's tunnel URL via the worker; `otk` is
+  // exchanged directly with the agent's `/api/login/one-time` endpoint and
+  // returns the per-device api_key + host_id we need to bootstrap Bearer auth.
+  // No cookies are used (different origin); CSRF is exempt for this endpoint.
+  const submitDiscoveryPair = async (tempKey: string, otkToken: string) => {
+    setError('')
+    setLoading(true)
+    try {
+      const session = await lookupSession(tempKey)
+      if (!session) {
+        throw new Error('Discovery key expired or unknown — generate a fresh QR.')
+      }
+      const res = await fetch(`${session.tunnelUrl}/api/login/one-time`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        credentials: 'omit',
+        body: JSON.stringify({ token: otkToken.toLowerCase() }),
+      })
+      if (res.status !== 200 && res.status !== 202) {
+        throw new Error('That key is invalid or expired.')
+      }
+      const body = (await res.json().catch(() => ({}))) as {
+        status?: string
+        api_key?: string
+        api_key_last4?: string
+        device_id?: string
+        host_id?: string
+        session_id?: string
+      }
+      if (!body.api_key || !body.host_id) {
+        throw new Error('Pairing succeeded but response is missing key/host id.')
+      }
+
+      if (deviceLabel.trim()) {
+        window.localStorage.setItem('oxi:device-label', deviceLabel.trim())
+      }
+
+      // Stash before navigation — every subsequent tunnel request needs
+      // Bearer; cross-origin can't use cookies.
+      storeApiKey(body.host_id, body.api_key)
+      recordSavedHost({
+        host_id: body.host_id,
+        label: deviceLabel.trim() || body.host_id.slice(0, 8),
+        api_key_last4: body.api_key_last4 ?? body.api_key.slice(-4),
+      })
+
+      // Bind a `RemoteClient` to the tunnel URL so /approval-waiting + the
+      // workspace can issue cross-origin Bearer requests once Phase 4 lands.
+      // For now we pass the resolved tunnel URL via location state so future
+      // pages can pick it up without re-resolving the temp key.
+      const remote = makeRemoteClient(session.tunnelUrl, body.api_key)
+      const tunnelBase = remote.baseUrl
+
+      if (body.status === 'pending' || res.status === 202) {
+        navigate('/approval-waiting', {
+          state: {
+            session_id: body.session_id,
+            device_id: body.device_id,
+            device_label: deviceLabel.trim() || undefined,
+            tunnel_base: tunnelBase,
+          },
+        })
+        return
+      }
+
+      navigate('/', { state: { tunnel_base: tunnelBase } })
+    } catch (e) {
+      setError(e instanceof Error ? e.message : 'Could not pair via discovery.')
+    } finally {
+      setLoading(false)
+    }
+  }
+
   // Single submit path. Auto-detects by `sk-` prefix:
   //   - permanent key   → /api/pairing/exchange { permanent_key }
   //   - everything else → try /api/login/one-time, fall back to /api/pairing/exchange { code }
@@ -197,12 +277,30 @@ export default function LoginPage() {
     }
   }
 
-  // Pre-fill from ?k=<token> (QR deep-link). Auto-submits when the token
-  // looks plausible. Scrubs the URL so it doesn't sit in history.
+  // Pre-fill from ?k=<token> (QR deep-link). Three shapes are possible:
+  //   1. Discovery temp key (32 lowercase hex) + ?otk=<otk> — cross-origin
+  //      pair against the agent resolved via the discovery worker.
+  //   2. OTK (16 base32) — same-origin /api/login/one-time auto-submit.
+  //   3. Anything else — pre-fill the form and let the user finish typing.
+  // The URL is scrubbed in the auto-submit branches so the credentials don't
+  // sit in browser history.
   useEffect(() => {
     if (checkingAuth) return
     const k = searchParams.get('k')
     if (!k) return
+
+    if (isDiscoveryMode() && isLikelyTempKey(k.trim().toLowerCase())) {
+      const otk = (searchParams.get('otk') ?? '').trim()
+      const tempKey = k.trim().toLowerCase()
+      if (otk && !loading) {
+        window.history.replaceState({}, '', '/login')
+        queueMicrotask(() => {
+          void submitDiscoveryPair(tempKey, otk)
+        })
+        return
+      }
+    }
+
     const OTK_RAW_LEN = 16
     const cleaned = sanitizeAccessKey(k).toLowerCase().slice(0, OTK_RAW_LEN)
     if (cleaned.length === OTK_RAW_LEN && !loading) {

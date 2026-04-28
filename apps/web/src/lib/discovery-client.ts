@@ -1,0 +1,64 @@
+/**
+ * Discovery worker client.
+ *
+ * Resolves the agent's current quick-tunnel URL from a short-lived temp key
+ * embedded in a QR code. Activated only when `VITE_DISCOVERY_URL` is set at
+ * build time — embedded-mode SPAs (served by the agent itself) never load
+ * this path.
+ *
+ * Worker contract:
+ *   GET /api/session/lookup?k=<tempKey>
+ *     200 { tunnelUrl: string, localIp: string | null }
+ *     404 { error: 'not found' }   // unknown / expired
+ */
+
+const TEMP_KEY_PATTERN = /^[a-f0-9]{32}$/
+
+export type LookupResult = {
+  tunnelUrl: string
+  localIp: string | null
+}
+
+/** Discovery worker base URL injected at SPA build time. Empty / unset means
+ *  embedded mode — callers must check `isDiscoveryMode()` before calling
+ *  `lookupSession`.
+ */
+export function discoveryBaseUrl(): string {
+  const raw = (import.meta.env.VITE_DISCOVERY_URL ?? '').toString().trim()
+  return raw.replace(/\/$/, '')
+}
+
+export function isDiscoveryMode(): boolean {
+  return discoveryBaseUrl().length > 0
+}
+
+/** Cheap shape gate so callers can branch on `?k=` form before round-tripping
+ *  to the worker. Temp keys are 32 lowercase hex chars; OTKs are 16 base32. */
+export function isLikelyTempKey(value: string): boolean {
+  return TEMP_KEY_PATTERN.test(value)
+}
+
+/** Resolves a temp key to the agent's tunnel URL. Returns null when the key
+ *  is unknown or the worker is unreachable — callers should surface an
+ *  "expired QR, regenerate from the host" error. No retry: a stale key will
+ *  not become valid by waiting. */
+export async function lookupSession(tempKey: string): Promise<LookupResult | null> {
+  const base = discoveryBaseUrl()
+  if (!base) return null
+  if (!isLikelyTempKey(tempKey)) return null
+  try {
+    const res = await fetch(`${base}/api/session/lookup?k=${encodeURIComponent(tempKey)}`, {
+      method: 'GET',
+      credentials: 'omit',
+    })
+    if (!res.ok) return null
+    const body = (await res.json()) as Partial<LookupResult>
+    if (typeof body.tunnelUrl !== 'string' || body.tunnelUrl.length === 0) return null
+    return {
+      tunnelUrl: body.tunnelUrl.replace(/\/$/, ''),
+      localIp: typeof body.localIp === 'string' ? body.localIp : null,
+    }
+  } catch {
+    return null
+  }
+}

@@ -118,6 +118,37 @@ export async function oxiFetch(path: string, init: RequestInit = {}): Promise<Re
 }
 
 /**
+ * Cross-origin Bearer-auth client. Used by the discovery flow on a Cloudflare
+ * Pages SPA where the tunnel lives on a different origin (no cookies).
+ * Caller is responsible for passing absolute paths starting with `/`.
+ */
+export type RemoteClient = {
+  fetch: (path: string, init?: RequestInit) => Promise<Response>
+  baseUrl: string
+}
+
+export function makeRemoteClient(baseUrl: string, apiKey: string): RemoteClient {
+  const trimmed = baseUrl.replace(/\/$/, '')
+  return {
+    baseUrl: trimmed,
+    fetch: (path: string, init: RequestInit = {}) => {
+      const headers = new Headers(init.headers ?? {})
+      if (!headers.has('Authorization')) {
+        headers.set('Authorization', `Bearer ${apiKey}`)
+      }
+      if (!headers.has('Content-Type') && init.body !== undefined) {
+        headers.set('Content-Type', 'application/json')
+      }
+      return fetch(`${trimmed}${path}`, {
+        ...init,
+        credentials: 'omit',
+        headers,
+      })
+    },
+  }
+}
+
+/**
  * Install a `window.fetch` interceptor that attaches auth headers to
  * same-origin `/api/*` and `/preview/*` requests. Idempotent; safe to call
  * multiple times (later calls no-op).
