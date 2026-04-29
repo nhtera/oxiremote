@@ -47,6 +47,9 @@ body {
   @apply bg-surface text-text-primary m-0;
   font-family: system-ui, -apple-system, sans-serif;
   -webkit-font-smoothing: antialiased;
+  /* Kills iOS pull-to-refresh + scroll-bounce that fights vertical drags
+     inside the remote-desktop canvas and terminal. */
+  overscroll-behavior-y: contain;
 }
 
 #root {
@@ -77,6 +80,19 @@ body {
 
 @layer utilities {
   .pb-safe { padding-bottom: env(safe-area-inset-bottom, 0px); }
+  .pt-safe { padding-top: env(safe-area-inset-top, 0px); }
+  .px-safe {
+    padding-left: env(safe-area-inset-left, 0px);
+    padding-right: env(safe-area-inset-right, 0px);
+  }
+  /* Use when a baseline padding-top is desired even in browser-tab
+     mode where safe-area-inset-top resolves to 0. */
+  .pt-safe-or-3 { padding-top: max(0.75rem, env(safe-area-inset-top, 0px)); }
+
+  /* iOS auto-zooms on input focus when font-size < 16px. xterm's hidden
+     helper textarea inherits the terminal's small font, so iOS Safari zooms
+     the page when the on-screen keyboard appears. Force 16px to suppress. */
+  .xterm-helper-textarea { font-size: 16px !important; }
 
   /* Warm dot-grid background — coral dots at low opacity over surface.
      Used on calm/empty surfaces (login, welcome, approval-waiting,

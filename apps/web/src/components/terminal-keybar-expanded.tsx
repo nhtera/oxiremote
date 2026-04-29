@@ -20,6 +20,9 @@ const ROW_CTRL: Key[] = [
   { label: '^A', value: '\x01' },
   { label: '^E', value: '\x05' },
   { label: '^W', value: '\x17' },
+  { label: '^D', value: '\x04' },
+  { label: '^B', value: '\x02' },
+  { label: '^F', value: '\x06' },
 ]
 
 // F-keys split into two rows of 6 — F6–F9 had been missing from the previous
@@ -57,10 +60,20 @@ type Props = {
   visible: boolean
   onSend: (bytes: string) => void
   onPaste?: () => void
+  /** Copies the current xterm selection to the clipboard (mobile-only —
+   *  keyboard users have ⌘/Ctrl+C). Optional so the legacy callers work. */
+  onCopySelection?: () => void
 }
 
-export default function TerminalKeybarExpanded({ visible, onSend, onPaste }: Props) {
+export default function TerminalKeybarExpanded({
+  visible,
+  onSend,
+  onPaste,
+  onCopySelection,
+}: Props) {
   if (!visible) return null
+
+  const hasTrailing = !!(onPaste || onCopySelection)
 
   return (
     <div className="flex flex-col gap-1 pt-1 border-t border-border/50">
@@ -69,15 +82,29 @@ export default function TerminalKeybarExpanded({ visible, onSend, onPaste }: Pro
       <Row keys={ROW_FN1} onSend={onSend} />
       <Row keys={ROW_FN2} onSend={onSend} />
       <Row keys={ROW_SYMBOLS} onSend={onSend} trailing={
-        onPaste ? (
-          <button
-            className="btn-secondary text-xs py-1 px-2 min-w-9 text-center"
-            onClick={onPaste}
-            title="Paste from clipboard"
-            aria-label="Paste"
-          >
-            Paste
-          </button>
+        hasTrailing ? (
+          <>
+            {onCopySelection ? (
+              <button
+                className="btn-secondary text-xs py-1 px-2 min-w-9 text-center"
+                onClick={onCopySelection}
+                title="Copy selection to clipboard"
+                aria-label="Copy selection"
+              >
+                Copy
+              </button>
+            ) : null}
+            {onPaste ? (
+              <button
+                className="btn-secondary text-xs py-1 px-2 min-w-9 text-center"
+                onClick={onPaste}
+                title="Paste from clipboard"
+                aria-label="Paste"
+              >
+                Paste
+              </button>
+            ) : null}
+          </>
         ) : null
       } />
     </div>

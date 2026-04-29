@@ -25,7 +25,8 @@ export default function DesktopTopStrip({
     typeof zoom === 'number' && zoom > 0 ? `${Math.round(zoom * 100)}%` : '—%'
   const zoomReady = typeof zoom === 'number' && zoom > 0
   return (
-    <div className="lg:hidden fixed top-0 inset-x-0 z-30 flex items-center gap-1 px-2 py-1 bg-surface/95 backdrop-blur border-b border-border">
+    <div className="lg:hidden fixed top-0 inset-x-0 z-30 pt-safe px-safe bg-surface/95 backdrop-blur border-b border-border">
+      <div className="flex items-center gap-1 px-2 py-1">
       <IconButton onClick={onExit} aria-label="Exit remote desktop" title="Exit">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.75" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
           <line x1="19" y1="12" x2="5" y2="12" />
@@ -70,6 +71,7 @@ export default function DesktopTopStrip({
           </svg>
         )}
       </IconButton>
+      </div>
     </div>
   )
 }

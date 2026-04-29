@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useParams, useSearchParams } from 'react-router-dom'
 import 'xterm/css/xterm.css'
 
@@ -8,7 +8,7 @@ import {
   type PaneCount,
   type PaneIndex,
 } from '../state/terminal-store'
-import { terminalThemes } from '../lib/terminal-themes'
+import { terminalThemes, TERMINAL_THEME_LABELS } from '../lib/terminal-themes'
 import {
   loadPrefs,
   savePrefs,
@@ -46,15 +46,20 @@ function TerminalSettingsPopover({ prefs, onChange, onClose }: SettingsProps) {
     <div className="absolute top-10 right-0 z-50 bg-surface-alt border border-border rounded-lg shadow-lg p-3 w-64 max-w-[calc(100vw-2rem)] space-y-3">
       <Section label="Theme">
         <div className="space-y-1">
-          {Object.keys(terminalThemes).map((key) => (
+          {Object.entries(terminalThemes).map(([key, t]) => (
             <button
               key={key}
               onClick={() => update({ theme: key })}
-              className={`w-full text-left text-xs px-2 py-1.5 rounded transition-colors ${
+              className={`w-full text-left text-xs px-2 py-1.5 rounded transition-colors flex items-center gap-2 ${
                 prefs.theme === key ? 'bg-accent/15 text-accent' : 'text-text-secondary hover:bg-surface-hover'
               }`}
             >
-              {key}
+              <span
+                className="w-4 h-4 rounded border border-border shrink-0"
+                aria-hidden
+                style={{ background: t.background, borderColor: t.foreground }}
+              />
+              <span className="truncate">{TERMINAL_THEME_LABELS[key] ?? key}</span>
             </button>
           ))}
         </div>
@@ -101,6 +106,18 @@ function TerminalSettingsPopover({ prefs, onChange, onClose }: SettingsProps) {
             </button>
           ))}
         </div>
+      </Section>
+      <Section label="Selection">
+        <label className="flex items-center gap-2 text-xs text-text-secondary cursor-pointer select-none">
+          <input
+            type="checkbox"
+            checked={prefs.copyOnSelect}
+            onChange={(e) => update({ copyOnSelect: e.target.checked })}
+            className="accent-accent"
+          />
+          Copy on select
+        </label>
+        <div className="text-[10px] text-text-muted mt-1">Auto-copies highlighted text to the clipboard.</div>
       </Section>
       <button
         onClick={onClose}
@@ -172,6 +189,8 @@ export default function WorkspacePage() {
   // Map<sessionId, sendFn> registered by each XtermPane while it's mounted.
   // The bottom composer dispatches to the focused pane via this map.
   const sendFnsRef = useRef<Map<string, (data: string) => void>>(new Map())
+  // Companion map for selection getters — drives the mobile "Copy" affordance.
+  const selectionFnsRef = useRef<Map<string, () => string>>(new Map())
 
   // Tombstones — older agent builds left exited rows in list responses.
   const closedIdsRef = useRef<Set<string>>(new Set())
@@ -360,6 +379,19 @@ export default function WorkspacePage() {
     [],
   )
 
+  const registerGetSelection = useMemo(
+    () => (sessionId: string, fn: (() => string) | null) => {
+      if (fn) selectionFnsRef.current.set(sessionId, fn)
+      else selectionFnsRef.current.delete(sessionId)
+    },
+    [],
+  )
+
+  const getFocusedSelection = useCallback((): string => {
+    if (!focusedSessionId) return ''
+    return selectionFnsRef.current.get(focusedSessionId)?.() ?? ''
+  }, [focusedSessionId])
+
   const handleConnectedChange = (sessionId: string, connected: boolean) => {
     setConnectedById((m) => (m[sessionId] === connected ? m : { ...m, [sessionId]: connected }))
     if (connected) {
@@ -473,6 +505,7 @@ export default function WorkspacePage() {
           onReconnectExhausted={handleReconnectExhausted}
           onError={setErr}
           registerSend={registerSend}
+          registerGetSelection={registerGetSelection}
         />
       ) : (
         <div className="flex-1 min-h-0 bg-dot-grid flex flex-col items-center justify-center gap-6 px-4">
@@ -498,7 +531,11 @@ export default function WorkspacePage() {
           {keybarToast && (
             <div className="text-[length:var(--text-meta)] text-warning mb-1 px-1">{keybarToast}</div>
           )}
-          <TerminalKeybar onSend={sendInput} onToast={(msg) => setKeybarToast(msg)} />
+          <TerminalKeybar
+            onSend={sendInput}
+            onToast={(msg) => setKeybarToast(msg)}
+            getSelection={getFocusedSelection}
+          />
         </div>
       )}
 

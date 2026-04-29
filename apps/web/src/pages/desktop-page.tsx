@@ -404,7 +404,7 @@ export default function DesktopPage() {
         )}
       </div>
 
-      <div className="fixed bottom-0 left-0 right-0 z-20 lg:static lg:w-60 lg:h-full lg:flex-shrink-0">
+      <div className="fixed bottom-0 left-0 right-0 z-20 pb-safe px-safe lg:static lg:w-60 lg:h-full lg:shrink-0 lg:pb-0 lg:px-0">
         <DesktopToolbar
           quality={quality}
           onQualityChange={handleQualityChange}

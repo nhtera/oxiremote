@@ -20,6 +20,14 @@ export const terminalThemes: Record<string, TerminalTheme> = {
     brightBlack: '#4b5563', brightRed: '#fca5a5', brightGreen: '#86efac', brightYellow: '#fde68a',
     brightBlue: '#93c9ff', brightMagenta: '#d8b4fe', brightCyan: '#67e8f9', brightWhite: '#f9fafb',
   },
+  light: {
+    background: '#ffffff', foreground: '#1f2937',
+    cursor: '#2563eb', selectionBackground: '#dbeafe',
+    black: '#1f2937', red: '#dc2626', green: '#16a34a', yellow: '#ca8a04',
+    blue: '#2563eb', magenta: '#9333ea', cyan: '#0891b2', white: '#e5e7eb',
+    brightBlack: '#6b7280', brightRed: '#ef4444', brightGreen: '#22c55e', brightYellow: '#eab308',
+    brightBlue: '#3b82f6', brightMagenta: '#a855f7', brightCyan: '#06b6d4', brightWhite: '#f9fafb',
+  },
   dracula: {
     background: '#282a36', foreground: '#f8f8f2',
     cursor: '#f8f8f2', selectionBackground: '#44475a',
@@ -27,6 +35,14 @@ export const terminalThemes: Record<string, TerminalTheme> = {
     blue: '#bd93f9', magenta: '#ff79c6', cyan: '#8be9fd', white: '#f8f8f2',
     brightBlack: '#6272a4', brightRed: '#ff6e6e', brightGreen: '#69ff94', brightYellow: '#ffffa5',
     brightBlue: '#d6acff', brightMagenta: '#ff92df', brightCyan: '#a4ffff', brightWhite: '#ffffff',
+  },
+  monokai: {
+    background: '#272822', foreground: '#f8f8f2',
+    cursor: '#f8f8f0', selectionBackground: '#49483e',
+    black: '#272822', red: '#f92672', green: '#a6e22e', yellow: '#f4bf75',
+    blue: '#66d9ef', magenta: '#ae81ff', cyan: '#a1efe4', white: '#f8f8f2',
+    brightBlack: '#75715e', brightRed: '#fd5ff0', brightGreen: '#cfcfc2', brightYellow: '#fce566',
+    brightBlue: '#5295e2', brightMagenta: '#ae81ff', brightCyan: '#a1efe4', brightWhite: '#f9f8f5',
   },
   'solarized-dark': {
     background: '#002b36', foreground: '#839496',
@@ -47,6 +63,17 @@ export const terminalThemes: Record<string, TerminalTheme> = {
 }
 
 const STORAGE_KEY = 'oxi.terminalTheme'
+
+// Display labels for theme keys (capital-cased for the settings picker).
+// Falls back to the raw key when missing — keeps adding a theme cheap.
+export const TERMINAL_THEME_LABELS: Record<string, string> = {
+  default: 'Default dark',
+  light: 'Light',
+  dracula: 'Dracula',
+  monokai: 'Monokai',
+  'solarized-dark': 'Solarized Dark',
+  'solarized-light': 'Solarized Light',
+}
 
 export function loadTheme(): string {
   return localStorage.getItem(STORAGE_KEY) ?? 'default'

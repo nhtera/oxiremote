@@ -22,6 +22,9 @@ type Props = {
   /** Workspace keeps a Map<sessionId, sendFn> so the global composer can
    *  forward input to whichever pane is focused. Pass null on unmount. */
   registerSend: (sessionId: string, sendFn: ((data: string) => void) | null) => void
+  /** Optional companion to registerSend — exposes the focused term's current
+   *  selection text so the mobile keybar can offer a Copy button. */
+  registerGetSelection?: (sessionId: string, fn: (() => string) | null) => void
   /** Bumped by the workspace's manual-reconnect button; forwarded to the hook. */
   reconnectNonce: number
 }
@@ -37,7 +40,7 @@ function debounce<F extends (...args: unknown[]) => void>(fn: F, ms: number) {
 export default function XtermPane({
   sessionId, prefs, isFocused, onFocus,
   onConnectedChange, onReconnectAttempt, onReconnectExhausted, onError,
-  registerSend, reconnectNonce,
+  registerSend, registerGetSelection, reconnectNonce,
 }: Props) {
   const containerRef = useRef<HTMLDivElement | null>(null)
   // Each pane owns its own handles map keyed by its single sessionId. Keeps
@@ -85,6 +88,18 @@ export default function XtermPane({
     handle.fit.fit()
     if (isFocused) handle.term.focus()
 
+    // Suppress iOS auto-correct / auto-capitalise / predictive bar on the
+    // hidden helper textarea — it otherwise mangles shell input by inserting
+    // smart quotes, capital first letters, or text suggestions.
+    const helper = el.querySelector<HTMLTextAreaElement>('.xterm-helper-textarea')
+    if (helper) {
+      helper.setAttribute('autocomplete', 'off')
+      helper.setAttribute('autocorrect', 'off')
+      helper.setAttribute('autocapitalize', 'off')
+      helper.setAttribute('spellcheck', 'false')
+      helper.setAttribute('inputmode', 'text')
+    }
+
     const debouncedResize = debounce(() => {
       try { handle.fit.fit() } catch { /* container detached */ }
       fetch(`/api/terminal/sessions/${sessionId}/resize`, {
@@ -109,6 +124,24 @@ export default function XtermPane({
     try { handle.fit.fit() } catch { /* container detached */ }
   }, [prefs.theme, prefs.fontSize, prefs.cursorStyle, sessionId])
 
+  // Copy-on-select: when the user finishes a selection, copy it to the
+  // clipboard. xterm.js fires onSelectionChange on every range mutation,
+  // including the final commit, so we copy the latest snapshot. Best-effort —
+  // navigator.clipboard requires a secure context (the tunnel always is).
+  useEffect(() => {
+    if (!prefs.copyOnSelect) return
+    const handle = handlesRef.current.get(sessionId)
+    if (!handle) return
+    const sub = handle.term.onSelectionChange(() => {
+      const sel = handle.term.getSelection()
+      if (!sel) return
+      navigator.clipboard?.writeText(sel).catch(() => {
+        /* clipboard denied / not focused — silent no-op */
+      })
+    })
+    return () => sub.dispose()
+  }, [prefs.copyOnSelect, sessionId, mounted])
+
   // Drive the WS for this sessionId via the existing hook (single-active mode).
   useTerminalWs(handlesRef, {
     activeId: mounted ? sessionId : null,
@@ -132,6 +165,18 @@ export default function XtermPane({
     registerSend(sessionId, send)
     return () => registerSend(sessionId, null)
   }, [sessionId, registerSend])
+
+  // Expose getSelection so the workspace's mobile keybar can offer a
+  // "Copy selection" action against whichever pane is focused.
+  useEffect(() => {
+    if (!registerGetSelection) return
+    const getter = () => {
+      const h = handlesRef.current.get(sessionId)
+      return h?.term.getSelection() ?? ''
+    }
+    registerGetSelection(sessionId, getter)
+    return () => registerGetSelection(sessionId, null)
+  }, [sessionId, registerGetSelection])
 
   // Refocus the term when this pane gains focus from a sibling click.
   useEffect(() => {

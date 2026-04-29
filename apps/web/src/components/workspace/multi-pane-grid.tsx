@@ -15,6 +15,9 @@ type Props = {
   onReconnectExhausted: (sessionId: string) => void
   onError: (msg: string) => void
   registerSend: (sessionId: string, sendFn: ((data: string) => void) | null) => void
+  /** Optional registry for per-session selection getters. When supplied, the
+   *  workspace's mobile keybar can offer a "Copy selection" button. */
+  registerGetSelection?: (sessionId: string, fn: (() => string) | null) => void
 }
 
 // Smallest pane width that still feels usable for a shell. Drag-resize
@@ -29,6 +32,7 @@ function evenSizes(n: PaneCount): number[] {
 export default function MultiPaneGrid({
   paneCount, paneAssignments, focusedPane, prefs, reconnectNonce,
   onFocusPane, onConnectedChange, onReconnectAttempt, onReconnectExhausted, onError, registerSend,
+  registerGetSelection,
 }: Props) {
   const [isNarrow, setIsNarrow] = useState(() => window.matchMedia('(max-width: 768px)').matches)
   useEffect(() => {
@@ -104,6 +108,7 @@ export default function MultiPaneGrid({
             onReconnectExhausted={onReconnectExhausted}
             onError={onError}
             registerSend={registerSend}
+            registerGetSelection={registerGetSelection}
             // The handle on the LEFT edge resizes between (idx-1, idx).
             onDragLeftHandle={idx > 0 ? (e) => onDragHandle(idx - 1, e.clientX) : null}
           />
@@ -126,12 +131,16 @@ type PaneProps = {
   onReconnectExhausted: (sessionId: string) => void
   onError: (msg: string) => void
   registerSend: (sessionId: string, sendFn: ((data: string) => void) | null) => void
+  /** Optional registry for per-session selection getters. When supplied, the
+   *  workspace's mobile keybar can offer a "Copy selection" button. */
+  registerGetSelection?: (sessionId: string, fn: (() => string) | null) => void
   onDragLeftHandle: ((e: React.PointerEvent) => void) | null
 }
 
 function Pane({
   paneIdx, sessionId, basis, isFocused, prefs, reconnectNonce,
   onFocus, onConnectedChange, onReconnectAttempt, onReconnectExhausted, onError, registerSend,
+  registerGetSelection,
   onDragLeftHandle,
 }: PaneProps) {
   return (
@@ -162,6 +171,7 @@ function Pane({
             onReconnectExhausted={onReconnectExhausted}
             onError={onError}
             registerSend={registerSend}
+            registerGetSelection={registerGetSelection}
             reconnectNonce={reconnectNonce}
           />
         ) : (

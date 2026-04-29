@@ -105,7 +105,11 @@ export default function Sheet({
         className={`absolute ${sideCls} bg-surface border-border ${
           side === 'right' ? 'border-l' : side === 'left' ? 'border-r' : 'border-t'
         } shadow-2xl outline-none overflow-y-auto ${panelClassName ?? ''}`}
-        style={side === 'right' || side === 'left' ? { paddingTop: 'env(safe-area-inset-top)', paddingBottom: 'env(safe-area-inset-bottom)' } : undefined}
+        style={
+          side === 'bottom'
+            ? { paddingBottom: 'env(safe-area-inset-bottom)', paddingLeft: 'env(safe-area-inset-left)', paddingRight: 'env(safe-area-inset-right)' }
+            : { paddingTop: 'env(safe-area-inset-top)', paddingBottom: 'env(safe-area-inset-bottom)' }
+        }
       >
         {children}
       </div>

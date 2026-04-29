@@ -11,10 +11,12 @@ interface Props {
 // grows beyond what fits, instead of being hidden behind a "more" sheet.
 export default function TopbarMobile({ hostId, onOpenGear }: Props) {
   return (
-    <div className="md:hidden h-11 px-2 border-b border-border bg-surface-alt flex items-center justify-between gap-2 shrink-0">
+    <div className="md:hidden pt-safe px-safe border-b border-border bg-surface-alt shrink-0">
+      <div className="h-11 px-2 flex items-center justify-between gap-2">
       <TopbarHostMenu />
       <div className="flex-1 min-w-0 overflow-x-auto">
         <TopbarIconNav hostId={hostId} compact onOpenGear={onOpenGear} />
+      </div>
       </div>
     </div>
   )

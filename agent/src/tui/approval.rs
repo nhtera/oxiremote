@@ -4,7 +4,7 @@
 // blocking pattern: spawn a short-lived thread.
 
 use std::io;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
@@ -17,7 +17,7 @@ use ratatui::{
     widgets::{Block, Borders, Clear, Paragraph},
 };
 
-use crate::auth::{browser_from_ua, platform_from_ua};
+use crate::auth::{PAIRING_TTL_SECS, browser_from_ua, platform_from_ua};
 use crate::events::AgentEvent;
 
 /// Capitalize the first letter of a coarse-platform code (e.g. "ios" → "iOS",
@@ -41,15 +41,26 @@ pub fn run_approval(term: &mut Term, event: &AgentEvent) -> Result<()> {
         device_id,
         ip,
         ua_parsed,
+        first_seen,
         ..
     } = event
     else {
         return Ok(());
     };
 
+    let expires_at = *first_seen + PAIRING_TTL_SECS;
+
     loop {
-        term.draw(|f| draw(f, device_id, ip, ua_parsed))?;
-        if event::poll(Duration::from_millis(200))?
+        let remaining = expires_at - now_secs();
+        // TTL exhausted — auto-dismiss without writing a decision so the
+        // server-side pairing record can age out via its own expiry path.
+        if remaining <= 0 {
+            return Ok(());
+        }
+        term.draw(|f| draw(f, device_id, ip, ua_parsed, remaining))?;
+        // 1 s tick — render-driven so the countdown updates even when no key
+        // is pressed. Falls through to redraw on either key or timeout.
+        if event::poll(Duration::from_secs(1))?
             && let Event::Key(key) = event::read()? {
                 if key.kind != KeyEventKind::Press {
                     continue;
@@ -69,6 +80,13 @@ pub fn run_approval(term: &mut Term, event: &AgentEvent) -> Result<()> {
     }
 }
 
+fn now_secs() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
 fn call_decision(device_id: &str, decision: &str) {
     // Fire-and-forget POST. We intentionally ignore errors — the UI flow is
     // already complete from the TUI side.
@@ -84,15 +102,15 @@ fn call_decision(device_id: &str, decision: &str) {
     });
 }
 
-fn draw(f: &mut ratatui::Frame<'_>, device_id: &str, ip: &str, ua: &str) {
+fn draw(f: &mut ratatui::Frame<'_>, device_id: &str, ip: &str, ua: &str, remaining: i64) {
     let area = f.area();
     f.render_widget(Clear, area);
 
     let layout = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length((area.height.saturating_sub(14)) / 2),
-            Constraint::Length(14),
+            Constraint::Length((area.height.saturating_sub(15)) / 2),
+            Constraint::Length(15),
             Constraint::Min(0),
         ])
         .split(area);
@@ -134,10 +152,22 @@ fn draw(f: &mut ratatui::Frame<'_>, device_id: &str, ip: &str, ua: &str) {
         (None, Some(b)) => b,
         (None, None) => ua.chars().take(48).collect(),
     };
+    // Countdown — red within the last minute so the operator sees urgency.
+    let mins = remaining / 60;
+    let secs = remaining % 60;
+    let countdown_style = if remaining < 60 {
+        Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::Yellow)
+    };
     let lines = vec![
         row("Device", &short_id),
         row("IP", ip),
         row("Client", &parsed),
+        Line::from(vec![
+            Span::styled(format!("{:<14}", "Expires in"), Style::default().fg(Color::Gray)),
+            Span::styled(format!("{}:{:02}", mins, secs), countdown_style),
+        ]),
         Line::from(""),
         Line::from(Span::styled(
             "  y  Approve",

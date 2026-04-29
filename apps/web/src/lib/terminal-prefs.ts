@@ -12,6 +12,9 @@ export interface TerminalPrefs {
   fontSize: number
   scrollback: number
   cursorStyle: CursorStyle
+  /** When true, mouse/touch text selection auto-copies to the clipboard.
+   *  Power-users want it; casual users hate the surprise. Off by default. */
+  copyOnSelect: boolean
 }
 
 export const DEFAULT_PREFS: TerminalPrefs = {
@@ -19,6 +22,7 @@ export const DEFAULT_PREFS: TerminalPrefs = {
   fontSize: 14,
   scrollback: 5000,
   cursorStyle: 'block',
+  copyOnSelect: false,
 }
 
 export const FONT_SIZE_MIN = 10
@@ -64,6 +68,8 @@ export function loadPrefs(): TerminalPrefs {
     fontSize: clampFontSize(stored.fontSize),
     scrollback: pickScrollback(stored.scrollback),
     cursorStyle: pickCursorStyle(stored.cursorStyle),
+    copyOnSelect:
+      typeof stored.copyOnSelect === 'boolean' ? stored.copyOnSelect : DEFAULT_PREFS.copyOnSelect,
   }
 }
 

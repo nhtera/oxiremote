@@ -5,6 +5,9 @@ type Props = {
   onSend: (bytes: string) => void
   /** Optional callback for transient user-visible messages (clipboard deny). */
   onToast?: (msg: string) => void
+  /** Returns the focused terminal's current selection text (or empty). When
+   *  provided, the expanded drawer renders a "Copy" button next to Paste. */
+  getSelection?: () => string
 }
 
 type Modifier = 'ctrl' | 'opt' | 'meta' | 'shift'
@@ -53,7 +56,7 @@ function applyModifiers(value: string, mods: ModifierState): string {
   return out
 }
 
-export default function TerminalKeybar({ onSend, onToast }: Props) {
+export default function TerminalKeybar({ onSend, onToast, getSelection }: Props) {
   const [mods, setMods] = useState<ModifierState>(INITIAL_MODS)
   const [expanded, setExpanded] = useState(false)
   // Tap-detection: same modifier tapped twice within 400 ms = lock.
@@ -96,6 +99,19 @@ export default function TerminalKeybar({ onSend, onToast }: Props) {
     }
   }
 
+  async function handleCopySelection() {
+    const sel = getSelection?.() ?? ''
+    if (!sel) {
+      onToast?.('Nothing selected')
+      return
+    }
+    try {
+      await navigator.clipboard.writeText(sel)
+    } catch {
+      onToast?.('Clipboard access denied')
+    }
+  }
+
   function modBtnClass(state: ModState): string {
     const base = 'btn-secondary text-xs py-1 px-2 min-w-9 text-center'
     if (state === 'lock') return `${base} !bg-accent !text-white !border-accent`
@@ -111,6 +127,7 @@ export default function TerminalKeybar({ onSend, onToast }: Props) {
         visible={expanded}
         onSend={onSend}
         onPaste={() => void handlePaste()}
+        onCopySelection={getSelection ? () => void handleCopySelection() : undefined}
       />
 
       <div className="flex flex-wrap gap-1">
