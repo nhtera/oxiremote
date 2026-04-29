@@ -56,6 +56,10 @@ interface RowProps {
   onApprove: () => void
   onReject: () => void
   onRevoke: () => void
+  /** Optional kick — closes the live session/sockets but keeps the device
+   *  trusted (API key intact, can reconnect). When undefined the action
+   *  is hidden. */
+  onDisconnect?: () => void
   onRename: (name: string | null) => Promise<void>
 }
 
@@ -65,6 +69,7 @@ export default function AgentDeviceRow({
   onApprove,
   onReject,
   onRevoke,
+  onDisconnect,
   onRename,
 }: RowProps) {
   const [editing, setEditing] = useState(false)
@@ -187,7 +192,12 @@ export default function AgentDeviceRow({
             </Button>
           </div>
         ) : device.approval_status === 'approved' ? (
-          <div className="flex justify-end">
+          <div className="flex justify-end gap-1.5">
+            {onDisconnect && (
+              <Button size="sm" variant="secondary" loading={busy} onClick={onDisconnect}>
+                Disconnect
+              </Button>
+            )}
             <Button size="sm" variant="danger" loading={busy} onClick={onRevoke}>
               Revoke
             </Button>

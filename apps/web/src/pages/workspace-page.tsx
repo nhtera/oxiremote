@@ -148,7 +148,7 @@ function SplitToggle({ value, onChange }: { value: PaneCount; onChange: (n: Pane
 
 export default function WorkspacePage() {
   const [searchParams, setSearchParams] = useSearchParams()
-  const { sessionId: sessionIdParam } = useParams<{ sessionId?: string }>()
+  const { sessionId: sessionIdParam, hostId } = useParams<{ sessionId?: string; hostId?: string }>()
   const {
     sessions, activeId, setActive, setSessions, rename, remove,
     paneAssignments, paneCount, focusedPane,
@@ -209,20 +209,37 @@ export default function WorkspacePage() {
   }
 
   // Initial load — fetch sessions, attach the best one to pane 0.
+  // If the host has no live sessions and we haven't already auto-created on
+  // this tab, mint one so the user lands on a usable terminal instead of an
+  // empty-state screen. The sessionStorage flag prevents a duplicate-create
+  // race when StrictMode double-fires the effect or the page remounts.
   useEffect(() => {
     const remembered = sessionIdParam || searchParams.get('session') || localStorage.getItem('oxi:last-terminal-session')
+    let cancelled = false
     void refreshSessions().then((data) => {
-      if (!data) return
+      if (cancelled || !data) return
+      const live = data.filter((s) => s.state !== 'exited')
       const found = remembered ? data.find((s) => s.id === remembered) ?? null : null
       const bestId = (found?.state !== 'exited' ? found?.id : null)
-        ?? data.find((s) => s.state === 'active' || s.state === 'idle')?.id
-        ?? data[0]?.id
+        ?? live.find((s) => s.state === 'active' || s.state === 'idle')?.id
+        ?? live[0]?.id
         ?? null
-      if (bestId && !paneAssignments.includes(bestId)) {
-        attachToPane(0, bestId)
-        localStorage.setItem('oxi:last-terminal-session', bestId)
+      if (bestId) {
+        if (!paneAssignments.includes(bestId)) {
+          attachToPane(0, bestId)
+          localStorage.setItem('oxi:last-terminal-session', bestId)
+        }
+        return
+      }
+      if (live.length === 0 && !sessionStorage.getItem('oxi:skip-autocreate')) {
+        sessionStorage.setItem('oxi:skip-autocreate', '1')
+        // Debounce briefly so transient empty hydration doesn't double-create.
+        window.setTimeout(() => {
+          if (!cancelled) void createSession()
+        }, 200)
       }
     })
+    return () => { cancelled = true }
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [sessionIdParam])
 
@@ -385,6 +402,7 @@ export default function WorkspacePage() {
           onNew={() => void createSession()}
           onRename={handleRename}
           onOpenSettings={() => setShowSettings((v) => !v)}
+          hostId={hostId}
         />
         {showSettings && (
           <TerminalSettingsPopover

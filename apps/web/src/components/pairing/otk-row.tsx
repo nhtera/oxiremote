@@ -45,7 +45,12 @@ export default function OtkRow({
           (otkActive ? 'border-border' : 'border-border/60 opacity-60')
         }
       >
-        <code className="font-mono text-base md:text-lg text-text-primary tracking-[0.06em] truncate select-all">
+        <code
+          className={
+            'font-mono text-base md:text-lg tracking-[0.06em] truncate select-all ' +
+            (otkActive ? 'text-text-primary' : 'text-text-muted line-through')
+          }
+        >
           {formattedKey || '—'}
         </code>
         <button
@@ -91,9 +96,9 @@ function Countdown({ remaining, expired, expiringSoon, hasKey, onRegenerate }: C
   if (expired) {
     return (
       <div className="flex items-center gap-2 flex-wrap">
-        <span className="inline-flex items-center gap-1.5 text-xs font-medium text-warning bg-warning/10 border border-warning/30 rounded-full px-2.5 py-1">
-          <span className="w-2 h-2 rounded-full bg-warning" />
-          OTK expired
+        <span className="inline-flex items-center gap-1.5 text-xs font-medium text-text-muted bg-surface-alt border border-border rounded-full px-2.5 py-1">
+          <span className="w-2 h-2 rounded-full bg-text-muted" />
+          Used — generate a new OTK
         </span>
         {onRegenerate && (
           <button

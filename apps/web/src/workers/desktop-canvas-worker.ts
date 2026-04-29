@@ -33,7 +33,16 @@ interface SmoothingMessage {
   enabled: boolean
 }
 
-type WorkerMessage = InitMessage | TileMessage | ResizeMessage | SmoothingMessage
+interface ScreenshotMessage {
+  type: 'screenshot'
+}
+
+type WorkerMessage =
+  | InitMessage
+  | TileMessage
+  | ResizeMessage
+  | SmoothingMessage
+  | ScreenshotMessage
 
 self.onmessage = async (e: MessageEvent<WorkerMessage>) => {
   const msg = e.data
@@ -58,6 +67,20 @@ self.onmessage = async (e: MessageEvent<WorkerMessage>) => {
   if (msg.type === 'smoothing') {
     smoothingEnabled = msg.enabled
     if (ctx) ctx.imageSmoothingEnabled = smoothingEnabled
+    return
+  }
+
+  if (msg.type === 'screenshot') {
+    if (!ctx) {
+      self.postMessage({ type: 'screenshot', error: 'Worker not initialized' })
+      return
+    }
+    try {
+      const blob = await ctx.canvas.convertToBlob({ type: 'image/png' })
+      self.postMessage({ type: 'screenshot', blob })
+    } catch (err) {
+      self.postMessage({ type: 'screenshot', error: String(err) })
+    }
     return
   }
 

@@ -43,4 +43,17 @@ impl DesktopService {
     pub fn remove(&self, device_id: &str) {
         self.sessions.remove(device_id);
     }
+
+    /// Forcibly evict the session for `device_id`, closing the WebSocket and
+    /// stopping the capture loop. Returns true when a session was kicked.
+    /// Used by the operator-side "Disconnect" action which kicks an active
+    /// device without revoking its trust (so it can reconnect later).
+    pub fn kick(&self, device_id: &str) -> bool {
+        if let Some((_, h)) = self.sessions.remove(device_id) {
+            let _ = h.close_tx.send(());
+            true
+        } else {
+            false
+        }
+    }
 }

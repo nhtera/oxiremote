@@ -14,7 +14,9 @@ import type {
   DesktopStatus,
   QualityTier,
 } from '../hooks/use-desktop-session'
-import { useDesktopInput, type InputMode } from '../hooks/use-desktop-input'
+import { useDesktopInput, type InputMode, type GestureMode } from '../hooks/use-desktop-input'
+import { captureCanvas } from '../lib/desktop-screenshot'
+import DesktopRectOverlay, { type DesktopRectOverlayHandle } from './desktop-rect-overlay'
 
 interface SessionSnapshot {
   status: DesktopStatus
@@ -27,6 +29,7 @@ interface SessionApi {
   setQuality: (tier: QualityTier) => void
   setSettings: (next: { hidpi: boolean }) => void
   disconnect: () => void
+  screenshot?: () => Promise<void>
 }
 
 interface Props {
@@ -34,9 +37,11 @@ interface Props {
   deviceId: string
   quality: QualityTier
   inputMode: InputMode
+  gestureMode?: GestureMode
   hidpi: boolean
   smoothScaling: boolean
   monitorDefault?: { width: number; height: number }
+  hostLabel: string
   onSessionChange: (s: SessionSnapshot) => void
   onSessionApi: (api: SessionApi) => void
 }
@@ -46,9 +51,11 @@ export default function DesktopH264View({
   deviceId,
   quality,
   inputMode,
+  gestureMode = 'pointer',
   hidpi,
   smoothScaling,
   monitorDefault,
+  hostLabel,
   onSessionChange,
   onSessionApi,
 }: Props) {
@@ -100,9 +107,17 @@ export default function DesktopH264View({
     onSessionChange({ status, attempt, screenDims })
   }, [status, attempt, screenDims, onSessionChange])
 
+  // The H.264 view paints to a main-thread canvas (drawImage from <video>),
+  // so toBlob can read pixels directly — no worker round-trip.
+  const screenshot = useCallback(async () => {
+    if (canvasRef.current) {
+      await captureCanvas(canvasRef.current, { label: hostLabel })
+    }
+  }, [hostLabel])
+
   useEffect(() => {
-    onSessionApi({ sendInput, setQuality, setSettings, disconnect })
-  }, [sendInput, setQuality, setSettings, disconnect, onSessionApi])
+    onSessionApi({ sendInput, setQuality, setSettings, disconnect, screenshot })
+  }, [sendInput, setQuality, setSettings, disconnect, screenshot, onSessionApi])
 
   // Set an initial canvas size from the monitor hint so the layout doesn't
   // pop when the first frame arrives; the onFrame loop adjusts precisely.
@@ -113,24 +128,51 @@ export default function DesktopH264View({
     canvas.height = monitorDefault?.height ?? 1080
   }, [monitorDefault])
 
-  return <CanvasWithInput canvasRef={canvasRef} mode={inputMode} sendInput={sendInput} />
+  return (
+    <CanvasWithInput
+      canvasRef={canvasRef}
+      mode={inputMode}
+      gestureMode={gestureMode}
+      sendInput={sendInput}
+    />
+  )
 }
 
 function CanvasWithInput({
   canvasRef,
   mode,
+  gestureMode,
   sendInput,
 }: {
   canvasRef: React.RefObject<HTMLCanvasElement | null>
   mode: InputMode
+  gestureMode: GestureMode
   sendInput: (ev: DesktopInputEvent) => void
 }) {
-  useDesktopInput({ canvas: canvasRef, mode, sendInput })
+  const overlayRef = useRef<DesktopRectOverlayHandle>(null)
+  const overlayForwarder = useRef({
+    show(start: { x: number; y: number }, end: { x: number; y: number }) {
+      overlayRef.current?.show(start, end)
+    },
+    hide() {
+      overlayRef.current?.hide()
+    },
+  }).current
+  useDesktopInput({
+    canvas: canvasRef,
+    mode,
+    sendInput,
+    gestureMode,
+    rectOverlay: overlayForwarder,
+  })
   return (
-    <canvas
-      ref={canvasRef}
-      className="w-full h-full object-contain"
-      style={{ display: 'block', touchAction: 'none' }}
-    />
+    <>
+      <canvas
+        ref={canvasRef}
+        className="w-full h-full object-contain"
+        style={{ display: 'block', touchAction: 'none' }}
+      />
+      <DesktopRectOverlay ref={overlayRef} />
+    </>
   )
 }

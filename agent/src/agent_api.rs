@@ -47,6 +47,7 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/api/agent/devices", get(api_agent_devices))
         .route("/api/agent/devices/{id}", patch(api_agent_device_patch))
         .route("/api/agent/devices/{id}/revoke", post(api_agent_device_revoke))
+        .route("/api/agent/devices/{id}/disconnect", post(api_agent_device_disconnect))
         .route(
             "/api/agent/autostart",
             get(api_agent_autostart_get).post(api_agent_autostart_post),
@@ -641,6 +642,38 @@ async fn api_agent_device_patch(
                 .into_response()
         }
     }
+}
+
+/// POST /api/agent/devices/{id}/disconnect — close active live connections
+/// for `id` (desktop session, push subscriptions) without revoking trust.
+/// Distinct from /revoke: the device's API key stays valid, so the user can
+/// rejoin from the same browser without re-pairing. Mirrors 9remote's
+/// "Disconnect" vs "Remove" distinction.
+async fn api_agent_device_disconnect(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    // Kick the active desktop session if one exists. Silently no-ops when
+    // there's nothing to kick (the device may only have a terminal open).
+    #[cfg(feature = "desktop")]
+    if let Some(svc) = state.desktop_service.as_ref() {
+        let _ = svc.kick(&id);
+    }
+
+    // Drop any push subscriptions so the device stops receiving notifications
+    // until it next reconnects (which will register a fresh subscription).
+    if let Ok(conn) = Connection::open(&state.db_path) {
+        let _ = conn.execute(
+            "DELETE FROM push_subscriptions WHERE device_id = ?1",
+            rusqlite::params![id],
+        );
+    }
+
+    info!(device_id = %id, "device disconnected via agent api");
+    state
+        .event_bus
+        .send(AgentEvent::DeviceDisconnected { device_id: id });
+    (StatusCode::OK, Json(json!({ "ok": true }))).into_response()
 }
 
 /// POST /api/agent/devices/{id}/revoke — revoke a device from the agent dashboard.

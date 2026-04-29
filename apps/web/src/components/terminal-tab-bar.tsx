@@ -1,5 +1,7 @@
 import { useRef, useState } from 'react'
+import { Link } from 'react-router-dom'
 import type { Session } from '../state/terminal-store'
+import { RemoteDesktopIcon } from './icons'
 
 type Props = {
   sessions: Session[]
@@ -16,6 +18,11 @@ type Props = {
   onNew: () => void
   onRename: (id: string, name: string) => void
   onOpenSettings: () => void
+  /** When supplied, render a Monitor icon between New-tab and gear that
+   *  navigates to the remote-desktop surface for this host. */
+  hostId?: string
+  /** Hide the Monitor button (no RD permission / disabled). */
+  desktopAvailable?: boolean
 }
 
 type DotKind = 'connected' | 'reconnecting' | 'exited' | 'idle'
@@ -49,6 +56,7 @@ function resolveDot(
 export default function TerminalTabBar({
   sessions, activeId, isActiveConnected, connectedById, reconnectingById,
   onSelect, onClose, onNew, onRename, onOpenSettings,
+  hostId, desktopAvailable = true,
 }: Props) {
   const [editingId, setEditingId] = useState<string | null>(null)
   const [editValue, setEditValue] = useState('')
@@ -141,6 +149,19 @@ export default function TerminalTabBar({
       >
         +
       </button>
+
+      {/* Quick-jump to remote desktop. Sits between New and gear so the eye
+          finds it without scanning the topbar. Hidden when RD is unavailable. */}
+      {hostId && desktopAvailable && (
+        <Link
+          to={`/h/${hostId}/desktop`}
+          className="px-2 py-1 shrink-0 text-text-muted hover:text-text-primary hover:bg-surface-hover transition-colors flex items-center"
+          title="Open remote desktop"
+          aria-label="Open remote desktop"
+        >
+          <RemoteDesktopIcon size={14} />
+        </Link>
+      )}
 
       {/* Spacer pushes gear to the right */}
       <div className="flex-1" />

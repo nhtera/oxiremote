@@ -109,6 +109,16 @@ export default function AgentDevicesPage() {
     }
   }
 
+  async function disconnectDevice(id: string) {
+    setBusyId(id)
+    try {
+      await fetch(`/api/agent/devices/${id}/disconnect`, { method: 'POST' })
+      await fetchDevices()
+    } finally {
+      setBusyId(null)
+    }
+  }
+
   async function rename(id: string, name: string | null) {
     await fetch(`/api/agent/devices/${id}`, {
       method: 'PATCH',
@@ -214,6 +224,7 @@ export default function AgentDevicesPage() {
                   onApprove={() => approve(d.device_id)}
                   onReject={() => reject(d.device_id)}
                   onRevoke={() => revoke(d.device_id)}
+                  onDisconnect={() => disconnectDevice(d.device_id)}
                   onRename={(name) => rename(d.device_id, name)}
                 />
               ))}

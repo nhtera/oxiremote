@@ -10,12 +10,13 @@
 
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { useNavigate, useParams } from 'react-router-dom'
+import { useHostStore } from '../state/host-store'
 import type {
   DesktopInputEvent,
   DesktopStatus,
   QualityTier,
 } from '../hooks/use-desktop-session'
-import type { InputMode } from '../hooks/use-desktop-input'
+import type { InputMode, GestureMode } from '../hooks/use-desktop-input'
 import { supportsH264Video } from '../hooks/use-desktop-video-session'
 import DesktopJpegView from '../components/desktop-jpeg-view'
 import DesktopH264View from '../components/desktop-h264-view'
@@ -42,6 +43,8 @@ interface SessionApi {
   setQuality: (tier: QualityTier) => void
   setSettings: (next: { hidpi: boolean }) => void
   disconnect: () => void
+  /** Trigger a PNG screenshot download. View-specific implementation. */
+  screenshot?: () => Promise<void>
 }
 
 const noopApi: SessionApi = {
@@ -80,11 +83,13 @@ function loadSettings(): DisplaySettings {
 export default function DesktopPage() {
   const { hostId = '' } = useParams<{ hostId: string }>()
   const navigate = useNavigate()
+  const hostLabel = useHostStore((s) => s.label) ?? hostId.slice(0, 8) ?? 'host'
   const [caps, setCaps] = useState<Capabilities | null>(null)
   const [capsError, setCapsError] = useState('')
   const [deviceId, setDeviceId] = useState<string | null>(null)
   const [quality, setQuality] = useState<QualityTier>('med')
   const [inputMode, setInputMode] = useState<InputMode>('touch')
+  const [gestureMode, setGestureMode] = useState<GestureMode>('pointer')
   const [showHelp, setShowHelp] = useState(false)
   const [showKeyboard, setShowKeyboard] = useState(false)
   const [showTextBatch, setShowTextBatch] = useState(false)
@@ -242,6 +247,13 @@ export default function DesktopPage() {
     setReloadNonce((n) => n + 1)
   }, [])
 
+  const handleScreenshot = useCallback(() => {
+    void sessionApiRef.current.screenshot?.().catch(() => {
+      // The view either wasn't ready or the browser denied the capture path.
+      // Surface nothing — the next try will succeed once a frame has landed.
+    })
+  }, [])
+
   const handleFullscreen = useCallback(async () => {
     type FsElement = HTMLElement & {
       webkitRequestFullscreen?: () => Promise<void> | void
@@ -351,6 +363,7 @@ export default function DesktopPage() {
         onExit={handleExit}
         onReload={handleReload}
         onFullscreen={handleFullscreen}
+        onScreenshot={handleScreenshot}
         inFullscreen={inFullscreen}
         zoom={zoom}
       />
@@ -365,9 +378,11 @@ export default function DesktopPage() {
             deviceId={deviceId}
             quality={quality}
             inputMode={inputMode}
+            gestureMode={gestureMode}
             hidpi={settings.hidpi}
             smoothScaling={settings.smoothScaling}
             monitorDefault={monitorDefault}
+            hostLabel={hostLabel}
             onSessionChange={onSessionChange}
             onSessionApi={onSessionApi}
           />
@@ -378,9 +393,11 @@ export default function DesktopPage() {
             deviceId={deviceId}
             quality={quality}
             inputMode={inputMode}
+            gestureMode={gestureMode}
             hidpi={settings.hidpi}
             smoothScaling={settings.smoothScaling}
             monitorDefault={monitorDefault}
+            hostLabel={hostLabel}
             onSessionChange={onSessionChange}
             onSessionApi={onSessionApi}
           />
@@ -393,6 +410,10 @@ export default function DesktopPage() {
           onQualityChange={handleQualityChange}
           inputMode={inputMode}
           onInputModeToggle={() => setInputMode((m) => (m === 'touch' ? 'trackpad' : 'touch'))}
+          gestureMode={gestureMode}
+          onGestureModeToggle={() =>
+            setGestureMode((g) => (g === 'pointer' ? 'rect' : 'pointer'))
+          }
           onKeyEvent={sendInput}
           onShowGestureHelp={() => setShowHelp(true)}
           onShowOnscreenKeyboard={() => setShowKeyboard(true)}

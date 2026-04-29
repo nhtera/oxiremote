@@ -75,14 +75,36 @@ export function useSendTextBatch(sendInput: (ev: DesktopInputEvent) => void) {
   }, [])
 }
 
+/** Higher-level interaction mode that runs alongside `InputMode`. `rect`
+ *  remaps single-finger drag into a marquee selection — pointer-down →
+ *  pointer-up still emits the same mouse-down/up events as a regular drag,
+ *  but the helper draws an overlay so the user sees what they're selecting. */
+export type GestureMode = 'pointer' | 'rect'
+
+interface RectOverlayHandle {
+  /** Starts/updates the dashed-overlay for the in-progress rectangle. */
+  show: (start: { x: number; y: number }, end: { x: number; y: number }) => void
+  /** Hides the overlay. */
+  hide: () => void
+}
+
 interface Props {
   canvas: RefObject<HTMLCanvasElement | null>
   mode: InputMode
   sendInput: (ev: DesktopInputEvent) => void
+  /** Optional gesture-mode toggle. When 'rect', single-finger drag draws the
+   *  overlay AND emits a normal mouse-drag to the host. */
+  gestureMode?: GestureMode
+  /** Optional overlay controller — when supplied, rect mode draws via it. */
+  rectOverlay?: RectOverlayHandle
 }
 
 const LONG_PRESS_MS = 500
 const DRAG_THRESHOLD_PX = 4
+// 2-finger double-tap window. 9remote-style: tap two fingers, release, tap
+// again with two fingers within 300 ms = double-click at midpoint.
+const TWO_FINGER_DTAP_MS = 300
+const TWO_FINGER_DTAP_PX = 30
 
 function normX(canvas: HTMLCanvasElement, clientX: number): number {
   const rect = canvas.getBoundingClientRect()
@@ -94,13 +116,33 @@ function normY(canvas: HTMLCanvasElement, clientY: number): number {
   return Math.max(0, Math.min(1, (clientY - rect.top) / rect.height))
 }
 
-export function useDesktopInput({ canvas, mode, sendInput }: Props) {
+export function useDesktopInput({
+  canvas,
+  mode,
+  sendInput,
+  gestureMode = 'pointer',
+  rectOverlay,
+}: Props) {
   // Refs for touch state — avoids stale closure issues
   const longPressTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
   const touchStartPos = useRef<{ x: number; y: number } | null>(null)
   const isDragging = useRef(false)
   const prevTwoFingerY = useRef<number | null>(null)
   const prevTwoFingerX = useRef<number | null>(null)
+  // Most recent 2-finger lift, for double-tap detection. Stored in client
+  // coords so the distance threshold is intuitive.
+  const lastTwoFingerLift = useRef<{ ts: number; cx: number; cy: number } | null>(null)
+  // Most recent 2-finger touch start client coords, used to detect a quick
+  // tap (touchstart → touchend without significant movement).
+  const twoFingerStart = useRef<{ ts: number; cx: number; cy: number } | null>(null)
+  // Pixel start of the in-progress rect (for overlay positioning).
+  const rectPxStart = useRef<{ cx: number; cy: number } | null>(null)
+  // Read latest gestureMode/overlay inside event handlers without re-binding
+  // the listeners (which would lose state).
+  const gestureModeRef = useRef(gestureMode)
+  const rectOverlayRef = useRef(rectOverlay)
+  useEffect(() => { gestureModeRef.current = gestureMode }, [gestureMode])
+  useEffect(() => { rectOverlayRef.current = rectOverlay }, [rectOverlay])
 
   useEffect(() => {
     const el = canvas.current
@@ -117,6 +159,10 @@ export function useDesktopInput({ canvas, mode, sendInput }: Props) {
         const x = normX(el!, t[0].clientX)
         const y = normY(el!, t[0].clientY)
         touchStartPos.current = { x, y }
+        // Track pixel start for the optional rect overlay.
+        if (gestureModeRef.current === 'rect') {
+          rectPxStart.current = { cx: t[0].clientX, cy: t[0].clientY }
+        }
 
         // Send mouse move first so cursor is at tap position
         sendInput({ t: 'mouse', action: 'move', x, y })
@@ -133,6 +179,7 @@ export function useDesktopInput({ canvas, mode, sendInput }: Props) {
         const avgX = (t[0].clientX + t[1].clientX) / 2
         prevTwoFingerY.current = avgY
         prevTwoFingerX.current = avgX
+        twoFingerStart.current = { ts: performance.now(), cx: avgX, cy: avgY }
       }
     }
 
@@ -154,6 +201,17 @@ export function useDesktopInput({ canvas, mode, sendInput }: Props) {
         }
 
         sendInput({ t: 'mouse', action: 'move', x, y })
+
+        // Rect-mode overlay: redraw the dashed rectangle from the start
+        // position to the current finger. The overlay is purely visual; the
+        // server still receives the same mouse-down / move / up triple as
+        // a regular drag.
+        if (gestureModeRef.current === 'rect' && rectPxStart.current && rectOverlayRef.current) {
+          rectOverlayRef.current.show(
+            { x: rectPxStart.current.cx, y: rectPxStart.current.cy },
+            { x: t[0].clientX, y: t[0].clientY },
+          )
+        }
       } else if (t.length === 2) {
         const avgY = (t[0].clientY + t[1].clientY) / 2
         const avgX = (t[0].clientX + t[1].clientX) / 2
@@ -185,25 +243,64 @@ export function useDesktopInput({ canvas, mode, sendInput }: Props) {
           // End drag
           sendInput({ t: 'mouse', action: 'up', btn: 'left', x, y })
           isDragging.current = false
+          // Rect overlay clears on release; the host already received the
+          // drag events so the selection is in place.
+          if (gestureModeRef.current === 'rect' && rectOverlayRef.current) {
+            rectOverlayRef.current.hide()
+          }
+          rectPxStart.current = null
         } else if (changedTouches.length === 1) {
           // Tap → left click
           sendInput({ t: 'mouse', action: 'down', btn: 'left', x, y })
           sendInput({ t: 'mouse', action: 'up', btn: 'left', x, y })
         } else if (changedTouches.length === 2) {
-          // Two-finger tap → right click at midpoint
-          const mx = normX(el!, (changedTouches[0].clientX + changedTouches[1].clientX) / 2)
-          const my = normY(el!, (changedTouches[0].clientY + changedTouches[1].clientY) / 2)
-          sendInput({ t: 'mouse', action: 'down', btn: 'right', x: mx, y: my })
-          sendInput({ t: 'mouse', action: 'up', btn: 'right', x: mx, y: my })
+          // Two-finger lift. Decide between a single right-click (the legacy
+          // gesture) and a 2-finger double-tap → double-click. The latter
+          // requires the two fingers to have landed and lifted within a
+          // short window, with low movement.
+          const mxPx = (changedTouches[0].clientX + changedTouches[1].clientX) / 2
+          const myPx = (changedTouches[0].clientY + changedTouches[1].clientY) / 2
+          const start = twoFingerStart.current
+          const moved =
+            start &&
+            (Math.hypot(mxPx - start.cx, myPx - start.cy) > TWO_FINGER_DTAP_PX)
+          const last = lastTwoFingerLift.current
+          const now = performance.now()
+          const isDoubleTap =
+            !moved &&
+            last &&
+            now - last.ts < TWO_FINGER_DTAP_MS &&
+            Math.hypot(mxPx - last.cx, myPx - last.cy) < TWO_FINGER_DTAP_PX
+
+          if (isDoubleTap) {
+            const mx = normX(el!, mxPx)
+            const my = normY(el!, myPx)
+            // Two left-clicks back-to-back → double-click on the OS side.
+            sendInput({ t: 'mouse', action: 'down', btn: 'left', x: mx, y: my })
+            sendInput({ t: 'mouse', action: 'up', btn: 'left', x: mx, y: my })
+            sendInput({ t: 'mouse', action: 'down', btn: 'left', x: mx, y: my })
+            sendInput({ t: 'mouse', action: 'up', btn: 'left', x: mx, y: my })
+            lastTwoFingerLift.current = null
+          } else {
+            // Two-finger tap → right click at midpoint (legacy behavior).
+            const mx = normX(el!, mxPx)
+            const my = normY(el!, myPx)
+            sendInput({ t: 'mouse', action: 'down', btn: 'right', x: mx, y: my })
+            sendInput({ t: 'mouse', action: 'up', btn: 'right', x: mx, y: my })
+            // Remember this lift for the next double-tap candidate window.
+            lastTwoFingerLift.current = { ts: now, cx: mxPx, cy: myPx }
+          }
         }
       }
 
       if (remaining.length < 2) {
         prevTwoFingerY.current = null
         prevTwoFingerX.current = null
+        twoFingerStart.current = null
       }
       if (remaining.length === 0) {
         touchStartPos.current = null
+        rectPxStart.current = null
       }
     }
 

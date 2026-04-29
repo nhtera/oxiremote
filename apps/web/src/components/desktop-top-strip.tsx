@@ -1,14 +1,15 @@
 // Slim top toolbar shown only on small viewports (`lg:hidden`). Pairs with
 // the bottom DesktopToolbar so a phone user has the full set of controls
-// without leaving the session — back/exit, reload, fullscreen — instead of
-// browser-back which loses click-and-drag state.
+// without leaving the session — back/exit, reload, screenshot, fullscreen.
 
 interface Props {
   onExit: () => void
   onReload: () => void
   onFullscreen: () => void
+  onScreenshot?: () => void
   inFullscreen: boolean
-  /** Display scale of the canvas vs the remote's native resolution. 1.0 = 100%. */
+  /** Display scale of the canvas vs the remote's native resolution. 1.0 = 100%.
+   *  When undefined we render `—%` as a skeleton so the slot doesn't pop. */
   zoom?: number
 }
 
@@ -16,9 +17,13 @@ export default function DesktopTopStrip({
   onExit,
   onReload,
   onFullscreen,
+  onScreenshot,
   inFullscreen,
   zoom,
 }: Props) {
+  const zoomLabel =
+    typeof zoom === 'number' && zoom > 0 ? `${Math.round(zoom * 100)}%` : '—%'
+  const zoomReady = typeof zoom === 'number' && zoom > 0
   return (
     <div className="lg:hidden fixed top-0 inset-x-0 z-30 flex items-center gap-1 px-2 py-1 bg-surface/95 backdrop-blur border-b border-border">
       <IconButton onClick={onExit} aria-label="Exit remote desktop" title="Exit">
@@ -27,14 +32,14 @@ export default function DesktopTopStrip({
           <polyline points="12 19 5 12 12 5" />
         </svg>
       </IconButton>
-      {typeof zoom === 'number' && zoom > 0 && (
-        <span
-          className="px-1.5 text-[11px] tabular-nums text-text-muted"
-          aria-label="Current zoom"
-        >
-          {Math.round(zoom * 100)}%
-        </span>
-      )}
+      <span
+        className={`px-1.5 text-[11px] tabular-nums transition-opacity ${
+          zoomReady ? 'text-text-muted' : 'text-text-muted/50'
+        }`}
+        aria-label="Current zoom"
+      >
+        {zoomLabel}
+      </span>
       <div className="flex-1" />
       <IconButton onClick={onReload} aria-label="Reload session" title="Reload">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.75" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
@@ -42,6 +47,14 @@ export default function DesktopTopStrip({
           <path d="M3.51 15a9 9 0 1 0 2.13-9.36L1 10" />
         </svg>
       </IconButton>
+      {onScreenshot && (
+        <IconButton onClick={onScreenshot} aria-label="Take screenshot" title="Screenshot">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.75" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+            <path d="M4 7h3l2-2h6l2 2h3a1 1 0 0 1 1 1v10a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V8a1 1 0 0 1 1-1z" />
+            <circle cx="12" cy="13" r="3.5" />
+          </svg>
+        </IconButton>
+      )}
       <IconButton
         onClick={onFullscreen}
         aria-label={inFullscreen ? 'Exit fullscreen' : 'Fullscreen'}

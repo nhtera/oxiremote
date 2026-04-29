@@ -7,11 +7,12 @@ import TopbarHostMenu from './topbar/topbar-host-menu'
 import TopbarIconNav from './topbar/topbar-icon-nav'
 import TopbarMobile from './topbar/topbar-mobile'
 import GearDrawer from './gear/gear-drawer'
+import MobileBottomTabs from './topbar/mobile-bottom-tabs'
 
-// Workspace-centric chrome. The sidebar is gone; navigation lives in a 48px
-// top bar with a host-switcher dropdown on the left and an icon strip on the
-// right. Mobile collapses to a 44px variant. Banners (PWA/push) sit between
-// the top bar and the routed page so they don't interfere with the chrome.
+// Workspace-centric chrome. Shell uses CSS Grid (auto/1fr/auto) so the routed
+// page owns its own scroll container. iOS Safari's soft keyboard would clip
+// xterm when an outer `overflow-auto` competed with the visualViewport — the
+// grid avoids that. Mobile gets a bottom tab bar in the last grid row.
 export default function AppLayout() {
   const { pathname } = useLocation()
   const { currentHostId } = useHostStore()
@@ -22,8 +23,8 @@ export default function AppLayout() {
   const isDashboardRoute = /\/h\/[^/]+\/dashboard$/.test(pathname)
 
   return (
-    <div className="flex flex-col min-h-dvh">
-      {currentHostId && (
+    <div className="grid grid-rows-[auto_1fr_auto] h-[100dvh] supports-[not(height:100dvh)]:h-screen">
+      {currentHostId ? (
         <>
           {/* Desktop top bar */}
           <header className="hidden md:flex h-12 px-3 border-b border-border bg-surface-alt items-center justify-between gap-4 shrink-0">
@@ -34,13 +35,23 @@ export default function AppLayout() {
           {/* Mobile top bar */}
           <TopbarMobile hostId={currentHostId} onOpenGear={() => setGearOpen(true)} />
         </>
+      ) : (
+        <div />
       )}
 
-      <main className="flex-1 min-h-0 overflow-auto">
+      <main className="min-h-0 overflow-hidden flex flex-col">
         <InstallPwaBanner />
         {isDashboardRoute && <PushPermissionBanner />}
-        <Outlet />
+        <div className="flex-1 min-h-0 overflow-auto">
+          <Outlet />
+        </div>
       </main>
+
+      {currentHostId ? (
+        <MobileBottomTabs hostId={currentHostId} />
+      ) : (
+        <div />
+      )}
 
       {currentHostId && (
         <GearDrawer

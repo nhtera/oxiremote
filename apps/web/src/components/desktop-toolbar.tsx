@@ -5,7 +5,7 @@
 
 import { useEffect, useRef, useState } from 'react'
 import type { QualityTier, DesktopInputEvent } from '../hooks/use-desktop-session'
-import type { InputMode } from '../hooks/use-desktop-input'
+import type { InputMode, GestureMode } from '../hooks/use-desktop-input'
 import DesktopSettingsPopover from './desktop-settings-popover'
 import { SettingsIcon } from './icons'
 
@@ -14,6 +14,9 @@ interface Props {
   onQualityChange: (tier: QualityTier) => void
   inputMode: InputMode
   onInputModeToggle: () => void
+  /** Higher-level gesture mode — 'pointer' (normal) vs 'rect' (marquee select). */
+  gestureMode?: GestureMode
+  onGestureModeToggle?: () => void
   onKeyEvent: (ev: DesktopInputEvent) => void
   onShowGestureHelp: () => void
   /** Optional FAB action — e.g. open the on-screen keyboard sheet. */
@@ -38,17 +41,35 @@ interface KeyDef {
   label: string
   code: string
   mod?: ModKey
+  /** Pre-fused modifier(s). Used for "Undo" which auto-applies Ctrl/Cmd. */
+  forceMods?: ModKey[]
 }
+
+// Detect macOS so the Undo key sends Cmd+Z to mac hosts and Ctrl+Z elsewhere.
+// `navigator.platform` is deprecated but still authoritative for OS detection;
+// `navigator.userAgentData.platform` is gated behind permissions and not on
+// every browser. The remote OS is what matters, but the client can't know it
+// without an extra round-trip — assume the user runs the same OS family they
+// remote into. This matches 9remote's behavior.
+function isMacClient(): boolean {
+  if (typeof navigator === 'undefined') return false
+  const ua = (navigator.userAgent || '').toLowerCase()
+  return /mac|iphone|ipad|ipod/.test(ua)
+}
+
+const UNDO_KEY: KeyDef = isMacClient()
+  ? { label: 'Undo', code: 'KeyZ', forceMods: ['meta'] }
+  : { label: 'Undo', code: 'KeyZ', forceMods: ['ctrl'] }
 
 const KEYS: KeyDef[] = [
   { label: 'Esc', code: 'Escape' },
-  { label: '⌃Z', code: 'KeyZ' },   // Undo — sends Ctrl+Z (ctrl fused in handler)
+  UNDO_KEY,
   { label: 'Tab', code: 'Tab' },
   { label: 'Ctrl', code: '', mod: 'ctrl' },
   { label: 'Alt', code: '', mod: 'alt' },
   { label: 'Shift', code: '', mod: 'shift' },
   { label: '⌘', code: '', mod: 'meta' },
-  { label: '✓', code: 'Enter' },    // green send button
+  { label: '⌫', code: 'Backspace' }, // backspace replaces ambiguous ✓
 ]
 
 export default function DesktopToolbar({
@@ -56,6 +77,8 @@ export default function DesktopToolbar({
   onQualityChange,
   inputMode,
   onInputModeToggle,
+  gestureMode = 'pointer',
+  onGestureModeToggle,
   onKeyEvent,
   onShowGestureHelp,
   onShowOnscreenKeyboard,
@@ -103,25 +126,24 @@ export default function DesktopToolbar({
       return
     }
 
-    // Undo shortcut: ⌃Z label pre-wires Ctrl modifier
-    const forceCtrl = key.label === '⌃Z'
+    const forced = key.forceMods ?? []
     const mods = activeModifiers
 
     const ev: DesktopInputEvent = {
       t: 'key',
       code: key.code,
       action: 'down',
-      ctrl: forceCtrl || mods.has('ctrl'),
-      alt: mods.has('alt'),
-      shift: mods.has('shift'),
-      meta: mods.has('meta'),
+      ctrl: forced.includes('ctrl') || mods.has('ctrl'),
+      alt: forced.includes('alt') || mods.has('alt'),
+      shift: forced.includes('shift') || mods.has('shift'),
+      meta: forced.includes('meta') || mods.has('meta'),
     }
 
     onKeyEvent(ev)
     onKeyEvent({ ...ev, action: 'up' })
 
     // Clear sticky modifiers after consumption
-    if (mods.size > 0 || forceCtrl) {
+    if (mods.size > 0 || forced.length > 0) {
       setActiveModifiers(new Set())
     }
   }
@@ -131,9 +153,6 @@ export default function DesktopToolbar({
       'flex-1 min-w-0 py-2 text-xs font-medium rounded-md border border-border transition-colors select-none active:scale-95'
     if (key.mod && activeModifiers.has(key.mod)) {
       return `${base} bg-[hsl(var(--accent-primary)/0.2)] text-[hsl(var(--accent-primary))] border-[hsl(var(--accent-primary)/0.4)]`
-    }
-    if (key.label === '✓') {
-      return `${base} bg-green-600/20 text-green-400 border-green-600/40 hover:bg-green-600/30`
     }
     return `${base} bg-surface-alt text-text-secondary hover:bg-surface-hover hover:text-text-primary`
   }
@@ -171,6 +190,27 @@ export default function DesktopToolbar({
             ].join(' ')}
           >
             Aa
+          </button>
+        )}
+
+        {onGestureModeToggle && (
+          <button
+            onClick={onGestureModeToggle}
+            title={
+              gestureMode === 'rect'
+                ? 'Rectangle-select mode is ON — drag to draw a marquee selection. Tap to switch back to pointer.'
+                : 'Rectangle-select mode — drag to sweep a selection rectangle on the remote.'
+            }
+            aria-label="Toggle rectangle select"
+            aria-pressed={gestureMode === 'rect'}
+            className={[
+              'shrink-0 text-xs px-2 py-1 border rounded-md transition-colors font-medium',
+              gestureMode === 'rect'
+                ? 'bg-[hsl(var(--accent-primary)/0.2)] text-[hsl(var(--accent-primary))] border-[hsl(var(--accent-primary)/0.4)]'
+                : 'bg-surface-alt text-text-muted border-border hover:text-text-primary hover:bg-surface-hover',
+            ].join(' ')}
+          >
+            ▢
           </button>
         )}
 

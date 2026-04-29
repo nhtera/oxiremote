@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { Terminal } from 'xterm'
 import { FitAddon } from 'xterm-addon-fit'
 import 'xterm/css/xterm.css'
@@ -6,6 +6,7 @@ import 'xterm/css/xterm.css'
 import { terminalThemes } from '../../lib/terminal-themes'
 import type { TerminalPrefs } from '../../lib/terminal-prefs'
 import { useTerminalWs, destroyHandle, type SessionHandle } from '../../lib/terminal-ws-hook'
+import { useVisualViewport } from '../../hooks/use-visual-viewport'
 
 type Props = {
   sessionId: string
@@ -138,6 +139,17 @@ export default function XtermPane({
     const h = handlesRef.current.get(sessionId)
     h?.term.focus()
   }, [isFocused, sessionId])
+
+  // iOS Safari soft-keyboard fix: when the visual viewport shrinks, the grid
+  // layout's `100dvh` may not contract on older Safari, leaving the cursor
+  // hidden behind the keyboard. A direct fit() pass against the new viewport
+  // height makes xterm recompute rows so the prompt stays in view.
+  const refitOnViewport = useCallback(() => {
+    const h = handlesRef.current.get(sessionId)
+    if (!h) return
+    try { h.fit.fit() } catch { /* container detached */ }
+  }, [sessionId])
+  useVisualViewport(refitOnViewport)
 
   return (
     <div

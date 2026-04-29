@@ -4,6 +4,11 @@ import { useRef, useState } from 'react'
 // Reuses POST /api/files/upload (multipart: dir + file) — the same endpoint
 // the FilesPage upload flow uses. On success, inserts `"<workspace-relative path>"`
 // into the composer via `onPathInsert`.
+//
+// Three distinct rows match the iOS share-sheet pattern (Photos / Camera /
+// Files). Each row owns its own <input type="file"> so the file picker shows
+// the right source UI on iOS — `accept` and `capture` only affect the picker
+// when set on the actual input the user clicks.
 
 type Props = {
   wsId: number
@@ -18,12 +23,10 @@ type UploadState =
   | { kind: 'error'; msg: string }
 
 export default function FileAttachSheet({ wsId, dir = '', onPathInsert, onClose }: Props) {
-  const fileInputRef = useRef<HTMLInputElement>(null)
+  const photoInputRef = useRef<HTMLInputElement>(null)
   const cameraInputRef = useRef<HTMLInputElement>(null)
+  const fileInputRef = useRef<HTMLInputElement>(null)
   const [state, setState] = useState<UploadState>({ kind: 'idle' })
-
-  const cameraSupported =
-    typeof navigator !== 'undefined' && !!navigator.mediaDevices
 
   function uploadFile(file: File) {
     setState({ kind: 'uploading', pct: 0 })
@@ -83,17 +86,23 @@ export default function FileAttachSheet({ wsId, dir = '', onPathInsert, onClose 
         {state.kind === 'idle' && (
           <div className="flex flex-col gap-1">
             <SheetOption
+              icon={<PhotoIcon />}
+              label="Photo Library"
+              desc="Pick an image or video from your library"
+              onClick={() => photoInputRef.current?.click()}
+            />
+            <SheetOption
+              icon={<CameraIcon />}
+              label="Take Photo or Video"
+              desc="Capture with the camera"
+              onClick={() => cameraInputRef.current?.click()}
+            />
+            <SheetOption
+              icon={<FolderIcon />}
               label="Choose File"
-              desc="Upload a file from your device"
+              desc="Upload any file from your device"
               onClick={() => fileInputRef.current?.click()}
             />
-            {cameraSupported && (
-              <SheetOption
-                label="Take Photo"
-                desc="Capture with the camera"
-                onClick={() => cameraInputRef.current?.click()}
-              />
-            )}
             <button
               onClick={onClose}
               className="mt-2 px-4 py-2.5 text-sm text-text-secondary border border-border rounded-md hover:bg-surface-hover"
@@ -138,16 +147,23 @@ export default function FileAttachSheet({ wsId, dir = '', onPathInsert, onClose 
         )}
 
         <input
-          ref={fileInputRef}
+          ref={photoInputRef}
           type="file"
+          accept="image/*,video/*"
           className="hidden"
           onChange={handleFileChange}
         />
         <input
           ref={cameraInputRef}
           type="file"
-          accept="image/*"
+          accept="image/*,video/*"
           capture="environment"
+          className="hidden"
+          onChange={handleFileChange}
+        />
+        <input
+          ref={fileInputRef}
+          type="file"
           className="hidden"
           onChange={handleFileChange}
         />
@@ -157,10 +173,12 @@ export default function FileAttachSheet({ wsId, dir = '', onPathInsert, onClose 
 }
 
 function SheetOption({
+  icon,
   label,
   desc,
   onClick,
 }: {
+  icon: React.ReactNode
   label: string
   desc: string
   onClick: () => void
@@ -168,10 +186,42 @@ function SheetOption({
   return (
     <button
       onClick={onClick}
-      className="text-left px-4 py-3 rounded-md border border-border hover:bg-surface-hover"
+      className="flex items-center gap-3 text-left px-4 py-3 rounded-md border border-border hover:bg-surface-hover"
     >
-      <div className="text-sm font-medium text-text-primary">{label}</div>
-      <div className="text-xs text-text-muted">{desc}</div>
+      <span className="shrink-0 w-9 h-9 rounded-md bg-surface flex items-center justify-center text-accent">
+        {icon}
+      </span>
+      <span className="min-w-0 flex-1">
+        <span className="block text-sm font-medium text-text-primary">{label}</span>
+        <span className="block text-xs text-text-muted">{desc}</span>
+      </span>
     </button>
+  )
+}
+
+function PhotoIcon() {
+  return (
+    <svg viewBox="0 0 24 24" width={18} height={18} fill="none" stroke="currentColor" strokeWidth={1.75} strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+      <rect x="3" y="5" width="18" height="14" rx="2" />
+      <circle cx="9" cy="11" r="2" />
+      <path d="M3 17l5-4 4 3 4-5 5 6" />
+    </svg>
+  )
+}
+
+function CameraIcon() {
+  return (
+    <svg viewBox="0 0 24 24" width={18} height={18} fill="none" stroke="currentColor" strokeWidth={1.75} strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+      <path d="M4 7h3l2-2h6l2 2h3a1 1 0 0 1 1 1v10a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V8a1 1 0 0 1 1-1z" />
+      <circle cx="12" cy="13" r="3.5" />
+    </svg>
+  )
+}
+
+function FolderIcon() {
+  return (
+    <svg viewBox="0 0 24 24" width={18} height={18} fill="none" stroke="currentColor" strokeWidth={1.75} strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+      <path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z" />
+    </svg>
   )
 }

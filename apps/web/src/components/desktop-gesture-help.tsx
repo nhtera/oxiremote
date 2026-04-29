@@ -17,10 +17,12 @@ const TOUCH_GESTURES = [
   { gesture: 'Long press (0.5 s)', action: 'Right click' },
   { gesture: 'Double tap', action: 'Double click' },
   { gesture: '2-finger tap', action: 'Right click' },
+  { gesture: '2-finger double-tap', action: 'Double click' },
   { gesture: '2-finger swipe', action: 'Scroll' },
   { gesture: '2-finger pinch', action: 'Zoom canvas' },
   { gesture: '1-finger drag (zoomed in)', action: 'Pan view' },
   { gesture: '1-finger drag (no zoom)', action: 'Click and drag' },
+  { gesture: 'Rectangle mode (▢) + drag', action: 'Marquee select on remote' },
 ]
 
 const TRACKPAD_GESTURES = [
@@ -33,6 +35,7 @@ const TRACKPAD_GESTURES = [
 const TOOLBAR_LEGEND = [
   { key: 'Touch / Trackpad', desc: 'Toggle pointer input mode' },
   { key: 'Aa', desc: 'Open text-batch input for long strings' },
+  { key: '▢', desc: 'Rectangle-select mode (drag to draw a marquee)' },
   { key: '?', desc: 'Show this gesture guide' },
 ]
 

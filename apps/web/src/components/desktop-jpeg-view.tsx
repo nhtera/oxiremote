@@ -12,7 +12,9 @@ import {
   type DesktopStatus,
   type QualityTier,
 } from '../hooks/use-desktop-session'
-import { useDesktopInput, type InputMode } from '../hooks/use-desktop-input'
+import { useDesktopInput, type InputMode, type GestureMode } from '../hooks/use-desktop-input'
+import { captureCanvas, captureViaWorker } from '../lib/desktop-screenshot'
+import DesktopRectOverlay, { type DesktopRectOverlayHandle } from './desktop-rect-overlay'
 
 const supportsOffscreen = typeof OffscreenCanvas !== 'undefined'
 
@@ -27,6 +29,7 @@ interface SessionApi {
   setQuality: (tier: QualityTier) => void
   setSettings: (next: { hidpi: boolean }) => void
   disconnect: () => void
+  screenshot?: () => Promise<void>
 }
 
 interface Props {
@@ -34,9 +37,12 @@ interface Props {
   deviceId: string
   quality: QualityTier
   inputMode: InputMode
+  gestureMode?: GestureMode
   hidpi: boolean
   smoothScaling: boolean
   monitorDefault?: { width: number; height: number }
+  /** Filename slug (host label) for the downloaded screenshot. */
+  hostLabel: string
   onSessionChange: (s: SessionSnapshot) => void
   onSessionApi: (api: SessionApi) => void
 }
@@ -46,9 +52,11 @@ export default function DesktopJpegView({
   deviceId,
   quality,
   inputMode,
+  gestureMode = 'pointer',
   hidpi,
   smoothScaling,
   monitorDefault,
+  hostLabel,
   onSessionChange,
   onSessionApi,
 }: Props) {
@@ -90,10 +98,21 @@ export default function DesktopJpegView({
     onSessionChange({ status, attempt, screenDims })
   }, [status, attempt, screenDims, onSessionChange])
 
+  // Stable screenshot callback — needs access to the worker (offscreen path)
+  // OR the main-thread canvas (fallback path). Defined via callback so the
+  // caller can invoke it imperatively from the top strip.
+  const screenshot = useCallback(async () => {
+    if (workerRef.current) {
+      await captureViaWorker(workerRef.current, { label: hostLabel })
+    } else if (canvasRef.current) {
+      await captureCanvas(canvasRef.current, { label: hostLabel })
+    }
+  }, [hostLabel])
+
   // Push a stable API reference whenever the callback identities change.
   useEffect(() => {
-    onSessionApi({ sendInput, setQuality, setSettings, disconnect })
-  }, [sendInput, setQuality, setSettings, disconnect, onSessionApi])
+    onSessionApi({ sendInput, setQuality, setSettings, disconnect, screenshot })
+  }, [sendInput, setQuality, setSettings, disconnect, screenshot, onSessionApi])
 
   // Apply smoothScaling: worker postMessage in offscreen mode, ctx flag in
   // main-thread fallback. Re-applied on every smoothScaling change AND on
@@ -142,24 +161,54 @@ export default function DesktopJpegView({
     }
   }, [screenDims])
 
-  return <CanvasWithInput canvasRef={canvasRef} mode={inputMode} sendInput={sendInput} />
+  return (
+    <CanvasWithInput
+      canvasRef={canvasRef}
+      mode={inputMode}
+      gestureMode={gestureMode}
+      sendInput={sendInput}
+    />
+  )
 }
 
 function CanvasWithInput({
   canvasRef,
   mode,
+  gestureMode,
   sendInput,
 }: {
   canvasRef: React.RefObject<HTMLCanvasElement | null>
   mode: InputMode
+  gestureMode: GestureMode
   sendInput: (ev: DesktopInputEvent) => void
 }) {
-  useDesktopInput({ canvas: canvasRef, mode, sendInput })
+  const overlayRef = useRef<DesktopRectOverlayHandle>(null)
+  // Stable forwarder so useDesktopInput's effect deps don't churn — the
+  // imperative-handle ref isn't populated on the first render, but the
+  // forwarder always reads the latest pointer.
+  const overlayForwarder = useRef({
+    show(start: { x: number; y: number }, end: { x: number; y: number }) {
+      overlayRef.current?.show(start, end)
+    },
+    hide() {
+      overlayRef.current?.hide()
+    },
+  }).current
+  useDesktopInput({
+    canvas: canvasRef,
+    mode,
+    sendInput,
+    gestureMode,
+    rectOverlay: overlayForwarder,
+  })
   return (
-    <canvas
-      ref={canvasRef}
-      className="w-full h-full object-contain"
-      style={{ display: 'block', touchAction: 'none' }}
-    />
+    <>
+      <canvas
+        ref={canvasRef}
+        className="w-full h-full object-contain"
+        style={{ display: 'block', touchAction: 'none' }}
+      />
+      <DesktopRectOverlay ref={overlayRef} />
+    </>
   )
 }
