@@ -775,6 +775,7 @@ mod tests {
             desktop_service: None,
             discovery_url: None,
             discovery_temp_key: Arc::new(std::sync::RwLock::new(None)),
+            tunnel_shutdown: Arc::new(tokio::sync::Notify::new()),
         })
     }
 

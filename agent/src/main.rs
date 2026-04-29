@@ -134,6 +134,11 @@ pub struct AppState {
     /// `TunnelUrlChanged` when discovery is enabled. Read by the TUI QR pane
     /// (and Phase 3 will surface it to the SPA bootstrap).
     pub discovery_temp_key: Arc<StdRwLock<Option<String>>>,
+    /// Notified by `POST /api/agent/tunnel/disconnect` to gracefully tear
+    /// down the cloudflared child without exiting the agent process. The
+    /// tunnel-spawn task selects on this; reaching it kills the child,
+    /// emits `TunnelDisconnected`, and returns.
+    pub tunnel_shutdown: Arc<tokio::sync::Notify>,
 }
 
 fn default_data_dir() -> anyhow::Result<PathBuf> {
@@ -503,6 +508,7 @@ async fn server_main(
         desktop_service: desktop_svc,
         discovery_url: discovery_url.clone(),
         discovery_temp_key: discovery_temp_key.clone(),
+        tunnel_shutdown: Arc::new(tokio::sync::Notify::new()),
     });
 
     // Background: periodic listening-port discovery + preview health checks.
@@ -767,9 +773,10 @@ async fn server_main(
     // fall back to a Quick Tunnel for the dev/first-run experience.
     let named_cfg = tunnel_named::load().unwrap_or(None);
     let tunnel_state = state.clone();
+    let tunnel_shutdown = state.tunnel_shutdown.clone();
     tokio::spawn(async move {
         let url = match named_cfg {
-            Some(cfg) => match tunnel::ensure_named_tunnel(cloudflared, cfg, tunnel_state.event_bus.clone()).await {
+            Some(cfg) => match tunnel::ensure_named_tunnel(cloudflared, cfg, tunnel_state.event_bus.clone(), tunnel_shutdown.clone()).await {
                 Ok(Some(target)) => {
                     info!(%target, "named tunnel ready");
                     Some(target)
@@ -793,7 +800,7 @@ async fn server_main(
                     None
                 }
             },
-            None => match tunnel::ensure_quick_tunnel(addr, cloudflared, tunnel_state.event_bus.clone()).await {
+            None => match tunnel::ensure_quick_tunnel(addr, cloudflared, tunnel_state.event_bus.clone(), tunnel_shutdown.clone()).await {
                 Ok(url) => {
                     info!(%url, "quick tunnel ready");
                     Some(url)

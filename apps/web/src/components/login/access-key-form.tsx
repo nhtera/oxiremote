@@ -10,7 +10,11 @@ interface Props {
   onSubmit: (raw: string) => void
 }
 
-const hasBarcodeDetector = typeof window !== 'undefined' && 'BarcodeDetector' in window
+// QR scanning works on every modern browser now: BarcodeDetector for live
+// preview where supported, jsQR-decoded photo capture as the iOS Safari
+// fallback (the modal picks the right tier internally). Always show the
+// affordance; the modal handles the rest.
+const canScanQr = typeof window !== 'undefined' && 'mediaDevices' in navigator
 
 // Permanent keys are issued with the `sk-` prefix; OTK / pairing codes never
 // start with that. The submit handler uses this to route to the correct
@@ -68,7 +72,7 @@ export default function AccessKeyForm({ value, onChange, loading, onSubmit }: Pr
         )}
       </div>
 
-      {hasBarcodeDetector && (
+      {canScanQr && (
         <button
           type="button"
           onClick={() => setScanOpen(true)}

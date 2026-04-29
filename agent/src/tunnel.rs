@@ -10,6 +10,7 @@ use reqwest::Client;
 use sha2::{Digest, Sha256};
 use tar::Archive;
 use tokio::io::AsyncBufReadExt;
+use tokio::sync::Notify;
 use tracing::info;
 
 use crate::events::{AgentEvent, EventBus, TunnelStep};
@@ -243,6 +244,7 @@ pub async fn ensure_quick_tunnel(
     addr: std::net::SocketAddr,
     cloudflared: PathBuf,
     bus: Arc<EventBus>,
+    shutdown: Arc<Notify>,
 ) -> anyhow::Result<String> {
     // Step 1 — process is about to spawn.
     bus.send(AgentEvent::TunnelStepChanged {
@@ -359,21 +361,30 @@ pub async fn ensure_quick_tunnel(
                         reason: None,
                     });
 
-                    // Spawn a separate task that blocks until the child exits,
-                    // then fires TunnelDown. No auto-restart — quick-tunnel
-                    // URLs rotate on each spawn which would silently invalidate
-                    // active QR codes.
+                    // Spawn a task that races child-exit against operator
+                    // disconnect. On natural exit: fire TunnelDown (no
+                    // auto-restart — quick-tunnel URLs rotate). On disconnect:
+                    // SIGTERM cloudflared, reap, emit TunnelDisconnected.
                     let bus_for_wait = bus.clone();
+                    let shutdown_for_wait = shutdown.clone();
                     tokio::spawn(async move {
-                        let status = child.wait().await;
-                        bus_for_wait.send(AgentEvent::TunnelDown {
-                            reason: format!("{status:?}"),
-                            recovery_hint: Some(
-                                "Restart the agent to spin up a fresh tunnel. \
-                                 Quick-tunnel URLs rotate per-spawn; share the new one once the agent is back up."
-                                    .into(),
-                            ),
-                        });
+                        tokio::select! {
+                            status = child.wait() => {
+                                bus_for_wait.send(AgentEvent::TunnelDown {
+                                    reason: format!("{status:?}"),
+                                    recovery_hint: Some(
+                                        "Restart the agent to spin up a fresh tunnel. \
+                                         Quick-tunnel URLs rotate per-spawn; share the new one once the agent is back up."
+                                            .into(),
+                                    ),
+                                });
+                            }
+                            _ = shutdown_for_wait.notified() => {
+                                let _ = child.kill().await;
+                                let _ = child.wait().await;
+                                bus_for_wait.send(AgentEvent::TunnelDisconnected);
+                            }
+                        }
                     });
                     Ok(u)
                 }
@@ -429,6 +440,7 @@ pub async fn ensure_named_tunnel(
     cloudflared: PathBuf,
     cfg: crate::tunnel_named::NamedTunnelConfig,
     bus: Arc<EventBus>,
+    shutdown: Arc<Notify>,
 ) -> anyhow::Result<Option<String>> {
     bus.send(AgentEvent::TunnelStepChanged {
         step: TunnelStep::Preparing,
@@ -555,20 +567,29 @@ pub async fn ensure_named_tunnel(
         }
     }
 
-    // Mirror the quick-tunnel path: a separate task waits for cloudflared
-    // to exit and fires TunnelDown so the dashboard surfaces the failure.
-    // No auto-restart — operator decides whether to relaunch.
+    // Mirror the quick-tunnel path: race child-exit against operator
+    // disconnect so the same `tunnel/disconnect` endpoint works regardless
+    // of tunnel mode.
     let bus_for_wait = bus.clone();
+    let shutdown_for_wait = shutdown.clone();
     tokio::spawn(async move {
-        let status = child.wait().await;
-        bus_for_wait.send(AgentEvent::TunnelDown {
-            reason: format!("{status:?}"),
-            recovery_hint: Some(
-                "Check `cloudflared` logs and the named-tunnel credentials in \
-                 ~/.config/oxiremote/tunnel.toml, then restart the agent."
-                    .into(),
-            ),
-        });
+        tokio::select! {
+            status = child.wait() => {
+                bus_for_wait.send(AgentEvent::TunnelDown {
+                    reason: format!("{status:?}"),
+                    recovery_hint: Some(
+                        "Check `cloudflared` logs and the named-tunnel credentials in \
+                         ~/.config/oxiremote/tunnel.toml, then restart the agent."
+                            .into(),
+                    ),
+                });
+            }
+            _ = shutdown_for_wait.notified() => {
+                let _ = child.kill().await;
+                let _ = child.wait().await;
+                bus_for_wait.send(AgentEvent::TunnelDisconnected);
+            }
+        }
     });
 
     // Suppress the historical `named://<tunnel_name>` placeholder when the
@@ -619,6 +640,57 @@ mod tests {
         assert!(
             matches!(event, AgentEvent::TunnelDown { .. }),
             "expected TunnelDown, got {event:?}"
+        );
+    }
+
+    /// Mirrors the production wait-task: select on child-exit vs shutdown
+    /// notify. Asserts that notifying shutdown emits TunnelDisconnected
+    /// (not TunnelDown), and that the long-running child gets reaped.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn tunnel_disconnect_emits_disconnected_and_kills_child() {
+        use crate::events::EventBus;
+
+        let bus = EventBus::new();
+        let mut rx = bus.subscribe();
+        let shutdown = Arc::new(Notify::new());
+
+        // `/bin/sleep 30` stays alive long enough that the wait branch can't
+        // win the race when shutdown fires first.
+        let mut child = tokio::process::Command::new("/bin/sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn /bin/sleep");
+
+        let bus_clone = bus.clone();
+        let shutdown_clone = shutdown.clone();
+        tokio::spawn(async move {
+            tokio::select! {
+                status = child.wait() => {
+                    bus_clone.send(AgentEvent::TunnelDown {
+                        reason: format!("{status:?}"),
+                        recovery_hint: None,
+                    });
+                }
+                _ = shutdown_clone.notified() => {
+                    let _ = child.kill().await;
+                    let _ = child.wait().await;
+                    bus_clone.send(AgentEvent::TunnelDisconnected);
+                }
+            }
+        });
+
+        // Give the spawn a beat to start awaiting before notifying.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        shutdown.notify_one();
+
+        let event = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("timed out waiting for TunnelDisconnected")
+            .expect("bus closed unexpectedly");
+        assert!(
+            matches!(event, AgentEvent::TunnelDisconnected),
+            "expected TunnelDisconnected, got {event:?}"
         );
     }
 

@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react'
 import { NavLink, Outlet } from 'react-router-dom'
 import { TunnelStatusPill } from './tunnel-status-card'
 import AgentDisconnectButton from './agent-disconnect-button'
+import TunnelDisconnectButton from './tunnel-disconnect-button'
 import { HomeIcon, DevicesIcon, LogsIcon, SettingsIcon } from './icons'
 
 type IconCmp = (props: { size?: number }) => React.ReactNode
@@ -61,6 +62,7 @@ export default function AgentLayout() {
         </div>
         <div className="flex-1" />
         <TunnelStatusPill />
+        <TunnelDisconnectButton />
         <AgentDisconnectButton />
       </header>
 

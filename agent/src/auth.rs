@@ -623,6 +623,26 @@ pub fn platform_from_ua(ua: &str) -> Option<String> {
     }
 }
 
+/// Coarse browser family from a UA string. Order matters: Edge/OPR/Vivaldi
+/// all advertise "Chrome" so they need to win that match first; Safari is
+/// only Safari when Chrome ISN'T also in the string.
+pub fn browser_from_ua(ua: &str) -> Option<String> {
+    let s = ua.to_lowercase();
+    if s.contains("edg/") || s.contains("edge/") {
+        Some("Edge".into())
+    } else if s.contains("opr/") || s.contains("opera") {
+        Some("Opera".into())
+    } else if s.contains("firefox") {
+        Some("Firefox".into())
+    } else if s.contains("chrome") || s.contains("crios") {
+        Some("Chrome".into())
+    } else if s.contains("safari") {
+        Some("Safari".into())
+    } else {
+        None
+    }
+}
+
 pub fn client_ip_key(headers: &axum::http::HeaderMap) -> String {
     headers
         .get("cf-connecting-ip")
@@ -780,6 +800,7 @@ mod tests {
             desktop_service: None,
             discovery_url: None,
             discovery_temp_key: std::sync::Arc::new(std::sync::RwLock::new(None)),
+            tunnel_shutdown: std::sync::Arc::new(tokio::sync::Notify::new()),
         }
     }
 

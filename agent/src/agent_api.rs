@@ -54,6 +54,24 @@ pub fn router() -> Router<Arc<AppState>> {
         )
         .route("/api/agent/services/desktop", post(api_agent_services_desktop))
         .route("/api/agent/shutdown", post(api_agent_shutdown))
+        .route("/api/agent/tunnel/disconnect", post(api_agent_tunnel_disconnect))
+}
+
+/// POST /api/agent/tunnel/disconnect — stop sharing without exiting the agent.
+/// Localhost-only. Notifies the tunnel-spawn task to SIGTERM cloudflared and
+/// reap the child; the task then broadcasts `TunnelDisconnected`. Re-spinning
+/// the tunnel requires an agent restart (matches the existing one-shot
+/// behavior — quick-tunnel URLs rotate, so restart-only is intentional).
+async fn api_agent_tunnel_disconnect(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    info!("tunnel disconnect requested via /api/agent/tunnel/disconnect");
+    state.tunnel_shutdown.notify_one();
+    // Clear the cached URL so /api/agent/state immediately reflects the new
+    // onboarding state; the bus event will arrive moments later but the SPA's
+    // first poll after the response already shows the right state.
+    if let Ok(mut guard) = state.tunnel_url.write() {
+        *guard = None;
+    }
+    (StatusCode::OK, Json(json!({ "ok": true }))).into_response()
 }
 
 /// POST /api/agent/shutdown — operator-initiated stop from the host dashboard.
@@ -764,6 +782,7 @@ mod tests {
             desktop_service: None,
             discovery_url: None,
             discovery_temp_key: std::sync::Arc::new(std::sync::RwLock::new(None)),
+            tunnel_shutdown: std::sync::Arc::new(tokio::sync::Notify::new()),
         })
     }
 

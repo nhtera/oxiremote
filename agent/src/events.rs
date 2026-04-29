@@ -132,6 +132,11 @@ pub enum AgentEvent {
     /// the embedded-tunnel form; the operator can retry by rotating the OTK
     /// (which re-enters the spawn path on next `TunnelUrlChanged`).
     DiscoveryUnavailable,
+    /// Operator-initiated tunnel disconnect via `POST /api/agent/tunnel/disconnect`.
+    /// The agent process stays alive; only the cloudflared child + outbound
+    /// transport are torn down. SPA listeners use this to transition the
+    /// dashboard back to the onboarding card without a full reload.
+    TunnelDisconnected,
     /// Granular tunnel progress — emitted at each lifecycle step so the TUI
     /// and WebUI can render a 5-row checklist with live sub-text.
     TunnelStepChanged {

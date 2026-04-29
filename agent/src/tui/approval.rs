@@ -17,7 +17,22 @@ use ratatui::{
     widgets::{Block, Borders, Clear, Paragraph},
 };
 
+use crate::auth::{browser_from_ua, platform_from_ua};
 use crate::events::AgentEvent;
+
+/// Capitalize the first letter of a coarse-platform code (e.g. "ios" → "iOS",
+/// "macos" → "macOS"). Used only by the approval modal to render
+/// `Platform · Browser` instead of a raw UA string.
+fn pretty_platform(p: &str) -> String {
+    match p {
+        "ios" => "iOS".into(),
+        "macos" => "macOS".into(),
+        "android" => "Android".into(),
+        "windows" => "Windows".into(),
+        "linux" => "Linux".into(),
+        other => other.into(),
+    }
+}
 
 type Term = Terminal<CrosstermBackend<io::Stdout>>;
 
@@ -109,10 +124,20 @@ fn draw(f: &mut ratatui::Frame<'_>, device_id: &str, ip: &str, ua: &str) {
     });
 
     let short_id: String = device_id.chars().take(12).collect();
+    // Derive Platform · Browser from the UA so the operator can decide at a
+    // glance instead of squinting at a long UA string.
+    let platform = platform_from_ua(ua).map(|p| pretty_platform(&p));
+    let browser = browser_from_ua(ua);
+    let parsed = match (platform, browser) {
+        (Some(p), Some(b)) => format!("{p} · {b}"),
+        (Some(p), None) => p,
+        (None, Some(b)) => b,
+        (None, None) => ua.chars().take(48).collect(),
+    };
     let lines = vec![
         row("Device", &short_id),
         row("IP", ip),
-        row("User-Agent", ua),
+        row("Client", &parsed),
         Line::from(""),
         Line::from(Span::styled(
             "  y  Approve",
