@@ -9,7 +9,7 @@ use argon2::{
 };
 use hmac::{Hmac, Mac};
 use rusqlite::{params, Connection};
-use sha2::Sha256;
+use sha2::{Digest, Sha256};
 
 use crate::db::now_ts;
 
@@ -491,11 +491,23 @@ pub async fn verify_api_key_async(db_path: PathBuf, presented: String) -> Option
         .flatten()
 }
 
+/// SHA-256 prefix used as the cross-origin lookup id for the permanent key.
+/// 16 hex chars (64 bits) is plenty for collision resistance with a single
+/// active key per agent and matches the worker's `LOOKUP_KEY` shape gate.
+fn permanent_key_lookup_id(plaintext: &str) -> String {
+    let digest = Sha256::digest(plaintext.as_bytes());
+    hex::encode(&digest[..8])
+}
+
 /// Generate a new permanent dashboard API key, store the Argon2id hash in the
-/// `settings` table, and return `(plaintext, last4, created_at)`.
+/// `settings` table, and return `(plaintext, last4, created_at, lookup_id)`.
 /// The plaintext is returned exactly once — the caller must surface it to the
-/// operator immediately because it is never stored in cleartext.
-pub fn rotate_permanent_key(db_path: &PathBuf) -> anyhow::Result<(String, String, i64)> {
+/// operator immediately because it is never stored in cleartext. The
+/// `lookup_id` is a non-secret SHA-256 prefix the discovery worker uses to
+/// resolve `sk-…` → tunnel_url for cross-origin pairing.
+pub fn rotate_permanent_key(
+    db_path: &PathBuf,
+) -> anyhow::Result<(String, String, i64, String)> {
     use base64::Engine as _;
     let mut raw = [0u8; 32];
     OsRng.fill_bytes(&mut raw);
@@ -505,6 +517,7 @@ pub fn rotate_permanent_key(db_path: &PathBuf) -> anyhow::Result<(String, String
         base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(raw)
     );
     let last4: String = key.chars().rev().take(4).collect::<Vec<_>>().into_iter().rev().collect();
+    let lookup_id = permanent_key_lookup_id(&key);
 
     let salt = SaltString::generate(&mut OsRng);
     let hash = Argon2::default()
@@ -514,8 +527,9 @@ pub fn rotate_permanent_key(db_path: &PathBuf) -> anyhow::Result<(String, String
 
     let created_at = now_ts();
     let mut conn = Connection::open(db_path)?;
-    // Wrap the three writes in a transaction so a concurrent rotation cannot
-    // produce a hash/last4 mismatch (e.g. two browser tabs clicking Regenerate).
+    // Wrap the four writes in a transaction so a concurrent rotation cannot
+    // produce a hash/last4/lookup_id mismatch (e.g. two browser tabs clicking
+    // Regenerate at the same time).
     let tx = conn.transaction()?;
     tx.execute(
         "INSERT INTO settings(key, value) VALUES ('permanent_key_hash', ?1)
@@ -532,8 +546,28 @@ pub fn rotate_permanent_key(db_path: &PathBuf) -> anyhow::Result<(String, String
          ON CONFLICT(key) DO UPDATE SET value = excluded.value",
         rusqlite::params![created_at.to_string()],
     )?;
+    tx.execute(
+        "INSERT INTO settings(key, value) VALUES ('permanent_key_lookup_id', ?1)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        rusqlite::params![lookup_id],
+    )?;
     tx.commit()?;
-    Ok((key, last4, created_at))
+    Ok((key, last4, created_at, lookup_id))
+}
+
+/// Read the current permanent-key lookup id (16 hex chars) without exposing
+/// the hash or plaintext. Returns `None` when no key has been generated yet
+/// or the lookup_id has not been backfilled (legacy db before this column).
+pub fn get_permanent_key_lookup_id(db_path: &PathBuf) -> anyhow::Result<Option<String>> {
+    let conn = Connection::open(db_path)?;
+    let val: Option<String> = conn
+        .query_row(
+            "SELECT value FROM settings WHERE key = 'permanent_key_lookup_id'",
+            [],
+            |row| row.get(0),
+        )
+        .ok();
+    Ok(val.filter(|s| !s.is_empty()))
 }
 
 /// Read permanent key metadata (last4 + created_at) without ever exposing the

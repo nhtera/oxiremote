@@ -156,6 +156,9 @@ pub fn init_db(db_path: &Path) -> anyhow::Result<()> {
     //   permanent_key_hash       — Argon2id PHC string
     //   permanent_key_last4      — cosmetic last-4 for the "••••abcd" mask
     //   permanent_key_created_at — Unix timestamp of last rotation
+    //   permanent_key_lookup_id  — sha256(plaintext)[..8] hex, registered with
+    //                              the discovery worker so cross-origin SPAs
+    //                              can resolve sk-… → tunnel_url. Non-secret.
     let _ = conn.execute(
         "INSERT OR IGNORE INTO settings(key, value) VALUES ('permanent_key_hash', '')",
         [],
@@ -166,6 +169,10 @@ pub fn init_db(db_path: &Path) -> anyhow::Result<()> {
     );
     let _ = conn.execute(
         "INSERT OR IGNORE INTO settings(key, value) VALUES ('permanent_key_created_at', '0')",
+        [],
+    );
+    let _ = conn.execute(
+        "INSERT OR IGNORE INTO settings(key, value) VALUES ('permanent_key_lookup_id', '')",
         [],
     );
 

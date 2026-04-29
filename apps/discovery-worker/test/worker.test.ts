@@ -199,13 +199,13 @@ describe('discovery worker', () => {
     expect(r.status).toBe(404)
   })
 
-  it('code/register: enforces TTL upper bound (rejects >10 min)', async () => {
+  it('code/register: clamps oversized TTL to default', async () => {
     await worker.fetch(makeReq('POST', '/api/session/create', { apiKey: HASH }), env)
     await worker.fetch(makeReq('POST', '/api/session/update', { apiKey: HASH, tunnelUrl: TUNNEL_URL }), env)
 
-    // 99 minutes -> falls back to default 5 mins instead of trusting caller.
+    // 30 days exceeds the 24h ceiling -> falls back to the 5-min default.
     const r = await worker.fetch(
-      makeReq('POST', '/api/code/register', { apiKey: HASH, code: 'CODE5678', expiryMinutes: 99 }),
+      makeReq('POST', '/api/code/register', { apiKey: HASH, code: 'CODE5678', expiryMinutes: 60 * 24 * 30 }),
       env,
     )
     expect(r.status).toBe(200)
@@ -213,5 +213,19 @@ describe('discovery worker', () => {
     const ttlSecs = Math.round((body.expiresAt - Date.now()) / 1000)
     expect(ttlSecs).toBeGreaterThan(0)
     expect(ttlSecs).toBeLessThanOrEqual(5 * 60 + 5) // tolerate +5s clock skew
+  })
+
+  it('code/register: accepts 24h TTL for permanent-key lookup_ids', async () => {
+    await worker.fetch(makeReq('POST', '/api/session/create', { apiKey: HASH }), env)
+    await worker.fetch(makeReq('POST', '/api/session/update', { apiKey: HASH, tunnelUrl: TUNNEL_URL }), env)
+
+    const r = await worker.fetch(
+      makeReq('POST', '/api/code/register', { apiKey: HASH, code: 'deadbeefcafebabe', expiryMinutes: 60 * 24 }),
+      env,
+    )
+    expect(r.status).toBe(200)
+    const body = (await r.json()) as { expiresAt: number }
+    const ttlSecs = Math.round((body.expiresAt - Date.now()) / 1000)
+    expect(ttlSecs).toBeGreaterThan(60 * 60 * 23) // ~24 h, allow a few seconds of slop
   })
 })

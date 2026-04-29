@@ -529,11 +529,28 @@ async fn api_agent_keys_permanent_post(
     .await;
 
     match result {
-        Ok(Ok((api_key, last4, created_at))) => {
+        Ok(Ok((api_key, last4, created_at, lookup_id))) => {
             info!(last4 = %last4, "permanent key rotated");
             state
                 .event_bus
                 .send(AgentEvent::PermanentKeyRotated { last4: last4.clone() });
+
+            // Register the new lookup_id with the discovery worker so the
+            // cross-origin SPA can resolve sk-… → tunnelUrl. No-op when
+            // discovery is unset; failure here doesn't block the response.
+            if let (Some(durl), Ok(disc_id)) = (
+                state.discovery_url.clone(),
+                crate::discovery::load_discovery_id(&state.db_path),
+            ) {
+                crate::discovery::spawn_register_code(
+                    state.http_client.clone(),
+                    durl,
+                    disc_id,
+                    lookup_id.clone(),
+                    crate::discovery::PERMANENT_LOOKUP_EXPIRY_MINUTES,
+                );
+            }
+
             (
                 StatusCode::OK,
                 Json(json!({
@@ -794,7 +811,8 @@ mod tests {
         assert!(auth::get_permanent_key_meta(&state.db_path).unwrap().is_none());
 
         // Rotate once.
-        let (plaintext, last4, created_at) = auth::rotate_permanent_key(&state.db_path).unwrap();
+        let (plaintext, last4, created_at, lookup_id) =
+            auth::rotate_permanent_key(&state.db_path).unwrap();
         let (meta_last4, meta_created_at) = auth::get_permanent_key_meta(&state.db_path)
             .unwrap()
             .expect("meta should exist after rotation");
@@ -809,14 +827,22 @@ mod tests {
         assert!(plaintext.starts_with("sk-"));
         // last4 is the tail of the full plaintext key.
         assert!(plaintext.ends_with(&last4));
+
+        // lookup_id is a non-secret 16-hex SHA-256 prefix and gets persisted.
+        assert_eq!(lookup_id.len(), 16);
+        assert!(lookup_id.chars().all(|c| c.is_ascii_hexdigit()));
+        let stored = auth::get_permanent_key_lookup_id(&state.db_path)
+            .unwrap()
+            .expect("lookup_id should be persisted");
+        assert_eq!(stored, lookup_id);
     }
 
     /// POST rotates the Argon2 hash — the new hash matches the new key.
     #[test]
     fn permanent_key_post_rotates_hash() {
         let state = test_state("pk-rotate");
-        let (key1, _, _) = auth::rotate_permanent_key(&state.db_path).unwrap();
-        let (key2, _, _) = auth::rotate_permanent_key(&state.db_path).unwrap();
+        let (key1, _, _, _) = auth::rotate_permanent_key(&state.db_path).unwrap();
+        let (key2, _, _, _) = auth::rotate_permanent_key(&state.db_path).unwrap();
 
         // Old key must no longer verify.
         assert!(!auth::verify_permanent_key(&state.db_path, &key1));
@@ -828,13 +854,13 @@ mod tests {
     #[test]
     fn permanent_key_post_invalidates_old_key() {
         let state = test_state("pk-invalidate");
-        let (old_key, _, _) = auth::rotate_permanent_key(&state.db_path).unwrap();
+        let (old_key, _, _, _) = auth::rotate_permanent_key(&state.db_path).unwrap();
 
         // Old key verifies before rotation.
         assert!(auth::verify_permanent_key(&state.db_path, &old_key));
 
         // Rotate to new key.
-        let (_new_key, _, _) = auth::rotate_permanent_key(&state.db_path).unwrap();
+        let (_new_key, _, _, _) = auth::rotate_permanent_key(&state.db_path).unwrap();
 
         // Old key no longer authenticates.
         assert!(!auth::verify_permanent_key(&state.db_path, &old_key));

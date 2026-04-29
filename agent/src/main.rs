@@ -575,6 +575,12 @@ async fn server_main(
                                 let code = discovery::active_pairing_code(&db_path)
                                     .ok()
                                     .flatten();
+                                // Re-register the permanent-key lookup_id alongside so cross-
+                                // origin sk-… pairing keeps resolving against the latest tunnel.
+                                let lookup_id =
+                                    crate::auth::get_permanent_key_lookup_id(&db_path)
+                                        .ok()
+                                        .flatten();
                                 discovery::spawn_register(
                                     client.clone(),
                                     url.clone(),
@@ -583,6 +589,7 @@ async fn server_main(
                                     slot.clone(),
                                     bus.clone(),
                                     code,
+                                    lookup_id,
                                 );
                             }
                             Ok(_) => continue,

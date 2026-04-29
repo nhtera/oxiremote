@@ -8,6 +8,7 @@ import {
   isLikelyPairingCode,
   isLikelyTempKey,
   lookupAny,
+  lookupPermanentKey,
   lookupSession,
 } from '../lib/discovery-client'
 import {
@@ -248,15 +249,87 @@ export default function LoginPage() {
     }
   }
 
+  // Cross-origin permanent-key (sk-…) pair. Hashes the plaintext to a 16-hex
+  // SHA-256 prefix, resolves the agent's tunnel via the discovery worker
+  // (worker holds only the lookup_id, never the plaintext), then POSTs the
+  // permanent_key to /api/pairing/exchange. CSRF is exempt for cross-origin
+  // pairing; auth happens at the agent via verify_permanent_key.
+  const submitDiscoveryPermanent = async (rawKey: string) => {
+    const trimmedKey = rawKey.trim()
+    const session = await lookupPermanentKey(trimmedKey).catch(() => null)
+    if (!session) {
+      throw new Error(
+        'That permanent key is unknown or the host is offline. Generate a new one from the host dashboard, or check that the agent is running.',
+      )
+    }
+    const res = await fetch(`${session.tunnelUrl}/api/pairing/exchange`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      credentials: 'omit',
+      body: JSON.stringify({
+        permanent_key: trimmedKey,
+        device_label: deviceLabel.trim() || undefined,
+      }),
+    })
+    if (!res.ok) {
+      throw new Error('Permanent key is invalid or has not been generated yet.')
+    }
+    const body = (await res.json().catch(() => ({}))) as {
+      api_key?: string
+      api_key_last4?: string
+      device_id?: string
+      host_id?: string
+      approval_status?: string
+    }
+    if (!body.api_key || !body.host_id) {
+      throw new Error('Pairing succeeded but response is missing key/host id.')
+    }
+    if (deviceLabel.trim()) {
+      window.localStorage.setItem('oxi:device-label', deviceLabel.trim())
+    }
+    storeApiKey(body.host_id, body.api_key)
+    storeTunnelBase(body.host_id, session.tunnelUrl)
+    recordSavedHost({
+      host_id: body.host_id,
+      label: deviceLabel.trim() || body.host_id.slice(0, 8),
+      api_key_last4: body.api_key_last4 ?? body.api_key.slice(-4),
+    })
+    useHostStore.setState({
+      currentHostId: body.host_id,
+      label: deviceLabel.trim() || null,
+      platform: null,
+      loading: false,
+      error: null,
+    })
+    if (body.approval_status === 'pending') {
+      navigate('/approval-waiting', {
+        state: {
+          device_id: body.device_id,
+          device_label: deviceLabel.trim() || undefined,
+          tunnel_base: session.tunnelUrl,
+        },
+      })
+      return
+    }
+    navigate('/', { state: { tunnel_base: session.tunnelUrl } })
+  }
+
   // Cross-origin manual pair via the discovery worker. Mirrors the QR flow
   // but uses a user-typed code instead of the temp_key embedded in a QR:
   //   1. SPA → worker: GET /api/session/lookup?k=<code>  → tunnelUrl
   //   2. SPA → tunnel: POST /api/{login/one-time | pairing/exchange} { … }
   // Shape decides the agent endpoint:
-  //   - 16 lowercase base32 → OTK   → /api/login/one-time { token }
-  //   - 8+ uppercase alnum  → code  → /api/pairing/exchange { code }
-  // Both kinds are registered with the worker by the agent on issuance.
+  //   - sk-…                 → permanent → /api/pairing/exchange { permanent_key }
+  //                            (worker stores SHA-256 prefix as lookup_id; the
+  //                            plaintext key never leaves the browser)
+  //   - 16 lowercase base32  → OTK       → /api/login/one-time { token }
+  //   - 8+ uppercase alnum   → code      → /api/pairing/exchange { code }
+  // All three kinds are registered with the worker by the agent.
   const submitDiscoveryCode = async (raw: string) => {
+    const trimmed = raw.trim()
+    if (isPermanentKey(trimmed)) {
+      return await submitDiscoveryPermanent(trimmed)
+    }
     const cleaned = sanitizeAccessKey(raw)
     const otkAttempt = cleaned.toLowerCase()
     const codeAttempt = cleaned.toUpperCase()
@@ -270,7 +343,7 @@ export default function LoginPage() {
       lookupKey = codeAttempt
     } else {
       throw new Error(
-        'Enter a one-time key (16 chars) or pairing code (8 chars) shown on your computer.',
+        'Enter a permanent key (sk-…), one-time key (16 chars), or pairing code (8 chars) shown on your computer.',
       )
     }
     const session = await lookupAny(lookupKey)

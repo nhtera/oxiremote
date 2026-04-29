@@ -20,6 +20,10 @@ const PAIRING_CODE_PATTERN = /^[A-Z0-9]{6,16}$/
 // `agent/src/one_time_keys.rs`. Strict shape lets the SPA disambiguate from
 // pairing codes before the worker round-trip.
 const OTK_PATTERN = /^[a-z2-7]{16}$/
+// Permanent dashboard keys: `sk-` followed by URL-safe base64 (no padding).
+// Plaintext is never sent to the worker — we hash it client-side and look up
+// the 16-hex SHA-256 prefix the agent registers on rotation.
+const PERMANENT_KEY_PATTERN = /^sk-[A-Za-z0-9_-]{4,}$/
 
 export type LookupResult = {
   tunnelUrl: string
@@ -57,6 +61,38 @@ export function isLikelyPairingCode(value: string): boolean {
  *  can resolve `?code=<otk>` -> tunnelUrl just like pairing codes. */
 export function isLikelyOtk(value: string): boolean {
   return OTK_PATTERN.test(value)
+}
+
+/** Permanent dashboard keys carry the `sk-` prefix the agent assigns at
+ *  rotation. Length is unbounded above (URL-safe base64 of 32 random bytes
+ *  is 43 chars without padding) — the regex only enforces the prefix and
+ *  alphabet so a typo doesn't get sent to the worker as a hash input. */
+export function isLikelyPermanentKey(value: string): boolean {
+  return PERMANENT_KEY_PATTERN.test(value)
+}
+
+/** Derive the worker-side lookup id for a permanent key. SHA-256(plaintext)
+ *  truncated to 16 hex chars — non-secret, deterministic, matches the agent
+ *  `auth::permanent_key_lookup_id`. Throws when SubtleCrypto is missing
+ *  (insecure context); callers should surface a "use https" error. */
+export async function permanentKeyLookupId(plaintext: string): Promise<string> {
+  if (typeof crypto === 'undefined' || !crypto.subtle) {
+    throw new Error('SubtleCrypto unavailable — sk-… pairing requires HTTPS')
+  }
+  const bytes = new TextEncoder().encode(plaintext)
+  const digest = await crypto.subtle.digest('SHA-256', bytes)
+  const view = new Uint8Array(digest, 0, 8)
+  let hex = ''
+  for (const b of view) hex += b.toString(16).padStart(2, '0')
+  return hex
+}
+
+/** Convenience: hash a sk-… plaintext, then resolve via the worker. Returns
+ *  null when discovery is disabled, the worker is unreachable, or the lookup
+ *  id is unknown / expired. Plaintext never leaves the browser. */
+export async function lookupPermanentKey(plaintext: string): Promise<LookupResult | null> {
+  const lookupId = await permanentKeyLookupId(plaintext.trim())
+  return rawLookup(lookupId)
 }
 
 /** Generic worker lookup — used when the caller has already shape-checked

@@ -30,9 +30,11 @@ const HEX64 = /^[a-f0-9]{64}$/
 // strips them client-side.
 const LOOKUP_KEY = /^[A-Za-z0-9]{6,32}$/
 const TEMP_KEY_BYTES = 16
-// Worker accepts up to 30 min — matches the OTK lifetime on the agent
-// (one_time_keys::DEFAULT_TTL). Pairing codes will use the agent's 5 min.
-const CODE_MAX_TTL_MIN = 30
+// Worker accepts up to 24 h — pairing codes still default to 5 min and OTKs
+// register with their 30 min lifetime, but permanent-key lookup_ids need a
+// long TTL so cross-origin pairing keeps working even when the tunnel URL
+// hasn't rotated for hours. Agent re-registers on every TunnelUrlChanged.
+const CODE_MAX_TTL_MIN = 24 * 60
 const CODE_DEFAULT_TTL_MIN = 5
 
 function jsonResponse(body: unknown, status: number, origin: string | null): Response {

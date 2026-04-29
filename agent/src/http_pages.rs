@@ -1093,7 +1093,8 @@ mod tests {
 
     /// Helper: mint a permanent key and store it in the given test DB.
     fn setup_permanent_key(db_path: &std::path::PathBuf) -> String {
-        let (key, _last4, _created_at) = crate::auth::rotate_permanent_key(db_path).unwrap();
+        let (key, _last4, _created_at, _lookup_id) =
+            crate::auth::rotate_permanent_key(db_path).unwrap();
         key
     }
 

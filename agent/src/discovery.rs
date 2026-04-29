@@ -25,6 +25,11 @@ use crate::events::{AgentEvent, EventBus};
 /// Worker-side TTL on the temp key (matches `phase-01-discovery-worker.md`).
 pub const TEMP_KEY_EXPIRY_MINUTES: u32 = 30;
 
+/// Worker-side TTL for the permanent-key lookup id. The agent re-registers on
+/// every `TunnelUrlChanged`, but tunnels can stay stable for hours; a long TTL
+/// keeps cross-origin sk-… pairing working in the no-rotation case.
+pub const PERMANENT_LOOKUP_EXPIRY_MINUTES: u32 = 24 * 60;
+
 const RETRY_ATTEMPTS: u32 = 3;
 const RETRY_BASE_MS: u64 = 2_000;
 const JITTER_MAX_MS: u64 = 1_000;
@@ -115,7 +120,10 @@ pub fn active_pairing_code(db_path: &Path) -> Result<Option<(String, u32)>> {
 ///
 /// `pairing_code` is optionally registered with the worker after the session
 /// is established so the SPA can resolve `?code=ABCD1234` → tunnelUrl for
-/// the manual-entry flow. Failure here is non-fatal — QR-scan still works.
+/// the manual-entry flow. `permanent_lookup_id` is the SHA-256 prefix the SPA
+/// derives from a user-typed `sk-…` to resolve the same way. Both registrations
+/// are best-effort — failure leaves QR-scan / OTK paths working.
+#[allow(clippy::too_many_arguments)]
 pub fn spawn_register(
     client: Client,
     discovery_url: String,
@@ -124,6 +132,7 @@ pub fn spawn_register(
     temp_key_slot: Arc<StdRwLock<Option<String>>>,
     event_bus: Arc<EventBus>,
     pairing_code: Option<(String, u32)>,
+    permanent_lookup_id: Option<String>,
 ) {
     tokio::spawn(async move {
         match register_with_retry(&client, &discovery_url, &discovery_id, &tunnel_url).await {
@@ -139,6 +148,21 @@ pub fn spawn_register(
                     match register_code(&client, &discovery_url, &discovery_id, &code, mins).await {
                         Ok(()) => debug!(mins, "pairing code registered with discovery worker"),
                         Err(e) => warn!(error = %e, "code/register failed (manual code-entry will fall back to QR)"),
+                    }
+                }
+
+                if let Some(lookup_id) = permanent_lookup_id {
+                    match register_code(
+                        &client,
+                        &discovery_url,
+                        &discovery_id,
+                        &lookup_id,
+                        PERMANENT_LOOKUP_EXPIRY_MINUTES,
+                    )
+                    .await
+                    {
+                        Ok(()) => debug!("permanent-key lookup_id registered with discovery worker"),
+                        Err(e) => warn!(error = %e, "permanent-key lookup_id register failed (sk- pairing will fail cross-origin until next rotation)"),
                     }
                 }
             }
