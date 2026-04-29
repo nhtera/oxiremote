@@ -1,4 +1,4 @@
-import { forwardRef, useImperativeHandle, useRef, useState } from 'react'
+import { forwardRef, useImperativeHandle, useState } from 'react'
 
 // Visual feedback for rectangle-select mode. The drag itself goes through the
 // same mouse-down → move → up that a regular drag uses; this overlay just
@@ -25,21 +25,17 @@ const DesktopRectOverlay = forwardRef<DesktopRectOverlayHandle>(function Desktop
   ref,
 ) {
   const [rect, setRect] = useState<Rect | null>(null)
-  const lastRef = useRef<Rect | null>(null)
 
   useImperativeHandle(ref, () => ({
     show(start, end) {
-      const next: Rect = {
+      setRect({
         left: Math.min(start.x, end.x),
         top: Math.min(start.y, end.y),
         width: Math.abs(end.x - start.x),
         height: Math.abs(end.y - start.y),
-      }
-      lastRef.current = next
-      setRect(next)
+      })
     },
     hide() {
-      lastRef.current = null
       setRect(null)
     },
   }))
