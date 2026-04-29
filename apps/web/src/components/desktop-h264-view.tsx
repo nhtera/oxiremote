@@ -15,8 +15,10 @@ import type {
   QualityTier,
 } from '../hooks/use-desktop-session'
 import { useDesktopInput, type InputMode, type GestureMode } from '../hooks/use-desktop-input'
+import { useCanvasGestures } from '../hooks/use-canvas-gestures'
 import { captureCanvas } from '../lib/desktop-screenshot'
 import DesktopRectOverlay, { type DesktopRectOverlayHandle } from './desktop-rect-overlay'
+import DesktopCursorOverlay from './desktop-cursor-overlay'
 
 interface SessionSnapshot {
   status: DesktopStatus
@@ -150,6 +152,8 @@ function CanvasWithInput({
   sendInput: (ev: DesktopInputEvent) => void
 }) {
   const overlayRef = useRef<DesktopRectOverlayHandle>(null)
+  const layerRef = useRef<HTMLDivElement>(null)
+  const viewportRef = useRef<HTMLDivElement>(null)
   const overlayForwarder = useRef({
     show(start: { x: number; y: number }, end: { x: number; y: number }) {
       overlayRef.current?.show(start, end)
@@ -165,14 +169,29 @@ function CanvasWithInput({
     gestureMode,
     rectOverlay: overlayForwarder,
   })
+  const { cursor } = useCanvasGestures({
+    target: canvasRef,
+    layer: layerRef,
+    viewport: viewportRef,
+    mode,
+    sendInput,
+    disabled: gestureMode === 'rect',
+  })
   return (
-    <>
-      <canvas
-        ref={canvasRef}
-        className="w-full h-full object-contain"
-        style={{ display: 'block', touchAction: 'none' }}
-      />
+    <div
+      ref={viewportRef}
+      className="w-full h-full relative overflow-hidden"
+      style={{ touchAction: 'none' }}
+    >
+      <div ref={layerRef} className="w-full h-full" style={{ willChange: 'transform' }}>
+        <canvas
+          ref={canvasRef}
+          className="w-full h-full object-contain"
+          style={{ display: 'block' }}
+        />
+      </div>
       <DesktopRectOverlay ref={overlayRef} />
-    </>
+      <DesktopCursorOverlay x={cursor.x} y={cursor.y} visible={cursor.visible} />
+    </div>
   )
 }

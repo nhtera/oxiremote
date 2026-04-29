@@ -13,8 +13,10 @@ import {
   type QualityTier,
 } from '../hooks/use-desktop-session'
 import { useDesktopInput, type InputMode, type GestureMode } from '../hooks/use-desktop-input'
+import { useCanvasGestures } from '../hooks/use-canvas-gestures'
 import { captureCanvas, captureViaWorker } from '../lib/desktop-screenshot'
 import DesktopRectOverlay, { type DesktopRectOverlayHandle } from './desktop-rect-overlay'
+import DesktopCursorOverlay from './desktop-cursor-overlay'
 
 const supportsOffscreen = typeof OffscreenCanvas !== 'undefined'
 
@@ -183,6 +185,8 @@ function CanvasWithInput({
   sendInput: (ev: DesktopInputEvent) => void
 }) {
   const overlayRef = useRef<DesktopRectOverlayHandle>(null)
+  const layerRef = useRef<HTMLDivElement>(null)
+  const viewportRef = useRef<HTMLDivElement>(null)
   // Stable forwarder so useDesktopInput's effect deps don't churn — the
   // imperative-handle ref isn't populated on the first render, but the
   // forwarder always reads the latest pointer.
@@ -201,14 +205,32 @@ function CanvasWithInput({
     gestureMode,
     rectOverlay: overlayForwarder,
   })
+  // New Pointer-Events gesture stack — owns 1-finger pan, pinch-zoom, and
+  // the trackpad-mode virtual cursor. Disabled in rect-marquee mode so the
+  // legacy useDesktopInput's touch handler can run instead.
+  const { cursor } = useCanvasGestures({
+    target: canvasRef,
+    layer: layerRef,
+    viewport: viewportRef,
+    mode,
+    sendInput,
+    disabled: gestureMode === 'rect',
+  })
   return (
-    <>
-      <canvas
-        ref={canvasRef}
-        className="w-full h-full object-contain"
-        style={{ display: 'block', touchAction: 'none' }}
-      />
+    <div
+      ref={viewportRef}
+      className="w-full h-full relative overflow-hidden"
+      style={{ touchAction: 'none' }}
+    >
+      <div ref={layerRef} className="w-full h-full" style={{ willChange: 'transform' }}>
+        <canvas
+          ref={canvasRef}
+          className="w-full h-full object-contain"
+          style={{ display: 'block' }}
+        />
+      </div>
       <DesktopRectOverlay ref={overlayRef} />
-    </>
+      <DesktopCursorOverlay x={cursor.x} y={cursor.y} visible={cursor.visible} />
+    </div>
   )
 }

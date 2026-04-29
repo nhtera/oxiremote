@@ -338,10 +338,16 @@ export function useDesktopInput({
     }
 
     if (mode === 'touch') {
-      el.addEventListener('touchstart', onTouchStart, { passive: false })
-      el.addEventListener('touchmove', onTouchMove, { passive: false })
-      el.addEventListener('touchend', onTouchEnd, { passive: false })
-      el.addEventListener('touchcancel', onTouchEnd, { passive: false })
+      // Touch handlers only run for the rect-marquee gesture mode now —
+      // useCanvasGestures owns default touch input (pinch-zoom, 1-finger
+      // pan, virtual cursor). Without this gate both hooks would emit
+      // duplicate remote events on every tap.
+      if (gestureModeRef.current === 'rect') {
+        el.addEventListener('touchstart', onTouchStart, { passive: false })
+        el.addEventListener('touchmove', onTouchMove, { passive: false })
+        el.addEventListener('touchend', onTouchEnd, { passive: false })
+        el.addEventListener('touchcancel', onTouchEnd, { passive: false })
+      }
     } else {
       el.addEventListener('mousemove', onMouseMove)
       el.addEventListener('mousedown', onMouseDown)
@@ -353,10 +359,12 @@ export function useDesktopInput({
     return () => {
       if (longPressTimer.current) clearTimeout(longPressTimer.current)
       if (mode === 'touch') {
-        el.removeEventListener('touchstart', onTouchStart)
-        el.removeEventListener('touchmove', onTouchMove)
-        el.removeEventListener('touchend', onTouchEnd)
-        el.removeEventListener('touchcancel', onTouchEnd)
+        if (gestureModeRef.current === 'rect') {
+          el.removeEventListener('touchstart', onTouchStart)
+          el.removeEventListener('touchmove', onTouchMove)
+          el.removeEventListener('touchend', onTouchEnd)
+          el.removeEventListener('touchcancel', onTouchEnd)
+        }
       } else {
         el.removeEventListener('mousemove', onMouseMove)
         el.removeEventListener('mousedown', onMouseDown)
@@ -365,5 +373,5 @@ export function useDesktopInput({
         el.removeEventListener('contextmenu', onContextMenu)
       }
     }
-  }, [canvas, mode, sendInput])
+  }, [canvas, mode, sendInput, gestureMode])
 }
