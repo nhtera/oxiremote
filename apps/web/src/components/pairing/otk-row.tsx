@@ -37,30 +37,44 @@ export default function OtkRow({
   }
 
   return (
-    <div className="space-y-2">
-      <div className="text-xs font-medium text-text-muted">One-time key</div>
+    <div className="space-y-1.5">
+      <div className="flex items-center justify-between">
+        <span className="text-xs font-medium text-text-muted">One-time key</span>
+        <span className="text-[10px] text-text-muted">Single use · expires</span>
+      </div>
       <div
         className={
-          'flex items-center justify-between gap-3 px-3 py-3 bg-surface-alt border rounded-lg ' +
-          (otkActive ? 'border-border' : 'border-border/60 opacity-60')
+          'flex items-center gap-2 px-3 py-2.5 bg-surface-alt border rounded-lg ' +
+          (otkActive ? 'border-border' : 'border-border/60')
         }
       >
+        <ClockIcon className={otkActive ? 'text-accent' : 'text-text-muted'} />
         <code
           className={
-            'font-mono text-base md:text-lg tracking-[0.06em] truncate select-all ' +
+            'flex-1 min-w-0 font-mono text-sm tracking-[0.08em] truncate select-all ' +
             (otkActive ? 'text-text-primary' : 'text-text-muted line-through')
           }
         >
           {formattedKey || '—'}
         </code>
+        {expired && hasKey && (
+          <span className="shrink-0 text-[10px] font-semibold uppercase tracking-wider text-danger bg-danger/10 border border-danger/30 rounded px-1.5 py-0.5">
+            Expired
+          </span>
+        )}
         <button
           onClick={handleCopy}
           disabled={!otkActive || !rawKey}
-          aria-label="Copy one-time key"
-          className="shrink-0 inline-flex items-center gap-1 px-2 py-1 text-xs text-text-secondary hover:text-text-primary disabled:opacity-30 disabled:cursor-not-allowed"
+          aria-label={copied ? 'Copied to clipboard' : 'Copy one-time key'}
+          className={
+            'shrink-0 inline-flex items-center justify-center w-7 h-7 rounded transition-colors disabled:opacity-30 disabled:cursor-not-allowed ' +
+            (copied
+              ? 'text-success bg-success/15'
+              : 'text-text-secondary hover:text-text-primary hover:bg-surface-hover')
+          }
+          title={copied ? 'Copied' : 'Copy'}
         >
-          <CopyIcon size={14} />
-          {copied ? 'Copied' : 'Copy'}
+          {copied ? <CheckIcon /> : <CopyIcon size={14} />}
         </button>
       </div>
 
@@ -72,6 +86,44 @@ export default function OtkRow({
         onRegenerate={onRegenerate}
       />
     </div>
+  )
+}
+
+function ClockIcon({ className = '' }: { className?: string }) {
+  return (
+    <svg
+      width={14}
+      height={14}
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth={1.75}
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      className={`shrink-0 ${className}`}
+      aria-hidden="true"
+    >
+      <circle cx="12" cy="12" r="9" />
+      <path d="M12 7v5l3 2" />
+    </svg>
+  )
+}
+
+function CheckIcon() {
+  return (
+    <svg
+      width={14}
+      height={14}
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth={2.25}
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden="true"
+    >
+      <polyline points="5 12 10 17 19 7" />
+    </svg>
   )
 }
 

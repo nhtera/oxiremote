@@ -56,8 +56,8 @@ export default function PairingCard({
 
   return (
     <section className="rounded-2xl border border-border bg-surface p-5 md:p-6 shadow-[0_8px_28px_-12px_rgba(0,0,0,0.55)]">
-      <div className="flex flex-col sm:flex-row gap-5 mb-5">
-        <div className="flex-1 min-w-0">
+      <div className="flex flex-col gap-4 mb-5">
+        <div className="min-w-0">
           <div className="text-[11px] uppercase tracking-[0.18em] text-text-muted font-medium">
             Pairing
           </div>
@@ -68,22 +68,8 @@ export default function PairingCard({
             Scan the QR with your camera, or open the link below and paste the
             one-time key.
           </p>
-          <Button
-            variant="accent-glow"
-            size="sm"
-            onClick={onRegenerate}
-            className="mt-3"
-            leftIcon={
-              <svg viewBox="0 0 24 24" className="w-3.5 h-3.5" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                <path d="M21 12a9 9 0 1 1-3-6.7L21 8" />
-                <path d="M21 3v5h-5" />
-              </svg>
-            }
-          >
-            New key
-          </Button>
         </div>
-        <div className="shrink-0 self-center sm:self-start">
+        <div className="self-center">
           <QrPanel
             tunnelUrl={tunnelUrl}
             qrPayload={qrPayload}
@@ -91,6 +77,20 @@ export default function PairingCard({
             otkExpired={expired}
           />
         </div>
+        <Button
+          variant="accent-glow"
+          size="sm"
+          onClick={onRegenerate}
+          className="self-start"
+          leftIcon={
+            <svg viewBox="0 0 24 24" className="w-3.5 h-3.5" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              <path d="M21 12a9 9 0 1 1-3-6.7L21 8" />
+              <path d="M21 3v5h-5" />
+            </svg>
+          }
+        >
+          New key
+        </Button>
       </div>
 
       <div className="space-y-4">

@@ -7,12 +7,16 @@ import ConnLogsTabs from '../../components/agent/conn-logs-tabs'
 import InlineLogsPanel from '../../components/agent/inline-logs-panel'
 import OnboardingView from '../../components/agent/onboarding-view'
 import OtkConfirmModal from '../../components/agent/otk-confirm-modal'
+import HostShell from '../../components/agent/host-shell'
+import ServicesStrip from '../../components/agent/services-strip'
 
 // Host-dashboard home. Live-updates via the `/api/agent/events` SSE stream;
 // initial snapshot from `/api/agent/state`. Both endpoints are localhost-only.
 //
-// Layout: 2-col grid at xl. Left = sticky PairingCard hero. Right = Connection
-// / Logs tab switcher.
+// Layout: HostShell renders a sticky pairing rail (left, lg ≥ 1024 px) and a
+// flowing right pane that holds the services strip + Connection/Logs tabs.
+// Tabs use CSS hide (not unmount) so the embedded log SSE stream survives
+// switching back and forth.
 
 interface OtkState {
   token: string
@@ -234,14 +238,9 @@ export default function AgentHomePage() {
   }
 
   return (
-    <div className="p-6 max-w-6xl mx-auto">
-      {tunnelDown && (
-        <div className="mb-4 px-4 py-3 rounded-md bg-danger/10 border border-danger/40 text-danger text-sm font-medium">
-          Tunnel went down — connections will fail. Restart the agent to reconnect.
-        </div>
-      )}
-      <div className="grid grid-cols-1 xl:grid-cols-[minmax(0,1.05fr)_minmax(0,1fr)] gap-6">
-        <aside className="lg:sticky lg:top-6 self-start space-y-4">
+    <>
+      <HostShell
+        rail={
           <PairingCard
             tunnelUrl={tunnelUrl}
             otkToken={otk?.token ?? null}
@@ -253,30 +252,48 @@ export default function AgentHomePage() {
             onRegeneratePermanent={handlePermanentRegen}
             onDismissReveal={() => setRevealedPlaintext(null)}
           />
-        </aside>
+        }
+        main={
+          <>
+            {tunnelDown && (
+              <div className="px-4 py-3 rounded-md bg-danger/10 border border-danger/40 text-danger text-sm font-medium">
+                Tunnel went down — connections will fail. Restart the agent to reconnect.
+              </div>
+            )}
 
-        <section className="space-y-4">
-          <ConnLogsTabs tab={tab} onChange={setTab} />
-          {tab === 'connection' && state && (
-            <ConnTab
-              hostId={state.host_id}
-              label={state.label}
-              platform={state.platform}
-              connectedDevices={state.connected_devices}
-              autoApprove={state.auto_approve ?? false}
-              desktopEnabled={state.desktop_enabled ?? true}
-              tunnelUrl={tunnelUrl}
-              onAutoApproveChange={(next) =>
-                setState((s) => (s ? { ...s, auto_approve: next } : s))
-              }
+            <ServicesStrip
+              desktopEnabled={state?.desktop_enabled ?? true}
               onDesktopEnabledChange={(next) =>
                 setState((s) => (s ? { ...s, desktop_enabled: next } : s))
               }
             />
-          )}
-          {tab === 'logs' && <InlineLogsPanel />}
-        </section>
-      </div>
+
+            <ConnLogsTabs tab={tab} onChange={setTab} />
+
+            {/* CSS-hide instead of conditional render so the inline log SSE
+                stream stays mounted across tab switches. */}
+            <div hidden={tab !== 'connection'}>
+              {state && (
+                <ConnTab
+                  hostId={state.host_id}
+                  label={state.label}
+                  platform={state.platform}
+                  connectedDevices={state.connected_devices}
+                  autoApprove={state.auto_approve ?? false}
+                  tunnelUrl={tunnelUrl}
+                  tunnelHealthy={tunnelHealthy}
+                  onAutoApproveChange={(next) =>
+                    setState((s) => (s ? { ...s, auto_approve: next } : s))
+                  }
+                />
+              )}
+            </div>
+            <div hidden={tab !== 'logs'}>
+              <InlineLogsPanel />
+            </div>
+          </>
+        }
+      />
 
       {pendingDevice && (
         <ApprovalModal
@@ -293,7 +310,6 @@ export default function AgentHomePage() {
           onCancel={() => setConfirmingOtk(false)}
         />
       )}
-    </div>
+    </>
   )
 }
-

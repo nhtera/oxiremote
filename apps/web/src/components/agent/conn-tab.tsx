@@ -2,10 +2,7 @@ import AutoApproveToggle from '../auto-approve-toggle'
 import DevicesPanel from '../devices-panel'
 import PermissionsWidget from '../permissions-widget'
 import ProxyPortsCard from '../proxy-ports-card'
-import StatusChip from '../ui/status-chip'
-import { TerminalIcon, RemoteDesktopIcon } from '../icons'
-import ServiceCard from './service-card'
-import DesktopServiceToggle from './desktop-service-toggle'
+import TunnelStatusCard from '../tunnel-status-card'
 
 interface Props {
   hostId: string
@@ -13,47 +10,29 @@ interface Props {
   platform: string
   connectedDevices: number
   autoApprove: boolean
-  desktopEnabled: boolean
   tunnelUrl: string | null
+  tunnelHealthy: boolean
   onAutoApproveChange: (next: boolean) => void
-  onDesktopEnabledChange: (next: boolean) => void
 }
 
 // Right-column content for the agent home's Connection tab. Pure presentation
 // over snapshot props — page owns SSE state and passes deltas down.
+//
+// Services strip lives in `services-strip.tsx` and is rendered ABOVE the tab
+// switcher in the right pane, so it stays visible regardless of active tab.
 export default function ConnTab({
   hostId,
   label,
   platform,
   connectedDevices,
   autoApprove,
-  desktopEnabled,
   tunnelUrl,
+  tunnelHealthy,
   onAutoApproveChange,
-  onDesktopEnabledChange,
 }: Props) {
   return (
     <div className="space-y-4">
-      <div className="grid gap-3">
-        <ServiceCard
-          icon={<TerminalIcon size={18} />}
-          title="Remote Terminal"
-          subtitle="Full shell access · always on"
-          trailing={<StatusChip variant="online">On</StatusChip>}
-          emphasized
-        />
-        <ServiceCard
-          icon={<RemoteDesktopIcon size={18} />}
-          title="Remote Desktop"
-          subtitle="Control screen, mouse, keyboard"
-          trailing={
-            <DesktopServiceToggle
-              enabled={desktopEnabled}
-              onChange={onDesktopEnabledChange}
-            />
-          }
-        />
-      </div>
+      <TunnelStatusCard tunnelUrl={tunnelUrl} healthy={tunnelHealthy} />
 
       <Card title="Host">
         <Row k="Host ID" v={hostId} />
@@ -62,18 +41,23 @@ export default function ConnTab({
       </Card>
 
       <Card
-        title="Connected Devices"
-        action={
-          <AutoApproveToggle enabled={autoApprove} onChange={onAutoApproveChange} />
+        title={
+          <span className="flex items-baseline gap-2">
+            <span>Clients</span>
+            <span className="text-[length:var(--text-meta)] tracking-normal normal-case text-text-secondary font-normal">
+              · {connectedDevices} {connectedDevices === 1 ? 'active session' : 'active sessions'}
+            </span>
+          </span>
         }
       >
-        <div className="flex items-baseline gap-2 mb-3">
-          <div className="text-[length:var(--text-display)] font-semibold text-text-primary leading-none">
-            {connectedDevices}
+        <div className="flex items-center justify-between gap-3 mb-3 px-3 py-2.5 rounded-lg border border-border bg-surface-alt">
+          <div className="min-w-0">
+            <div className="text-sm font-medium text-text-primary leading-tight">Auto-approve new devices</div>
+            <div className="text-xs text-text-muted leading-snug mt-0.5">
+              Skip manual approval — newly paired devices connect immediately.
+            </div>
           </div>
-          <div className="text-[length:var(--text-meta)] text-text-muted">
-            active terminal/preview sessions
-          </div>
+          <AutoApproveToggle enabled={autoApprove} onChange={onAutoApproveChange} />
         </div>
         <DevicesPanel />
       </Card>
@@ -94,14 +78,14 @@ function Card({
   action,
   children,
 }: {
-  title: string
+  title: React.ReactNode
   action?: React.ReactNode
   children: React.ReactNode
 }) {
   return (
     <div className="rounded-xl border border-border bg-surface p-4">
       <div className="flex items-center justify-between gap-3 mb-3">
-        <div className="text-xs uppercase tracking-wide text-text-muted">{title}</div>
+        <div className="text-xs uppercase tracking-wide text-text-muted min-w-0">{title}</div>
         {action}
       </div>
       {children}
