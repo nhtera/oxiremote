@@ -1,14 +1,23 @@
 /// Screen capture abstraction and FPS-capped capture loop.
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use image::RgbaImage;
 use tokio::sync::mpsc::{error::TrySendError, Sender};
-use tokio::sync::oneshot;
+use tokio::sync::{oneshot, Notify};
 use tracing::{info, warn};
 use xcap::Monitor;
 
-use crate::encode::{quality_resize, FrameOutput, QualityTier, TileDiff, TileEncoder};
+use crate::encode::{
+    quality_resize, FrameOutput, QualityTier, TileDiff, TileEncoder, IDLE_INTERVAL_MAX_MS,
+};
+
+/// Wake the capture loop on any input event. JPEG path uses this to break out
+/// of an idle-backoff sleep so the next frame after a mouse jiggle ships at
+/// active cadence. Constructed in the WS layer; cloned into both the input
+/// dispatch path (notify_one) and the capture loop (await on notified()).
+pub type InputWake = Arc<Notify>;
 
 /// Wraps a single monitor handle for frame-by-frame capture.
 pub struct ScreenCapture {
@@ -94,6 +103,9 @@ impl CaptureLoop {
     /// - `force_iframe_rx`: optional oneshot that, when fired, resets the tile
     ///   diff so the next emitted frame contains every tile (equivalent to an
     ///   H.264 IDR for a joining viewer).
+    /// - `input_wake`: optional `Arc<Notify>` that breaks the idle-backoff
+    ///   sleep when input arrives so the next frame ships at active cadence.
+    ///   `None` keeps the legacy fixed-cadence behaviour.
     ///
     /// **Precondition:** Caller must verify `desktop::desktop_available()`
     /// is `true` before spawning this loop. We do not re-probe here — that
@@ -104,6 +116,7 @@ impl CaptureLoop {
         scale_factor: f32,
         hidpi_mode: bool,
         mut force_iframe_rx: Option<oneshot::Receiver<()>>,
+        input_wake: Option<InputWake>,
     ) {
         let capture = match ScreenCapture::primary() {
             Ok(c) => c,
@@ -119,10 +132,21 @@ impl CaptureLoop {
             "CaptureLoop started"
         );
 
-        let interval = frame_interval(tier);
+        let active_interval = frame_interval(tier);
+        let idle_max = Duration::from_millis(IDLE_INTERVAL_MAX_MS);
+        let mut interval = active_interval;
+        let mut idle_streak: u32 = 0;
         let mut diff = TileDiff::new();
         let mut frame_count: u64 = 0;
         let mut dropped_count: u64 = 0;
+
+        // Tokio handle for input-wake select. Captured once up-front so the
+        // hot loop doesn't pay the lookup cost.
+        let tokio_handle = if input_wake.is_some() {
+            tokio::runtime::Handle::try_current().ok()
+        } else {
+            None
+        };
 
         loop {
             let frame_start = Instant::now();
@@ -161,7 +185,8 @@ impl CaptureLoop {
 
             // Only emit non-idle frames. Drop-newest on backpressure so the
             // capture thread never stalls behind a slow consumer.
-            if !output.tiles.is_empty() {
+            let was_idle = output.tiles.is_empty();
+            if !was_idle {
                 match tx.try_send(output) {
                     Ok(()) => frame_count += 1,
                     Err(TrySendError::Full(_)) => {
@@ -178,10 +203,44 @@ impl CaptureLoop {
                 }
             }
 
-            // Sleep the remaining budget for this frame interval.
+            // Adaptive backoff: 3 idle frames in a row → grow interval 1.5×
+            // up to the idle ceiling. Any non-idle frame snaps back to active
+            // cadence immediately.
+            if was_idle {
+                idle_streak = idle_streak.saturating_add(1);
+                if idle_streak >= 3 {
+                    let next_ms = (interval.as_millis() as u64).saturating_mul(3) / 2;
+                    interval = Duration::from_millis(next_ms).min(idle_max);
+                }
+            } else {
+                idle_streak = 0;
+                interval = active_interval;
+            }
+
+            // Sleep the remaining budget for this frame interval. With
+            // `input_wake` wired up we use a tokio select so a mouse jiggle
+            // shortens the sleep — wake.notified() resets us to active.
             let elapsed = frame_start.elapsed();
-            if let Some(remaining) = interval.checked_sub(elapsed) {
-                std::thread::sleep(remaining);
+            let Some(remaining) = interval.checked_sub(elapsed) else {
+                continue;
+            };
+
+            let woken = match (&tokio_handle, &input_wake) {
+                (Some(h), Some(wake)) => h.block_on(async {
+                    tokio::select! {
+                        _ = tokio::time::sleep(remaining) => false,
+                        _ = wake.notified() => true,
+                    }
+                }),
+                _ => {
+                    std::thread::sleep(remaining);
+                    false
+                }
+            };
+
+            if woken {
+                interval = active_interval;
+                idle_streak = 0;
             }
         }
 

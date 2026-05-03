@@ -14,7 +14,7 @@ pub mod inner {
     use std::sync::Arc;
 
     use bytes::{BufMut, Bytes, BytesMut};
-    use desktop::capture::CaptureLoop;
+    use desktop::capture::{CaptureLoop, InputWake};
     use desktop::{FrameOutput, QualityTier};
     use tokio::sync::{mpsc, oneshot, watch};
     use tracing::{info, warn};
@@ -67,6 +67,7 @@ pub mod inner {
         mut shutdown_rx: tokio::sync::oneshot::Receiver<()>,
         scale_factor: f32,
         cap_ended_tx: tokio::sync::mpsc::Sender<String>,
+        input_wake: InputWake,
     ) {
         tokio::spawn(async move {
             let sink = Arc::new(sink);
@@ -94,8 +95,16 @@ pub mod inner {
                 let _ = iframe_tx.send(());
 
                 // Spawn the blocking capture loop.
+                let wake_for_loop = Arc::clone(&input_wake);
                 let _capture_handle = tokio::task::spawn_blocking(move || {
-                    CaptureLoop::run(tier, frame_tx, scale_factor, hidpi, Some(iframe_rx))
+                    CaptureLoop::run(
+                        tier,
+                        frame_tx,
+                        scale_factor,
+                        hidpi,
+                        Some(iframe_rx),
+                        Some(wake_for_loop),
+                    )
                 });
 
                 info!(tier = ?tier, scale_factor, hidpi, "capture pipeline started");

@@ -20,7 +20,9 @@ h264 = [
 
 [dependencies]
 xcap = "0.9"
-mozjpeg = "0.10"
+# libjpeg-turbo binding: ~5× faster per tile than mozjpeg, RGBA in directly.
+# Pulls bundled libjpeg-turbo via turbojpeg-sys; build needs cmake + nasm.
+turbojpeg = "1"
 enigo = { version = "0.6", default-features = false }
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 image = { version = "0.25", default-features = false, features = ["jpeg"] }

@@ -87,7 +87,13 @@ export default function DesktopPage() {
   const [caps, setCaps] = useState<Capabilities | null>(null)
   const [capsError, setCapsError] = useState('')
   const [deviceId, setDeviceId] = useState<string | null>(null)
-  const [quality, setQuality] = useState<QualityTier>('med')
+  // Default to High on retina (sharper text + 2× framerate). Phase 01's idle
+  // backoff + thumbnail short-circuit makes the higher framerate ~free at
+  // rest; the bandwidth difference only shows up under motion.
+  const [quality, setQuality] = useState<QualityTier>(() => {
+    if (typeof window === 'undefined') return 'med'
+    return (window.devicePixelRatio ?? 1) >= 1.5 ? 'high' : 'med'
+  })
   const [inputMode, setInputMode] = useState<InputMode>('touch')
   const [gestureMode, setGestureMode] = useState<GestureMode>('pointer')
   const [showHelp, setShowHelp] = useState(false)

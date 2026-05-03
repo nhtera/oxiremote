@@ -38,6 +38,11 @@ interface SessionApi {
   disconnect: () => void
   attempt: number
   screenDims?: { width: number; height: number }
+  /// Tile side length emitted in the most recent `capabilities` message.
+  /// Clients use this for tile placement (`tileX * tileSize`) so the server
+  /// can change the constant without an SPA redeploy. Sanity-clamped to
+  /// 64 | 128 by the consumer in case of an out-of-protocol echo.
+  tileSize?: number
   /// Reason from the agent's last `captureEnded` signal (e.g. "screen capture
   /// stopped"). Set when the capture pipeline exits mid-session so the UI can
   /// show a meaningful reconnect message instead of a frozen frame.
@@ -90,6 +95,7 @@ export function useDesktopSession(
   const [status, setStatus] = useState<DesktopStatus>('idle')
   const [attempt, setAttempt] = useState(0)
   const [screenDims, setScreenDims] = useState<{ width: number; height: number } | undefined>()
+  const [tileSize, setTileSize] = useState<number | undefined>()
   const [lastEndReason, setLastEndReason] = useState<string | undefined>()
 
   // Refs hold live handles so reconnect logic can tear down and rebuild.
@@ -294,6 +300,14 @@ export function useDesktopSession(
           if (msg.width && msg.height) {
             setScreenDims({ width: msg.width as number, height: msg.height as number })
           }
+          if (typeof msg.tileSize === 'number') {
+            // Sanity guard against an out-of-protocol value — only 64 / 128
+            // are valid grid sizes; anything else means the client and server
+            // disagree about wire format and we'd rather keep the previous
+            // setting than mis-paint the canvas.
+            const ts = msg.tileSize as number
+            if (ts === 64 || ts === 128) setTileSize(ts)
+          }
           break
 
         case 'captureEnded': {
@@ -386,5 +400,5 @@ export function useDesktopSession(
     }
   }, [hostId, deviceId]) // eslint-disable-line react-hooks/exhaustive-deps
 
-  return { status, sendInput, setQuality, setSettings, disconnect, attempt, screenDims, lastEndReason }
+  return { status, sendInput, setQuality, setSettings, disconnect, attempt, screenDims, tileSize, lastEndReason }
 }

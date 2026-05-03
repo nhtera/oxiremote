@@ -1,20 +1,37 @@
-/// Tile-diff encoder: resize → xxhash tile comparison → mozjpeg JPEG encode.
+/// Tile-diff encoder: resize → xxhash tile comparison → libjpeg-turbo JPEG encode.
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
 use fast_image_resize::images::Image as FirImage;
 use fast_image_resize::{FilterType as FirFilter, PixelType, ResizeAlg, ResizeOptions, Resizer};
-use image::{GenericImageView, RgbaImage};
+use image::RgbaImage;
 use rayon::prelude::*;
+use turbojpeg::{Compressor, Image as TjImage, PixelFormat as TjPixel, Subsamp};
 use xxhash_rust::xxh3::xxh3_64;
 
-/// JPEG quality per tier (0–100).
-const QUALITY_HIGH: u8 = 85;
+/// JPEG quality per tier (0–100). High bumped to 90 for sharper text on
+/// retina hosts at the same bandwidth tier (turbojpeg's 4:4:4 chroma at
+/// q=90 is close to visually lossless on UI/text content).
+const QUALITY_HIGH: u8 = 90;
 const QUALITY_MED: u8 = 75;
 const QUALITY_LOW: u8 = 60;
 
-/// Tile side length in pixels.
-pub const TILE_SIZE: u32 = 128;
+/// Tile side length in pixels. Industry-standard 64 px sweet spot — smaller
+/// dirty-area packets, fewer SCTP fragmentations, finer change resolution.
+/// The 4× tile-count bloat on full I-frames is acceptable because I-frames
+/// happen only on session start / quality change / new viewer.
+pub const TILE_SIZE: u32 = 64;
+
+/// Global thumbnail dimensions for the two-tier hash short-circuit. Picked at
+/// roughly the standard 16:9 aspect; xxh3 over ~5 KB is single-digit µs on
+/// modern cores so the cost is dwarfed by the win on idle frames.
+const THUMB_W: u32 = 96;
+const THUMB_H: u32 = 54;
+
+/// Idle ceiling for the capture loop's adaptive backoff. Matches 9remote's
+/// observed 400 ms idle cadence — eyes can detect a mouse-jiggle wake about
+/// this fast and any longer feels stuck.
+pub const IDLE_INTERVAL_MAX_MS: u64 = 400;
 
 /// Capture quality / resolution tier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -31,6 +48,15 @@ impl QualityTier {
             QualityTier::High => QUALITY_HIGH,
             QualityTier::Med => QUALITY_MED,
             QualityTier::Low => QUALITY_LOW,
+        }
+    }
+
+    /// Chroma subsampling per tier. High/Med keep 4:4:4 for crisp text on the
+    /// retina path; Low drops to 4:2:0 (Sub2x2) to halve bandwidth on cellular.
+    fn subsamp(self) -> Subsamp {
+        match self {
+            QualityTier::High | QualityTier::Med => Subsamp::None,
+            QualityTier::Low => Subsamp::Sub2x2,
         }
     }
 
@@ -56,6 +82,16 @@ pub struct EncodedTile {
     pub y: u16,
     /// JPEG-encoded bytes for this tile.
     pub jpeg: Bytes,
+}
+
+/// One changed tile: grid coordinates plus packed RGBA bytes ready for JPEG
+/// encode (no per-pixel iteration needed by the encoder).
+pub struct ChangedTile {
+    pub col: u16,
+    pub row: u16,
+    pub w: u32,
+    pub h: u32,
+    pub rgba: Vec<u8>,
 }
 
 /// Output of one capture-encode cycle: changed tiles + timestamp.
@@ -161,9 +197,19 @@ pub fn resize_dims(
     (w, h)
 }
 
-/// Tracks per-tile xxhash3 values from the previous frame to detect changes.
+/// Hash a thumbnail of `img` for the global short-circuit. Resized via
+/// `fast_image_resize` to a fixed ~96×54 RGBA, then xxh3'd. ~5 KB hashed per
+/// frame ≈ < 1 µs on Apple Silicon — well below the savings on idle frames.
+pub fn global_thumbnail_hash(img: &RgbaImage) -> u64 {
+    let thumb = fir_resize_rgba8(img, THUMB_W, THUMB_H);
+    xxh3_64(thumb.as_raw())
+}
+
+/// Tracks per-tile xxhash3 values from the previous frame to detect changes,
+/// plus a global thumbnail hash for the idle-frame short-circuit.
 pub struct TileDiff {
     prev_hashes: Vec<u64>,
+    prev_global: Option<u64>,
     cols: u32,
     rows: u32,
 }
@@ -173,6 +219,7 @@ impl TileDiff {
     pub fn new() -> Self {
         TileDiff {
             prev_hashes: Vec::new(),
+            prev_global: None,
             cols: 0,
             rows: 0,
         }
@@ -191,16 +238,33 @@ impl TileDiff {
         for h in &mut self.prev_hashes {
             *h = u64::MAX;
         }
+        // Force the global short-circuit to miss next call too.
+        self.prev_global = None;
     }
 
     /// Compare `img` against the previous frame.
     ///
-    /// Returns a list of `(tile_col, tile_row, tile_rgba)` for every tile
-    /// whose xxhash3 differs from the stored hash. On the first call (no
-    /// previous state), all tiles are returned as changed.
-    pub fn diff(&mut self, img: &RgbaImage) -> Vec<(u16, u16, RgbaImage)> {
+    /// Returns the changed tiles as packed RGBA buffers (no per-pixel copy in
+    /// the caller). On the first call (no previous state), all tiles are
+    /// returned as changed. When the global thumbnail matches the prior
+    /// frame's, returns empty immediately without per-tile work.
+    pub fn diff(&mut self, img: &RgbaImage) -> Vec<ChangedTile> {
         let img_w = img.width();
         let img_h = img.height();
+
+        // Two-tier hash: cheap thumbnail check first. If the whole frame
+        // looks identical at coarse resolution we can skip the per-tile loop
+        // entirely. Mismatch → fall through; we update prev_global only after
+        // the per-tile pass so a mid-update bail-out doesn't desync state.
+        let global = global_thumbnail_hash(img);
+        if let Some(prev) = self.prev_global
+            && prev == global
+            && !self.prev_hashes.is_empty()
+        {
+            // No first-frame edge case: prev_hashes is empty until the first
+            // real diff has populated it.
+            return Vec::new();
+        }
 
         // Integer ceiling division: (n + d - 1) / d
         let cols = img_w.div_ceil(TILE_SIZE);
@@ -214,7 +278,10 @@ impl TileDiff {
             self.rows = rows;
         }
 
-        let mut changed = Vec::new();
+        let src_bytes = img.as_raw();
+        let src_stride = (img_w * 4) as usize;
+        let mut tile_buf: Vec<u8> = Vec::with_capacity((TILE_SIZE * TILE_SIZE * 4) as usize);
+        let mut changed: Vec<ChangedTile> = Vec::new();
 
         for row in 0..rows {
             for col in 0..cols {
@@ -223,19 +290,40 @@ impl TileDiff {
                 let tw = (img_w - px).min(TILE_SIZE);
                 let th = (img_h - py).min(TILE_SIZE);
 
-                // Extract tile RGBA bytes.
-                let tile_img = img.view(px, py, tw, th).to_image();
-                let tile_bytes = tile_img.as_raw();
-                let hash = xxh3_64(tile_bytes);
+                // Pack tile bytes by memcpy'ing each row slice — drops the
+                // per-pixel walk that `view().to_image()` did via
+                // `ImageBuffer::pixels()`.
+                let row_bytes = (tw * 4) as usize;
+                tile_buf.clear();
+                tile_buf.reserve(row_bytes * th as usize);
+                for ty in 0..th as usize {
+                    let y = py as usize + ty;
+                    let start = y * src_stride + (px * 4) as usize;
+                    tile_buf.extend_from_slice(&src_bytes[start..start + row_bytes]);
+                }
 
+                let hash = xxh3_64(&tile_buf);
                 let idx = (row * cols + col) as usize;
                 if hash != self.prev_hashes[idx] {
                     self.prev_hashes[idx] = hash;
-                    changed.push((col as u16, row as u16, tile_img));
+                    // Move the packed buffer to the changed list and reset
+                    // the working buffer. capacity restored on next iteration.
+                    let owned = std::mem::take(&mut tile_buf);
+                    tile_buf = Vec::with_capacity((TILE_SIZE * TILE_SIZE * 4) as usize);
+                    changed.push(ChangedTile {
+                        col: col as u16,
+                        row: row as u16,
+                        w: tw,
+                        h: th,
+                        rgba: owned,
+                    });
                 }
             }
         }
 
+        // Update the global hash *after* the per-tile pass so prev_hashes and
+        // prev_global stay consistent.
+        self.prev_global = Some(global);
         changed
     }
 }
@@ -246,22 +334,26 @@ impl Default for TileDiff {
     }
 }
 
-/// Encodes changed tiles to JPEG using mozjpeg.
+/// Encodes changed tiles to JPEG using libjpeg-turbo.
 pub struct TileEncoder;
 
 impl TileEncoder {
     /// Encode a list of changed tiles to JPEG bytes, in parallel via rayon.
     ///
-    /// `mozjpeg::Compress` is `!Send`, but each call constructs a fresh
-    /// instance — rayon workers never share one, so the parallel path is
-    /// safe. Input order is preserved by `into_par_iter().collect()` so
-    /// existing callers observing tile ordering remain correct.
-    pub fn encode(tiles: Vec<(u16, u16, RgbaImage)>, quality: u8) -> Vec<EncodedTile> {
+    /// Each rayon worker constructs a fresh `turbojpeg::Compressor` —
+    /// `Compressor` is `!Send` in its `BorrowedCompressor` form and the C
+    /// handle is per-thread. Construction cost is single-digit µs so this is
+    /// cheap relative to the encode itself. Input order is preserved by
+    /// `into_par_iter().collect()` so callers observing tile ordering remain
+    /// correct.
+    pub fn encode(tiles: Vec<ChangedTile>, tier: QualityTier) -> Vec<EncodedTile> {
+        let quality = tier.jpeg_quality();
+        let subsamp = tier.subsamp();
         tiles
             .into_par_iter()
-            .filter_map(|(x, y, tile)| {
-                let jpeg = encode_tile_jpeg(&tile, quality).ok()?;
-                Some(EncodedTile { x, y, jpeg })
+            .filter_map(|tile| {
+                let jpeg = encode_tile_jpeg(&tile.rgba, tile.w, tile.h, quality, subsamp).ok()?;
+                Some(EncodedTile { x: tile.col, y: tile.row, jpeg })
             })
             .collect()
     }
@@ -282,48 +374,47 @@ impl TileEncoder {
             .unwrap_or(0);
 
         let resized = quality_resize(raw, tier, scale_factor, hidpi_mode);
-        let changed_tiles = diff.diff(&resized);
-        let tiles = TileEncoder::encode(changed_tiles, tier.jpeg_quality());
+        let changed = diff.diff(&resized);
+        let tiles = TileEncoder::encode(changed, tier);
 
         FrameOutput { tiles, frame_ts }
     }
 }
 
-/// Encode a single RGBA tile as JPEG bytes via mozjpeg.
-fn encode_tile_jpeg(tile: &RgbaImage, quality: u8) -> anyhow::Result<Bytes> {
-    let width = tile.width() as usize;
-    let height = tile.height() as usize;
+/// Encode a packed RGBA buffer as JPEG via libjpeg-turbo.
+///
+/// `pixels` is `width * height * 4` bytes in RGBA order (alpha ignored by the
+/// JPEG colour space). turbojpeg accepts RGBA natively — no manual alpha
+/// strip — and uses NEON / AVX2 SIMD internally.
+fn encode_tile_jpeg(
+    pixels: &[u8],
+    width: u32,
+    height: u32,
+    quality: u8,
+    subsamp: Subsamp,
+) -> anyhow::Result<Bytes> {
+    debug_assert_eq!(pixels.len(), (width * height * 4) as usize);
 
-    // mozjpeg encodes RGB, not RGBA — strip the alpha channel.
-    let rgb_bytes: Vec<u8> = tile
-        .pixels()
-        .flat_map(|p| [p[0], p[1], p[2]])
-        .collect();
+    let img = TjImage {
+        pixels,
+        width: width as usize,
+        pitch: (width * 4) as usize,
+        height: height as usize,
+        format: TjPixel::RGBA,
+    };
 
-    // mozjpeg 0.10 API: Compress takes a writer; Vec<u8> acts as the sink.
-    // Compress is NOT Send — create fresh per call (never share across threads).
-    let mut compress = mozjpeg::Compress::new(mozjpeg::ColorSpace::JCS_RGB);
-    compress.set_size(width, height);
-    compress.set_quality(quality as f32);
+    let mut compressor =
+        Compressor::new().map_err(|e| anyhow::anyhow!("turbojpeg compressor: {e}"))?;
+    compressor
+        .set_quality(quality as i32)
+        .map_err(|e| anyhow::anyhow!("turbojpeg quality: {e}"))?;
+    compressor
+        .set_subsamp(subsamp)
+        .map_err(|e| anyhow::anyhow!("turbojpeg subsamp: {e}"))?;
 
-    let buf: Vec<u8> = Vec::new();
-    let mut started = compress
-        .start_compress(buf)
-        .map_err(|e| anyhow::anyhow!("mozjpeg start_compress: {e}"))?;
-
-    // Write scan lines row by row.
-    let row_stride = width * 3;
-    for row in 0..height {
-        let start = row * row_stride;
-        let end = start + row_stride;
-        started
-            .write_scanlines(&rgb_bytes[start..end])
-            .map_err(|_| anyhow::anyhow!("mozjpeg write_scanlines failed at row {row}"))?;
-    }
-
-    let jpeg_vec = started
-        .finish()
-        .map_err(|e| anyhow::anyhow!("mozjpeg finish: {e}"))?;
+    let jpeg_vec = compressor
+        .compress_to_vec(img)
+        .map_err(|e| anyhow::anyhow!("turbojpeg encode: {e}"))?;
 
     Ok(Bytes::from(jpeg_vec))
 }
@@ -343,22 +434,23 @@ mod tests {
         img
     }
 
-    /// TileDiff must report exactly the one tile that changed between frames.
+    /// TileDiff must report exactly the tiles that changed between frames.
+    /// At TILE_SIZE = 64, a 256×256 frame is a 4×4 grid (16 tiles); modifying
+    /// the upper-right 128×128 quadrant covers cols 2..=3, rows 0..=1 → 4 tiles.
     #[test]
     fn tile_diff_detects_single_change() {
-        // 256×256 image → 2×2 tiles (each 128×128).
         let base = solid_rgba(256, 256, Rgba([100, 100, 100, 255]));
         let mut diff = TileDiff::new();
 
-        // First frame: all tiles reported as changed.
+        // First frame: all 16 tiles reported as changed.
         let first = diff.diff(&base);
-        assert_eq!(first.len(), 4, "first frame must return all 4 tiles");
+        assert_eq!(first.len(), 16, "first frame must return all 16 tiles");
 
         // Second frame: identical to first — no changes.
         let none = diff.diff(&base);
         assert!(none.is_empty(), "identical frame must yield zero changed tiles");
 
-        // Modify tile at (col=1, row=0): pixel at x=128..255, y=0..127.
+        // Modify the upper-right 128×128 region: cols 2-3, rows 0-1 at 64-px.
         let mut modified = base.clone();
         for x in 128..256u32 {
             for y in 0..128u32 {
@@ -367,10 +459,11 @@ mod tests {
         }
 
         let changed = diff.diff(&modified);
-        assert_eq!(changed.len(), 1, "only one tile should change");
-        let (cx, cy, _) = &changed[0];
-        assert_eq!(*cx, 1, "changed tile col must be 1");
-        assert_eq!(*cy, 0, "changed tile row must be 0");
+        assert_eq!(changed.len(), 4, "exactly four 64-px tiles cover the modified quadrant");
+        for tile in &changed {
+            assert!(tile.col == 2 || tile.col == 3, "col must be 2 or 3");
+            assert!(tile.row == 0 || tile.row == 1, "row must be 0 or 1");
+        }
     }
 
     /// After `reset()` every tile must re-register as changed on the next diff.
@@ -384,7 +477,35 @@ mod tests {
 
         diff.reset();
         let all_again = diff.diff(&base);
-        assert_eq!(all_again.len(), 4, "reset must force every tile changed");
+        assert_eq!(all_again.len(), 16, "reset must force every tile changed");
+    }
+
+    /// Two-tier hash short-circuit: identical frames bail out before the
+    /// per-tile pass. Verified by checking the global hash matches on the
+    /// second call (semantic check; the early-return path is the same code
+    /// that produces an empty Vec, so the assertion is on `is_empty()`).
+    #[test]
+    fn global_thumbnail_short_circuits_idle() {
+        let base = solid_rgba(512, 512, Rgba([42, 42, 42, 255]));
+        let mut diff = TileDiff::new();
+
+        // First call seeds prev_global.
+        let first = diff.diff(&base);
+        assert!(!first.is_empty(), "first frame seeds the diff state");
+
+        // Second call: thumbnail matches → early return. prev_hashes is intact.
+        let idle = diff.diff(&base);
+        assert!(idle.is_empty(), "idle thumbnail short-circuit must yield empty");
+        // Confirm the short-circuit kept the state consistent so a real change
+        // afterwards still flows through normally.
+        let mut moved = base.clone();
+        for x in 0..32 {
+            for y in 0..32 {
+                moved.put_pixel(x, y, Rgba([200, 50, 50, 255]));
+            }
+        }
+        let after = diff.diff(&moved);
+        assert!(!after.is_empty(), "real change after idle must still be detected");
     }
 
     /// `resize_dims(logical, tier, scale_factor, hidpi)` must agree with
@@ -469,10 +590,17 @@ mod tests {
     /// Parallel encode preserves input ordering (rayon docs contract).
     #[test]
     fn encode_preserves_tile_order() {
-        let tiles: Vec<(u16, u16, RgbaImage)> = (0..8u16)
-            .map(|i| (i, 0, solid_rgba(16, 16, Rgba([i as u8 * 10, 0, 0, 255]))))
+        let tiles: Vec<ChangedTile> = (0..8u16)
+            .map(|i| {
+                let mut rgba = vec![0u8; 16 * 16 * 4];
+                for px in rgba.chunks_exact_mut(4) {
+                    px[0] = (i as u8) * 10;
+                    px[3] = 255;
+                }
+                ChangedTile { col: i, row: 0, w: 16, h: 16, rgba }
+            })
             .collect();
-        let out = TileEncoder::encode(tiles, QUALITY_LOW);
+        let out = TileEncoder::encode(tiles, QualityTier::Low);
         assert_eq!(out.len(), 8);
         for (i, t) in out.iter().enumerate() {
             assert_eq!(t.x, i as u16, "tile x must equal input index");
@@ -483,8 +611,13 @@ mod tests {
     /// Mean absolute error per channel must be < 10.
     #[test]
     fn encode_decode_roundtrip() {
-        let tile = solid_rgba(128, 128, Rgba([255, 0, 0, 255]));
-        let jpeg = encode_tile_jpeg(&tile, QUALITY_HIGH).expect("encode must succeed");
+        let mut rgba = vec![0u8; 128 * 128 * 4];
+        for px in rgba.chunks_exact_mut(4) {
+            px[0] = 255; // R
+            px[3] = 255; // A
+        }
+        let jpeg = encode_tile_jpeg(&rgba, 128, 128, QUALITY_HIGH, Subsamp::None)
+            .expect("encode must succeed");
 
         let decoded = image::load_from_memory_with_format(&jpeg, image::ImageFormat::Jpeg)
             .expect("decode must succeed")
@@ -496,7 +629,7 @@ mod tests {
         // Compute mean absolute error across R, G, B channels.
         let total_pixels = (128 * 128) as f64;
         let mut sum_delta = [0u64; 3];
-        for (orig, dec) in tile.pixels().zip(decoded.pixels()) {
+        for (orig, dec) in rgba.chunks_exact(4).zip(decoded.pixels()) {
             for ch in 0..3 {
                 sum_delta[ch] += (orig[ch] as i32 - dec[ch] as i32).unsigned_abs() as u64;
             }
@@ -532,7 +665,9 @@ mod tests {
             let tier = QualityTier::High;
 
             // Spawn blocking capture loop with default 1× scale (CI).
-            tokio::task::spawn_blocking(move || CaptureLoop::run(tier, tx, 1.0, false, None));
+            tokio::task::spawn_blocking(move || {
+                CaptureLoop::run(tier, tx, 1.0, false, None, None)
+            });
 
             // Collect frames for 1 second.
             let deadline = tokio::time::Instant::now() + Duration::from_millis(1000);

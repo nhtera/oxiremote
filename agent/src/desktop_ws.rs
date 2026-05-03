@@ -409,6 +409,14 @@ mod inner {
         // to pre-compute per-tier output dimensions for `Capabilities`.
         let scale_factor = desktop::primary_scale_factor();
 
+        // ── Input wake ────────────────────────────────────────────────────────
+        // Phase 01 idle-backoff: every ctrl-DC message bumps this Notify so
+        // the JPEG capture loop breaks out of its idle sleep and ships the
+        // next frame at active cadence. H.264 path doesn't use it (own
+        // keyframe + RTCP PLI loop instead).
+        let input_wake: desktop::capture::InputWake =
+            Arc::new(tokio::sync::Notify::new());
+
         // ── Ctrl DC: parse and dispatch input events ──────────────────────────
         // The dispatch closure also needs to re-emit `Capabilities` over the
         // WS text channel whenever the tier changes so clients resize their
@@ -418,16 +426,22 @@ mod inner {
             let qtx = quality_tx.clone();
             let stx = settings_tx.clone();
             let caps_ws_tx = ws_out_tx.clone();
+            let wake = Arc::clone(&input_wake);
             ctrl_dc.on_message(Box::new(move |msg| {
                 let inj = inj.clone();
                 let qtx = qtx.clone();
                 let stx = stx.clone();
                 let caps_tx = caps_ws_tx.clone();
+                let wake = Arc::clone(&wake);
                 Box::pin(async move {
                     let text = match std::str::from_utf8(&msg.data) {
                         Ok(t) => t,
                         Err(_) => return,
                     };
+                    // Wake the capture loop ahead of dispatch — every ctrl
+                    // message means user activity, so even a Settings/Quality
+                    // event should snap the loop back to active cadence.
+                    wake.notify_one();
                     dispatch_input(
                         text,
                         &inj,
@@ -660,6 +674,7 @@ mod inner {
             cap_shutdown_rx,
             scale_factor,
             cap_ended_tx,
+            Arc::clone(&input_wake),
         );
 
         // ── Main WS event loop ────────────────────────────────────────────────
@@ -677,6 +692,7 @@ mod inner {
             scale_factor,
             &ws_out_tx,
             &mut cap_ended_rx,
+            &input_wake,
         )
         .await;
 
@@ -880,6 +896,7 @@ mod inner {
                                 settings_tx,
                                 scale_factor,
                                 ws_out_tx,
+                                None,
                             ).await;
                         }
                         Some(Ok(Message::Close(_))) | None => break,
@@ -1060,6 +1077,7 @@ mod inner {
         scale_factor: f32,
         ws_out_tx: &mpsc::Sender<String>,
         cap_ended_rx: &mut mpsc::Receiver<String>,
+        input_wake: &desktop::capture::InputWake,
     ) {
         loop {
             tokio::select! {
@@ -1105,6 +1123,7 @@ mod inner {
                                 settings_tx,
                                 scale_factor,
                                 ws_out_tx,
+                                Some(input_wake),
                             )
                             .await;
                         }
@@ -1132,6 +1151,7 @@ mod inner {
         settings_tx: &watch::Sender<bool>,
         scale_factor: f32,
         ws_out_tx: &mpsc::Sender<String>,
+        input_wake: Option<&desktop::capture::InputWake>,
     ) {
         // ICE / Settings — handled inline. Settings on the WS text channel
         // covers the case where the client wants to push a preference change
@@ -1152,7 +1172,11 @@ mod inner {
 
         // Ctrl / input event (fallback mode — DC never opened)?
         // dispatch_input parses internally; only call it when the text is not
-        // a signaling message (handled above).
+        // a signaling message (handled above). Wake the capture loop on any
+        // ctrl traffic so idle backoff snaps to active cadence.
+        if let Some(wake) = input_wake {
+            wake.notify_one();
+        }
         dispatch_input(
             text,
             injector,

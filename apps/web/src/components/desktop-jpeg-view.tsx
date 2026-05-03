@@ -66,6 +66,9 @@ export default function DesktopJpegView({
   const workerRef = useRef<Worker | null>(null)
   const ctx2dRef = useRef<CanvasRenderingContext2D | null>(null)
   const workerInitialized = useRef(false)
+  // Live tile size for the main-thread fallback path. Worker has its own
+  // copy via `init` / `tileSize` messages.
+  const tileSizeRef = useRef<number>(64)
 
   // Tile callback — forwarded to worker or drawn on main thread.
   const onTile = useCallback((buf: ArrayBuffer) => {
@@ -83,16 +86,17 @@ export default function DesktopJpegView({
     } else {
       const jpeg = new Uint8Array(buf, 5)
       const blob = new Blob([jpeg], { type: 'image/jpeg' })
+      const ts = tileSizeRef.current
       createImageBitmap(blob)
         .then((bmp) => {
-          ctx2dRef.current?.drawImage(bmp, tileX * 128, tileY * 128)
+          ctx2dRef.current?.drawImage(bmp, tileX * ts, tileY * ts)
           bmp.close()
         })
         .catch(() => {})
     }
   }, [])
 
-  const { status, sendInput, setQuality, setSettings, disconnect, attempt, screenDims } =
+  const { status, sendInput, setQuality, setSettings, disconnect, attempt, screenDims, tileSize } =
     useDesktopSession(hostId, deviceId, onTile, quality, hidpi)
 
   // Push session state to the parent whenever it changes.
@@ -142,13 +146,28 @@ export default function DesktopJpegView({
       )
       workerRef.current = worker
       const offscreen = canvasRef.current.transferControlToOffscreen()
-      worker.postMessage({ type: 'init', canvas: offscreen, tileSize: 128 }, [offscreen])
+      // Default to 64 — agent's current TILE_SIZE. Server re-emits the
+      // authoritative value in every `capabilities` message and we forward
+      // it on the dedicated effect below, but seeding the right value keeps
+      // the very first tile painted at the right grid offset.
+      worker.postMessage({ type: 'init', canvas: offscreen, tileSize: 64 }, [offscreen])
     } else {
       ctx2dRef.current = canvasRef.current.getContext('2d')
     }
     // See desktop-page.tsx history for why no cleanup: worker owns a
     // transferred canvas and StrictMode double-invoke would kill it.
   }, [monitorDefault])
+
+  // Forward authoritative tile size to the worker on every capabilities
+  // change (including the JPEG↔H.264 mode flip if the server ever does that
+  // mid-session). Cheap enough to send unconditionally.
+  useEffect(() => {
+    if (typeof tileSize !== 'number') return
+    tileSizeRef.current = tileSize
+    if (supportsOffscreen && workerRef.current) {
+      workerRef.current.postMessage({ type: 'tileSize', tileSize })
+    }
+  }, [tileSize])
 
   // Resize canvas on encoder output changes (server re-emits capabilities
   // on tier changes so the tileX*128/tileY*128 grid stays aligned).
