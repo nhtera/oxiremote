@@ -1,3 +1,5 @@
+import TransportPill from './transport-pill'
+
 // Slim top toolbar shown only on small viewports (`lg:hidden`). Pairs with
 // the bottom DesktopToolbar so a phone user has the full set of controls
 // without leaving the session — back/exit, reload, screenshot, fullscreen.
@@ -41,6 +43,7 @@ export default function DesktopTopStrip({
       >
         {zoomLabel}
       </span>
+      <TransportPill compact />
       <div className="flex-1" />
       <IconButton onClick={onReload} aria-label="Reload session" title="Reload">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.75" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">

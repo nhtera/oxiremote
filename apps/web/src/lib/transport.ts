@@ -13,12 +13,41 @@
  */
 
 const CACHE_KEY = 'oxi_api_base'
+const CACHE_RTT_KEY = 'oxi_api_base_rtt'
 const LAN_STORAGE_KEY = 'oxi_lan_base'
 const PROBE_TIMEOUT_MS = 200
 const LAN_WIN_MARGIN_MS = 50
 const PROBE_PATH = '/api/host'
 
 let inflight: Promise<string> | null = null
+
+export type TransportKind = 'lan' | 'tunnel' | 'unknown'
+
+export interface TransportInfo {
+  base: string
+  transport: TransportKind
+  latencyMs: number | null
+}
+
+function readCachedRtt(): number | null {
+  try {
+    const raw = sessionStorage.getItem(CACHE_RTT_KEY)
+    if (!raw) return null
+    const n = parseFloat(raw)
+    return Number.isFinite(n) ? Math.round(n) : null
+  } catch {
+    return null
+  }
+}
+
+function persistRtt(ms: number | null) {
+  try {
+    if (ms == null) sessionStorage.removeItem(CACHE_RTT_KEY)
+    else sessionStorage.setItem(CACHE_RTT_KEY, String(Math.round(ms)))
+  } catch {
+    /* ignore */
+  }
+}
 
 function readLanBase(): string | null {
   try {
@@ -69,15 +98,15 @@ async function probe(base: string, timeoutMs: number): Promise<number | null> {
   }
 }
 
-async function race(tunnel: string, lan: string): Promise<string> {
+async function race(tunnel: string, lan: string): Promise<{ winner: string; rtt: number | null }> {
   const [lanRtt, tunnelRtt] = await Promise.all([
     probe(lan, PROBE_TIMEOUT_MS),
     probe(tunnel, PROBE_TIMEOUT_MS),
   ])
   if (lanRtt !== null && (tunnelRtt === null || lanRtt + LAN_WIN_MARGIN_MS <= tunnelRtt)) {
-    return lan
+    return { winner: lan, rtt: lanRtt }
   }
-  return tunnel
+  return { winner: tunnel, rtt: tunnelRtt }
 }
 
 export async function getApiBase(): Promise<string> {
@@ -88,12 +117,15 @@ export async function getApiBase(): Promise<string> {
   const lan = readLanBase()
   if (!lan || lan === tunnel) {
     persist(tunnel)
+    // Tunnel-only mode: skip the probe; latency is unknown until something
+    // actually fires. Leave cache empty so the pill renders without a number.
     return tunnel
   }
 
   if (!inflight) {
-    inflight = race(tunnel, lan).then((winner) => {
+    inflight = race(tunnel, lan).then(({ winner, rtt }) => {
       persist(winner)
+      persistRtt(rtt)
       inflight = null
       return winner
     })
@@ -104,9 +136,31 @@ export async function getApiBase(): Promise<string> {
 export function resetApiBase() {
   try {
     sessionStorage.removeItem(CACHE_KEY)
+    sessionStorage.removeItem(CACHE_RTT_KEY)
   } catch {
     /* ignore */
   }
+}
+
+/** Synchronous read of the cached transport info — returns 'unknown' until
+ *  the race resolves (callers can `await ensureTransport()` to force it). */
+export function readTransportInfo(): TransportInfo {
+  const tunnel = (typeof window !== 'undefined' ? window.location.origin : '') || ''
+  const base = cached()
+  if (!base) {
+    return { base: tunnel, transport: 'unknown', latencyMs: null }
+  }
+  return {
+    base,
+    transport: base === tunnel ? 'tunnel' : 'lan',
+    latencyMs: readCachedRtt(),
+  }
+}
+
+/** Force resolve transport (kicks the race if still pending). */
+export async function ensureTransport(): Promise<TransportInfo> {
+  await getApiBase()
+  return readTransportInfo()
 }
 
 /** Convenience: relative path + credentialed fetch against current base. */

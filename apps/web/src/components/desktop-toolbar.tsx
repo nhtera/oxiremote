@@ -7,6 +7,7 @@ import { useEffect, useRef, useState } from 'react'
 import type { QualityTier, DesktopInputEvent } from '../hooks/use-desktop-session'
 import type { InputMode, GestureMode } from '../hooks/use-desktop-input'
 import DesktopSettingsPopover from './desktop-settings-popover'
+import TransportPill from './transport-pill'
 import { SettingsIcon } from './icons'
 
 interface Props {
@@ -223,7 +224,24 @@ export default function DesktopToolbar({
           ?
         </button>
 
-        <div className="relative shrink-0" ref={settingsContainerRef}>
+        <div className="relative shrink-0 flex items-center gap-1.5" ref={settingsContainerRef}>
+          <button
+            type="button"
+            onClick={() => setSettingsOpen((v) => !v)}
+            aria-label={`Active video pipeline: ${pipeline === 'h264' ? 'H.264' : 'JPEG'}. Click to open display settings.`}
+            title={
+              pipeline === 'h264'
+                ? 'H.264 — WebRTC video track'
+                : 'JPEG — tile frames over DataChannel'
+            }
+            className={`text-[10px] font-semibold px-1.5 py-0.5 rounded transition-colors ${
+              pipeline === 'h264'
+                ? 'bg-accent/15 text-accent border border-accent/30 hover:bg-accent/25'
+                : 'bg-surface-alt text-text-muted border border-border hover:text-text-primary'
+            }`}
+          >
+            {pipeline === 'h264' ? 'H.264' : 'JPEG'}
+          </button>
           <button
             onClick={() => setSettingsOpen((v) => !v)}
             title="Display settings (quality, pipeline)"
@@ -262,6 +280,11 @@ export default function DesktopToolbar({
             {key.label}
           </button>
         ))}
+      </div>
+
+      {/* Transport indicator — lg only; mobile sees this via DesktopTopStrip. */}
+      <div className="hidden lg:flex items-center justify-end pt-1">
+        <TransportPill compact />
       </div>
 
       {/* On-screen keyboard launcher — full key sheet (modifiers + arrows + Fn). */}
