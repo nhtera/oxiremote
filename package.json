@@ -4,8 +4,10 @@
   "workspaces": ["apps/*"],
   "scripts": {
     "dev": "bun run --parallel dev:agent dev:web",
+    "dev:h264": "bun run --parallel dev:agent:h264 dev:web",
     "dev:web": "bun --cwd apps/web dev",
     "dev:agent": "cargo run --manifest-path agent/Cargo.toml",
+    "dev:agent:h264": "OXI_VIDEO_PIPELINE=h264 cargo run --manifest-path agent/Cargo.toml --features h264",
     "build": "bun run build:web && cargo build --manifest-path agent/Cargo.toml",
     "build:release": "bun run build:web && cargo build --release --manifest-path agent/Cargo.toml",
     "build:web": "bun --cwd apps/web build",
