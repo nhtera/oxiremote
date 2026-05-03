@@ -337,6 +337,16 @@ export function useDesktopInput({
       e.preventDefault()
     }
 
+    // Detect whether the device has a real fine-grained pointer (mouse,
+    // trackpad). Touch-only mobile reports `any-pointer: coarse` but not
+    // `fine`. Without this gate, iOS synthesises mouse events from finger
+    // taps and the trackpad-mode mouse handlers below double-fire on top of
+    // useCanvasGestures' tap, sending a click at the finger position that
+    // competes with the click at the virtual cursor.
+    const hasFinePointer =
+      typeof window !== 'undefined' &&
+      window.matchMedia?.('(any-pointer: fine)')?.matches === true
+
     if (mode === 'touch') {
       // Touch handlers only run for the rect-marquee gesture mode now —
       // useCanvasGestures owns default touch input (pinch-zoom, 1-finger
@@ -348,7 +358,7 @@ export function useDesktopInput({
         el.addEventListener('touchend', onTouchEnd, { passive: false })
         el.addEventListener('touchcancel', onTouchEnd, { passive: false })
       }
-    } else {
+    } else if (hasFinePointer) {
       el.addEventListener('mousemove', onMouseMove)
       el.addEventListener('mousedown', onMouseDown)
       el.addEventListener('mouseup', onMouseUp)
@@ -365,7 +375,7 @@ export function useDesktopInput({
           el.removeEventListener('touchend', onTouchEnd)
           el.removeEventListener('touchcancel', onTouchEnd)
         }
-      } else {
+      } else if (hasFinePointer) {
         el.removeEventListener('mousemove', onMouseMove)
         el.removeEventListener('mousedown', onMouseDown)
         el.removeEventListener('mouseup', onMouseUp)
