@@ -2,6 +2,16 @@ import { useEffect, useRef, useState } from 'react'
 import { useHostStore } from '../state/host-store'
 import { useWorkspaceStore } from '../state/workspace-store'
 import FileAttachSheet from './file-attach-sheet'
+import { PaperclipIcon } from './icons'
+
+// POSIX-style shell quoting. If the path has nothing dangerous, returns it
+// bare; otherwise wraps in single quotes and escapes embedded single quotes
+// via the standard `'\''` terminate-escape-restart trick. Backslashes (Windows
+// paths) are preserved verbatim by single-quote rules.
+function shellQuote(path: string): string {
+  if (!/[\s'"\\$`(){}[\]<>|&;*?#~!]/.test(path)) return path
+  return `'${path.replace(/'/g, `'\\''`)}'`
+}
 
 type Props = {
   onSend: (bytes: string) => void
@@ -46,7 +56,7 @@ export default function TerminalSendComposer({ onSend }: Props) {
   }
 
   function insertPath(path: string) {
-    const quoted = `"${path}"`
+    const quoted = shellQuote(path)
     const el = inputRef.current
     if (!el) {
       setText((t) => (t ? `${t} ${quoted}` : quoted))
@@ -76,9 +86,9 @@ export default function TerminalSendComposer({ onSend }: Props) {
           disabled={wsId == null}
           title={wsId == null ? 'Open a workspace to attach files' : 'Attach file'}
           aria-label="Attach file"
-          className="btn-secondary text-base px-2 py-1.5 disabled:opacity-40"
+          className="btn-secondary text-text-secondary px-2 py-1.5 disabled:opacity-40"
         >
-          📎
+          <PaperclipIcon size={18} />
         </button>
         <input
           ref={inputRef}
