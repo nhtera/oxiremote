@@ -30,11 +30,24 @@ export type LookupResult = {
   localIp: string | null
 }
 
+/** True when the SPA is being served by Vite's dev server on localhost. The
+ *  Vite proxy already routes `/api/*` to the local agent at 127.0.0.1:8787,
+ *  so cross-origin discovery is never the right path in dev — even when
+ *  `VITE_DISCOVERY_URL` is set in `.env` for production builds. Without this
+ *  gate `bun dev` would hit the production discovery worker and fail to pair
+ *  against the local agent. */
+function isLocalDevHost(): boolean {
+  if (typeof window === 'undefined') return false
+  const h = window.location.hostname
+  return h === 'localhost' || h === '127.0.0.1' || h === '0.0.0.0' || h === '::1'
+}
+
 /** Discovery worker base URL injected at SPA build time. Empty / unset means
  *  embedded mode — callers must check `isDiscoveryMode()` before calling
- *  `lookupSession`.
+ *  `lookupSession`. Always empty when served from localhost (dev mode).
  */
 export function discoveryBaseUrl(): string {
+  if (isLocalDevHost()) return ''
   const raw = (import.meta.env.VITE_DISCOVERY_URL ?? '').toString().trim()
   return raw.replace(/\/$/, '')
 }
