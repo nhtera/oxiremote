@@ -205,9 +205,9 @@ function CanvasWithInput({
     gestureMode,
     rectOverlay: overlayForwarder,
   })
-  // New Pointer-Events gesture stack — owns 1-finger pan, pinch-zoom, and
-  // the trackpad-mode virtual cursor. Disabled in rect-marquee mode so the
-  // legacy useDesktopInput's touch handler can run instead.
+  // Pointer-Events gesture stack owns 1-finger pan, pinch-zoom, and the
+  // trackpad-mode virtual cursor. The sprite renders only in trackpad mode;
+  // touch mode taps directly without a cursor.
   const { cursor } = useCanvasGestures({
     target: canvasRef,
     layer: layerRef,

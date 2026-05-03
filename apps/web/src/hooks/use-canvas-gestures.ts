@@ -24,9 +24,14 @@
 //     - 2-finger drag = scroll wheel
 //     - 2-finger pinch = zoom canvas (same as touch mode)
 //
-// Coords sent to the agent are normalized 0..1 against the canvas's displayed
-// rect — the wrapper's CSS transform is irrelevant because
-// `getBoundingClientRect()` already returns the post-transform rect.
+// Coords sent to the agent are normalized 0..1 against the canvas's PAINTED
+// rect (the object-contain letterboxed area inside the canvas box) — not the
+// box itself. The DOM `<canvas>` element fills its parent (`w-full h-full`),
+// but `object-contain` paints the actual frame letterboxed inside that box.
+// Mapping against the box would route taps in the black bars to the middle
+// of the remote screen, and taps near the visible top of the image to ~27%
+// down on the remote — the original cursor-position bug. We centre the
+// virtual cursor on the painted rect for the same reason.
 
 import { useCallback, useEffect, useRef, useState, type RefObject } from 'react'
 import type { DesktopInputEvent } from './use-desktop-session'
@@ -51,12 +56,12 @@ interface Args {
   disabled?: boolean
 }
 
+/** Trackpad-mode virtual cursor position, in viewport-local pixels. The
+ *  consumer renders a sprite at (x, y) when `visible` is true; a tap without
+ *  drag fires a click at this position rather than at the finger. */
 interface CursorState {
-  /** Position in viewport-local pixels. */
   x: number
   y: number
-  /** When true, the overlay component renders the arrow. Hidden in touch
-   *  mode and on first mount. */
   visible: boolean
 }
 
@@ -65,12 +70,41 @@ const PAN_THRESHOLD_PX = 8
 const TAP_MAX_MS = 300
 const MIN_SCALE = 1
 const MAX_SCALE = 4
+// Trackpad-mode sensitivity multiplier. CRD/MS-RD ship 1.0× by default and
+// the most common user complaint is "cursor feels too slow" (e.g. RustDesk
+// discussion #12090). 1.5× lets a single finger swipe traverse most of the
+// remote screen without the user feeling the cursor is dragging behind.
+const TRACKPAD_SENSITIVITY = 1.5
+
+/** Compute the canvas's painted rect (object-contain letterboxed area) inside
+ *  its bounding box. Reads `width`/`height` attributes for intrinsic dims —
+ *  both JPEG and H.264 views resize the canvas attribute to the stream dims
+ *  so this is reliable. Falls back to the bounding rect when intrinsics are
+ *  unknown (first frame race). */
+function paintedRect(el: HTMLElement) {
+  const r = el.getBoundingClientRect()
+  const iw = (el as HTMLCanvasElement).width ?? 0
+  const ih = (el as HTMLCanvasElement).height ?? 0
+  if (iw <= 0 || ih <= 0 || r.width <= 0 || r.height <= 0) {
+    return { left: r.left, top: r.top, width: r.width, height: r.height }
+  }
+  const boxAspect = r.width / r.height
+  const intAspect = iw / ih
+  if (intAspect > boxAspect) {
+    // Intrinsic wider → fit width, letterbox top/bottom.
+    const height = r.width / intAspect
+    return { left: r.left, top: r.top + (r.height - height) / 2, width: r.width, height }
+  }
+  // Intrinsic taller → fit height, pillarbox left/right.
+  const width = r.height * intAspect
+  return { left: r.left + (r.width - width) / 2, top: r.top, width, height: r.height }
+}
 
 /** Normalize a viewport pixel coord to the canvas's 0..1 remote-screen space.
- *  Uses the canvas's post-transform rect so the math is unaffected by the
- *  wrapper's matrix transform. */
+ *  Uses the painted rect so taps in the letterbox bars map to the nearest
+ *  edge of the remote screen instead of being scattered across the middle. */
 function clientToRemote(canvas: HTMLElement, clientX: number, clientY: number) {
-  const r = canvas.getBoundingClientRect()
+  const r = paintedRect(canvas)
   if (r.width <= 0 || r.height <= 0) return { x: 0, y: 0 }
   return {
     x: Math.max(0, Math.min(1, (clientX - r.left) / r.width)),
@@ -96,7 +130,9 @@ export function useCanvasGestures({
   onZoomChange,
   disabled = false,
 }: Args) {
-  // Virtual cursor only re-renders when its (x, y, visible) snapshot changes.
+  // Trackpad-mode virtual cursor. Mirrored into a ref so the rAF-driven
+  // pointermove path can read the latest value without a closure rebuild,
+  // while React re-renders the sprite on (x, y, visible) changes.
   const [cursor, setCursor] = useState<CursorState>({ x: 0, y: 0, visible: false })
   const cursorRef = useRef(cursor)
   useEffect(() => {
@@ -132,14 +168,31 @@ export function useCanvasGestures({
   const modeRef = useRef(mode)
   useEffect(() => {
     modeRef.current = mode
-    // Hide the cursor when leaving trackpad mode; show on entry so the user
-    // sees where their cursor is even before the first finger touches.
-    if (mode === 'trackpad') {
-      setCursor((c) => ({ ...c, visible: true }))
-    } else {
+    if (mode !== 'trackpad') {
       setCursor((c) => ({ ...c, visible: false }))
+      return
     }
-  }, [mode])
+    // Park the cursor over the painted-image centre on every entry. The
+    // canvas is `object-contain`-letterboxed inside the viewport; landing
+    // in the bars would feel broken. Defer one rAF so layout has settled
+    // (refs can return 0×0 on synchronous read after a route remount).
+    const raf = requestAnimationFrame(() => {
+      const c = target.current
+      const v = viewport.current
+      if (!c || !v) {
+        setCursor((cur) => ({ ...cur, visible: true }))
+        return
+      }
+      const pr = paintedRect(c)
+      const vr = v.getBoundingClientRect()
+      setCursor({
+        x: pr.left - vr.left + pr.width / 2,
+        y: pr.top - vr.top + pr.height / 2,
+        visible: true,
+      })
+    })
+    return () => cancelAnimationFrame(raf)
+  }, [mode, target, viewport])
 
   const sendInputRef = useRef(sendInput)
   useEffect(() => {
@@ -263,15 +316,13 @@ export function useCanvasGestures({
           sendMouse('down', 'left', startClientX, startClientY)
         }, LONG_PRESS_MS)
       } else {
-        // Trackpad mode: 1-finger drag controls the virtual cursor. Show the
-        // cursor at its current position immediately on touch-down — gives
-        // the user feedback that the finger landed.
+        // Trackpad mode: 1-finger drag drives the virtual cursor (which in
+        // turn drives the streamed remote cursor via mouse-move).
         trackpadDraggingRef.current = true
-        // Arm long-press for trackpad-mode right-click.
         clearLongPress()
         longPressRef.current = setTimeout(() => {
+          // Long-press right-click at the cursor's current pos.
           const c = cursorRef.current
-          // Right-click at the cursor's current pos.
           const v = viewport.current
           if (!v) return
           const r = v.getBoundingClientRect()
@@ -279,7 +330,6 @@ export function useCanvasGestures({
           sendMouse('up', 'right', r.left + c.x, r.top + c.y)
           navigator.vibrate?.(15)
         }, LONG_PRESS_MS)
-        setCursor((c) => ({ ...c, visible: true }))
       }
     }
 
@@ -359,16 +409,24 @@ export function useCanvasGestures({
         }
       } else {
         // Trackpad mode: 1-finger drag moves the virtual cursor by finger
-        // delta. We clamp to the viewport so it can't escape the visible
-        // area. The remote also gets a hover-mouse-move so its cursor
-        // tracks visibly.
+        // delta with a sensitivity multiplier so fast finger movements
+        // traverse the screen without the cursor visibly trailing the
+        // finger. Clamped to the PAINTED image bounds (not the viewport)
+        // so the cursor can't drift into the letterbox bars and send
+        // edge-clamped coords to the remote.
         if (!trackpadDraggingRef.current) return
         const v = viewport.current
-        if (!v) return
+        const c = target.current
+        if (!v || !c) return
         const vrect = v.getBoundingClientRect()
+        const pr = paintedRect(c)
+        const minX = pr.left - vrect.left
+        const minY = pr.top - vrect.top
+        const maxX = minX + pr.width
+        const maxY = minY + pr.height
         const cur = cursorRef.current
-        const nx = Math.max(0, Math.min(vrect.width, cur.x + dx))
-        const ny = Math.max(0, Math.min(vrect.height, cur.y + dy))
+        const nx = Math.max(minX, Math.min(maxX, cur.x + dx * TRACKPAD_SENSITIVITY))
+        const ny = Math.max(minY, Math.min(maxY, cur.y + dy * TRACKPAD_SENSITIVITY))
         setCursor({ x: nx, y: ny, visible: true })
         sendMove(vrect.left + nx, vrect.top + ny)
       }
@@ -452,23 +510,11 @@ export function useCanvasGestures({
     }
   }, [layer, viewport, target, applyTransform, sendMouse, sendMove, disabled])
 
-  // Re-center the virtual cursor whenever the viewport changes size — keeps
-  // it visible even after a rotation or pane resize.
-  useEffect(() => {
-    const v = viewport.current
-    if (!v || mode !== 'trackpad') return
-    const ro = new ResizeObserver(() => {
-      const r = v.getBoundingClientRect()
-      setCursor((c) => {
-        if (c.x === 0 && c.y === 0) {
-          return { x: r.width / 2, y: r.height / 2, visible: true }
-        }
-        return c
-      })
-    })
-    ro.observe(v)
-    return () => ro.disconnect()
-  }, [viewport, mode])
+  // (No ResizeObserver auto-recenter — the mode-change effect above handles
+  // initial positioning at canvas centre, and once the user drags the cursor
+  // to a new spot we leave it alone. Auto-recentering on every resize would
+  // erase finger-driven movements after the on-screen keyboard appears /
+  // hides.)
 
   /** Reset the matrix transform — exposed so the toolbar can offer a
    *  "Reset zoom" button. Not wired by default. */
