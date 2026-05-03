@@ -115,9 +115,37 @@ impl CaptureLoop {
         tx: Sender<FrameOutput>,
         scale_factor: f32,
         hidpi_mode: bool,
-        mut force_iframe_rx: Option<oneshot::Receiver<()>>,
+        force_iframe_rx: Option<oneshot::Receiver<()>>,
         input_wake: Option<InputWake>,
     ) {
+        // ── macOS SCK fast path ─────────────────────────────────────────────
+        // SCK delivers BGRA pre-sized at the encoder's tier dims via GPU
+        // IOSurface (~3-5 ms vs xcap's ~28 ms). Skip the entire
+        // `quality_resize` stage when SCK is available; xcap stays as
+        // fallback for older macOS / permission denied / non-macOS.
+        #[cfg(target_os = "macos")]
+        if let Some((logical_w, logical_h)) = primary_dims() {
+            let (target_w, target_h) =
+                crate::encode::resize_dims(logical_w, logical_h, tier, scale_factor, hidpi_mode);
+            let target_fps = max_tier_fps_hz();
+            match crate::sck::SckCapture::new(target_w, target_h, target_fps) {
+                Ok(sck) => {
+                    info!(
+                        tier = ?tier,
+                        target_w, target_h, target_fps, hidpi_mode,
+                        "CaptureLoop started (ScreenCaptureKit, JPEG)"
+                    );
+                    return run_jpeg_sck(sck, tier, tx, force_iframe_rx, input_wake);
+                }
+                Err(err) => warn!(
+                    error = %err,
+                    "ScreenCaptureKit init failed for JPEG path, falling back to xcap"
+                ),
+            }
+        }
+
+        // ── xcap fallback ────────────────────────────────────────────────────
+        let mut force_iframe_rx = force_iframe_rx;
         let capture = match ScreenCapture::primary() {
             Ok(c) => c,
             Err(err) => {
@@ -129,7 +157,7 @@ impl CaptureLoop {
         info!(
             tier = ?tier,
             scale_factor,
-            "CaptureLoop started"
+            "CaptureLoop started (xcap, JPEG)"
         );
 
         let active_interval = frame_interval(tier);
@@ -488,8 +516,107 @@ fn run_bgra_sck(
     );
 }
 
-/// Look up the primary monitor's physical pixel dimensions. Used to decide
-/// SCK output dims — see `run_bgra`.
+/// JPEG-on-SCK driver. SCK delivers BGRA pre-sized at the encoder's tier
+/// dims via GPU IOSurface; we hand the bytes straight to `process_frame_bgra`
+/// (no `quality_resize`, no RGBA→BGRA convert).
+///
+/// The input-wake `Arc<Notify>` from the WS layer isn't consumed here —
+/// SCK pushes frames at its configured cadence, so there is no sleep for
+/// us to interrupt. The tier gate + idle backoff naturally re-engage on
+/// the next frame after input reaches the encoder.
+#[cfg(target_os = "macos")]
+fn run_jpeg_sck(
+    mut sck: crate::sck::SckCapture,
+    tier: QualityTier,
+    tx: Sender<FrameOutput>,
+    mut force_iframe_rx: Option<oneshot::Receiver<()>>,
+    _input_wake: Option<InputWake>,
+) {
+    use crate::encode::{TileDiff, TileEncoder, IDLE_INTERVAL_MAX_MS};
+
+    let active_interval = frame_interval(tier);
+    let idle_max = Duration::from_millis(IDLE_INTERVAL_MAX_MS);
+    let mut interval = active_interval;
+    let mut idle_streak: u32 = 0;
+    let mut diff = TileDiff::new();
+    let mut last_emit = Instant::now() - Duration::from_secs(1);
+    let mut frame_count: u64 = 0;
+    let mut dropped_count: u64 = 0;
+
+    loop {
+        // Force-IDR poll mirrors the xcap path so a new viewer joining
+        // mid-session always sees a complete frame.
+        if let Some(mut rx) = force_iframe_rx.take() {
+            match rx.try_recv() {
+                Ok(()) => {
+                    diff.reset();
+                    info!("run_jpeg_sck: force-iframe received, next frame is full");
+                }
+                Err(oneshot::error::TryRecvError::Empty) => force_iframe_rx = Some(rx),
+                Err(oneshot::error::TryRecvError::Closed) => {}
+            }
+        }
+
+        let frame = match sck.next_frame_blocking() {
+            Some(f) => f,
+            None => {
+                info!("run_jpeg_sck: SCK stream ended");
+                break;
+            }
+        };
+
+        // Tier gate: SCK runs at its max configured cadence; drop frames
+        // arriving sooner than the tier interval. Idle backoff ramps
+        // `interval` up to 400 ms when the screen is static.
+        let now = Instant::now();
+        if now.duration_since(last_emit) < interval {
+            continue;
+        }
+        last_emit = now;
+
+        let output = TileEncoder::process_frame_bgra(
+            &frame.bytes,
+            frame.width,
+            frame.height,
+            tier,
+            &mut diff,
+        );
+        let was_idle = output.tiles.is_empty();
+        if !was_idle {
+            match tx.try_send(output) {
+                Ok(()) => frame_count += 1,
+                Err(TrySendError::Full(_)) => {
+                    dropped_count += 1;
+                    tracing::debug!(dropped = dropped_count, "run_jpeg_sck: backpressure drop");
+                }
+                Err(TrySendError::Closed(_)) => {
+                    info!("run_jpeg_sck: channel closed, stopping");
+                    break;
+                }
+            }
+        }
+
+        if was_idle {
+            idle_streak = idle_streak.saturating_add(1);
+            if idle_streak >= 3 {
+                let next_ms = (interval.as_millis() as u64).saturating_mul(3) / 2;
+                interval = Duration::from_millis(next_ms).min(idle_max);
+            }
+        } else {
+            idle_streak = 0;
+            interval = active_interval;
+        }
+    }
+
+    info!(
+        frames_sent = frame_count,
+        frames_dropped = dropped_count,
+        "run_jpeg_sck stopped"
+    );
+}
+
+/// Look up the primary monitor's logical pixel dimensions. Used to decide
+/// SCK output dims — see `run_bgra` and the JPEG SCK fast path.
 #[cfg(target_os = "macos")]
 fn primary_dims() -> Option<(u32, u32)> {
     let cap = ScreenCapture::primary().ok()?;

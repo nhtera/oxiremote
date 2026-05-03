@@ -84,14 +84,25 @@ pub struct EncodedTile {
     pub jpeg: Bytes,
 }
 
-/// One changed tile: grid coordinates plus packed RGBA bytes ready for JPEG
+/// Pixel byte order for an in-flight tile. xcap delivers RGBA; SCK delivers
+/// BGRA. turbojpeg supports both natively so we just thread the discriminant
+/// to the encoder instead of paying for a software channel swap per tile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TilePixelFormat {
+    Rgba,
+    Bgra,
+}
+
+/// One changed tile: grid coordinates plus packed pixel bytes ready for JPEG
 /// encode (no per-pixel iteration needed by the encoder).
 pub struct ChangedTile {
     pub col: u16,
     pub row: u16,
     pub w: u32,
     pub h: u32,
-    pub rgba: Vec<u8>,
+    /// Packed pixels, 4 bytes/pixel in the format declared by `format`.
+    pub pixels: Vec<u8>,
+    pub format: TilePixelFormat,
 }
 
 /// Output of one capture-encode cycle: changed tiles + timestamp.
@@ -205,6 +216,25 @@ pub fn global_thumbnail_hash(img: &RgbaImage) -> u64 {
     xxh3_64(thumb.as_raw())
 }
 
+/// Format-agnostic thumbnail hash. Treats the input as opaque 4-bytes/pixel
+/// data — the channel order doesn't matter for change detection because
+/// xxh3 is byte-keyed and we never compare hashes across formats inside a
+/// session (TileDiff state resets on backend switch).
+fn global_thumbnail_hash_bytes(bytes: &[u8], w: u32, h: u32) -> u64 {
+    use fast_image_resize::images::Image as FirImage;
+    let src_fir = match FirImage::from_vec_u8(w, h, bytes.to_vec(), PixelType::U8x4) {
+        Ok(i) => i,
+        Err(_) => return xxh3_64(bytes),
+    };
+    let mut dst_fir = FirImage::new(THUMB_W, THUMB_H, PixelType::U8x4);
+    let opts = ResizeOptions::new().resize_alg(ResizeAlg::Convolution(FirFilter::Bilinear));
+    let mut resizer = Resizer::new();
+    if resizer.resize(&src_fir, &mut dst_fir, &opts).is_err() {
+        return xxh3_64(bytes);
+    }
+    xxh3_64(dst_fir.buffer())
+}
+
 /// Tracks per-tile xxhash3 values from the previous frame to detect changes,
 /// plus a global thumbnail hash for the idle-frame short-circuit.
 pub struct TileDiff {
@@ -242,21 +272,32 @@ impl TileDiff {
         self.prev_global = None;
     }
 
-    /// Compare `img` against the previous frame.
-    ///
-    /// Returns the changed tiles as packed RGBA buffers (no per-pixel copy in
-    /// the caller). On the first call (no previous state), all tiles are
-    /// returned as changed. When the global thumbnail matches the prior
-    /// frame's, returns empty immediately without per-tile work.
+    /// Compare an RGBA image against the previous frame. Convenience wrapper
+    /// for callers that already hold an `RgbaImage` (xcap path + tests).
     pub fn diff(&mut self, img: &RgbaImage) -> Vec<ChangedTile> {
-        let img_w = img.width();
-        let img_h = img.height();
+        self.diff_bytes(img.as_raw(), img.width(), img.height(), TilePixelFormat::Rgba)
+    }
+
+    /// Compare a packed pixel buffer against the previous frame.
+    ///
+    /// Format-agnostic — xxh3 hashes raw bytes so RGBA and BGRA both work
+    /// without conversion. The format is stamped on each emitted
+    /// `ChangedTile` so the encoder can pick the right turbojpeg pixel
+    /// format. Used by both the xcap RGBA path and the SCK BGRA path.
+    pub fn diff_bytes(
+        &mut self,
+        bytes: &[u8],
+        img_w: u32,
+        img_h: u32,
+        format: TilePixelFormat,
+    ) -> Vec<ChangedTile> {
+        debug_assert_eq!(bytes.len(), (img_w * img_h * 4) as usize);
 
         // Two-tier hash: cheap thumbnail check first. If the whole frame
         // looks identical at coarse resolution we can skip the per-tile loop
         // entirely. Mismatch → fall through; we update prev_global only after
         // the per-tile pass so a mid-update bail-out doesn't desync state.
-        let global = global_thumbnail_hash(img);
+        let global = global_thumbnail_hash_bytes(bytes, img_w, img_h);
         if let Some(prev) = self.prev_global
             && prev == global
             && !self.prev_hashes.is_empty()
@@ -278,7 +319,6 @@ impl TileDiff {
             self.rows = rows;
         }
 
-        let src_bytes = img.as_raw();
         let src_stride = (img_w * 4) as usize;
         let mut tile_buf: Vec<u8> = Vec::with_capacity((TILE_SIZE * TILE_SIZE * 4) as usize);
         let mut changed: Vec<ChangedTile> = Vec::new();
@@ -299,7 +339,7 @@ impl TileDiff {
                 for ty in 0..th as usize {
                     let y = py as usize + ty;
                     let start = y * src_stride + (px * 4) as usize;
-                    tile_buf.extend_from_slice(&src_bytes[start..start + row_bytes]);
+                    tile_buf.extend_from_slice(&bytes[start..start + row_bytes]);
                 }
 
                 let hash = xxh3_64(&tile_buf);
@@ -315,7 +355,8 @@ impl TileDiff {
                         row: row as u16,
                         w: tw,
                         h: th,
-                        rgba: owned,
+                        pixels: owned,
+                        format,
                     });
                 }
             }
@@ -352,7 +393,15 @@ impl TileEncoder {
         tiles
             .into_par_iter()
             .filter_map(|tile| {
-                let jpeg = encode_tile_jpeg(&tile.rgba, tile.w, tile.h, quality, subsamp).ok()?;
+                let jpeg = encode_tile_jpeg(
+                    &tile.pixels,
+                    tile.w,
+                    tile.h,
+                    quality,
+                    subsamp,
+                    tile.format,
+                )
+                .ok()?;
                 Some(EncodedTile { x: tile.col, y: tile.row, jpeg })
             })
             .collect()
@@ -379,19 +428,39 @@ impl TileEncoder {
 
         FrameOutput { tiles, frame_ts }
     }
+
+    /// SCK fast path: BGRA bytes already pre-sized at tier dims, no software
+    /// resize needed. The encoder picks `TjPixel::BGRA` from the per-tile
+    /// format stamp set by `diff_bytes`.
+    pub fn process_frame_bgra(
+        bytes: &[u8],
+        width: u32,
+        height: u32,
+        tier: QualityTier,
+        diff: &mut TileDiff,
+    ) -> FrameOutput {
+        let frame_ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let changed = diff.diff_bytes(bytes, width, height, TilePixelFormat::Bgra);
+        let tiles = TileEncoder::encode(changed, tier);
+        FrameOutput { tiles, frame_ts }
+    }
 }
 
-/// Encode a packed RGBA buffer as JPEG via libjpeg-turbo.
+/// Encode a packed pixel buffer as JPEG via libjpeg-turbo.
 ///
-/// `pixels` is `width * height * 4` bytes in RGBA order (alpha ignored by the
-/// JPEG colour space). turbojpeg accepts RGBA natively — no manual alpha
-/// strip — and uses NEON / AVX2 SIMD internally.
+/// `pixels` is `width * height * 4` bytes in either RGBA or BGRA order
+/// (alpha ignored by the JPEG colour space). turbojpeg accepts both natively
+/// and uses NEON / AVX2 SIMD internally — no software channel swap.
 fn encode_tile_jpeg(
     pixels: &[u8],
     width: u32,
     height: u32,
     quality: u8,
     subsamp: Subsamp,
+    format: TilePixelFormat,
 ) -> anyhow::Result<Bytes> {
     debug_assert_eq!(pixels.len(), (width * height * 4) as usize);
 
@@ -400,7 +469,10 @@ fn encode_tile_jpeg(
         width: width as usize,
         pitch: (width * 4) as usize,
         height: height as usize,
-        format: TjPixel::RGBA,
+        format: match format {
+            TilePixelFormat::Rgba => TjPixel::RGBA,
+            TilePixelFormat::Bgra => TjPixel::BGRA,
+        },
     };
 
     let mut compressor =
@@ -597,7 +669,14 @@ mod tests {
                     px[0] = (i as u8) * 10;
                     px[3] = 255;
                 }
-                ChangedTile { col: i, row: 0, w: 16, h: 16, rgba }
+                ChangedTile {
+                    col: i,
+                    row: 0,
+                    w: 16,
+                    h: 16,
+                    pixels: rgba,
+                    format: TilePixelFormat::Rgba,
+                }
             })
             .collect();
         let out = TileEncoder::encode(tiles, QualityTier::Low);
@@ -616,8 +695,15 @@ mod tests {
             px[0] = 255; // R
             px[3] = 255; // A
         }
-        let jpeg = encode_tile_jpeg(&rgba, 128, 128, QUALITY_HIGH, Subsamp::None)
-            .expect("encode must succeed");
+        let jpeg = encode_tile_jpeg(
+            &rgba,
+            128,
+            128,
+            QUALITY_HIGH,
+            Subsamp::None,
+            TilePixelFormat::Rgba,
+        )
+        .expect("encode must succeed");
 
         let decoded = image::load_from_memory_with_format(&jpeg, image::ImageFormat::Jpeg)
             .expect("decode must succeed")
@@ -640,6 +726,56 @@ mod tests {
                 mean < 10.0,
                 "channel {ch} mean delta {mean:.2} exceeds threshold of 10"
             );
+        }
+    }
+
+    /// BGRA encode round-trips with the same fidelity as the RGBA path —
+    /// turbojpeg's BGRA pixel format is supported natively, no software swap.
+    #[test]
+    fn bgra_encode_roundtrips_within_threshold() {
+        let mut bgra = vec![0u8; 128 * 128 * 4];
+        for px in bgra.chunks_exact_mut(4) {
+            px[2] = 255; // R (in B-G-R-A order, R is third)
+            px[3] = 255; // A
+        }
+        let jpeg = encode_tile_jpeg(
+            &bgra,
+            128,
+            128,
+            QUALITY_HIGH,
+            Subsamp::None,
+            TilePixelFormat::Bgra,
+        )
+        .expect("encode must succeed");
+
+        let decoded = image::load_from_memory_with_format(&jpeg, image::ImageFormat::Jpeg)
+            .expect("decode must succeed")
+            .to_rgba8();
+
+        // Decoded image's R channel should match the input's R (which lived
+        // in BGRA byte 2). Mean delta < 10 mirrors the RGBA test.
+        let total = (128 * 128) as f64;
+        let mut delta_r = 0u64;
+        for dec in decoded.pixels() {
+            delta_r += (255 - dec[0] as i32).unsigned_abs() as u64;
+        }
+        let mean_r = delta_r as f64 / total;
+        assert!(mean_r < 10.0, "BGRA → JPEG → RGBA R-channel mean delta {mean_r:.2}");
+    }
+
+    /// `diff_bytes` and `diff(&RgbaImage)` produce byte-identical change lists
+    /// for the same input. Locks the format-agnostic refactor.
+    #[test]
+    fn diff_bytes_matches_diff_image() {
+        let img = solid_rgba(256, 256, Rgba([100, 100, 100, 255]));
+        let mut da = TileDiff::new();
+        let mut db = TileDiff::new();
+        let a = da.diff(&img);
+        let b = db.diff_bytes(img.as_raw(), 256, 256, TilePixelFormat::Rgba);
+        assert_eq!(a.len(), b.len());
+        for (ta, tb) in a.iter().zip(b.iter()) {
+            assert_eq!((ta.col, ta.row, ta.w, ta.h), (tb.col, tb.row, tb.w, tb.h));
+            assert_eq!(ta.pixels, tb.pixels);
         }
     }
 
