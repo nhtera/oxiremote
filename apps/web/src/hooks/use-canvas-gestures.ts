@@ -130,14 +130,14 @@ export function useCanvasGestures({
   onZoomChange,
   disabled = false,
 }: Args) {
-  // Trackpad-mode virtual cursor. Mirrored into a ref so the rAF-driven
-  // pointermove path can read the latest value without a closure rebuild,
-  // while React re-renders the sprite on (x, y, visible) changes.
+  // Trackpad-mode virtual cursor. cursorRef holds the *actual* position used
+  // by the gesture math + the remote mouse-move events; the React state may
+  // briefly hold a 1-frame-ahead predicted position for the visible sprite.
+  // Both are written manually in the three sites that change cursor state
+  // (mode-change, pointer-move) so the predicted display can never leak back
+  // into the math via a state→ref sync effect.
   const [cursor, setCursor] = useState<CursorState>({ x: 0, y: 0, visible: false })
-  const cursorRef = useRef(cursor)
-  useEffect(() => {
-    cursorRef.current = cursor
-  }, [cursor])
+  const cursorRef = useRef<CursorState>({ x: 0, y: 0, visible: false })
 
   // Hot-state refs — never trigger re-renders. The matrix is applied imperatively.
   const scaleRef = useRef(1)
@@ -169,6 +169,7 @@ export function useCanvasGestures({
   useEffect(() => {
     modeRef.current = mode
     if (mode !== 'trackpad') {
+      cursorRef.current = { ...cursorRef.current, visible: false }
       setCursor((c) => ({ ...c, visible: false }))
       return
     }
@@ -180,16 +181,19 @@ export function useCanvasGestures({
       const c = target.current
       const v = viewport.current
       if (!c || !v) {
+        cursorRef.current = { ...cursorRef.current, visible: true }
         setCursor((cur) => ({ ...cur, visible: true }))
         return
       }
       const pr = paintedRect(c)
       const vr = v.getBoundingClientRect()
-      setCursor({
+      const next = {
         x: pr.left - vr.left + pr.width / 2,
         y: pr.top - vr.top + pr.height / 2,
         visible: true,
-      })
+      }
+      cursorRef.current = next
+      setCursor(next)
     })
     return () => cancelAnimationFrame(raf)
   }, [mode, target, viewport])
@@ -427,7 +431,20 @@ export function useCanvasGestures({
         const cur = cursorRef.current
         const nx = Math.max(minX, Math.min(maxX, cur.x + dx * TRACKPAD_SENSITIVITY))
         const ny = Math.max(minY, Math.min(maxY, cur.y + dy * TRACKPAD_SENSITIVITY))
-        setCursor({ x: nx, y: ny, visible: true })
+        // Actual position drives the math + the remote mouse-move so the
+        // host sees the truth. Visual sprite optionally leads by 1 predicted
+        // event for a perceptual frame of lead on iOS Safari 17.4+ / Chrome.
+        cursorRef.current = { x: nx, y: ny, visible: true }
+        let displayX = nx
+        let displayY = ny
+        const pred = e.getPredictedEvents?.()?.[0]
+        if (pred) {
+          const pdx = pred.clientX - e.clientX
+          const pdy = pred.clientY - e.clientY
+          displayX = Math.max(minX, Math.min(maxX, nx + pdx * TRACKPAD_SENSITIVITY))
+          displayY = Math.max(minY, Math.min(maxY, ny + pdy * TRACKPAD_SENSITIVITY))
+        }
+        setCursor({ x: displayX, y: displayY, visible: true })
         sendMove(vrect.left + nx, vrect.top + ny)
       }
     }
