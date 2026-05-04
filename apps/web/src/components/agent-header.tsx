@@ -1,5 +1,4 @@
-import { useRef, useState } from 'react'
-import TunnelStatusPill from './tunnel/status-pill'
+import { useEffect, useRef, useState } from 'react'
 import AgentDisconnectButton from './agent-disconnect-button'
 import { useAgentVersion } from '../lib/use-agent-version'
 
@@ -11,17 +10,19 @@ interface QuickAction {
   danger?: boolean
 }
 
+// Only ship actions whose endpoints actually exist. There is no in-app
+// "Reconnect tunnel" — quick-tunnel URLs rotate on restart, so reconnect
+// is a process-level operation handled by re-running the binary.
 const QUICK_ACTIONS: QuickAction[] = [
-  { label: 'Reconnect tunnel', endpoint: '/api/agent/tunnel/reconnect' },
-  { label: 'Stop tunnel', endpoint: '/api/agent/tunnel/disconnect' },
+  { label: 'Stop sharing', endpoint: '/api/agent/tunnel/disconnect', danger: true },
   { label: 'Sign out', href: '/login' },
 ]
 
-// Sticky header for all /agent/* routes. Replaces the inline header previously
-// embedded in AgentLayout. Shows: logo, version chip (from useAgentVersion),
-// tunnel status pill, quick-actions dropdown, and the Stop-agent button.
-//
-// Theme toggle slot is intentionally absent (dark-only for v1).
+// Sticky header for all /agent/* routes — agent-level chrome only:
+// brand mark, version, actions menu, stop button. Tunnel state and live
+// telemetry live in TunnelTelemetryBlock on /agent home (and were
+// previously duplicated here as a "Reachable" pill — three identical
+// status indicators on one screen is sloppy).
 export default function AgentHeader() {
   const version = useAgentVersion()
   const [menuOpen, setMenuOpen] = useState(false)
@@ -35,18 +36,28 @@ export default function AgentHeader() {
     try {
       await fetch(action.endpoint, { method: 'POST' })
     } catch {
-      // Network error on shutdown/reconnect is expected — ignore.
+      // Network error on shutdown/disconnect is expected — ignore.
     } finally {
       setBusyAction(null)
     }
   }
 
-  // Close menu on outside click.
-  function handleMenuBlur(e: React.FocusEvent<HTMLDivElement>) {
-    if (!menuRef.current?.contains(e.relatedTarget as Node | null)) {
-      setMenuOpen(false)
+  // Close menu on outside click or Escape.
+  useEffect(() => {
+    if (!menuOpen) return
+    const onClick = (e: MouseEvent) => {
+      if (!menuRef.current?.contains(e.target as Node)) setMenuOpen(false)
     }
-  }
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') setMenuOpen(false)
+    }
+    document.addEventListener('mousedown', onClick)
+    document.addEventListener('keydown', onKey)
+    return () => {
+      document.removeEventListener('mousedown', onClick)
+      document.removeEventListener('keydown', onKey)
+    }
+  }, [menuOpen])
 
   return (
     <header className="sticky top-0 z-40 flex items-center gap-3 px-4 py-2.5 border-b border-border bg-surface-alt">
@@ -71,7 +82,8 @@ export default function AgentHeader() {
         </svg>
       </span>
 
-      {/* Brand + version chip */}
+      {/* Brand + neutral version chip (deliberately not accent-coloured so it
+          doesn't compete visually with status pills elsewhere on the page) */}
       <div className="min-w-0">
         <div className="text-sm font-semibold text-text-primary tracking-tight leading-tight flex items-center gap-2">
           <span>
@@ -79,7 +91,7 @@ export default function AgentHeader() {
             <span className="text-text-muted font-normal">host</span>
           </span>
           {version && (
-            <span className="text-[10px] font-medium text-accent bg-accent/10 border border-accent/30 rounded px-1.5 py-0.5 leading-none">
+            <span className="font-mono text-[10px] font-medium text-text-muted bg-surface border border-border rounded px-1.5 py-0.5 leading-none">
               v{version.agent}
             </span>
           )}
@@ -91,22 +103,16 @@ export default function AgentHeader() {
 
       <div className="flex-1" />
 
-      {/* Tunnel status */}
-      <TunnelStatusPill />
-
-      {/* Quick-actions dropdown */}
-      <div
-        ref={menuRef}
-        className="relative"
-        onBlur={handleMenuBlur}
-      >
+      {/* Actions dropdown — single utility menu, no duplicate Logs/help nav
+          (sidebar already covers those routes) */}
+      <div ref={menuRef} className="relative">
         <button
           type="button"
           aria-label="Quick actions"
           aria-expanded={menuOpen}
           aria-haspopup="menu"
           onClick={() => setMenuOpen((o) => !o)}
-          className="inline-flex items-center gap-1 rounded-md px-2.5 py-1.5 text-xs font-medium text-text-secondary border border-border hover:bg-surface-hover hover:text-text-primary transition-colors"
+          className="inline-flex items-center gap-1.5 rounded-md px-2.5 py-1.5 text-xs font-medium text-text-secondary border border-border hover:bg-surface-hover hover:text-text-primary transition-colors"
         >
           {busyAction ? (
             <span className="text-text-muted">{busyAction}…</span>
@@ -120,7 +126,7 @@ export default function AgentHeader() {
                 strokeWidth="1.5"
                 strokeLinecap="round"
                 strokeLinejoin="round"
-                className="w-3 h-3"
+                className={`w-3 h-3 transition-transform ${menuOpen ? 'rotate-180' : ''}`}
                 aria-hidden="true"
               >
                 <path d="M4 6l4 4 4-4" />
@@ -132,16 +138,23 @@ export default function AgentHeader() {
         {menuOpen && (
           <div
             role="menu"
-            className="absolute right-0 top-full mt-1 w-44 rounded-lg border border-border bg-surface-alt shadow-lg z-50 overflow-hidden"
+            className="absolute right-0 top-full mt-1 w-52 rounded-lg border border-border bg-surface-alt shadow-[0_10px_30px_-12px_rgba(0,0,0,0.6)] z-50 overflow-hidden"
           >
-            {QUICK_ACTIONS.map((action) =>
-              action.href ? (
+            {QUICK_ACTIONS.map((action, i) => {
+              const prevDanger = QUICK_ACTIONS[i - 1]?.danger
+              const showDivider = action.danger && prevDanger === false
+              const className = `block w-full text-left px-3 py-2 text-sm transition-colors ${
+                action.danger
+                  ? 'text-danger hover:bg-danger/10'
+                  : 'text-text-secondary hover:bg-surface-hover hover:text-text-primary'
+              }`
+              const node = action.href ? (
                 <a
                   key={action.label}
                   href={action.href}
                   role="menuitem"
                   onClick={() => setMenuOpen(false)}
-                  className="block w-full text-left px-3 py-2 text-sm text-text-secondary hover:bg-surface-hover hover:text-text-primary transition-colors"
+                  className={className}
                 >
                   {action.label}
                 </a>
@@ -151,44 +164,26 @@ export default function AgentHeader() {
                   type="button"
                   role="menuitem"
                   onClick={() => void runAction(action)}
-                  className={`block w-full text-left px-3 py-2 text-sm transition-colors ${
-                    action.danger
-                      ? 'text-danger hover:bg-danger/10'
-                      : 'text-text-secondary hover:bg-surface-hover hover:text-text-primary'
-                  }`}
+                  className={className}
                 >
                   {action.label}
                 </button>
-              ),
-            )}
+              )
+              return showDivider ? (
+                <div key={`${action.label}-wrap`}>
+                  <div className="border-t border-border my-1" />
+                  {node}
+                </div>
+              ) : (
+                node
+              )
+            })}
           </div>
         )}
       </div>
 
-      {/* Help link */}
-      <a
-        href="/agent/logs"
-        title="View logs"
-        aria-label="View logs"
-        className="inline-flex items-center justify-center w-7 h-7 rounded-md text-text-muted hover:text-text-primary hover:bg-surface-hover transition-colors"
-      >
-        <svg
-          viewBox="0 0 16 16"
-          fill="none"
-          stroke="currentColor"
-          strokeWidth="1.5"
-          strokeLinecap="round"
-          strokeLinejoin="round"
-          className="w-4 h-4"
-          aria-hidden="true"
-        >
-          <circle cx="8" cy="8" r="6.5" />
-          <path d="M8 7v4" />
-          <circle cx="8" cy="5.5" r="0.5" fill="currentColor" stroke="none" />
-        </svg>
-      </a>
-
-      {/* Stop-agent button — wires the previously-dead AgentDisconnectButton */}
+      {/* Stop-agent — explicit, always-visible destructive action. Outlined
+          (not filled) so it reads "danger available" rather than "press me". */}
       <AgentDisconnectButton />
     </header>
   )
