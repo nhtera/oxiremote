@@ -3,6 +3,7 @@ import { Heading, StatusChip } from '../../components/ui'
 import AutoApproveToggle from '../../components/auto-approve-toggle'
 import ProxyPortsCard from '../../components/proxy-ports-card'
 import { PushStatusRow } from '../../components/push-permission-banner'
+import PermissionsWidget from '../../components/permissions-widget'
 
 interface AutostartStatus {
   enabled: boolean
@@ -10,16 +11,14 @@ interface AutostartStatus {
   mechanism: string | null
 }
 
-// Host-side configuration. Persists where the underlying control persists —
-// auto-approve goes to the agent SQLite; quality/HiDPI defaults are per-device
-// localStorage; proxy ports go to the agent. Each card calls out its scope so
-// the operator isn't surprised by a setting that doesn't follow them across
-// devices.
+// Host-side configuration, refactored from long-scroll into tabbed nav.
+// Tabs: Pairing | Desktop | Notifications | Sites | Tunnel | Autostart | About
 //
 // Endpoints used (all localhost-only via route_scope.rs):
-//   GET  /api/agent/state             — initial settings + tunnel info
+//   GET  /api/agent/state
 //   POST /api/agent/settings/auto-approve
 //   GET/POST /api/agent/proxy/ports
+//   GET/POST /api/agent/autostart
 
 interface AgentState {
   tunnel_url: string | null
@@ -32,6 +31,18 @@ interface AgentState {
 const QUALITY_KEY = 'oxi:desktop:quality'
 const HIDPI_KEY = 'oxi:desktop:hidpi'
 
+type TabId = 'pairing' | 'desktop' | 'notifications' | 'sites' | 'tunnel' | 'autostart' | 'about'
+
+const TABS: { id: TabId; label: string }[] = [
+  { id: 'pairing', label: 'Pairing' },
+  { id: 'desktop', label: 'Desktop' },
+  { id: 'notifications', label: 'Notifications' },
+  { id: 'sites', label: 'Sites' },
+  { id: 'tunnel', label: 'Tunnel' },
+  { id: 'autostart', label: 'Autostart' },
+  { id: 'about', label: 'About' },
+]
+
 export default function AgentSettingsPage() {
   const [state, setState] = useState<AgentState | null>(null)
   const [error, setError] = useState<string | null>(null)
@@ -43,6 +54,7 @@ export default function AgentSettingsPage() {
   )
   const [autostart, setAutostart] = useState<AutostartStatus | null>(null)
   const [autostartBusy, setAutostartBusy] = useState(false)
+  const [activeTab, setActiveTab] = useState<TabId>('pairing')
 
   useEffect(() => {
     let cancelled = false
@@ -111,144 +123,182 @@ export default function AgentSettingsPage() {
         </div>
       )}
 
-      <Section
-        title="Pairing"
-        scope="Host-wide"
-        description="Auto-approve trusts new devices the moment they pair, skipping the approval prompt. Disable it when you want to vet each pairing."
-      >
-        {state && (
-          <AutoApproveToggle
-            enabled={state.auto_approve ?? false}
-            onChange={(next) =>
-              setState((s) => (s ? { ...s, auto_approve: next } : s))
-            }
-          />
-        )}
-      </Section>
-
-      <Section
-        title="Desktop streaming"
-        scope="This browser"
-        description="Defaults applied when you open the remote desktop. Override per-session from the desktop toolbar."
-      >
-        <Row label="Quality">
-          <select
-            value={quality}
-            onChange={(e) => setQualityPersist(e.target.value)}
-            className="bg-surface border border-border rounded-md px-2 py-1 text-[length:var(--text-meta)] text-text-primary"
+      {/* Tab bar */}
+      <div className="flex gap-1 border-b border-border overflow-x-auto">
+        {TABS.map((tab) => (
+          <button
+            key={tab.id}
+            type="button"
+            onClick={() => setActiveTab(tab.id)}
+            className={[
+              'shrink-0 px-3 py-2 text-sm font-medium border-b-2 -mb-px transition-colors',
+              activeTab === tab.id
+                ? 'border-accent text-text-primary'
+                : 'border-transparent text-text-muted hover:text-text-secondary hover:border-border',
+            ].join(' ')}
           >
-            <option value="low">Smooth (low)</option>
-            <option value="med">Balanced (med)</option>
-            <option value="high">Crisp (high)</option>
-          </select>
-        </Row>
-        <Row label="HiDPI">
-          <SwitchButton checked={hidpi} onToggle={() => setHidpiPersist(!hidpi)} />
-        </Row>
-      </Section>
+            {tab.label}
+          </button>
+        ))}
+      </div>
 
-      <Section
-        title="Notifications"
-        scope="This browser"
-        description="Web Push for build / shell pings. Subscription is per-device — each browser opts in separately."
-      >
-        <PushStatusRow />
-      </Section>
+      {/* Tab panels */}
+      {activeTab === 'pairing' && (
+        <Section
+          title="Pairing"
+          scope="Host-wide"
+          description="Auto-approve trusts new devices the moment they pair, skipping the approval prompt. Disable it when you want to vet each pairing."
+        >
+          {state && (
+            <AutoApproveToggle
+              enabled={state.auto_approve ?? false}
+              onChange={(next) =>
+                setState((s) => (s ? { ...s, auto_approve: next } : s))
+              }
+            />
+          )}
+        </Section>
+      )}
 
-      <Section
-        title="Local sites"
-        scope="Host-wide"
-        description="Toggle a discovered port to expose it at <tunnel>/proxy/<port>/. The upstream app handles its own auth."
-      >
-        <ProxyPortsCard tunnelUrl={state?.tunnel_url ?? null} />
-      </Section>
+      {activeTab === 'desktop' && (
+        <>
+          <Section
+            title="Desktop streaming"
+            scope="This browser"
+            description="Defaults applied when you open the remote desktop. Override per-session from the desktop toolbar."
+          >
+            <Row label="Quality">
+              <select
+                value={quality}
+                onChange={(e) => setQualityPersist(e.target.value)}
+                className="bg-surface border border-border rounded-md px-2 py-1 text-[length:var(--text-meta)] text-text-primary"
+              >
+                <option value="low">Smooth (low)</option>
+                <option value="med">Balanced (med)</option>
+                <option value="high">Crisp (high)</option>
+              </select>
+            </Row>
+            <Row label="HiDPI">
+              <SwitchButton checked={hidpi} onToggle={() => setHidpiPersist(!hidpi)} />
+            </Row>
+          </Section>
 
-      <Section
-        title="Workspace"
-        scope="Read-only"
-        description="Files page roots here. Override with OXI_WORKSPACE env var when starting the agent."
-      >
-        <Row label="OXI_WORKSPACE">
-          <code className="font-mono text-[length:var(--text-mono)] text-text-primary truncate">
-            (set on agent startup)
-          </code>
-        </Row>
-      </Section>
+          {/* PermissionsWidget wired here — previously dead code */}
+          <Section
+            title="macOS Permissions"
+            scope="Host-wide"
+            description="Screen Recording and Accessibility permissions required for remote desktop on macOS. Grant them in System Settings."
+          >
+            <PermissionsWidget />
+          </Section>
+        </>
+      )}
 
-      <Section
-        title="Tunnel"
-        scope="Host-wide"
-        description="Quick tunnel rotates on agent restart. Configure a Named Tunnel for a stable URL."
-      >
-        <Row label="Mode">
-          <StatusChip variant="info" noDot>
-            Quick
-          </StatusChip>
-        </Row>
-        <Row label="URL">
-          {state?.tunnel_url ? (
-            <code className="font-mono text-[length:var(--text-mono)] text-text-primary truncate max-w-[60%]">
-              {state.tunnel_url}
+      {activeTab === 'notifications' && (
+        <Section
+          title="Notifications"
+          scope="This browser"
+          description="Web Push for build / shell pings. Subscription is per-device — each browser opts in separately."
+        >
+          <PushStatusRow />
+        </Section>
+      )}
+
+      {activeTab === 'sites' && (
+        <Section
+          title="Local sites"
+          scope="Host-wide"
+          description="Toggle a discovered port to expose it at <tunnel>/proxy/<port>/. The upstream app handles its own auth."
+        >
+          <ProxyPortsCard tunnelUrl={state?.tunnel_url ?? null} />
+        </Section>
+      )}
+
+      {activeTab === 'tunnel' && (
+        <Section
+          title="Tunnel"
+          scope="Host-wide"
+          description="Quick tunnel rotates on agent restart. Configure a Named Tunnel for a stable URL."
+        >
+          <Row label="Mode">
+            <StatusChip variant="info" noDot>
+              Quick
+            </StatusChip>
+          </Row>
+          <Row label="URL">
+            {state?.tunnel_url ? (
+              <code className="font-mono text-[length:var(--text-mono)] text-text-primary truncate max-w-[60%]">
+                {state.tunnel_url}
+              </code>
+            ) : (
+              <span className="text-text-muted">—</span>
+            )}
+          </Row>
+          <Row label="Named tunnel">
+            <a
+              href="https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/get-started/"
+              target="_blank"
+              rel="noopener noreferrer"
+              className="text-accent hover:text-accent-hover text-[length:var(--text-meta)]"
+            >
+              Setup guide ↗
+            </a>
+          </Row>
+          <Row label="Workspace">
+            <code className="font-mono text-[length:var(--text-mono)] text-text-primary truncate">
+              (set on agent startup via OXI_WORKSPACE)
             </code>
-          ) : (
-            <span className="text-text-muted">—</span>
-          )}
-        </Row>
-        <Row label="Named tunnel">
-          <a
-            href="https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/get-started/"
-            target="_blank"
-            rel="noopener noreferrer"
-            className="text-accent hover:text-accent-hover text-[length:var(--text-meta)]"
-          >
-            Setup guide ↗
-          </a>
-        </Row>
-      </Section>
+          </Row>
+        </Section>
+      )}
 
-      <Section
-        title="Autostart"
-        scope="Host-wide"
-        description="Start the agent automatically at login. Uses launchd on macOS, systemd user unit on Linux, or the Windows registry."
-      >
-        <Row label="Start at login">
-          {autostart === null ? (
-            <span className="text-text-muted text-[length:var(--text-meta)]">Loading…</span>
-          ) : autostart.supported ? (
-            <div className="flex items-center gap-2">
-              <SwitchButton
-                checked={autostart.enabled}
-                disabled={autostartBusy}
-                onToggle={() => toggleAutostart(!autostart.enabled)}
-              />
-              {autostart.mechanism && (
-                <span className="text-text-muted text-[length:var(--text-meta)]">
-                  {autostart.mechanism}
-                </span>
-              )}
-            </div>
-          ) : (
-            <span className="text-text-muted text-[length:var(--text-meta)]">
-              Not supported on this platform
-            </span>
-          )}
-        </Row>
-      </Section>
+      {activeTab === 'autostart' && (
+        <Section
+          title="Autostart"
+          scope="Host-wide"
+          description="Start the agent automatically at login. Uses launchd on macOS, systemd user unit on Linux, or the Windows registry."
+        >
+          <Row label="Start at login">
+            {autostart === null ? (
+              <span className="text-text-muted text-[length:var(--text-meta)]">Loading…</span>
+            ) : autostart.supported ? (
+              <div className="flex items-center gap-2">
+                <SwitchButton
+                  checked={autostart.enabled}
+                  disabled={autostartBusy}
+                  onToggle={() => void toggleAutostart(!autostart.enabled)}
+                />
+                {autostart.mechanism && (
+                  <span className="text-text-muted text-[length:var(--text-meta)]">
+                    {autostart.mechanism}
+                  </span>
+                )}
+              </div>
+            ) : (
+              <span className="text-text-muted text-[length:var(--text-meta)]">
+                Not supported on this platform
+              </span>
+            )}
+          </Row>
+        </Section>
+      )}
 
-      <Section
-        title="About"
-        scope="Read-only"
-        description="Run oxiremote --version in your terminal to print the binary version. Self-update via oxiremote update."
-      >
-        <Row label="Host ID">
-          <code className="font-mono text-[length:var(--text-mono)] text-text-primary">
-            {state?.host_id ?? '—'}
-          </code>
-        </Row>
-        <Row label="Platform">
-          <span className="text-text-secondary">{state?.platform ?? '—'}</span>
-        </Row>
-      </Section>
+      {activeTab === 'about' && (
+        <Section
+          title="About"
+          scope="Read-only"
+          description="Run oxiremote --version in your terminal to print the binary version. Self-update via oxiremote update."
+        >
+          <Row label="Host ID">
+            <code className="font-mono text-[length:var(--text-mono)] text-text-primary">
+              {state?.host_id ?? '—'}
+            </code>
+          </Row>
+          <Row label="Platform">
+            <span className="text-text-secondary">{state?.platform ?? '—'}</span>
+          </Row>
+        </Section>
+      )}
     </div>
   )
 }

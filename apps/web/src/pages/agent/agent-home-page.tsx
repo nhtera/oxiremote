@@ -9,6 +9,9 @@ import OnboardingView from '../../components/agent/onboarding-view'
 import OtkConfirmModal from '../../components/agent/otk-confirm-modal'
 import HostShell from '../../components/agent/host-shell'
 import ServicesStrip from '../../components/agent/services-strip'
+import ActiveSessionsList from '../../components/active-sessions-list'
+import TunnelTelemetryBlock from '../../components/tunnel-telemetry-block'
+import RecentKeyUsage from '../../components/recent-key-usage'
 
 // Host-dashboard home. Live-updates via the `/api/agent/events` SSE stream;
 // initial snapshot from `/api/agent/state`. Both endpoints are localhost-only.
@@ -267,6 +270,10 @@ export default function AgentHomePage() {
                 setState((s) => (s ? { ...s, desktop_enabled: next } : s))
               }
             />
+
+            <ActiveSessionsList />
+            <TunnelTelemetryBlock />
+            <RecentKeyUsage />
 
             <ConnLogsTabs tab={tab} onChange={setTab} />
 
