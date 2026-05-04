@@ -9,6 +9,7 @@ use axum::Json;
 use axum_extra::extract::cookie::CookieJar;
 use portable_pty::PtySize;
 use rusqlite::{params, Connection, OptionalExtension};
+use serde::Deserialize;
 use tracing::warn;
 use uuid::Uuid;
 
@@ -20,6 +21,22 @@ use crate::terminal_pty::{
     WsOut, MAX_TERMINAL_SESSIONS_PER_USER,
 };
 use crate::AppState;
+
+// Row type returned by the terminal session list query (10 columns including
+// the new agent-aware fields). Defined as a type alias to keep clippy happy
+// about tuple complexity.
+type SessionListRow = (
+    String,       // terminal_session_id
+    Option<String>, // name
+    i64,          // created_at
+    i64,          // last_seen_at
+    i64,          // cols
+    i64,          // rows
+    String,       // status
+    Option<i64>,  // exit_code
+    Option<String>, // detected_agent
+    i64,          // notify_on_agent_end
+);
 
 pub async fn api_terminal_sessions_list(
     State(state): State<Arc<AppState>>,
@@ -41,7 +58,8 @@ pub async fn api_terminal_sessions_list(
         // 'dead' = WS evicted). 'exited' (process died naturally) stays visible
         // so the user sees the red dot before deciding whether to close the tab.
         let mut stmt = conn.prepare(
-            "SELECT terminal_session_id, name, created_at, last_seen_at, cols, rows, status, exit_code \
+            "SELECT terminal_session_id, name, created_at, last_seen_at, cols, rows, status, \
+                    exit_code, detected_agent, notify_on_agent_end \
              FROM terminal_sessions \
              WHERE owner_session_id=?1 AND status NOT IN ('closed','dead') \
              ORDER BY created_at DESC",
@@ -49,13 +67,23 @@ pub async fn api_terminal_sessions_list(
         let rows = stmt.query_map(params![owner_session_id], |row| {
             let id: String = row.get(0)?;
             let status: String = row.get(6)?;
-            Ok((id, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, status, row.get(7)?))
+            Ok((
+                id,
+                row.get::<_, Option<String>>(1)?,   // name
+                row.get::<_, i64>(2)?,               // created_at
+                row.get::<_, i64>(3)?,               // last_seen_at
+                row.get::<_, i64>(4)?,               // cols
+                row.get::<_, i64>(5)?,               // rows
+                status,
+                row.get::<_, Option<i64>>(7)?,       // exit_code
+                row.get::<_, Option<String>>(8)?,    // detected_agent
+                row.get::<_, i64>(9).unwrap_or(0),  // notify_on_agent_end
+            ))
         })?;
         let mut out = Vec::new();
         for r in rows {
-            let (id, name, created_at, last_seen_at, cols, rows_v, status, exit_code): (
-                String, Option<String>, i64, i64, i64, i64, String, Option<i64>,
-            ) = r?;
+            let (id, name, created_at, last_seen_at, cols, rows_v, status, exit_code,
+                 detected_agent, notify_on_agent_end_i): SessionListRow = r?;
             let sess = state.terminal_sessions.get(&id);
             // Compute live state from in-memory session if available, else derive from DB status.
             let state_str = sess
@@ -91,6 +119,8 @@ pub async fn api_terminal_sessions_list(
                 last_seq,
                 buffer_bytes,
                 attached,
+                detected_agent,
+                notify_on_agent_end: notify_on_agent_end_i != 0,
             });
         }
         Ok(out)
@@ -161,8 +191,6 @@ pub async fn api_terminal_sessions_create(
     let shell_cmd = build_default_command(req.command.as_deref());
     let cwd = req.cwd.clone();
 
-    // spawn_terminal_session inserts into terminal_sessions itself so the
-    // PTY's reader thread can self-remove on exit without a TOCTOU window.
     match spawn_terminal_session(
         &id,
         &owner_session_id,
@@ -172,6 +200,7 @@ pub async fn api_terminal_sessions_create(
         req.rows,
         state.db_path.clone(),
         state.terminal_sessions.clone(),
+        state.event_bus.clone(),
     ) {
         Ok(_sess) => {
             (StatusCode::OK, Json(CreateTerminalSessionResponse { id })).into_response()
@@ -410,6 +439,51 @@ pub async fn api_terminal_session_rename(
         Ok(false) => StatusCode::FORBIDDEN.into_response(),
         Err(err) => {
             warn!(error=%err, "rename terminal session failed");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+#[derive(Deserialize)]
+pub struct NotifyOnFinishRequest {
+    pub enabled: bool,
+}
+
+/// `POST /api/terminal/sessions/:id/notify-on-finish`
+///
+/// Opt the session into (or out of) a Web Push notification when the detected
+/// agent CLI exits. Auth-gated — only the session owner can flip the toggle.
+pub async fn api_terminal_session_notify_on_finish(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    jar: CookieJar,
+    AxumPath(id): AxumPath<String>,
+    Json(req): Json<NotifyOnFinishRequest>,
+) -> impl IntoResponse {
+    let bearer = extract_bearer(&headers);
+    let Some(owner_session_id) =
+        require_owner_session_dual(&state.db_path, &state.signing_key, &jar, bearer.as_deref()).await
+    else {
+        return StatusCode::UNAUTHORIZED.into_response();
+    };
+
+    let enabled_i: i64 = if req.enabled { 1 } else { 0 };
+
+    let updated: anyhow::Result<bool> = (|| {
+        let conn = Connection::open(&state.db_path)?;
+        let n = conn.execute(
+            "UPDATE terminal_sessions SET notify_on_agent_end=?3 \
+             WHERE terminal_session_id=?1 AND owner_session_id=?2",
+            params![id, owner_session_id, enabled_i],
+        )?;
+        Ok(n > 0)
+    })();
+
+    match updated {
+        Ok(true) => (StatusCode::OK, Json(serde_json::json!({ "ok": true }))).into_response(),
+        Ok(false) => StatusCode::FORBIDDEN.into_response(),
+        Err(err) => {
+            warn!(error=%err, "notify-on-finish update failed");
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }

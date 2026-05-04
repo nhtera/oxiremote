@@ -8,8 +8,10 @@ use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
+use tracing::warn;
 
 use crate::db::now_ts;
+use crate::events::{AgentEvent, EventBus};
 use crate::terminal_buffer::{RingBuffer, Snapshot};
 
 pub const MAX_TERMINAL_SESSIONS_PER_USER: usize = 10;
@@ -20,6 +22,9 @@ const ACTIVE_THRESHOLD_MS: u128 = 250;
 
 /// Default ring buffer capacity (bytes). Override via `OXI_PTY_BUFFER_BYTES`.
 const DEFAULT_BUFFER_BYTES: usize = 2 * 1024 * 1024;
+
+/// How often to poll the PTY foreground process for agent detection.
+const AGENT_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
 
 fn buffer_capacity_bytes() -> usize {
     std::env::var("OXI_PTY_BUFFER_BYTES")
@@ -40,6 +45,10 @@ pub struct TerminalSession {
     pub buffer: Arc<std::sync::Mutex<RingBuffer>>,
     /// Latest seq published to the buffer. Lock-free read for API.
     pub last_seq: Arc<AtomicU64>,
+    /// Raw file descriptor for the PTY master — used by the agent detector
+    /// to call tcgetpgrp(). Only valid on Unix; -1 on other platforms.
+    #[cfg(unix)]
+    pub master_fd: std::os::unix::io::RawFd,
 }
 
 impl TerminalSession {
@@ -71,6 +80,27 @@ impl TerminalSession {
                 data: String::new(),
             })
     }
+
+    /// Read the last `n` lines from the ring buffer for push payload.
+    pub fn last_n_lines(&self, n: usize) -> Vec<String> {
+        let snap = self.buffer
+            .lock()
+            .map(|b| b.snapshot_since(None))
+            .unwrap_or(Snapshot { from_seq: 0, to_seq: 0, data: String::new() });
+        if snap.data.is_empty() {
+            return Vec::new();
+        }
+        snap.data
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .rev()
+            .take(n)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .map(str::to_string)
+            .collect()
+    }
 }
 
 #[derive(Serialize)]
@@ -88,6 +118,8 @@ pub struct TerminalSessionMeta {
     pub last_seq: u64,
     pub buffer_bytes: u64,
     pub attached: bool,
+    pub detected_agent: Option<String>,
+    pub notify_on_agent_end: bool,
 }
 
 #[derive(Deserialize)]
@@ -114,6 +146,12 @@ pub enum WsOut {
     State { state: String },
     #[serde(rename = "renamed")]
     Renamed { name: String },
+    /// Agent detection state change — client renders badge/toggle.
+    #[serde(rename = "agent_detected")]
+    AgentDetected { agent_name: String },
+    /// Agent ended — client clears badge.
+    #[serde(rename = "agent_ended")]
+    AgentEnded { agent_name: String },
 }
 
 #[derive(Deserialize)]
@@ -161,6 +199,126 @@ pub fn build_default_command(command: Option<&[String]>) -> Vec<String> {
     }
 }
 
+/// Spawn the 5s agent-detection poll loop for a PTY session. On each tick,
+/// calls `detect_in_pty` and broadcasts `SessionAgentDetected/Ended` on state
+/// changes. Also updates the `detected_agent` column in SQLite.
+///
+/// Only compiled on Unix — on other platforms this is a no-op stub.
+#[cfg(unix)]
+pub fn spawn_agent_detector(
+    session_id: String,
+    master_fd: std::os::unix::io::RawFd,
+    db_path: PathBuf,
+    event_bus: Arc<EventBus>,
+    output_tx: broadcast::Sender<WsOut>,
+) {
+    use crate::agent_detector::{detect_in_pty, OsCommReader};
+
+    tokio::spawn(async move {
+        let reader = OsCommReader;
+        let mut prev_agent: Option<String> = None;
+        // Timestamp when the current agent was first detected (for duration calc).
+        let mut agent_started_at: Option<std::time::Instant> = None;
+        let mut interval = tokio::time::interval(AGENT_POLL_INTERVAL);
+        // Skip the first tick (fires immediately) to avoid a false positive on
+        // the shell startup phase before any real agent has been launched.
+        interval.tick().await;
+
+        loop {
+            interval.tick().await;
+
+            let current = detect_in_pty(master_fd, &reader).map(|a| a.to_string());
+
+            match (&prev_agent, &current) {
+                // No change — nothing to do.
+                (a, b) if a == b => {}
+
+                // Agent appeared (or changed to a different agent).
+                (_, Some(name)) => {
+                    let name = name.clone();
+                    agent_started_at = Some(std::time::Instant::now());
+
+                    // Update DB.
+                    let db = db_path.clone();
+                    let id = session_id.clone();
+                    let agent_col = name.clone();
+                    if let Err(err) = tokio::task::spawn_blocking(move || {
+                        let conn = Connection::open(&db)?;
+                        conn.execute(
+                            "UPDATE terminal_sessions SET detected_agent=?2 WHERE terminal_session_id=?1",
+                            params![id, agent_col],
+                        )?;
+                        Ok::<_, anyhow::Error>(())
+                    })
+                    .await
+                    {
+                        warn!(session=%session_id, error=%err, "agent detect db update failed");
+                    }
+
+                    // Broadcast to event bus + WS subscribers.
+                    event_bus.send(AgentEvent::SessionAgentDetected {
+                        session_id: session_id.clone(),
+                        agent_name: name.clone(),
+                    });
+                    let _ = output_tx.send(WsOut::AgentDetected { agent_name: name.clone() });
+                    prev_agent = Some(name);
+                }
+
+                // Agent disappeared.
+                (Some(prev_name), None) => {
+                    let duration_ms = agent_started_at
+                        .take()
+                        .map(|t| t.elapsed().as_millis() as u64)
+                        .unwrap_or(0);
+                    let name = prev_name.clone();
+
+                    // Clear DB column.
+                    let db = db_path.clone();
+                    let id = session_id.clone();
+                    if let Err(err) = tokio::task::spawn_blocking(move || {
+                        let conn = Connection::open(&db)?;
+                        conn.execute(
+                            "UPDATE terminal_sessions SET detected_agent=NULL WHERE terminal_session_id=?1",
+                            params![id],
+                        )?;
+                        Ok::<_, anyhow::Error>(())
+                    })
+                    .await
+                    {
+                        warn!(session=%session_id, error=%err, "agent end db clear failed");
+                    }
+
+                    event_bus.send(AgentEvent::SessionAgentEnded {
+                        session_id: session_id.clone(),
+                        agent_name: name.clone(),
+                        duration_ms,
+                        // We don't have the exit code in the poll loop — the
+                        // PTY reader thread has it on process wait(). Pass None
+                        // here; the notifier will still emit the push with
+                        // duration info and last-5 lines.
+                        exit_code: None,
+                    });
+                    let _ = output_tx.send(WsOut::AgentEnded { agent_name: name });
+                    prev_agent = None;
+                }
+
+                // (None, None) — covered by the first arm above.
+                (None, None) => {}
+            }
+        }
+    });
+}
+
+#[cfg(not(unix))]
+pub fn spawn_agent_detector(
+    _session_id: String,
+    _db_path: PathBuf,
+    _event_bus: Arc<EventBus>,
+    _output_tx: broadcast::Sender<WsOut>,
+) {
+    // Agent detection not supported on non-Unix platforms (deferred to v2).
+}
+
 #[allow(clippy::too_many_arguments)]
 /// Spawn a PTY session, register it in the in-memory `sessions` map, and
 /// start the reader + idle watchdog threads. The reader thread auto-removes
@@ -176,6 +334,7 @@ pub fn spawn_terminal_session(
     rows: u16,
     db_path: PathBuf,
     sessions: Arc<DashMap<String, Arc<TerminalSession>>>,
+    event_bus: Arc<EventBus>,
 ) -> anyhow::Result<Arc<TerminalSession>> {
     let pty_system = native_pty_system();
     let pair = pty_system.openpty(PtySize {
@@ -196,6 +355,14 @@ pub fn spawn_terminal_session(
     let child = pair.slave.spawn_command(cmd)?;
     let reader = pair.master.try_clone_reader()?;
     let writer = pair.master.take_writer()?;
+
+    // Capture the raw fd BEFORE consuming master into the session struct so
+    // the agent detector can call tcgetpgrp() on it. The MasterPty trait
+    // exposes `as_raw_fd() -> Option<RawFd>` on Unix. Fall back to -1 if the
+    // backend does not expose one (serial PTY etc.) — detector will return None.
+    #[cfg(unix)]
+    let master_fd: std::os::unix::io::RawFd = pair.master.as_raw_fd().unwrap_or(-1);
+
     let master = pair.master;
 
     let (output_tx, _) = broadcast::channel::<WsOut>(1024);
@@ -203,7 +370,7 @@ pub fn spawn_terminal_session(
 
     let child = Arc::new(std::sync::Mutex::new(child));
     let child_for_wait = child.clone();
-    let db_path = db_path.clone();
+    let db_path_clone = db_path.clone();
     let id = id.to_string();
     let id_for_reader = id.clone();
     let sessions_for_reader = sessions.clone();
@@ -238,8 +405,25 @@ pub fn spawn_terminal_session(
         last_activity,
         buffer,
         last_seq,
+        #[cfg(unix)]
+        master_fd,
     });
-    sessions.insert(id, session.clone());
+    sessions.insert(id.clone(), session.clone());
+
+    // Start the 5s agent-detection polling loop (Unix only).
+    #[cfg(unix)]
+    spawn_agent_detector(
+        id.clone(),
+        master_fd,
+        db_path.clone(),
+        event_bus,
+        output_tx.clone(),
+    );
+    #[cfg(not(unix))]
+    {
+        // Consume so the variable is not flagged unused.
+        let _ = event_bus;
+    }
 
     // Idle watchdog: emit State{idle} once output has been quiet for > ACTIVE_THRESHOLD.
     std::thread::spawn(move || {
@@ -338,7 +522,7 @@ pub fn spawn_terminal_session(
 
         let now = now_ts();
         let _ = (|| -> anyhow::Result<()> {
-            let conn = Connection::open(&db_path)?;
+            let conn = Connection::open(&db_path_clone)?;
             conn.execute(
                 "UPDATE terminal_sessions SET status='exited', exit_code=?2, last_seen_at=?3 WHERE terminal_session_id=?1",
                 params![id_for_reader, code, now],

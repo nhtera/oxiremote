@@ -1,4 +1,5 @@
 mod agent_api;
+mod agent_detector;
 mod approval;
 mod auth;
 mod autostart;
@@ -643,10 +644,21 @@ async fn server_main(
         }
     }
 
-    // Desktop notifications (no-op when no notification daemon — headless,
-    // sandboxed, Codespaces). Tray runtime is not yet wired; this keeps
-    // device-pending toasts working in TUI/headless modes.
-    notifier::spawn_event_notifier(state.event_bus.clone());
+    // Desktop notifications + agent-end Web Push. Tray runtime is not yet
+    // wired; device-pending toasts and agent-finish pushes work in all modes.
+    {
+        // VAPID subject — mailto or https origin identifying the push sender.
+        let notify_subject = format!("mailto:{}", std::env::var("OXI_PUSH_SUBJECT")
+            .unwrap_or_else(|_| "admin@localhost".into()));
+        notifier::spawn_event_notifier(
+            state.event_bus.clone(),
+            state.db_path.clone(),
+            state.host_info.host_id.clone(),
+            state.vapid_keys.clone(),
+            state.http_client.clone(),
+            notify_subject,
+        );
+    }
 
     let app = Router::new()
         .route("/api/health", get(api_health))
@@ -678,6 +690,7 @@ async fn server_main(
             { || async { axum::http::StatusCode::SERVICE_UNAVAILABLE } }
         }))
         .route("/api/terminal/sessions/{id}/close", post(terminal_api::api_terminal_session_close))
+        .route("/api/terminal/sessions/{id}/notify-on-finish", post(terminal_api::api_terminal_session_notify_on_finish))
         .route("/api/terminal/sessions/{id}", axum::routing::patch(terminal_api::api_terminal_session_rename))
         // git
         .route("/api/git/status", get(git::api_git_status))
