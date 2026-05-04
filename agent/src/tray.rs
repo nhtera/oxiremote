@@ -16,19 +16,20 @@ use tray_icon::{
 
 use crate::AGENT_PORT;
 
-/// 44×44 retina menu-bar bolt rendered from `assets/menu-bar-bolt.svg`. Pre-
-/// rasterised at build time (`rsvg-convert -w 44 -h 44 …`) and embedded so
-/// the binary stays self-contained — adding `resvg` for runtime SVG drawing
-/// would pull ~1 MB of extra deps for a single 44 px raster.
+/// 44×44 retina menu-bar monitor outline rendered from
+/// `assets/menu-bar-monitor.svg` — same glyph the SPA uses in its
+/// agent-header logo, kept in sync so the tray and the dashboard read
+/// as the same product. Pre-rasterised via `rsvg-convert` so the binary
+/// stays self-contained without pulling resvg for a single 44 px raster.
 ///
-/// The PNG is solid black on transparent; we mark the tray icon as a macOS
-/// template image so the OS auto-tints it (white in dark menu bars, black
-/// in light) and respects the system's accent / inverted modes.
-const MENU_BAR_BOLT_PNG: &[u8] = include_bytes!("../assets/menu-bar-bolt-44.png");
+/// The PNG is solid black on transparent; the tray sets template-image
+/// mode so AppKit auto-tints it (white in dark menu bars, black in
+/// light) and respects accent / inverted modes.
+const MENU_BAR_ICON_PNG: &[u8] = include_bytes!("../assets/menu-bar-monitor-44.png");
 
 fn make_icon() -> Result<Icon> {
-    let img = image::load_from_memory(MENU_BAR_BOLT_PNG)
-        .map_err(|e| anyhow::anyhow!("decode menu-bar bolt png: {e}"))?
+    let img = image::load_from_memory(MENU_BAR_ICON_PNG)
+        .map_err(|e| anyhow::anyhow!("decode menu-bar icon png: {e}"))?
         .to_rgba8();
     let (w, h) = img.dimensions();
     Icon::from_rgba(img.into_raw(), w, h)
