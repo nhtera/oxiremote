@@ -3727,6 +3727,7 @@ dependencies = [
  "hkdf",
  "hmac",
  "http",
+ "http-body-util",
  "ignore",
  "image",
  "libc",
