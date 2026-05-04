@@ -8,7 +8,6 @@ import type { QualityTier, DesktopInputEvent } from '../hooks/use-desktop-sessio
 import type { InputMode, GestureMode } from '../hooks/use-desktop-input'
 import DesktopSettingsPopover from './desktop-settings-popover'
 import TransportPill from './transport-pill'
-import { SettingsIcon } from './icons'
 
 interface Props {
   quality: QualityTier
@@ -150,8 +149,11 @@ export default function DesktopToolbar({
   }
 
   function keyBtnClass(key: KeyDef) {
+    // 4×2 grid means each cell is ~52 px wide in the lg:w-60 sidebar — enough
+    // for the longest label ("Shift") at text-xs without truncation. Drop
+    // flex-1/min-w-0 since the parent grid handles sizing.
     const base =
-      'flex-1 min-w-0 py-2 text-xs font-medium rounded-md border border-border transition-colors select-none active:scale-95'
+      'py-2 text-xs font-medium rounded-md border border-border transition-colors select-none active:scale-95'
     if (key.mod && activeModifiers.has(key.mod)) {
       return `${base} bg-[hsl(var(--accent-primary)/0.2)] text-[hsl(var(--accent-primary))] border-[hsl(var(--accent-primary)/0.4)]`
     }
@@ -160,11 +162,12 @@ export default function DesktopToolbar({
 
   return (
     <div className="flex flex-col gap-2 p-2 bg-surface border-t border-border lg:border-t-0 lg:border-l lg:h-full lg:w-60 lg:p-3">
-      {/* Input mode + Aa text-batch + gesture help + display gear row.
-          Layout: [Touch/Trackpad toggle] [Aa] [?] [⚙]
-          Aa is orange when the text-batch sheet is open.
-          ⚙ opens the Display popover (quality, pipeline, hidpi, scaling). */}
-      <div className="flex items-center gap-2 min-w-0">
+      {/* Tools row.
+          Layout (left → right): [Touch/Trackpad mode] [Aa] [▢] [?] [Pipeline ▾]
+          Five controls fit a 240 px lg sidebar because the pipeline chip and
+          the display-popover trigger were merged into a single button —
+          one button per concept (display settings) instead of two. */}
+      <div className="flex items-center gap-1.5 min-w-0">
         <button
           onClick={onInputModeToggle}
           title={
@@ -172,7 +175,7 @@ export default function DesktopToolbar({
               ? 'Touch (Direct): tap = click at finger position. Drag with one finger to move the pointer.'
               : 'Trackpad: relative cursor. Two-finger swipe scrolls; tap clicks at the cursor.'
           }
-          className="flex-1 min-w-0 text-xs px-2 py-1 border border-border rounded-md bg-surface-alt text-text-secondary hover:bg-surface-hover transition-colors"
+          className="flex-1 min-w-0 text-xs px-2 py-1.5 border border-border rounded-md bg-surface-alt text-text-secondary hover:bg-surface-hover transition-colors truncate"
         >
           {inputMode === 'touch' ? 'Touch' : 'Trackpad'}
         </button>
@@ -184,7 +187,7 @@ export default function DesktopToolbar({
             aria-label="Toggle text input sheet"
             aria-pressed={textBatchOpen}
             className={[
-              'shrink-0 text-xs px-2 py-1 border rounded-md transition-colors font-medium',
+              'shrink-0 inline-flex items-center justify-center w-8 h-8 border rounded-md transition-colors text-[13px] font-semibold',
               textBatchOpen
                 ? 'bg-[hsl(var(--accent-primary)/0.2)] text-[hsl(var(--accent-primary))] border-[hsl(var(--accent-primary)/0.4)]'
                 : 'bg-surface-alt text-text-muted border-border hover:text-text-primary hover:bg-surface-hover',
@@ -205,13 +208,25 @@ export default function DesktopToolbar({
             aria-label="Toggle rectangle select"
             aria-pressed={gestureMode === 'rect'}
             className={[
-              'shrink-0 text-xs px-2 py-1 border rounded-md transition-colors font-medium',
+              'shrink-0 inline-flex items-center justify-center w-8 h-8 border rounded-md transition-colors',
               gestureMode === 'rect'
                 ? 'bg-[hsl(var(--accent-primary)/0.2)] text-[hsl(var(--accent-primary))] border-[hsl(var(--accent-primary)/0.4)]'
                 : 'bg-surface-alt text-text-muted border-border hover:text-text-primary hover:bg-surface-hover',
             ].join(' ')}
           >
-            ▢
+            <svg
+              viewBox="0 0 16 16"
+              width="14"
+              height="14"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="1.5"
+              strokeLinecap="round"
+              strokeDasharray="2 2"
+              aria-hidden="true"
+            >
+              <rect x="2" y="2" width="12" height="12" rx="1" />
+            </svg>
           </button>
         )}
 
@@ -219,41 +234,60 @@ export default function DesktopToolbar({
           onClick={onShowGestureHelp}
           title="Gesture help"
           aria-label="Gesture help"
-          className="shrink-0 text-xs px-2 py-1 border border-border rounded-md bg-surface-alt text-text-muted hover:text-text-primary hover:bg-surface-hover transition-colors"
+          className="shrink-0 inline-flex items-center justify-center w-8 h-8 border border-border rounded-md bg-surface-alt text-text-muted hover:text-text-primary hover:bg-surface-hover transition-colors"
         >
-          ?
+          <svg
+            viewBox="0 0 16 16"
+            width="14"
+            height="14"
+            fill="none"
+            stroke="currentColor"
+            strokeWidth="1.5"
+            strokeLinecap="round"
+            strokeLinejoin="round"
+            aria-hidden="true"
+          >
+            <circle cx="8" cy="8" r="6.5" />
+            <path d="M6.2 6.2c0-1 .8-1.7 1.8-1.7s1.8.6 1.8 1.7c0 1.6-1.8 1.4-1.8 2.8" />
+            <circle cx="8" cy="11" r="0.5" fill="currentColor" stroke="none" />
+          </svg>
         </button>
 
-        <div className="relative shrink-0 flex items-center gap-1.5" ref={settingsContainerRef}>
+        {/* Display popover trigger — pipeline label is the visual state. */}
+        <div className="relative shrink-0" ref={settingsContainerRef}>
           <button
             type="button"
             onClick={() => setSettingsOpen((v) => !v)}
-            aria-label={`Active video pipeline: ${pipeline === 'h264' ? 'H.264' : 'JPEG'}. Click to open display settings.`}
+            aria-expanded={settingsOpen}
+            aria-haspopup="dialog"
             title={
               pipeline === 'h264'
-                ? 'H.264 — WebRTC video track'
-                : 'JPEG — tile frames over DataChannel'
+                ? 'Display — H.264 (WebRTC video track). Click to change quality and scaling.'
+                : 'Display — JPEG (tile frames over DataChannel). Click to change quality and scaling.'
             }
-            className={`text-[10px] font-semibold px-1.5 py-0.5 rounded transition-colors ${
-              pipeline === 'h264'
-                ? 'bg-accent/15 text-accent border border-accent/30 hover:bg-accent/25'
-                : 'bg-surface-alt text-text-muted border border-border hover:text-text-primary'
+            className={`inline-flex items-center gap-1 h-8 px-2 border rounded-md transition-colors text-[10px] font-semibold ${
+              settingsOpen
+                ? 'bg-accent/15 text-accent border-accent/40'
+                : pipeline === 'h264'
+                  ? 'bg-accent/10 text-accent border-accent/30 hover:bg-accent/20'
+                  : 'bg-surface-alt text-text-muted border-border hover:text-text-primary hover:bg-surface-hover'
             }`}
           >
             {pipeline === 'h264' ? 'H.264' : 'JPEG'}
-          </button>
-          <button
-            onClick={() => setSettingsOpen((v) => !v)}
-            title="Display settings (quality, pipeline)"
-            aria-label="Display settings"
-            aria-expanded={settingsOpen}
-            className={`inline-flex items-center justify-center w-8 h-7 border border-border rounded-md transition-colors ${
-              settingsOpen
-                ? 'bg-surface-hover text-text-primary'
-                : 'bg-surface-alt text-text-muted hover:text-text-primary hover:bg-surface-hover'
-            }`}
-          >
-            <SettingsIcon size={14} />
+            <svg
+              viewBox="0 0 16 16"
+              width="10"
+              height="10"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="1.5"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+              className={`transition-transform ${settingsOpen ? 'rotate-180' : ''}`}
+              aria-hidden="true"
+            >
+              <path d="M4 6l4 4 4-4" />
+            </svg>
           </button>
           {settingsOpen && (
             <DesktopSettingsPopover
@@ -268,8 +302,10 @@ export default function DesktopToolbar({
         </div>
       </div>
 
-      {/* 8-button key row */}
-      <div className="flex gap-1">
+      {/* Modifier keys — 4×2 grid so labels never truncate (was 8×1 flex,
+          which squeezed "Undo" → "Und" and "Shift" → "Shif" in the 240 px
+          lg sidebar). Same key set, same dispatch logic. */}
+      <div className="grid grid-cols-4 gap-1">
         {KEYS.map((key) => (
           <button
             key={key.label}
@@ -282,8 +318,12 @@ export default function DesktopToolbar({
         ))}
       </div>
 
-      {/* Transport indicator — lg only; mobile sees this via DesktopTopStrip. */}
-      <div className="hidden lg:flex items-center justify-end pt-1">
+      {/* Transport indicator — lg only. Labelled so it doesn't read as an
+          orphan pill; mobile sees the same info via DesktopTopStrip. */}
+      <div className="hidden lg:flex items-center justify-end gap-2 pt-1">
+        <span className="text-[10px] uppercase tracking-[0.12em] text-text-muted">
+          Transport
+        </span>
         <TransportPill compact />
       </div>
 
