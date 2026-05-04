@@ -766,7 +766,7 @@ async fn api_agent_device_revoke(
 ///
 /// Returns:
 /// ```json
-/// { "agent": "0.1.0", "cloudflared": "2025.2.1", "build_date": "2026-05-04" }
+/// { "agent": "0.4.2", "cloudflared": "2025.2.1", "build_date": "2026-05-04" }
 /// ```
 /// `cloudflared` is `null` when the binary is not found or `--version` fails.
 /// `build_date` is injected at compile time via `VERGEN_BUILD_DATE` or falls
