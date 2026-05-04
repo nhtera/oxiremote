@@ -593,6 +593,11 @@ pub async fn api_auth_approval_status(
 
 #[cfg(debug_assertions)]
 pub async fn login_page() -> impl IntoResponse {
+    // Debug-build fallback that auto-handles `?k=<otk>` from the QR / share
+    // link. Release builds serve the embedded React SPA from rust-embed; this
+    // page only runs in `cargo run` (debug). Without this `?k=` handling,
+    // scanning a QR or clicking the dashboard share link landed on a blank
+    // form even though the OTK was right there in the URL.
     Html(
         r#"<!doctype html>
 <html>
@@ -605,34 +610,89 @@ pub async fn login_page() -> impl IntoResponse {
       input { font-size: 18px; padding: 12px; width: 100%; box-sizing: border-box; }
       button { font-size: 18px; padding: 12px; width: 100%; margin-top: 12px; }
       .err { color: #b00020; margin-top: 12px; }
+      .ok  { color: #137333; margin-top: 12px; }
+      .muted { color: #555; font-size: 14px; margin-top: 8px; }
     </style>
   </head>
   <body>
     <h1>Pair device</h1>
-    <p>Enter the pairing code shown in your local agent.</p>
+    <p id="lead">Enter the pairing code shown in your local agent.</p>
 
     <input id="code" placeholder="ABCDEFGH" maxlength="16" autocomplete="one-time-code" />
     <button id="btn">Pair</button>
     <div id="err" class="err"></div>
+    <div id="status" class="muted"></div>
 
     <script>
+      const OTK_PATTERN = /^[a-z2-7]{16}$/;        // one_time_keys.rs
+      const PAIR_PATTERN = /^[A-Z0-9]{6,16}$/;     // auth::PAIRING_CODE_LEN ≥ 6
+
       const codeEl = document.getElementById('code');
-      const errEl = document.getElementById('err');
-      document.getElementById('btn').addEventListener('click', async () => {
-        errEl.textContent = '';
-        const code = codeEl.value.trim();
-        try {
-          const res = await fetch('/api/pairing/exchange', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ code })
-          });
-          if (!res.ok) throw new Error('Invalid or expired code');
+      const btnEl  = document.getElementById('btn');
+      const errEl  = document.getElementById('err');
+      const statusEl = document.getElementById('status');
+      const leadEl = document.getElementById('lead');
+
+      function setStatus(text)  { statusEl.textContent = text; statusEl.className = 'muted'; }
+      function setError(text)   { errEl.textContent = text; }
+
+      async function submitOtk(token) {
+        const res = await fetch('/api/login/one-time', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          credentials: 'include',
+          body: JSON.stringify({ token }),
+        });
+        if (res.status === 200 || res.status === 202) {
           location.href = '/';
+          return true;
+        }
+        return false;
+      }
+
+      async function submitPairCode(code) {
+        const res = await fetch('/api/pairing/exchange', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ code }),
+        });
+        if (!res.ok) throw new Error('Invalid or expired code');
+        location.href = '/';
+      }
+
+      btnEl.addEventListener('click', async () => {
+        setError('');
+        const raw = codeEl.value.trim();
+        try {
+          if (OTK_PATTERN.test(raw.toLowerCase())) {
+            if (!(await submitOtk(raw.toLowerCase()))) throw new Error('OTK expired or already used');
+            return;
+          }
+          await submitPairCode(raw.toUpperCase());
         } catch (e) {
-          errEl.textContent = e.message || 'Pairing failed';
+          setError(e.message || 'Pairing failed');
         }
       });
+
+      // Auto-submit when arriving via QR / dashboard share link with ?k=<token>.
+      const urlKey = new URLSearchParams(location.search).get('k');
+      if (urlKey) {
+        const lower = urlKey.toLowerCase();
+        if (OTK_PATTERN.test(lower)) {
+          leadEl.textContent = 'Signing you in…';
+          setStatus('Using one-time key from link');
+          history.replaceState({}, '', location.pathname);
+          submitOtk(lower).then((ok) => {
+            if (!ok) {
+              leadEl.textContent = 'That one-time key is no longer valid. Generate a new one.';
+              setStatus('');
+            }
+          }).catch((e) => setError(e.message || 'Pairing failed'));
+        } else if (PAIR_PATTERN.test(urlKey.toUpperCase())) {
+          codeEl.value = urlKey.toUpperCase();
+          history.replaceState({}, '', location.pathname);
+        }
+      }
     </script>
   </body>
 </html>"#,
