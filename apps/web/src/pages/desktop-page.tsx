@@ -460,6 +460,7 @@ export default function DesktopPage() {
         maxAttempts={3}
         exhausted={status === 'disconnected'}
         onCancel={disconnect}
+        onRetry={status !== 'disconnected' ? handleReload : undefined}
       />
     </div>
   )
