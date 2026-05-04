@@ -59,9 +59,13 @@ pub fn restore_terminal_if_active() {
     if !TUI_ACTIVE.swap(false, Ordering::SeqCst) {
         return;
     }
+    // Disable raw mode BEFORE leaving the alternate screen — otherwise OPOST
+    // stays off and any subsequent println!() lines stair-step (LF moves the
+    // cursor down without returning to column 0). Order matches ratatui's
+    // canonical restore path.
+    let _ = disable_raw_mode();
     let mut out = io::stdout();
     let _ = execute!(out, LeaveAlternateScreen, DisableMouseCapture);
-    let _ = disable_raw_mode();
 }
 
 extern "C" fn atexit_restore() {
