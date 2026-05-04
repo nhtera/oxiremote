@@ -18,8 +18,9 @@ interface Tab {
 }
 
 // Mobile bottom tab bar. Lives in the app-layout's last grid row so it stays
-// mounted across surface navigation. Hidden on md+ (desktop has top icon nav).
-// Hit targets ≥44×44 px; safe-area-inset-bottom on iOS home-indicator devices.
+// mounted across surface navigation. Hidden on lg+ (desktop has top icon nav).
+// Visible up to 1024px so tablet portrait users get the bar. Hit targets
+// ≥44×44 px; safe-area-inset-bottom on iOS home-indicator devices.
 export default function MobileBottomTabs({ hostId }: Props) {
   const tabs: Tab[] = [
     { to: `/h/${hostId}/workspace`, label: 'Terminal', Icon: TerminalIcon },
@@ -31,7 +32,7 @@ export default function MobileBottomTabs({ hostId }: Props) {
 
   return (
     <nav
-      className="md:hidden border-t border-border bg-surface-alt flex items-stretch shrink-0"
+      className="lg:hidden border-t border-border bg-surface-alt flex items-stretch shrink-0"
       style={{ paddingBottom: 'env(safe-area-inset-bottom, 0px)' }}
       aria-label="Primary"
     >

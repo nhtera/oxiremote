@@ -8,6 +8,7 @@ import TopbarIconNav from './topbar/topbar-icon-nav'
 import TopbarMobile from './topbar/topbar-mobile'
 import GearDrawer from './gear/gear-drawer'
 import MobileBottomTabs from './topbar/mobile-bottom-tabs'
+import { useAppChromeHeight } from '../lib/use-app-chrome-height'
 
 // Workspace-centric chrome. Shell uses CSS Grid (auto/1fr/auto) so the routed
 // page owns its own scroll container. iOS Safari's soft keyboard would clip
@@ -17,17 +18,19 @@ export default function AppLayout() {
   const { pathname } = useLocation()
   const { currentHostId } = useHostStore()
   const [gearOpen, setGearOpen] = useState(false)
+  // Measures combined top+bottom chrome and publishes --app-chrome-height on body.
+  useAppChromeHeight()
 
   // Push banner is a setup nudge, not an in-flow nag. Show it only when the
   // operator is on the dashboard surface (the calm one).
   const isDashboardRoute = /\/h\/[^/]+\/dashboard$/.test(pathname)
 
   return (
-    <div className="grid grid-rows-[auto_1fr_auto] h-[100dvh] supports-[not(height:100dvh)]:h-screen">
+    <div data-app-grid className="grid grid-rows-[auto_1fr_auto] h-[100dvh] supports-[not(height:100dvh)]:h-screen">
       {currentHostId ? (
         <>
           {/* Desktop top bar */}
-          <header className="hidden md:flex h-12 px-3 border-b border-border bg-surface-alt items-center justify-between gap-4 shrink-0">
+          <header className="hidden lg:flex h-12 px-3 border-b border-border bg-surface-alt items-center justify-between gap-4 shrink-0">
             <TopbarHostMenu />
             <TopbarIconNav hostId={currentHostId} onOpenGear={() => setGearOpen(true)} />
           </header>
