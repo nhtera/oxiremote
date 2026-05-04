@@ -1,11 +1,12 @@
 // System tray integration. Built on `tray-icon` 0.19. The tray lives on the
 // main thread on macOS/Windows (platform constraint); the tokio runtime must
-// already be running on a sibling thread before `run_tray` is called.
+// already be running on a sibling thread before `run_event_loop` is called.
 //
-// Event loop is driven by a polling `MenuEvent::receiver()` that this module
-// owns. Not wired to the default bare-invocation dispatch due to main-thread
-// contention with the TUI's raw-mode stdio. Kept here to lock the API surface.
-#![allow(dead_code)]
+// Menu mirrors 9remote's pattern: a non-clickable status header that flips
+// between "Local only" and "Tunnel: <host>", plus "Open Web UI" and
+// "Shutdown". Updates are driven by `AgentEvent::TunnelUrlChanged` /
+// `TunnelDown` so the operator sees the current reachability without
+// opening the dashboard.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -16,7 +17,8 @@ use tray_icon::{
     menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem},
 };
 
-use crate::events::EventBus;
+use crate::events::{AgentEvent, EventBus};
+use crate::AGENT_PORT;
 
 /// Programmatically paint a 32×32 icon. Two tones so it matches the
 /// idle/active visual without shipping binary PNG assets in the repo.
@@ -48,26 +50,28 @@ pub struct TrayHandle {
     // Held to keep the tray alive for the lifetime of the process.
     _tray: tray_icon::TrayIcon,
     ids: MenuIds,
+    // Held so we can rewrite the status text from bus events.
+    status_item: MenuItem,
 }
 
 struct MenuIds {
-    status: String,
     open_web: String,
-    open_host: String,
     shutdown: String,
+}
+
+fn initial_status_text() -> String {
+    format!("OxiRemote (Port {AGENT_PORT}) · Local only")
 }
 
 pub fn build_tray() -> Result<TrayHandle> {
     let menu = Menu::new();
-    let status = MenuItem::new("OxiRemote — starting…", false, None);
+    let status = MenuItem::new(initial_status_text(), false, None);
     let open_web = MenuItem::new("Open Web UI", true, None);
-    let open_host = MenuItem::new("Open Host Dashboard", true, None);
     let shutdown = MenuItem::new("Shutdown", true, None);
 
     menu.append(&status)?;
     menu.append(&PredefinedMenuItem::separator())?;
     menu.append(&open_web)?;
-    menu.append(&open_host)?;
     menu.append(&PredefinedMenuItem::separator())?;
     menu.append(&shutdown)?;
 
@@ -80,40 +84,61 @@ pub fn build_tray() -> Result<TrayHandle> {
     Ok(TrayHandle {
         _tray: tray,
         ids: MenuIds {
-            status: status.id().0.clone(),
             open_web: open_web.id().0.clone(),
-            open_host: open_host.id().0.clone(),
             shutdown: shutdown.id().0.clone(),
         },
+        status_item: status,
     })
 }
 
 /// Blocks the caller (typically the main thread on macOS/Windows) and
-/// dispatches menu clicks until the "Shutdown" item is chosen. Bus events
-/// only drive icon state here; desktop notifications are owned by
-/// `crate::notifier` and fire regardless of whether the tray is wired.
+/// dispatches menu clicks until the "Shutdown" item is chosen. The status
+/// header re-renders on every TunnelUrlChanged / TunnelDown so the menu
+/// reflects current reachability without polling.
 pub fn run_event_loop(handle: &TrayHandle, event_bus: Arc<EventBus>) {
     let menu_rx = MenuEvent::receiver();
     let mut bus_rx = event_bus.subscribe();
 
     loop {
-        // Drain bus events (non-blocking) so the channel doesn't lag the
-        // notifier and other subscribers. Currently no per-event behaviour;
-        // future icon-tone changes (idle/active) hook in here.
-        while let Ok(_event) = bus_rx.try_recv() {}
+        // Drain bus events (non-blocking) — only the tunnel transitions
+        // affect the menu; everything else is dropped to keep the broadcast
+        // channel from lagging other subscribers (notifier, dashboard SSE).
+        while let Ok(event) = bus_rx.try_recv() {
+            match event {
+                AgentEvent::TunnelUrlChanged { url } => {
+                    let host = host_only(&url);
+                    handle
+                        .status_item
+                        .set_text(format!("OxiRemote · {host}"));
+                }
+                AgentEvent::TunnelDown { .. } => {
+                    handle.status_item.set_text(initial_status_text());
+                }
+                _ => {}
+            }
+        }
 
         if let Ok(evt) = menu_rx.try_recv() {
             let id = evt.id.0;
-            if id == handle.ids.open_web || id == handle.ids.open_host {
-                let _ = open::that("http://localhost:8787/agent");
+            if id == handle.ids.open_web {
+                let _ = open::that(format!("http://localhost:{AGENT_PORT}/agent"));
             } else if id == handle.ids.shutdown {
                 crate::tui::restore_terminal_if_active();
                 std::process::exit(0);
-            } else if id == handle.ids.status {
-                // noop — disabled item
             }
         }
 
         std::thread::sleep(Duration::from_millis(100));
     }
+}
+
+/// Strip scheme + path so the menu shows just `oxiremote.example.com` in
+/// the limited width of a menu-bar item.
+fn host_only(url: &str) -> String {
+    url.trim_start_matches("https://")
+        .trim_start_matches("http://")
+        .split('/')
+        .next()
+        .unwrap_or(url)
+        .to_string()
 }

@@ -214,14 +214,20 @@ fn main() -> anyhow::Result<()> {
         if sub == "ui" {
             return run_ui_command();
         }
-        if sub == "--tray" || sub == "--background" {
-            // Re-entry from `oxiremote ui` after detached spawn — same as headless,
-            // but no log output to stderr (parent already detached our stdio).
+        if sub == "--tray" {
+            // Re-entry from `oxiremote ui` after detached spawn. Server runs
+            // on a sibling thread; the tray menu owns the main thread because
+            // tray-icon requires it on macOS/Windows.
+            return run_with_tray();
+        }
+        if sub == "--background" {
+            // Legacy headless re-entry — kept for older `ui` callers that
+            // pre-date the tray integration.
             return run_server_headless();
         }
         if sub == "--help" || sub == "-h" {
             println!(
-                "Usage:\n  oxiremote                     Run agent + TUI (if TTY) or headless server\n  oxiremote tui                 Force TUI mode (server in background)\n  oxiremote ui                  Spawn agent in background, open browser to dashboard\n  oxiremote serve               Force headless server mode\n  oxiremote --auto              Headless start (alias of `serve`, useful for Codespaces postStartCommand)\n  oxiremote update              Self-update from the latest GitHub release\n  oxiremote --version           Print version and exit\n  oxiremote notify --title <text> [--body <text>] [--deep-link </h/...>]\n  oxiremote tunnel use <name>   Write ~/.config/oxiremote/tunnel.toml"
+                "Usage:\n  oxiremote                     Run agent + TUI (if TTY) or headless server\n  oxiremote tui                 Force TUI mode (server in background)\n  oxiremote ui                  Spawn agent in background with menu-bar tray, open browser\n  oxiremote serve               Force headless server mode\n  oxiremote --auto              Headless start (alias of `serve`, useful for Codespaces postStartCommand)\n  oxiremote update              Self-update from the latest GitHub release\n  oxiremote --version           Print version and exit\n  oxiremote notify --title <text> [--body <text>] [--deep-link </h/...>]\n  oxiremote tunnel use <name>   Write ~/.config/oxiremote/tunnel.toml"
             );
             return Ok(());
         }
@@ -413,6 +419,64 @@ fn run_with_tui() -> anyhow::Result<()> {
             std::process::exit(1);
         }
     }
+}
+
+/// Tray path: tokio runtime on a sibling thread, tray-icon event loop on
+/// main. macOS / Windows require the tray to live on the main thread, so the
+/// dispatcher is symmetric with `run_with_tui` — only the consumer differs.
+fn run_with_tray() -> anyhow::Result<()> {
+    let bus = EventBus::new();
+    tracing_setup::init(tracing_setup::AgentMode::Headless, bus.clone());
+
+    let data_dir = default_data_dir()?;
+    let _lock = instance_lock::InstanceLock::acquire(&data_dir)
+        .context("acquire instance lock")?;
+
+    let discovery_url = read_discovery_url();
+    let discovery_temp_key: Arc<StdRwLock<Option<String>>> = Arc::new(StdRwLock::new(None));
+
+    let bus_for_server = bus.clone();
+    let discovery_url_srv = discovery_url.clone();
+    let discovery_temp_key_srv = discovery_temp_key.clone();
+    std::thread::Builder::new()
+        .name("oxiremote-server".into())
+        .spawn(move || {
+            let rt = match tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(rt) => rt,
+                Err(err) => {
+                    bus_for_server.send(crate::events::AgentEvent::LogEntry {
+                        level: crate::events::LogLevel::Error,
+                        module: "agent".into(),
+                        ts: 0,
+                        msg: format!("failed to build tokio runtime: {err}"),
+                    });
+                    return;
+                }
+            };
+            if let Err(err) = rt.block_on(server_main(
+                bus_for_server.clone(),
+                discovery_url_srv,
+                discovery_temp_key_srv,
+            )) {
+                bus_for_server.send(crate::events::AgentEvent::LogEntry {
+                    level: crate::events::LogLevel::Error,
+                    module: "agent".into(),
+                    ts: 0,
+                    msg: format!("server exited: {err:#}"),
+                });
+            }
+        })
+        .context("spawn server thread")?;
+
+    // Build the tray on the main thread, then drive its event loop. The loop
+    // never returns under normal use — `Shutdown` from the menu calls
+    // `process::exit(0)` directly so the lock drop is unreachable here.
+    let handle = tray::build_tray().context("build tray")?;
+    tray::run_event_loop(&handle, bus);
+    unreachable!()
 }
 
 async fn server_main(

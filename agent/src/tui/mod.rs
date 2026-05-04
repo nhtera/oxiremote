@@ -132,17 +132,29 @@ pub fn run_tui(
                 drop(term);
                 drop(_guard);
                 let _ = open::that("http://localhost:8787/agent");
-                println!("OxiRemote agent running in the background.");
+                println!("OxiRemote agent running. Right-click the menu-bar icon to quit.");
                 println!("  Dashboard: http://localhost:8787/agent");
-                println!("  Press Ctrl+C to stop.");
-                // Register this thread so the server's SIGINT handler can
-                // wake us. Park until shutdown is requested; loop guards
-                // against spurious wakeups.
-                let _ = BACKGROUND_MAIN.set(std::thread::current());
-                while !BACKGROUND_SHUTDOWN.load(Ordering::SeqCst) {
-                    std::thread::park();
+                // Hand the main thread off to the tray event loop. macOS /
+                // Windows require the tray to live on the main thread; on
+                // Linux this is also the simplest layout. Build failures
+                // fall back to the legacy park-and-wait so the agent stays
+                // reachable even without a tray.
+                match crate::tray::build_tray() {
+                    Ok(handle) => {
+                        crate::tray::run_event_loop(&handle, event_bus);
+                        // run_event_loop only returns via process::exit — keep
+                        // the compiler happy with an unreachable return.
+                        return Ok(());
+                    }
+                    Err(err) => {
+                        eprintln!("(tray unavailable: {err}) — press Ctrl+C to stop.");
+                        let _ = BACKGROUND_MAIN.set(std::thread::current());
+                        while !BACKGROUND_SHUTDOWN.load(Ordering::SeqCst) {
+                            std::thread::park();
+                        }
+                        return Ok(());
+                    }
                 }
-                return Ok(());
             }
             MenuChoice::TerminalUi => {
                 dashboard::run_dashboard(
