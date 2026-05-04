@@ -75,15 +75,20 @@ jobs:
         with:
           workspaces: agent -> target
 
-      # Linux: pull X11/wayland dev headers needed by the desktop crate, plus
-      # nasm for libjpeg-turbo's x86_64 SIMD assembly (turbojpeg-sys cmake
-      # build hard-fails on x86_64 Linux without it; ARM Linux is fine — uses
-      # Clang intrinsics for NEON, not NASM).
+      # Linux: X11/xcb headers for the desktop crate + glib/gtk/appindicator
+      # for tray-icon (gobject-sys / glib-sys hard-fail without libglib2.0-dev,
+      # tray-icon itself needs libgtk-3-dev + libayatana-appindicator3-dev) +
+      # nasm for libjpeg-turbo SIMD on x86_64 (turbojpeg-sys cmake hard-fails
+      # without it; ARM uses Clang NEON intrinsics, no NASM needed).
       - name: Install Linux build deps
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y libx11-dev libxcb-randr0-dev libxcb-xtest0-dev libxcb-xinerama0-dev libxcb-shape0-dev libxcb-xkb-dev libxkbcommon-dev libxcb-cursor-dev pkg-config nasm
+          sudo apt-get install -y \
+            libx11-dev libxcb-randr0-dev libxcb-xtest0-dev libxcb-xinerama0-dev \
+            libxcb-shape0-dev libxcb-xkb-dev libxkbcommon-dev libxcb-cursor-dev \
+            libglib2.0-dev libgtk-3-dev libayatana-appindicator3-dev \
+            pkg-config nasm
 
       - name: Install JS deps + build web assets
         run: |
