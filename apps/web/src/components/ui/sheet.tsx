@@ -88,10 +88,20 @@ export default function Sheet({
     side === 'left' ? 'left-0 top-0 h-full w-full sm:w-96 max-w-full' :
     'left-0 right-0 bottom-0 w-full max-h-[80vh]'
 
+  // Slide-in transform: start offscreen on mount, animate to zero translate.
+  // Tailwind doesn't have data-state helpers wired for one-shot entry, so we
+  // use animate-* approach: always render translated-out then transition to
+  // in via a CSS class added after mount (done with the `open` boolean already
+  // being true on first render when we reach here).
+  const enterTranslate =
+    side === 'right' ? 'animate-slide-in-right' :
+    side === 'left' ? 'animate-slide-in-left' :
+    'animate-slide-in-bottom'
+
   return (
     <div className="fixed inset-0 z-50">
       <div
-        className="absolute inset-0 bg-black/60"
+        className="absolute inset-0 bg-black/60 animate-fade-in"
         onClick={onClose}
         aria-hidden="true"
       />
@@ -104,7 +114,7 @@ export default function Sheet({
         tabIndex={-1}
         className={`absolute ${sideCls} bg-surface border-border ${
           side === 'right' ? 'border-l' : side === 'left' ? 'border-r' : 'border-t'
-        } shadow-2xl outline-none overflow-y-auto ${panelClassName ?? ''}`}
+        } shadow-2xl outline-none overflow-y-auto ${enterTranslate} ${panelClassName ?? ''}`}
         style={
           side === 'bottom'
             ? { paddingBottom: 'env(safe-area-inset-bottom)', paddingLeft: 'env(safe-area-inset-left)', paddingRight: 'env(safe-area-inset-right)' }
