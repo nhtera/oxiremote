@@ -459,6 +459,13 @@ pub async fn api_login_one_time(
 
         one_time_keys::consume_otk_tx(&tx, &token_for_event).map_err(OtkErr::Consume)?;
 
+        // Stamp the OTK row with the device that consumed it so Recent Key
+        // Usage can render the actual phone/browser instead of "unknown".
+        tx.execute(
+            "UPDATE one_time_keys SET consumed_by_device = ?1 WHERE token = ?2",
+            params![device_id, token_for_event],
+        ).map_err(|e| OtkErr::Other(e.into()))?;
+
         let now = now_ts();
         tx.execute(
             "INSERT INTO sessions(session_id, created_at, last_seen_at, device_id) VALUES (?1, ?2, ?2, ?3)",

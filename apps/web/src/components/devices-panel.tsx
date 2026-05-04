@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useState } from 'react'
 import { WifiIcon } from './icons'
+import { prettyDeviceLabel, relativeTimeSec } from '../lib/device-label'
 
 // Localhost-only list of paired devices. /api/agent/devices is auth-free on
 // loopback (the host operator owns the machine), so this works on a freshly
@@ -12,20 +13,14 @@ interface TrustedDevice {
   created_at: number
   last_seen_at: number
   revoked_at: number | null
+  /** User-supplied display name. Takes precedence over the UA-derived label. */
+  device_name?: string | null
+  /** Coarse OS hint captured at pair time — fallback when UA parse misses. */
+  platform?: string | null
 }
 
 const POLL_MS = 10_000
 const STALE_AFTER_SEC = 300 // 5 min — treat as offline/grey
-
-function relTime(tsSec: number): string {
-  if (!tsSec) return '—'
-  const diff = Math.floor(Date.now() / 1000 - tsSec)
-  if (diff < 5) return 'just now'
-  if (diff < 60) return `${diff}s ago`
-  if (diff < 3600) return `${Math.floor(diff / 60)}m ago`
-  if (diff < 86_400) return `${Math.floor(diff / 3600)}h ago`
-  return `${Math.floor(diff / 86_400)}d ago`
-}
 
 function statusFor(d: TrustedDevice): { dotClass: string; title: string } {
   if (d.revoked_at) return { dotClass: 'bg-danger', title: 'Revoked' }
@@ -71,6 +66,12 @@ export default function DevicesPanel() {
     <div className="grid gap-1">
       {devices.map((d) => {
         const { dotClass, title } = statusFor(d)
+        // Prefer user-set name, then friendly UA cue ("Mac · Chrome"), then
+        // raw label as last resort. Full UA stays in the title attribute so
+        // power users can hover for forensic detail.
+        const display = d.device_name?.trim()
+          || prettyDeviceLabel(d.label, d.platform ?? undefined)
+        const fullUa = d.user_agent || d.label
         return (
           <div
             key={d.device_id}
@@ -80,14 +81,14 @@ export default function DevicesPanel() {
             <span className="text-text-muted shrink-0" aria-hidden>
               <WifiIcon size={14} />
             </span>
-            <span className="flex-1 truncate text-sm text-text-primary" title={d.label}>
-              {d.label}
+            <span className="flex-1 truncate text-sm text-text-primary" title={fullUa}>
+              {display}
             </span>
             <span
               className="text-xs text-text-muted"
               title={new Date(d.last_seen_at * 1000).toLocaleString()}
             >
-              {relTime(d.last_seen_at)}
+              {relativeTimeSec(d.last_seen_at)}
             </span>
           </div>
         )

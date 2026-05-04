@@ -211,6 +211,15 @@ pub fn init_db(db_path: &Path) -> anyhow::Result<()> {
         [],
     );
 
+    // Migration: link consumed OTKs back to the device that consumed them so
+    // Recent Key Usage can show "iPhone · 1.2.3.4" instead of "unknown" — the
+    // legacy `issued_by_session` column points at the issuing dashboard
+    // session, not the phone that scanned the QR.
+    let _ = conn.execute(
+        "ALTER TABLE one_time_keys ADD COLUMN consumed_by_device TEXT",
+        [],
+    );
+
     Ok(())
 }
 

@@ -6,6 +6,9 @@ interface KeyUsageEvent {
   kind: 'otk_used' | 'key_verified'
   device_label: string
   ip: string
+  /** OS hint captured at pair time. Used by prettyDeviceLabel as a fallback
+   *  when the UA fragment doesn't parse cleanly. Null on legacy rows. */
+  platform?: string | null
   at: number
 }
 
@@ -73,7 +76,7 @@ export default function RecentKeyUsage() {
       {events.length > 0 && (
         <div className="space-y-1.5">
           {events.map((ev, i) => {
-            const label = prettyDeviceLabel(ev.device_label)
+            const label = prettyDeviceLabel(ev.device_label, ev.platform ?? undefined)
             return (
               <div
                 key={i}

@@ -1088,14 +1088,17 @@ fn query_recent_key_usage(db_path: &std::path::PathBuf) -> Vec<serde_json::Value
     };
 
     // OTK usages: one_time_keys where used_at IS NOT NULL.
+    // Join via `consumed_by_device` (the phone that scanned the QR) — the
+    // legacy `issued_by_session` link points at the dashboard session that
+    // generated the code, which never has the consuming-device info.
     let otk_rows: Vec<serde_json::Value> = conn
         .prepare(
             "SELECT COALESCE(td.device_name, td.label, 'unknown'),
                     td.first_seen_ip,
+                    td.platform,
                     ok.used_at
              FROM one_time_keys ok
-             LEFT JOIN sessions s ON ok.issued_by_session = s.session_id
-             LEFT JOIN trusted_devices td ON s.device_id = td.device_id
+             LEFT JOIN trusted_devices td ON ok.consumed_by_device = td.device_id
              WHERE ok.used_at IS NOT NULL
              ORDER BY ok.used_at DESC
              LIMIT 10",
@@ -1106,13 +1109,14 @@ fn query_recent_key_usage(db_path: &std::path::PathBuf) -> Vec<serde_json::Value
                 Ok((
                     row.get::<_, Option<String>>(0)?,
                     row.get::<_, Option<String>>(1)?,
-                    row.get::<_, i64>(2)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, i64>(3)?,
                 ))
             })
             .ok()
             .map(|rows| {
                 rows.flatten()
-                    .map(|(label, ip, at)| {
+                    .map(|(label, ip, platform, at)| {
                         // Cap at 80 to match `sanitize_device_label`'s upper
                         // bound. Frontend re-formats UA-fallback labels into
                         // a friendly "OS · Browser" form, so we want enough
@@ -1126,6 +1130,7 @@ fn query_recent_key_usage(db_path: &std::path::PathBuf) -> Vec<serde_json::Value
                             "kind": "otk_used",
                             "device_label": label,
                             "ip": ip.unwrap_or_default(),
+                            "platform": platform,
                             "at": at,
                         })
                     })
@@ -1137,7 +1142,7 @@ fn query_recent_key_usage(db_path: &std::path::PathBuf) -> Vec<serde_json::Value
     // Key verifications: trusted_devices sorted by last_seen_at DESC.
     let key_rows: Vec<serde_json::Value> = conn
         .prepare(
-            "SELECT COALESCE(device_name, label), first_seen_ip, last_seen_at
+            "SELECT COALESCE(device_name, label), first_seen_ip, platform, last_seen_at
              FROM trusted_devices
              WHERE revoked_at IS NULL AND last_seen_at IS NOT NULL
              ORDER BY last_seen_at DESC
@@ -1149,18 +1154,20 @@ fn query_recent_key_usage(db_path: &std::path::PathBuf) -> Vec<serde_json::Value
                 Ok((
                     row.get::<_, String>(0)?,
                     row.get::<_, Option<String>>(1)?,
-                    row.get::<_, i64>(2)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, i64>(3)?,
                 ))
             })
             .ok()
             .map(|rows| {
                 rows.flatten()
-                    .map(|(label, ip, at)| {
+                    .map(|(label, ip, platform, at)| {
                         let label: String = label.chars().take(80).collect();
                         json!({
                             "kind": "key_verified",
                             "device_label": label,
                             "ip": ip.unwrap_or_default(),
+                            "platform": platform,
                             "at": at,
                         })
                     })
