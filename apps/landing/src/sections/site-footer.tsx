@@ -4,6 +4,7 @@ const COLUMNS = [
   {
     title: 'Product',
     items: [
+      { label: 'Open the live app', href: 'https://remote.erai.dev' },
       { label: 'Features', href: '#features' },
       { label: 'How it works', href: '#how-it-works' },
       { label: 'Compare', href: '#compare' },

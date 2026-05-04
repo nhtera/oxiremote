@@ -74,6 +74,20 @@ export default function SiteNav() {
               </svg>
             </a>
             <a
+              href="https://remote.erai.dev"
+              target="_blank"
+              rel="noreferrer"
+              className="hidden md:inline-flex items-center gap-1.5 h-9 rounded-lg border border-border bg-surface-alt/60 backdrop-blur-sm px-3.5 text-[13.5px] font-medium text-text-primary hover:border-text-secondary hover:bg-surface-hover transition-colors"
+            >
+              <span className="inline-flex items-center gap-1.5">
+                <span className="w-1.5 h-1.5 rounded-full bg-success live-dot" />
+                Open app
+              </span>
+              <svg viewBox="0 0 16 16" className="w-3 h-3 opacity-60" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round">
+                <path d="M6 4h6v6M12 4l-7 7" />
+              </svg>
+            </a>
+            <a
               href="#install"
               className="hidden sm:inline-flex items-center gap-1.5 h-9 rounded-lg bg-accent px-3.5 text-[13.5px] font-medium text-white ring-accent-soft hover:bg-accent-soft transition-colors"
             >
@@ -107,6 +121,15 @@ export default function SiteNav() {
                 {l.label}
               </a>
             ))}
+            <a
+              href="https://remote.erai.dev"
+              target="_blank"
+              rel="noreferrer"
+              className="px-3 py-2.5 text-[14px] text-accent hover:text-accent-soft rounded-md hover:bg-surface-hover inline-flex items-center gap-2"
+            >
+              <span className="w-1.5 h-1.5 rounded-full bg-success live-dot" />
+              Open app · remote.erai.dev
+            </a>
             <a
               href="https://github.com/nhtera/oxiremote"
               target="_blank"

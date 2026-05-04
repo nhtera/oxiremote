@@ -48,18 +48,33 @@ export default function Hero() {
                 Install OxiRemote
               </CtaButton>
               <CtaButton
-                href="https://github.com/nhtera/oxiremote"
+                href="https://remote.erai.dev"
                 variant="outline"
                 external
                 icon={
-                  <svg viewBox="0 0 24 24" className="w-4 h-4" fill="currentColor" aria-hidden>
-                    <path d="M12 1a11 11 0 0 0-3.48 21.45c.55.1.75-.24.75-.53v-1.84c-3.06.66-3.7-1.48-3.7-1.48-.5-1.27-1.22-1.6-1.22-1.6-1-.69.07-.67.07-.67 1.1.07 1.69 1.13 1.69 1.13.98 1.69 2.58 1.2 3.21.92.1-.71.39-1.2.7-1.48-2.44-.28-5.01-1.22-5.01-5.42 0-1.2.43-2.18 1.13-2.95-.11-.28-.49-1.4.11-2.92 0 0 .92-.3 3.02 1.13a10.4 10.4 0 0 1 5.5 0c2.1-1.43 3.02-1.13 3.02-1.13.6 1.52.22 2.64.11 2.92.7.77 1.13 1.75 1.13 2.95 0 4.21-2.57 5.13-5.02 5.41.39.34.74 1.01.74 2.04v3.02c0 .29.2.64.76.53A11 11 0 0 0 12 1Z" />
-                  </svg>
+                  <span className="inline-flex w-4 h-4 items-center justify-center">
+                    <span className="w-1.5 h-1.5 rounded-full bg-success live-dot" />
+                  </span>
                 }
               >
-                Star on GitHub
+                Try the live app
               </CtaButton>
+              <a
+                href="https://github.com/nhtera/oxiremote"
+                target="_blank"
+                rel="noreferrer"
+                className="group inline-flex items-center gap-2 h-11 text-[14px] text-text-secondary hover:text-text-primary transition-colors"
+              >
+                <svg viewBox="0 0 24 24" className="w-4 h-4" fill="currentColor" aria-hidden>
+                  <path d="M12 1a11 11 0 0 0-3.48 21.45c.55.1.75-.24.75-.53v-1.84c-3.06.66-3.7-1.48-3.7-1.48-.5-1.27-1.22-1.6-1.22-1.6-1-.69.07-.67.07-.67 1.1.07 1.69 1.13 1.69 1.13.98 1.69 2.58 1.2 3.21.92.1-.71.39-1.2.7-1.48-2.44-.28-5.01-1.22-5.01-5.42 0-1.2.43-2.18 1.13-2.95-.11-.28-.49-1.4.11-2.92 0 0 .92-.3 3.02 1.13a10.4 10.4 0 0 1 5.5 0c2.1-1.43 3.02-1.13 3.02-1.13.6 1.52.22 2.64.11 2.92.7.77 1.13 1.75 1.13 2.95 0 4.21-2.57 5.13-5.02 5.41.39.34.74 1.01.74 2.04v3.02c0 .29.2.64.76.53A11 11 0 0 0 12 1Z" />
+                </svg>
+                Source on GitHub
+              </a>
             </div>
+            <p className="mt-3 text-[12.5px] text-text-muted">
+              Live demo runs the full PWA — pair, browse files, open a terminal.
+              <span className="font-mono text-text-secondary ml-1">remote.erai.dev</span>
+            </p>
 
             <div className="mt-6">
               <CopyCommand command="curl -fsSL get.oxiremote.dev | bash" />

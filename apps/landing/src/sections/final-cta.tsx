@@ -28,11 +28,23 @@ export default function FinalCta() {
                   Install OxiRemote
                 </CtaButton>
                 <CtaButton
-                  href="https://github.com/nhtera/oxiremote"
+                  href="https://remote.erai.dev"
                   variant="outline"
                   external
+                  icon={
+                    <span className="inline-flex w-4 h-4 items-center justify-center">
+                      <span className="w-1.5 h-1.5 rounded-full bg-success live-dot" />
+                    </span>
+                  }
                 >
-                  Browse the source
+                  Try the live app
+                </CtaButton>
+                <CtaButton
+                  href="https://github.com/nhtera/oxiremote"
+                  variant="ghost"
+                  external
+                >
+                  Source on GitHub
                 </CtaButton>
               </div>
               <p className="font-mono text-[12px] text-text-muted">
