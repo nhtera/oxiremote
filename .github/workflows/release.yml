@@ -88,6 +88,7 @@ jobs:
             libx11-dev libxcb-randr0-dev libxcb-xtest0-dev libxcb-xinerama0-dev \
             libxcb-shape0-dev libxcb-xkb-dev libxkbcommon-dev libxcb-cursor-dev \
             libglib2.0-dev libgtk-3-dev libayatana-appindicator3-dev \
+            libpipewire-0.3-dev \
             pkg-config nasm
 
       - name: Install JS deps + build web assets

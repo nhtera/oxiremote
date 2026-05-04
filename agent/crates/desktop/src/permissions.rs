@@ -62,8 +62,6 @@ pub fn desktop_available() -> bool {
 }
 
 fn probe_screen_recording() -> bool {
-    use std::sync::mpsc;
-    use std::time::Duration;
     use xcap::Monitor;
 
     let monitors = match Monitor::all() {
@@ -77,24 +75,40 @@ fn probe_screen_recording() -> bool {
             return false;
         }
     };
-
-    // Run the capture on a worker thread with a hard deadline. Guards against
-    // Linux PipeWire portal handshakes that can block arbitrarily long.
     let monitor = monitors.into_iter().next().unwrap();
-    let (tx, rx) = mpsc::channel();
-    std::thread::spawn(move || {
-        let _ = tx.send(monitor.capture_image().is_ok());
-    });
 
-    match rx.recv_timeout(Duration::from_secs(3)) {
-        Ok(true) => true,
-        Ok(false) => {
-            warn!("screen capture probe failed (TCC denied or display unavailable)");
-            false
+    // Linux: capture can block on the Wayland PipeWire portal handshake, so
+    // probe in a worker thread with a hard deadline. macOS / Windows are
+    // synchronous and fast — and on Windows `xcap::Monitor` isn't `Send`
+    // (HMONITOR is `*mut c_void`), so the thread-spawn version won't compile.
+    #[cfg(target_os = "linux")]
+    {
+        use std::sync::mpsc;
+        use std::time::Duration;
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(monitor.capture_image().is_ok());
+        });
+        match rx.recv_timeout(Duration::from_secs(3)) {
+            Ok(true) => true,
+            Ok(false) => {
+                warn!("screen capture probe failed (TCC denied or display unavailable)");
+                false
+            }
+            Err(_) => {
+                warn!("screen capture probe timed out (3s)");
+                false
+            }
         }
-        Err(_) => {
-            warn!("screen capture probe timed out (3s)");
-            false
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        match monitor.capture_image() {
+            Ok(_) => true,
+            Err(err) => {
+                warn!(error = %err, "screen capture probe failed");
+                false
+            }
         }
     }
 }
