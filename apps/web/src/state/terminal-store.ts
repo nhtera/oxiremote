@@ -17,6 +17,9 @@ export type Session = {
   last_seq?: number
   buffer_bytes?: number
   attached?: boolean
+  // Agent-aware moat fields (nullable — old servers omit them)
+  detected_agent?: string | null
+  notify_on_agent_end?: boolean
 }
 
 // Workspace can host up to 3 horizontal panes. Each pane is either empty or
@@ -46,6 +49,10 @@ type TerminalStoreState = {
   detachFromPane: (paneIdx: PaneIndex) => void
   setPaneCount: (n: PaneCount) => void
   setFocusedPane: (idx: PaneIndex) => void
+  /** Set or clear the detected agent name for a session. */
+  setDetectedAgent: (id: string, agentName: string | null) => void
+  /** Update the notify-on-finish opt-in flag after a successful API call. */
+  setNotifyOnAgentEnd: (id: string, enabled: boolean) => void
 }
 
 export const useTerminalStore = create<TerminalStoreState>((set) => ({
@@ -142,4 +149,18 @@ export const useTerminalStore = create<TerminalStoreState>((set) => ({
       const sid = s.paneAssignments[idx]
       return { focusedPane: idx, activeId: sid ?? s.activeId }
     }),
+
+  setDetectedAgent: (id, agentName) =>
+    set((s) => ({
+      sessions: s.sessions.map((x) =>
+        x.id === id ? { ...x, detected_agent: agentName } : x,
+      ),
+    })),
+
+  setNotifyOnAgentEnd: (id, enabled) =>
+    set((s) => ({
+      sessions: s.sessions.map((x) =>
+        x.id === id ? { ...x, notify_on_agent_end: enabled } : x,
+      ),
+    })),
 }))

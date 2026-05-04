@@ -35,6 +35,9 @@ export default function WelcomePage() {
             Your dev box, in your pocket. Reach your terminal, files, and
             desktop from anywhere.
           </p>
+          <p className="mt-1 text-xs text-text-muted leading-relaxed">
+            Designed for AI coding sessions — supervise from your phone.
+          </p>
         </header>
 
         {recentHosts.length > 0 && <RecentHosts hosts={recentHosts} />}
@@ -61,6 +64,13 @@ export default function WelcomePage() {
               }
               title="Remote desktop"
               body="Real-time screen with H.264 or JPEG fallback. Quality auto-adapts to your network."
+            />
+            <FeatureRow
+              icon={
+                <path d="M18 8a6 6 0 0 1-6 6m0 0a6 6 0 0 1-6-6m6 6v4m-4 2h8 M12 2v2" />
+              }
+              title="Agent supervision"
+              body="Notify when Claude / Codex finishes a long task — tap to jump straight to that session."
             />
           </div>
         )}

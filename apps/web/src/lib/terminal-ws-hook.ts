@@ -190,7 +190,7 @@ function connect(
     try {
       // Tolerant: ignore unknown message types
       const msg = JSON.parse(ev.data) as Record<string, unknown>
-      const { setLastSeq, setState, rename } = useTerminalStore.getState()
+      const { setLastSeq, setState, rename, setDetectedAgent } = useTerminalStore.getState()
       if (msg.t === 'chunk' && typeof msg.data === 'string' && typeof msg.seq === 'number') {
         handle.term.write(msg.data)
         setLastSeq(sessionId, msg.seq)
@@ -204,6 +204,12 @@ function connect(
         setState(sessionId, msg.state as Session['state'])
       } else if (msg.t === 'renamed' && typeof msg.name === 'string') {
         rename(sessionId, msg.name)
+      } else if (msg.t === 'agent_detected' && typeof msg.agent_name === 'string') {
+        // Agent CLI appeared in PTY foreground — show badge in tab bar.
+        setDetectedAgent(sessionId, msg.agent_name)
+      } else if (msg.t === 'agent_ended') {
+        // Agent CLI exited — clear badge.
+        setDetectedAgent(sessionId, null)
       }
       // Unknown variants silently ignored per spec
     } catch {}

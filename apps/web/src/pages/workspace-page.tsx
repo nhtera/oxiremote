@@ -35,6 +35,7 @@ export default function WorkspacePage() {
     sessions, activeId, setActive, setSessions, rename, remove,
     paneAssignments, paneCount, focusedPane,
     attachToPane, setPaneCount, setFocusedPane,
+    setNotifyOnAgentEnd,
   } = useTerminalStore()
   const confirm = useConfirm()
   const [err, setErr] = useState<string | null>(null)
@@ -281,6 +282,7 @@ export default function WorkspacePage() {
           onRename={handleRename}
           onOpenSettings={() => setShowSettings((v) => !v)}
           hostId={hostId}
+          onNotifyToggle={(sessionId, enabled) => setNotifyOnAgentEnd(sessionId, enabled)}
         />
         {showSettings && (
           <TerminalSettingsPopover
@@ -341,6 +343,15 @@ export default function WorkspacePage() {
           />
           <NewSessionRow onCreate={createSession} />
           {err && <div className="text-danger text-xs">{err}</div>}
+          {!hasSessions && (
+            <p className="text-xs text-text-muted text-center max-w-xs leading-relaxed">
+              Tip: start{' '}
+              <code className="px-1 py-px rounded bg-surface border border-border text-accent font-mono text-[10px]">
+                claude code
+              </code>{' '}
+              in a session and we&apos;ll notify your phone when it finishes.
+            </p>
+          )}
         </div>
       )}
 
