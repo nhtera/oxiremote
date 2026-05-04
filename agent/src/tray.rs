@@ -16,30 +16,23 @@ use tray_icon::{
 
 use crate::AGENT_PORT;
 
-/// Programmatically paint a 32×32 icon. Two tones so it matches the
-/// idle/active visual without shipping binary PNG assets in the repo.
-fn make_icon(active: bool) -> Result<Icon> {
-    const SIZE: u32 = 32;
-    let (r, g, b) = if active {
-        (0xFF, 0x8C, 0x00) // idle → orange accent when a device needs attention
-    } else {
-        (0xAA, 0xAA, 0xAA) // neutral grey when healthy/idle
-    };
-    let mut rgba = Vec::with_capacity((SIZE * SIZE * 4) as usize);
-    for y in 0..SIZE {
-        for x in 0..SIZE {
-            // Filled disc with 2px padding so the icon reads at menu-bar scale.
-            let dx = x as i32 - 16;
-            let dy = y as i32 - 16;
-            let d2 = dx * dx + dy * dy;
-            if d2 <= 14 * 14 {
-                rgba.extend_from_slice(&[r, g, b, 0xFF]);
-            } else {
-                rgba.extend_from_slice(&[0, 0, 0, 0]);
-            }
-        }
-    }
-    Icon::from_rgba(rgba, SIZE, SIZE).map_err(|e| anyhow::anyhow!("tray icon: {e}"))
+/// 44×44 retina menu-bar bolt rendered from `assets/menu-bar-bolt.svg`. Pre-
+/// rasterised at build time (`rsvg-convert -w 44 -h 44 …`) and embedded so
+/// the binary stays self-contained — adding `resvg` for runtime SVG drawing
+/// would pull ~1 MB of extra deps for a single 44 px raster.
+///
+/// The PNG is solid black on transparent; we mark the tray icon as a macOS
+/// template image so the OS auto-tints it (white in dark menu bars, black
+/// in light) and respects the system's accent / inverted modes.
+const MENU_BAR_BOLT_PNG: &[u8] = include_bytes!("../assets/menu-bar-bolt-44.png");
+
+fn make_icon() -> Result<Icon> {
+    let img = image::load_from_memory(MENU_BAR_BOLT_PNG)
+        .map_err(|e| anyhow::anyhow!("decode menu-bar bolt png: {e}"))?
+        .to_rgba8();
+    let (w, h) = img.dimensions();
+    Icon::from_rgba(img.into_raw(), w, h)
+        .map_err(|e| anyhow::anyhow!("tray icon: {e}"))
 }
 
 pub struct TrayHandle {
@@ -72,7 +65,11 @@ pub fn build_tray() -> Result<TrayHandle> {
     let tray = TrayIconBuilder::new()
         .with_menu(Box::new(menu))
         .with_tooltip("OxiRemote")
-        .with_icon(make_icon(false)?)
+        .with_icon(make_icon()?)
+        // Template flag tells AppKit the icon is a monochrome silhouette so
+        // it auto-tints to match the menu bar's tone — the only sane mode
+        // for a CLI-style status item.
+        .with_icon_as_template(true)
         .build()?;
 
     Ok(TrayHandle {
