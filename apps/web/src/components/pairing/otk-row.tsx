@@ -10,8 +10,8 @@ interface Props {
   hasKey: boolean
   otkActive: boolean
   /** True after the SSE `otk_used` event arrives. The token is masked and
-   *  the countdown swaps for a "Used" pill — matches 9remote's pairing flow
-   *  where a consumed code visibly retreats. */
+   *  the countdown swaps for a "Used" pill — a consumed code should visibly
+   *  retreat so the operator knows it can no longer be redeemed. */
   consumed?: boolean
   /** Called when the user clicks "Generate new OTK" from the expiry CTA. */
   onRegenerate?: () => void

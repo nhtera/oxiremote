@@ -1,0 +1,176 @@
+@import "tailwindcss";
+
+@theme {
+  --color-surface: #0d0e12;
+  --color-surface-alt: #14151a;
+  --color-surface-raised: #1c1d24;
+  --color-surface-hover: #262731;
+  --color-border: #2c2e38;
+  --color-border-soft: #1f2028;
+  --color-text-primary: #f5f5f7;
+  --color-text-secondary: #a1a3ae;
+  --color-text-muted: #6b6d7a;
+  --color-accent: #ff7a40;
+  --color-accent-soft: #ff8f5a;
+  --color-accent-deep: #e2632c;
+  --color-success: #4ade80;
+  --color-info: #6cb4ff;
+  --color-danger: #f87171;
+  --font-sans: "Geist", ui-sans-serif, system-ui, -apple-system, sans-serif;
+  --font-mono: "Geist Mono", ui-monospace, "SF Mono", Consolas, monospace;
+  --font-serif: "Instrument Serif", ui-serif, Georgia, serif;
+}
+
+:root {
+  --grain: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='160' height='160'><filter id='n'><feTurbulence type='fractalNoise' baseFrequency='0.85' numOctaves='2' stitchTiles='stitch'/><feColorMatrix values='0 0 0 0 1 0 0 0 0 1 0 0 0 0 1 0 0 0 0.06 0'/></filter><rect width='100%25' height='100%25' filter='url(%23n)'/></svg>");
+  color-scheme: dark;
+}
+
+html, body { background: var(--color-surface); color: var(--color-text-primary); }
+
+body {
+  font-family: var(--font-sans);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  text-rendering: optimizeLegibility;
+  margin: 0;
+  font-feature-settings: "ss01", "ss02", "cv11";
+  letter-spacing: -0.005em;
+}
+
+/* Atmospheric base — radial coral glow on top, soft amber on side, then film grain.
+   Fixed-attachment so it stays put while sections scroll over. */
+body::before {
+  content: "";
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  z-index: 0;
+  background:
+    radial-gradient(ellipse 80% 55% at 70% -10%, color-mix(in srgb, var(--color-accent) 22%, transparent), transparent 60%),
+    radial-gradient(ellipse 60% 45% at 10% 30%, color-mix(in srgb, var(--color-accent-deep) 12%, transparent), transparent 65%),
+    radial-gradient(ellipse 90% 50% at 50% 110%, color-mix(in srgb, var(--color-accent) 10%, transparent), transparent 70%);
+}
+body::after {
+  content: "";
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  z-index: 0;
+  background-image: var(--grain);
+  background-size: 220px 220px;
+  opacity: 0.42;
+  mix-blend-mode: overlay;
+}
+#root { position: relative; z-index: 1; min-height: 100dvh; }
+
+/* Hairline grid baseline used in many sections */
+.bg-grid {
+  background-image:
+    linear-gradient(to right, color-mix(in srgb, var(--color-text-muted) 14%, transparent) 1px, transparent 1px),
+    linear-gradient(to bottom, color-mix(in srgb, var(--color-text-muted) 14%, transparent) 1px, transparent 1px);
+  background-size: 56px 56px;
+  mask-image: radial-gradient(ellipse 70% 60% at 50% 35%, black 35%, transparent 78%);
+  -webkit-mask-image: radial-gradient(ellipse 70% 60% at 50% 35%, black 35%, transparent 78%);
+}
+
+/* Subtle dot grid alt */
+.bg-dots {
+  background-image: radial-gradient(circle, color-mix(in srgb, var(--color-text-muted) 22%, transparent) 1px, transparent 1px);
+  background-size: 22px 22px;
+}
+
+/* Tinted inner shadow ring used on glass cards */
+.ring-glass {
+  box-shadow:
+    inset 0 1px 0 0 color-mix(in srgb, white 8%, transparent),
+    inset 0 0 0 1px color-mix(in srgb, white 4%, transparent),
+    0 24px 60px -28px rgb(0 0 0 / 0.7);
+}
+
+/* Coral inner glow for accent surfaces */
+.ring-accent-soft {
+  box-shadow:
+    inset 0 1px 0 0 color-mix(in srgb, white 18%, transparent),
+    inset 0 -20px 40px -28px color-mix(in srgb, var(--color-accent-deep) 60%, transparent),
+    0 18px 40px -20px color-mix(in srgb, var(--color-accent) 35%, transparent);
+}
+
+/* Editorial display heading — Geist tightened */
+.heading-display {
+  font-family: var(--font-sans);
+  font-weight: 600;
+  letter-spacing: -0.04em;
+  line-height: 0.96;
+}
+.heading-display em {
+  font-family: var(--font-serif);
+  font-weight: 400;
+  font-style: italic;
+  letter-spacing: -0.01em;
+}
+
+/* Coral text gradient for emphasis spans */
+.text-coral-gradient {
+  background: linear-gradient(180deg, #ffaa7a 0%, #ff7a40 55%, #e2632c 100%);
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+}
+
+/* Tag pill */
+.eyebrow {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--color-text-secondary);
+}
+
+/* Scroll-marquee for the trust strip */
+@keyframes slide-x {
+  from { transform: translateX(0); }
+  to   { transform: translateX(-50%); }
+}
+.marquee-track { animation: slide-x 38s linear infinite; }
+.marquee-track:hover { animation-play-state: paused; }
+
+/* Caret blink for terminal mocks */
+@keyframes caret { 50% { opacity: 0; } }
+.caret { animation: caret 1s steps(1) infinite; }
+
+/* Idle pulse for the live dot */
+@keyframes live-pulse {
+  0%, 100% { box-shadow: 0 0 0 0 color-mix(in srgb, var(--color-success) 60%, transparent); }
+  50%      { box-shadow: 0 0 0 8px color-mix(in srgb, var(--color-success) 0%, transparent); }
+}
+.live-dot { animation: live-pulse 2.2s ease-out infinite; }
+
+/* Float orbiting glow for hero card */
+@keyframes float-orb {
+  0%, 100% { transform: translate3d(0, 0, 0); }
+  50%      { transform: translate3d(8px, -10px, 0); }
+}
+.float-orb { animation: float-orb 9s ease-in-out infinite; }
+
+/* Reveal on scroll baseline */
+.reveal {
+  opacity: 0;
+  transform: translateY(18px);
+  transition: opacity 700ms ease, transform 700ms cubic-bezier(0.2, 0.7, 0.2, 1);
+  transition-delay: var(--reveal-delay, 0ms);
+}
+.reveal.visible { opacity: 1; transform: translateY(0); }
+
+/* Custom scrollbar — neutral, brand-respectful */
+* { scrollbar-color: #2c2e38 transparent; scrollbar-width: thin; }
+*::-webkit-scrollbar { width: 10px; height: 10px; }
+*::-webkit-scrollbar-thumb { background: #2c2e38; border-radius: 999px; }
+*::-webkit-scrollbar-track { background: transparent; }
+
+/* Hide scrollbar inside terminal mock for cleaner look */
+.no-scrollbar::-webkit-scrollbar { display: none; }
+.no-scrollbar { scrollbar-width: none; }
+
+/* Selection */
+::selection { background: color-mix(in srgb, var(--color-accent) 35%, transparent); color: var(--color-text-primary); }

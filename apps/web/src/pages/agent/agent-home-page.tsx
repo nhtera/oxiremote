@@ -167,9 +167,9 @@ export default function AgentHomePage() {
         } else if (ev.type === 'otk_expired') {
           setOtk((o) => (o ? { ...o, expires_at: 0 } : o))
         } else if (ev.type === 'otk_used') {
-          // OTK consumed by /login (one-time pair). Match 9remote — keep the
-          // record but flip `used` so the card renders the "Used" state.
-          // Operator clicks "New key" to mint a fresh one.
+          // OTK consumed by /login (one-time pair). Keep the record but flip
+          // `used` so the card renders the "Used" state. Operator clicks
+          // "New key" to mint a fresh one.
           setOtk((o) => (o ? { ...o, used: true } : o))
         } else if (ev.type === 'permanent_key_rotated') {
           fetch('/api/agent/keys/permanent')
