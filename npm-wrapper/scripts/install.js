@@ -24,7 +24,8 @@ function detectTarget() {
   const arch = process.arch
   const map = {
     'darwin/arm64': 'aarch64-apple-darwin',
-    'darwin/x64': 'x86_64-apple-darwin',
+    // 'darwin/x64' temporarily unsupported — see .github/workflows/release.yml.
+    // Falls through to the "no prebuilt binary" path below.
     'linux/x64': 'x86_64-unknown-linux-gnu',
     'linux/arm64': 'aarch64-unknown-linux-gnu',
     'win32/x64': 'x86_64-pc-windows-msvc',
