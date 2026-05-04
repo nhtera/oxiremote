@@ -15,11 +15,29 @@ use crate::push::{send_agent_finished_push, AgentFinishedPushParams, PushSubscri
 
 const APP_NAME: &str = "OxiRemote";
 
+/// Pre-register a bundle identifier on macOS so `notify-rust` doesn't fall
+/// back to the literal `"use_default"` string — which `mac-notification-sys`
+/// then hands to LaunchServices, which then prompts the user with a
+/// "Where is `use_default`?" Choose Application dialog. Pinning to
+/// `com.apple.Terminal` (always present) suppresses the dialog and lets
+/// notifications post under the launching terminal's identity, which is
+/// the right semantics for a CLI tool that runs unbundled. No-op on
+/// non-macOS hosts and on subsequent calls (`set_application` is `call_once`
+/// internally).
+#[cfg(target_os = "macos")]
+fn ensure_macos_bundle_registered() {
+    let _ = notify_rust::set_application("com.apple.Terminal");
+}
+
+#[cfg(not(target_os = "macos"))]
+fn ensure_macos_bundle_registered() {}
+
 /// One-shot launch toast. Best-effort; failures (no DBus, sandboxed, etc.)
 /// are dropped — startup must never block on a notification daemon.
 pub fn show_startup(addr: SocketAddr) {
     let body = format!("Open http://{addr}/agent for the host dashboard.");
     tokio::task::spawn_blocking(move || {
+        ensure_macos_bundle_registered();
         let _ = notify_rust::Notification::new()
             .appname(APP_NAME)
             .summary("OxiRemote running")
@@ -102,6 +120,7 @@ pub fn spawn_event_notifier(
                     let short = device_id.chars().take(10).collect::<String>();
                     let body = format!("Device {short}… from {ip} is waiting for approval");
                     tokio::task::spawn_blocking(move || {
+                        ensure_macos_bundle_registered();
                         let _ = notify_rust::Notification::new()
                             .appname(APP_NAME)
                             .summary("OxiRemote — device pending")
@@ -122,6 +141,7 @@ pub fn spawn_event_notifier(
                     last_fired = Some((TUNNEL_DEDUP_KEY.to_string(), std::time::Instant::now()));
 
                     tokio::task::spawn_blocking(move || {
+                        ensure_macos_bundle_registered();
                         let _ = notify_rust::Notification::new()
                             .appname(APP_NAME)
                             .summary("OxiRemote — tunnel down")
