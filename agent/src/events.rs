@@ -137,6 +137,22 @@ pub enum AgentEvent {
     /// transport are torn down. SPA listeners use this to transition the
     /// dashboard back to the onboarding card without a full reload.
     TunnelDisconnected,
+    /// An AI coding agent CLI (claude/codex/cursor/opencode) was detected as
+    /// the foreground process in a terminal session. Emitted at most once per
+    /// state change — repeated polls that see the same agent are no-ops.
+    SessionAgentDetected {
+        session_id: String,
+        agent_name: String,
+    },
+    /// The previously-detected agent process is no longer the foreground PG
+    /// (it exited or was replaced by another process). Carries duration and
+    /// exit code so the notifier can build a rich push payload.
+    SessionAgentEnded {
+        session_id: String,
+        agent_name: String,
+        duration_ms: u64,
+        exit_code: Option<i32>,
+    },
     /// Granular tunnel progress — emitted at each lifecycle step so the TUI
     /// and WebUI can render a 5-row checklist with live sub-text.
     TunnelStepChanged {

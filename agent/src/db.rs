@@ -198,6 +198,19 @@ pub fn init_db(db_path: &Path) -> anyhow::Result<()> {
         [],
     );
 
+    // Migration: agent-aware moat columns on terminal_sessions.
+    // Whether the user opted in to "notify when agent finishes" for this
+    // session (1 = enabled, 0 = disabled, default 0).
+    let _ = conn.execute(
+        "ALTER TABLE terminal_sessions ADD COLUMN notify_on_agent_end INTEGER DEFAULT 0",
+        [],
+    );
+    // Name of the agent currently detected in this session (NULL when none).
+    let _ = conn.execute(
+        "ALTER TABLE terminal_sessions ADD COLUMN detected_agent TEXT",
+        [],
+    );
+
     Ok(())
 }
 
