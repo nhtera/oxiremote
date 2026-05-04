@@ -135,6 +135,13 @@ pub struct AppState {
     /// the agent runs in single-binary embedded mode and emits `<tunnel>/login`
     /// QR payloads exactly as before.
     pub discovery_url: Option<String>,
+    /// Public web app base URL (`OXI_WEB_URL`). When set, QR payloads and the
+    /// dashboard share-link point here (e.g.
+    /// `https://remote.example.com/login?k=<otk>`) instead of the per-host
+    /// tunnel — phones scan into the user-facing SPA which then resolves the
+    /// tunnel URL via the discovery worker. Independent of `discovery_url`:
+    /// the worker handles lookups, the SPA URL is where humans land.
+    pub web_url: Option<String>,
     /// Latest temp key issued by the discovery worker — populated after every
     /// `TunnelUrlChanged` when discovery is enabled. Read by the TUI QR pane
     /// (and Phase 3 will surface it to the SPA bootstrap).
@@ -319,7 +326,19 @@ fn run_server_headless() -> anyhow::Result<()> {
 /// without double-slash guards. Returns None when the agent runs in embedded
 /// mode (single-binary, no Cloudflare discovery worker).
 fn read_discovery_url() -> Option<String> {
-    let raw = std::env::var("OXI_DISCOVERY_URL").ok()?;
+    read_trimmed_env("OXI_DISCOVERY_URL")
+}
+
+/// Read `OXI_WEB_URL` — the public SPA where users land when they scan the
+/// QR or click the share-link. Independent of `OXI_DISCOVERY_URL` (the
+/// worker). Returns None when unset / blank, in which case the QR falls
+/// back to `<tunnel>/login`.
+fn read_web_url() -> Option<String> {
+    read_trimmed_env("OXI_WEB_URL")
+}
+
+fn read_trimmed_env(name: &str) -> Option<String> {
+    let raw = std::env::var(name).ok()?;
     let trimmed = raw.trim().trim_end_matches('/');
     if trimmed.is_empty() {
         None
@@ -531,6 +550,7 @@ async fn server_main(
         desktop_available: desktop_avail,
         desktop_service: desktop_svc,
         discovery_url: discovery_url.clone(),
+        web_url: read_web_url(),
         discovery_temp_key: discovery_temp_key.clone(),
         tunnel_shutdown: Arc::new(tokio::sync::Notify::new()),
         telemetry,

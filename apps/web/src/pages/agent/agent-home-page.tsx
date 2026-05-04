@@ -28,6 +28,9 @@ interface OtkState {
 
 type AgentState = {
   tunnel_url: string | null
+  /** Public web app URL (OXI_WEB_URL) — preferred over tunnel_url for QR /
+   *  share-link payloads when set. Phones land here, not on the tunnel. */
+  web_url: string | null
   host_id: string
   label: string
   platform: string
@@ -214,6 +217,11 @@ export default function AgentHomePage() {
   }
 
   const tunnelUrl = state?.tunnel_url ?? null
+  // Pairing link / QR payload: prefer the operator-configured public web URL
+  // (OXI_WEB_URL) so phones land on the user-facing SPA which then resolves
+  // the per-host tunnel via the discovery worker. Falls back to the tunnel
+  // URL for embedded-mode deployments.
+  const pairingBaseUrl = state?.web_url ?? tunnelUrl
   const onboarding = !tunnelStepReady || !tunnelHealthy
 
   if (fetchStatus === 'error') {
@@ -245,7 +253,7 @@ export default function AgentHomePage() {
       <HostShell
         rail={
           <PairingCard
-            tunnelUrl={tunnelUrl}
+            tunnelUrl={pairingBaseUrl}
             otkToken={otk?.token ?? null}
             otkExpiresAt={otk?.expires_at ?? null}
             onRegenerate={() => setConfirmingOtk(true)}

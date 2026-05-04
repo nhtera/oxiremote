@@ -127,6 +127,11 @@ async fn api_agent_state(State(state): State<Arc<AppState>>) -> Json<serde_json:
         "desktop_enabled": desktop_enabled,
         "version": env!("CARGO_PKG_VERSION"),
         "active_clients": active_clients,
+        // Public web app base URL (OXI_WEB_URL). When set, the SPA prefers
+        // it over `tunnel_url` for QR / share-link payloads — phones land
+        // on the user-facing SPA which then resolves the tunnel via the
+        // discovery worker. Null when unset (tunnel-only deployments).
+        "web_url": state.web_url,
     }))
 }
 
@@ -1224,6 +1229,7 @@ mod tests {
             desktop_available: false,
             desktop_service: None,
             discovery_url: None,
+            web_url: None,
             discovery_temp_key: std::sync::Arc::new(std::sync::RwLock::new(None)),
             tunnel_shutdown: std::sync::Arc::new(tokio::sync::Notify::new()),
             telemetry: std::sync::Arc::new(crate::telemetry::TelemetryState::new()),
