@@ -43,6 +43,7 @@ export default function SiteNav() {
   const headerOpaque = scrolled || mobileOpen
 
   return (
+    <>
     <header
       className={`fixed inset-x-0 top-0 z-50 transition-all duration-300 ${
         headerOpaque
@@ -133,26 +134,29 @@ export default function SiteNav() {
         </div>
 
       </div>
+    </header>
 
-      {/* Mobile drawer — fills the viewport BELOW the 64px header so the close
-          button and brand stay visible. Solid surface (no opacity bleed),
-          its own scroll, dismisses on link click / Esc / outside tap.        */}
-      {mobileOpen && (
-        <>
-          {/* Backdrop catches taps outside the panel content */}
-          <button
-            type="button"
-            aria-label="Close menu"
-            onClick={() => setMobileOpen(false)}
-            className="md:hidden fixed inset-0 top-16 z-40 bg-surface/40 backdrop-blur-sm animate-fade-in"
-          />
-          <div
-            id="mobile-menu"
-            role="dialog"
-            aria-modal="true"
-            aria-label="Site navigation"
-            className="md:hidden fixed inset-x-0 top-16 bottom-0 z-50 bg-surface border-t border-border-soft overflow-y-auto"
-          >
+    {/* Mobile drawer — rendered as a sibling of <header> (NOT inside it).
+        The header has backdrop-filter, which establishes a containing block,
+        which would force `position: fixed` children to resolve against the
+        header's content box instead of the viewport — collapsing the drawer
+        to 1px tall. Sibling positioning avoids that trap entirely. */}
+    {mobileOpen && (
+      <>
+        {/* Backdrop catches taps outside the panel content */}
+        <button
+          type="button"
+          aria-label="Close menu"
+          onClick={() => setMobileOpen(false)}
+          className="md:hidden fixed inset-0 top-16 z-40 bg-surface/40 backdrop-blur-sm animate-fade-in"
+        />
+        <div
+          id="mobile-menu"
+          role="dialog"
+          aria-modal="true"
+          aria-label="Site navigation"
+          className="md:hidden fixed inset-x-0 top-16 bottom-0 z-50 bg-surface border-t border-border-soft overflow-y-auto"
+        >
             <nav className="flex flex-col px-4 pt-4 pb-8">
               {NAV_LINKS.map((l) => (
                 <a
@@ -211,11 +215,11 @@ export default function SiteNav() {
                   GitHub
                 </a>
                 <span className="font-mono">{VERSION}</span>
-              </div>
-            </nav>
-          </div>
-        </>
-      )}
-    </header>
+            </div>
+          </nav>
+        </div>
+      </>
+    )}
+    </>
   )
 }
