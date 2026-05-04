@@ -13,6 +13,7 @@
     "build:release": "bun run build:web && cargo build --release --manifest-path agent/Cargo.toml",
     "build:web": "bun --cwd apps/web build",
     "build:landing": "bun --cwd apps/landing build",
+    "deploy:web": "bun run build:web && wrangler pages deploy apps/web/dist --project-name oxiremote-web --branch main --commit-dirty=true",
     "deploy:landing": "bun run build:landing && wrangler pages deploy apps/landing/dist --project-name oxiremote-landing --branch main --commit-dirty=true",
     "typecheck:web": "bun --cwd apps/web typecheck",
     "typecheck:landing": "bun --cwd apps/landing typecheck",
