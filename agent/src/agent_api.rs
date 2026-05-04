@@ -995,8 +995,10 @@ fn fetch_device_meta(
     };
     let mut out = std::collections::HashMap::new();
     for (device_id, label, platform, last_active_ms) in rows.flatten() {
-        // Truncate label to 24 chars per spec.
-        let label: String = label.chars().take(24).collect();
+        // Cap at 80 to match `sanitize_device_label`'s upper bound. Frontend
+        // re-formats UA-fallback labels into a friendly "OS · Browser" form,
+        // so we want enough chars to keep the browser token intact.
+        let label: String = label.chars().take(80).collect();
         out.insert(device_id, (label, platform, last_active_ms));
     }
     out
@@ -1097,10 +1099,14 @@ fn query_recent_key_usage(db_path: &std::path::PathBuf) -> Vec<serde_json::Value
             .map(|rows| {
                 rows.flatten()
                     .map(|(label, ip, at)| {
+                        // Cap at 80 to match `sanitize_device_label`'s upper
+                        // bound. Frontend re-formats UA-fallback labels into
+                        // a friendly "OS · Browser" form, so we want enough
+                        // chars to keep the browser token intact.
                         let label: String = label
                             .unwrap_or_else(|| "unknown".into())
                             .chars()
-                            .take(24)
+                            .take(80)
                             .collect();
                         json!({
                             "kind": "otk_used",
@@ -1136,7 +1142,7 @@ fn query_recent_key_usage(db_path: &std::path::PathBuf) -> Vec<serde_json::Value
             .map(|rows| {
                 rows.flatten()
                     .map(|(label, ip, at)| {
-                        let label: String = label.chars().take(24).collect();
+                        let label: String = label.chars().take(80).collect();
                         json!({
                             "kind": "key_verified",
                             "device_label": label,

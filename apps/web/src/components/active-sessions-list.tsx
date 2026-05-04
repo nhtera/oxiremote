@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react'
 import StatusChip from './ui/status-chip'
+import { prettyDeviceLabel, relativeTimeMs } from '../lib/device-label'
 
 // Active client session data from GET /api/agent/sessions/active
 export interface ActiveSession {
@@ -29,14 +30,6 @@ function doingLabel(doing: ActiveSession['doing']): string {
     case 'files': return 'Files'
     case 'idle': return 'Idle'
   }
-}
-
-function fmtRelativeMs(ms: number): string {
-  const diff = Math.floor((Date.now() - ms) / 1000)
-  if (diff < 5) return 'just now'
-  if (diff < 60) return `${diff}s ago`
-  if (diff < 3600) return `${Math.floor(diff / 60)}m ago`
-  return `${Math.floor(diff / 3600)}h ago`
 }
 
 // Polls /api/agent/sessions/active every 5 s. Renders a compact per-client
@@ -119,8 +112,11 @@ export default function ActiveSessionsList() {
           <span className="shrink-0 text-[10px] font-medium px-1.5 py-0.5 rounded bg-surface-alt border border-border text-text-muted min-w-8 text-center">
             {platformBadge(s.platform)}
           </span>
-          <span className="flex-1 min-w-0 text-sm text-text-primary truncate">
-            {s.label}
+          <span
+            className="flex-1 min-w-0 text-sm text-text-primary truncate"
+            title={s.label}
+          >
+            {prettyDeviceLabel(s.label, s.platform)}
           </span>
           <StatusChip
             variant={s.doing === 'idle' ? 'offline' : 'online'}
@@ -129,7 +125,7 @@ export default function ActiveSessionsList() {
             {doingLabel(s.doing)}
           </StatusChip>
           <span className="shrink-0 text-[length:var(--text-meta)] text-text-muted">
-            {fmtRelativeMs(s.last_active_ms)}
+            {relativeTimeMs(s.last_active_ms)}
           </span>
           <button
             type="button"

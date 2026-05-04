@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'react'
+import { prettyDeviceLabel, relativeTimeSec } from '../lib/device-label'
 
 // Key usage event from GET /api/agent/keys/recent-usage (last 10)
 interface KeyUsageEvent {
@@ -9,15 +10,6 @@ interface KeyUsageEvent {
 }
 
 const POLL_MS = 30_000
-
-function fmtRelativeSec(sec: number): string {
-  const diff = Math.floor(Date.now() / 1000) - sec
-  if (diff < 5) return 'just now'
-  if (diff < 60) return `${diff}s ago`
-  if (diff < 3600) return `${Math.floor(diff / 60)}m ago`
-  if (diff < 86_400) return `${Math.floor(diff / 3600)}h ago`
-  return `${Math.floor(diff / 86_400)}d ago`
-}
 
 function kindLabel(kind: KeyUsageEvent['kind']): string {
   return kind === 'otk_used' ? 'OTK used' : 'Key verified'
@@ -81,9 +73,7 @@ export default function RecentKeyUsage() {
       {events.length > 0 && (
         <div className="space-y-1.5">
           {events.map((ev, i) => {
-            const label = ev.device_label.length > 24
-              ? ev.device_label.slice(0, 24) + '…'
-              : ev.device_label
+            const label = prettyDeviceLabel(ev.device_label)
             return (
               <div
                 key={i}
@@ -97,11 +87,13 @@ export default function RecentKeyUsage() {
                 <span className="flex-1 min-w-0 text-text-primary truncate" title={ev.device_label}>
                   {label}
                 </span>
-                <span className="shrink-0 text-text-muted font-mono">
-                  {ev.ip}
-                </span>
+                {ev.ip && (
+                  <span className="shrink-0 text-text-muted font-mono">
+                    {ev.ip}
+                  </span>
+                )}
                 <span className="shrink-0 text-text-muted">
-                  {fmtRelativeSec(ev.at)}
+                  {relativeTimeSec(ev.at)}
                 </span>
               </div>
             )
