@@ -1,4 +1,5 @@
 pub mod api_key_guard;
+pub mod bytes_counter;
 pub mod cors;
 pub mod csrf;
 pub mod rate_limit;
