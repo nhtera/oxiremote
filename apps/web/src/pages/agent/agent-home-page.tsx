@@ -191,6 +191,21 @@ export default function AgentHomePage() {
     }
   }
 
+  // Auto-mint a single OTK on first load when none is active — operator opens
+  // the dashboard expecting a ready pairing link, not an empty card. Server
+  // returns the existing active OTK on refresh so this only fires when the DB
+  // genuinely has no live key (fresh boot, or all prior keys expired/used).
+  useEffect(() => {
+    if (fetchStatus !== 'ready') return
+    const live = otk && otk.expires_at * 1000 > Date.now()
+    if (live) return
+    // Defer one tick so the cascading setStates inside handleRegenOtk don't
+    // fire synchronously inside the effect body.
+    const id = setTimeout(() => { void handleRegenOtk() }, 0)
+    return () => clearTimeout(id)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [fetchStatus])
+
   const handlePermanentRegen = async () => {
     setOtkError(null)
     try {

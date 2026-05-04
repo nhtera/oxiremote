@@ -116,6 +116,14 @@ async fn api_agent_state(State(state): State<Arc<AppState>>) -> Json<serde_json:
     // Used by the stop-agent confirm dialog to list connected clients.
     let active_clients = query_active_clients(&state.db_path);
 
+    // Surface the latest unused/unexpired OTK so a page refresh keeps the
+    // same key alive instead of stranding the SPA with `otk: null`. The SPA
+    // will auto-mint when this is null (fresh boot or post-expiry).
+    let otk = one_time_keys::active_otk(&state.db_path)
+        .ok()
+        .flatten()
+        .map(|rec| json!({ "token": rec.token, "expires_at": rec.expires_at }));
+
     Json(json!({
         "tunnel_url": tunnel_url,
         "tunnel_step": tunnel_step,
@@ -127,6 +135,7 @@ async fn api_agent_state(State(state): State<Arc<AppState>>) -> Json<serde_json:
         "desktop_enabled": desktop_enabled,
         "version": env!("CARGO_PKG_VERSION"),
         "active_clients": active_clients,
+        "otk": otk,
         // Public web app base URL (OXI_WEB_URL). When set, the SPA prefers
         // it over `tunnel_url` for QR / share-link payloads — phones land
         // on the user-facing SPA which then resolves the tunnel via the
