@@ -35,6 +35,7 @@ use menu::MenuChoice;
 /// not on `process::exit`, so without this the shell ends up still in
 /// mouse-tracking mode and prints SGR motion reports as plain text.
 static TUI_ACTIVE: AtomicBool = AtomicBool::new(false);
+#[cfg(unix)]
 static ATEXIT_REGISTERED: AtomicBool = AtomicBool::new(false);
 
 /// Main-thread handle stashed when the TUI menu picks "Open Web UI
@@ -117,6 +118,7 @@ pub fn restore_terminal_if_active() {
     let _ = execute!(out, LeaveAlternateScreen, DisableMouseCapture);
 }
 
+#[cfg(unix)]
 extern "C" fn atexit_restore() {
     restore_terminal_if_active();
 }
@@ -129,6 +131,11 @@ impl TerminalGuard {
         let mut out = io::stdout();
         execute!(out, EnterAlternateScreen, EnableMouseCapture)?;
         TUI_ACTIVE.store(true, Ordering::SeqCst);
+        // libc is a unix-only dep (see agent/Cargo.toml). Windows still gets
+        // restore via the Drop impl on TerminalGuard + the panic hook in
+        // run_with_panic_hook — atexit was a belt-and-braces fallback for the
+        // POSIX abort()/exit() paths that bypass Drop on unix.
+        #[cfg(unix)]
         if !ATEXIT_REGISTERED.swap(true, Ordering::SeqCst) {
             unsafe {
                 libc::atexit(atexit_restore);
