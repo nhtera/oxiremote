@@ -1,4 +1,5 @@
 import { ExternalLinkIcon } from '../icons'
+import { tunnelUrlAbs } from '../../lib/tunnel-url'
 
 interface Props {
   tunnelUrl: string | null
@@ -11,7 +12,7 @@ interface Props {
 // from messaging apps ("green = available") so they can confirm the link is
 // live before pasting it to a teammate.
 export default function QrPanel({ tunnelUrl, qrPayload, otkActive, otkExpired }: Props) {
-  const loginUrl = tunnelUrl ? `${tunnelUrl.replace(/\/$/, '')}/login` : null
+  const loginUrl = tunnelUrl ? `${tunnelUrlAbs(tunnelUrl)}/login` : null
 
   return (
     <div className="flex flex-col items-center gap-3 w-48 min-w-0">

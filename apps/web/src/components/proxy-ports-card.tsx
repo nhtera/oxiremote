@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
+import { tunnelUrlAbs } from '../lib/tunnel-url'
 
 // Localhost-only proxy-port toggle list. Discovered ports come from the
 // background lsof/netstat scan; the operator opts each one in or out, and the
@@ -77,7 +78,7 @@ export default function ProxyPortsCard({ tunnelUrl }: Props) {
 
   const copyShareUrl = async (port: number) => {
     if (!tunnelUrl) return
-    const url = `${tunnelUrl.replace(/\/$/, '')}/proxy/${port}/`
+    const url = `${tunnelUrlAbs(tunnelUrl)}/proxy/${port}/`
     try {
       await navigator.clipboard.writeText(url)
       setCopied(port)

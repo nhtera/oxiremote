@@ -3,6 +3,7 @@ import QrPanel from './pairing/qr-panel'
 import OtkRow from './pairing/otk-row'
 import PermanentRow from './pairing/permanent-row'
 import Button from './ui/button'
+import { tunnelUrlAbs } from '../lib/tunnel-url'
 
 // Hero pairing card: composes the QR panel, OTK row, and permanent-key row.
 // Logic-heavy bits (countdown tick, QR payload assembly, key formatting) live
@@ -51,8 +52,10 @@ export default function PairingCard({
   const formattedKey = useMemo(() => formatGroupedKey(otkToken ?? ''), [otkToken])
   const qrPayload =
     tunnelUrl && otkActive
-      ? `${tunnelUrl.replace(/\/$/, '')}/login?k=${otkToken!}`
-      : tunnelUrl ?? ''
+      ? `${tunnelUrlAbs(tunnelUrl)}/login?k=${otkToken!}`
+      : tunnelUrl
+        ? tunnelUrlAbs(tunnelUrl)
+        : ''
 
   return (
     <section className="rounded-2xl border border-border bg-surface p-5 md:p-6 shadow-[0_8px_28px_-12px_rgba(0,0,0,0.55)]">
