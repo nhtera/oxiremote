@@ -10,10 +10,9 @@ interface Props {
   onSubmit: (raw: string) => void
 }
 
-// QR scanning works on every modern browser now: BarcodeDetector for live
-// preview where supported, jsQR-decoded photo capture as the iOS Safari
-// fallback (the modal picks the right tier internally). Always show the
-// affordance; the modal handles the rest.
+// QR scanning uses live camera + jsQR on every browser that exposes
+// getUserMedia over a secure origin (HTTPS or localhost). Including iOS
+// Safari — only BarcodeDetector is missing there, which we don't need.
 const canScanQr = typeof window !== 'undefined' && 'mediaDevices' in navigator
 
 // Permanent keys are issued with the `sk-` prefix; OTK / pairing codes never
