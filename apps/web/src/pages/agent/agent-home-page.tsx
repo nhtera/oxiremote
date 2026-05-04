@@ -24,6 +24,9 @@ import RecentKeyUsage from '../../components/recent-key-usage'
 interface OtkState {
   token: string
   expires_at: number
+  /** True after the SSE `otk_used` event arrives — distinct from time-expired
+   *  so the UI can show a "scan complete" success state vs "regenerate". */
+  used?: boolean
 }
 
 type AgentState = {
@@ -163,6 +166,11 @@ export default function AgentHomePage() {
           setPendingDevice((d) => (d?.device_id === ev.device_id ? null : d))
         } else if (ev.type === 'otk_expired') {
           setOtk((o) => (o ? { ...o, expires_at: 0 } : o))
+        } else if (ev.type === 'otk_used') {
+          // OTK consumed by /login (one-time pair). Match 9remote — keep the
+          // record but flip `used` so the card renders the "Used" state.
+          // Operator clicks "New key" to mint a fresh one.
+          setOtk((o) => (o ? { ...o, used: true } : o))
         } else if (ev.type === 'permanent_key_rotated') {
           fetch('/api/agent/keys/permanent')
             .then((r) => (r.ok ? r.json() : null))
@@ -271,6 +279,7 @@ export default function AgentHomePage() {
             tunnelUrl={pairingBaseUrl}
             otkToken={otk?.token ?? null}
             otkExpiresAt={otk?.expires_at ?? null}
+            otkUsed={otk?.used ?? false}
             onRegenerate={() => setConfirmingOtk(true)}
             errorMessage={otkError}
             permanentKey={permanentKey}

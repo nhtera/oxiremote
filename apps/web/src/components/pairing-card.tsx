@@ -18,6 +18,11 @@ interface Props {
   tunnelUrl: string | null
   otkToken: string | null
   otkExpiresAt: number | null // Unix seconds
+  /** True once the SSE `otk_used` event arrives. Distinct from `expired` so
+   *  the card can render a "scan complete" success state vs a "regenerate"
+   *  warning state — the user-facing distinction matters: one means success,
+   *  the other means time ran out before anyone scanned. */
+  otkUsed?: boolean
   onRegenerate: () => void
   errorMessage: string | null
   permanentKey: PermanentKeyMeta | null
@@ -30,6 +35,7 @@ export default function PairingCard({
   tunnelUrl,
   otkToken,
   otkExpiresAt,
+  otkUsed = false,
   onRegenerate,
   errorMessage,
   permanentKey,
@@ -45,9 +51,12 @@ export default function PairingCard({
   }, [])
 
   const remaining = otkExpiresAt ? otkExpiresAt - now : 0
-  const otkActive = !!otkToken && remaining > 0
+  // "Used" wins over "active" — once the OTK is consumed it's spent regardless
+  // of remaining TTL. Time-expiry only matters when the OTK was never used.
+  const otkActive = !!otkToken && remaining > 0 && !otkUsed
   const expiringSoon = otkActive && remaining <= 60
-  const expired = !!otkToken && remaining <= 0
+  const expired = !!otkToken && remaining <= 0 && !otkUsed
+  const consumed = !!otkToken && otkUsed
 
   const formattedKey = useMemo(() => formatGroupedKey(otkToken ?? ''), [otkToken])
   const qrPayload =
@@ -78,6 +87,7 @@ export default function PairingCard({
             qrPayload={qrPayload}
             otkActive={otkActive}
             otkExpired={expired}
+            otkUsed={consumed}
           />
         </div>
         <Button
@@ -105,6 +115,7 @@ export default function PairingCard({
           expiringSoon={expiringSoon}
           hasKey={!!otkToken}
           otkActive={otkActive}
+          consumed={consumed}
           onRegenerate={onRegenerate}
         />
 

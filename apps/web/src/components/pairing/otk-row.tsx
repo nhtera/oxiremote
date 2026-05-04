@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useMemo, useState } from 'react'
 import { CopyIcon } from '../icons'
 
 interface Props {
@@ -9,6 +9,10 @@ interface Props {
   expiringSoon: boolean
   hasKey: boolean
   otkActive: boolean
+  /** True after the SSE `otk_used` event arrives. The token is masked and
+   *  the countdown swaps for a "Used" pill — matches 9remote's pairing flow
+   *  where a consumed code visibly retreats. */
+  consumed?: boolean
   /** Called when the user clicks "Generate new OTK" from the expiry CTA. */
   onRegenerate?: () => void
 }
@@ -21,6 +25,7 @@ export default function OtkRow({
   expiringSoon,
   hasKey,
   otkActive,
+  consumed = false,
   onRegenerate,
 }: Props) {
   const [copied, setCopied] = useState(false)
@@ -36,6 +41,20 @@ export default function OtkRow({
     }
   }
 
+  // Bullet-mask the token while consumed. Same group spacing as the live key
+  // so the row doesn't reflow when the SSE `otk_used` event arrives.
+  const maskedKey = useMemo(
+    () =>
+      formattedKey
+        ? formattedKey
+            .split(' ')
+            .map((g) => '•'.repeat(g.length))
+            .join(' ')
+        : '—',
+    [formattedKey],
+  )
+  const displayKey = consumed ? maskedKey : (formattedKey || '—')
+
   return (
     <div className="space-y-1.5">
       <div className="flex items-center justify-between">
@@ -48,14 +67,27 @@ export default function OtkRow({
           (otkActive ? 'border-border' : 'border-border/60')
         }
       >
-        <ClockIcon className={otkActive ? 'text-accent' : 'text-text-muted'} />
+        <ClockIcon
+          className={
+            otkActive
+              ? 'text-accent'
+              : consumed
+                ? 'text-success'
+                : 'text-text-muted'
+          }
+        />
         <code
           className={
             'flex-1 min-w-0 font-mono text-sm tracking-[0.08em] truncate select-all ' +
-            (otkActive ? 'text-text-primary' : 'text-text-muted line-through')
+            (otkActive
+              ? 'text-text-primary'
+              : consumed
+                ? 'text-text-muted'
+                : 'text-text-muted line-through')
           }
+          aria-label={consumed ? 'One-time key (consumed)' : 'One-time key'}
         >
-          {formattedKey || '—'}
+          {displayKey}
         </code>
         {expired && hasKey && (
           <span className="shrink-0 text-[10px] font-semibold uppercase tracking-wider text-danger bg-danger/10 border border-danger/30 rounded px-1.5 py-0.5">
@@ -83,6 +115,7 @@ export default function OtkRow({
         expired={expired}
         expiringSoon={expiringSoon}
         hasKey={hasKey}
+        consumed={consumed}
         onRegenerate={onRegenerate}
       />
     </div>
@@ -132,10 +165,11 @@ interface CountdownProps {
   expired: boolean
   expiringSoon: boolean
   hasKey: boolean
+  consumed?: boolean
   onRegenerate?: () => void
 }
 
-function Countdown({ remaining, expired, expiringSoon, hasKey, onRegenerate }: CountdownProps) {
+function Countdown({ remaining, expired, expiringSoon, hasKey, consumed = false, onRegenerate }: CountdownProps) {
   if (!hasKey) {
     return (
       <div className="text-xs text-text-muted">
@@ -145,12 +179,32 @@ function Countdown({ remaining, expired, expiringSoon, hasKey, onRegenerate }: C
       </div>
     )
   }
+  if (consumed) {
+    // Distinct from time-expiry: green tone signals "the pair flow worked".
+    return (
+      <div className="flex items-center gap-2 flex-wrap">
+        <span className="inline-flex items-center gap-1.5 text-xs font-medium text-success bg-success/10 border border-success/30 rounded-full px-2.5 py-1">
+          <span className="w-2 h-2 rounded-full bg-success" />
+          Used — pairing complete
+        </span>
+        {onRegenerate && (
+          <button
+            type="button"
+            onClick={onRegenerate}
+            className="text-xs font-medium text-accent hover:text-accent-hover transition-colors"
+          >
+            Generate new OTK →
+          </button>
+        )}
+      </div>
+    )
+  }
   if (expired) {
     return (
       <div className="flex items-center gap-2 flex-wrap">
         <span className="inline-flex items-center gap-1.5 text-xs font-medium text-text-muted bg-surface-alt border border-border rounded-full px-2.5 py-1">
           <span className="w-2 h-2 rounded-full bg-text-muted" />
-          Used — generate a new OTK
+          Expired — generate a new OTK
         </span>
         {onRegenerate && (
           <button
