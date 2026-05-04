@@ -203,8 +203,8 @@ pub(super) fn render_device_list(
 // ── Help overlay ──────────────────────────────────────────────────────────────
 
 pub(super) fn render_help_overlay(f: &mut Frame<'_>, area: Rect) {
-    let box_w = 56u16;
-    let box_h = 22u16;
+    let box_w = 58u16;
+    let box_h = 27u16;
     let x = area.width.saturating_sub(box_w) / 2;
     let y = area.height.saturating_sub(box_h) / 2;
     let modal = Rect::new(x, y, box_w.min(area.width), box_h.min(area.height));
@@ -233,6 +233,10 @@ pub(super) fn render_help_overlay(f: &mut Frame<'_>, area: Rect) {
         ("d", "Device manager (approve/revoke)"),
         ("a", "Approve next pending device"),
         ("l", "Toggle log view"),
+        ("f", "Filter log view (while logs visible)"),
+        ("t", "Toggle Remote Desktop service"),
+        ("s", "Toggle autostart on login"),
+        ("R", "Rotate permanent API key (confirm)"),
         ("b", "Return to splash menu"),
         ("?", "Toggle this help overlay"),
         ("q / Esc", "Exit TUI"),

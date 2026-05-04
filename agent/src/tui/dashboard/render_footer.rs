@@ -26,13 +26,20 @@ pub(super) fn render_footer(f: &mut ratatui::Frame<'_>, area: Rect, state: &Stat
     let para = Paragraph::new(text).style(Style::default().fg(Color::DarkGray));
     f.render_widget(para, rows[0]);
 
-    // Static hotkey hint row.
+    // Always-visible hotkey hint strip.
+    // Includes the new t/s/R keys for operator parity with the WebUI.
     let hints = Line::from(vec![
-        hint_span("r", "regen key"),
+        hint_span("r", "regen-otk"),
         sep_span(),
         hint_span("d", "devices"),
         sep_span(),
         hint_span("l", "logs"),
+        sep_span(),
+        hint_span("t", "toggle-rd"),
+        sep_span(),
+        hint_span("s", "autostart"),
+        sep_span(),
+        hint_span("R", "rotate-key"),
         sep_span(),
         hint_span("c", "copy URL"),
         sep_span(),
