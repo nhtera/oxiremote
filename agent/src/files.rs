@@ -14,6 +14,7 @@ use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio_util::io::ReaderStream;
 use tracing::warn;
 
+use crate::files_activity;
 use crate::workspaces;
 use crate::AppState;
 
@@ -163,9 +164,10 @@ pub async fn api_files_list(
     Query(q): Query<ListQuery>,
 ) -> Response {
     let bearer = crate::auth::extract_bearer(&headers);
-    if crate::auth::require_tunnel_auth(&state.db_path, &state.signing_key, &jar, bearer.as_deref()).await.is_none() {
+    let Some(device_id) = crate::auth::require_tunnel_auth(&state.db_path, &state.signing_key, &jar, bearer.as_deref()).await else {
         return unauthed();
-    }
+    };
+    files_activity::touch(&state.files_activity, &device_id);
 
     let root = match active_root(&state, q.ws_id) {
         Ok(r) => r,
@@ -254,9 +256,10 @@ pub async fn api_files_stat(
     Query(q): Query<PathQuery>,
 ) -> Response {
     let bearer = crate::auth::extract_bearer(&headers);
-    if crate::auth::require_tunnel_auth(&state.db_path, &state.signing_key, &jar, bearer.as_deref()).await.is_none() {
+    let Some(device_id) = crate::auth::require_tunnel_auth(&state.db_path, &state.signing_key, &jar, bearer.as_deref()).await else {
         return unauthed();
-    }
+    };
+    files_activity::touch(&state.files_activity, &device_id);
     let root = match active_root(&state, q.ws_id) {
         Ok(r) => r,
         Err(msg) => return bad_request(msg),
@@ -310,9 +313,10 @@ pub async fn api_files_read(
     Query(q): Query<PathQuery>,
 ) -> Response {
     let bearer = crate::auth::extract_bearer(&headers);
-    if crate::auth::require_tunnel_auth(&state.db_path, &state.signing_key, &jar, bearer.as_deref()).await.is_none() {
+    let Some(device_id) = crate::auth::require_tunnel_auth(&state.db_path, &state.signing_key, &jar, bearer.as_deref()).await else {
         return unauthed();
-    }
+    };
+    files_activity::touch(&state.files_activity, &device_id);
     let root = match active_root(&state, q.ws_id) {
         Ok(r) => r,
         Err(msg) => return bad_request(msg),
@@ -394,9 +398,10 @@ pub async fn api_files_write(
     Json(req): Json<WriteRequest>,
 ) -> Response {
     let bearer = crate::auth::extract_bearer(&headers);
-    if crate::auth::require_tunnel_auth(&state.db_path, &state.signing_key, &jar, bearer.as_deref()).await.is_none() {
+    let Some(device_id) = crate::auth::require_tunnel_auth(&state.db_path, &state.signing_key, &jar, bearer.as_deref()).await else {
         return unauthed();
-    }
+    };
+    files_activity::touch(&state.files_activity, &device_id);
     if req.content.len() as u64 > MAX_TEXT_OPEN_BYTES {
         return bad_request("content too large (max 1MB)");
     }
@@ -458,9 +463,10 @@ pub async fn api_files_create(
     Json(req): Json<CreateRequest>,
 ) -> Response {
     let bearer = crate::auth::extract_bearer(&headers);
-    if crate::auth::require_tunnel_auth(&state.db_path, &state.signing_key, &jar, bearer.as_deref()).await.is_none() {
+    let Some(device_id) = crate::auth::require_tunnel_auth(&state.db_path, &state.signing_key, &jar, bearer.as_deref()).await else {
         return unauthed();
-    }
+    };
+    files_activity::touch(&state.files_activity, &device_id);
     let root = match active_root(&state, req.ws_id) {
         Ok(r) => r,
         Err(msg) => return bad_request(msg),
@@ -503,9 +509,10 @@ pub async fn api_files_rename(
     Json(req): Json<RenameRequest>,
 ) -> Response {
     let bearer = crate::auth::extract_bearer(&headers);
-    if crate::auth::require_tunnel_auth(&state.db_path, &state.signing_key, &jar, bearer.as_deref()).await.is_none() {
+    let Some(device_id) = crate::auth::require_tunnel_auth(&state.db_path, &state.signing_key, &jar, bearer.as_deref()).await else {
         return unauthed();
-    }
+    };
+    files_activity::touch(&state.files_activity, &device_id);
     let root = match active_root(&state, req.ws_id) {
         Ok(r) => r,
         Err(msg) => return bad_request(msg),
@@ -539,9 +546,10 @@ pub async fn api_files_delete(
     Json(req): Json<PathQuery>,
 ) -> Response {
     let bearer = crate::auth::extract_bearer(&headers);
-    if crate::auth::require_tunnel_auth(&state.db_path, &state.signing_key, &jar, bearer.as_deref()).await.is_none() {
+    let Some(device_id) = crate::auth::require_tunnel_auth(&state.db_path, &state.signing_key, &jar, bearer.as_deref()).await else {
         return unauthed();
-    }
+    };
+    files_activity::touch(&state.files_activity, &device_id);
     let root = match active_root(&state, req.ws_id) {
         Ok(r) => r,
         Err(msg) => return bad_request(msg),
@@ -577,9 +585,10 @@ pub async fn api_files_download(
     Query(q): Query<PathQuery>,
 ) -> Response {
     let bearer = crate::auth::extract_bearer(&headers);
-    if crate::auth::require_tunnel_auth(&state.db_path, &state.signing_key, &jar, bearer.as_deref()).await.is_none() {
+    let Some(device_id) = crate::auth::require_tunnel_auth(&state.db_path, &state.signing_key, &jar, bearer.as_deref()).await else {
         return unauthed();
-    }
+    };
+    files_activity::touch(&state.files_activity, &device_id);
     let root = match active_root(&state, q.ws_id) {
         Ok(r) => r,
         Err(msg) => return bad_request(msg),
