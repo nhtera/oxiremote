@@ -82,6 +82,14 @@ ignore = "0.4"
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
+# macOS: bring up an NSApplication on the main thread so the tray-icon's
+# NSStatusItem actually renders in the menu bar. Both crates are already
+# pulled in transitively by tray-icon 0.19; declaring them as direct deps
+# locks the version range to what's resolved today.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-app-kit = { version = "0.3", features = ["NSApplication", "NSResponder"] }
+
 # Phase 03: remote desktop capture + encode (optional, enabled by default).
 desktop = { path = "crates/desktop", optional = true }
 

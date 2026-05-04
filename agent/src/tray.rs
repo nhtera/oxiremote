@@ -2,13 +2,10 @@
 // main thread on macOS/Windows (platform constraint); the tokio runtime must
 // already be running on a sibling thread before `run_event_loop` is called.
 //
-// Menu mirrors 9remote's pattern: a non-clickable status header that flips
-// between "Local only" and "Tunnel: <host>", plus "Open Web UI" and
-// "Shutdown". Updates are driven by `AgentEvent::TunnelUrlChanged` /
-// `TunnelDown` so the operator sees the current reachability without
-// opening the dashboard.
+// Menu layout: a non-clickable status header showing the agent port, plus
+// "Open Web UI" and "Shutdown" — minimal so the operator never has to dig.
 
-use std::sync::Arc;
+#[cfg(not(target_os = "macos"))]
 use std::time::Duration;
 
 use anyhow::Result;
@@ -17,7 +14,6 @@ use tray_icon::{
     menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem},
 };
 
-use crate::events::{AgentEvent, EventBus};
 use crate::AGENT_PORT;
 
 /// Programmatically paint a 32×32 icon. Two tones so it matches the
@@ -50,8 +46,6 @@ pub struct TrayHandle {
     // Held to keep the tray alive for the lifetime of the process.
     _tray: tray_icon::TrayIcon,
     ids: MenuIds,
-    // Held so we can rewrite the status text from bus events.
-    status_item: MenuItem,
 }
 
 struct MenuIds {
@@ -87,58 +81,59 @@ pub fn build_tray() -> Result<TrayHandle> {
             open_web: open_web.id().0.clone(),
             shutdown: shutdown.id().0.clone(),
         },
-        status_item: status,
     })
 }
 
 /// Blocks the caller (typically the main thread on macOS/Windows) and
-/// dispatches menu clicks until the "Shutdown" item is chosen. The status
-/// header re-renders on every TunnelUrlChanged / TunnelDown so the menu
-/// reflects current reachability without polling.
-pub fn run_event_loop(handle: &TrayHandle, event_bus: Arc<EventBus>) {
-    let menu_rx = MenuEvent::receiver();
-    let mut bus_rx = event_bus.subscribe();
-
-    loop {
-        // Drain bus events (non-blocking) — only the tunnel transitions
-        // affect the menu; everything else is dropped to keep the broadcast
-        // channel from lagging other subscribers (notifier, dashboard SSE).
-        while let Ok(event) = bus_rx.try_recv() {
-            match event {
-                AgentEvent::TunnelUrlChanged { url } => {
-                    let host = host_only(&url);
-                    handle
-                        .status_item
-                        .set_text(format!("OxiRemote · {host}"));
-                }
-                AgentEvent::TunnelDown { .. } => {
-                    handle.status_item.set_text(initial_status_text());
-                }
-                _ => {}
-            }
+/// dispatches menu clicks until the "Shutdown" item is chosen.
+///
+/// On macOS the host process must own a running NSApplication for the
+/// status item to render in the menu bar — we spin one up here and route
+/// menu clicks via `MenuEvent::set_event_handler` so the NSApp run loop
+/// can stay blocking. On other platforms we fall back to parking the
+/// thread; the click callback fires on its own dispatcher.
+pub fn run_event_loop(handle: &TrayHandle) {
+    // Wire menu clicks via the global handler — fires from whichever thread
+    // the platform delivers menu events on (main on macOS).
+    let open_web_id = handle.ids.open_web.clone();
+    let shutdown_id = handle.ids.shutdown.clone();
+    MenuEvent::set_event_handler(Some(move |evt: MenuEvent| {
+        let id = evt.id.0;
+        if id == open_web_id {
+            let _ = open::that(format!("http://localhost:{AGENT_PORT}/agent"));
+        } else if id == shutdown_id {
+            crate::tui::restore_terminal_if_active();
+            std::process::exit(0);
         }
+    }));
 
-        if let Ok(evt) = menu_rx.try_recv() {
-            let id = evt.id.0;
-            if id == handle.ids.open_web {
-                let _ = open::that(format!("http://localhost:{AGENT_PORT}/agent"));
-            } else if id == handle.ids.shutdown {
-                crate::tui::restore_terminal_if_active();
-                std::process::exit(0);
-            }
+    #[cfg(target_os = "macos")]
+    {
+        macos_run();
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        loop {
+            std::thread::sleep(Duration::from_secs(60));
         }
-
-        std::thread::sleep(Duration::from_millis(100));
     }
 }
 
-/// Strip scheme + path so the menu shows just `oxiremote.example.com` in
-/// the limited width of a menu-bar item.
-fn host_only(url: &str) -> String {
-    url.trim_start_matches("https://")
-        .trim_start_matches("http://")
-        .split('/')
-        .next()
-        .unwrap_or(url)
-        .to_string()
+/// Bootstrap an NSApplication, set Accessory activation policy (menu-bar
+/// icon only, no Dock entry), and hand the main thread to `[NSApp run]`.
+/// The run loop only returns when the process is asked to terminate.
+#[cfg(target_os = "macos")]
+fn macos_run() {
+    use objc2_app_kit::{NSApplication, NSApplicationActivationPolicy};
+
+    let mtm = objc2::MainThreadMarker::new()
+        .expect("tray::run_event_loop must be called on the main thread");
+    let app = NSApplication::sharedApplication(mtm);
+    app.setActivationPolicy(NSApplicationActivationPolicy::Accessory);
+
+    // Block forever — `[NSApp run]` returns only on terminate. Menu clicks
+    // fire via the global `MenuEvent::set_event_handler` installed above.
+    app.run();
 }
+

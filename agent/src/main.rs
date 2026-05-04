@@ -475,7 +475,8 @@ fn run_with_tray() -> anyhow::Result<()> {
     // never returns under normal use — `Shutdown` from the menu calls
     // `process::exit(0)` directly so the lock drop is unreachable here.
     let handle = tray::build_tray().context("build tray")?;
-    tray::run_event_loop(&handle, bus);
+    drop(bus); // bus stays live via the server thread's clone; we don't need ours
+    tray::run_event_loop(&handle);
     unreachable!()
 }
 

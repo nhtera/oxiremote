@@ -141,7 +141,7 @@ pub fn run_tui(
                 // reachable even without a tray.
                 match crate::tray::build_tray() {
                     Ok(handle) => {
-                        crate::tray::run_event_loop(&handle, event_bus);
+                        crate::tray::run_event_loop(&handle);
                         // run_event_loop only returns via process::exit — keep
                         // the compiler happy with an unreachable return.
                         return Ok(());

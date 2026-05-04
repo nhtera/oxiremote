@@ -69,8 +69,11 @@ fn build_items(update_version: Option<&str>) -> Vec<MenuItem> {
 pub fn run_menu(term: &mut Term, update_version: Option<&str>) -> Result<MenuChoice> {
     let items = build_items(update_version);
 
-    // Default selection: "Terminal UI" (or index 1 when update item is prepended).
-    let default_label = "Terminal UI";
+    // Default selection: "Open Web UI (background)". Hitting Enter on the
+    // splash gives the operator a menu-bar tray + browser dashboard, which
+    // is the right default for a remote-access tool. Arrow to "Terminal UI"
+    // for the in-terminal dashboard when desired.
+    let default_label = "Open Web UI (background)";
     let mut selected: usize = items
         .iter()
         .position(|i| i.label == default_label)
