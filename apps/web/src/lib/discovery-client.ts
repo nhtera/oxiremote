@@ -30,24 +30,23 @@ export type LookupResult = {
   localIp: string | null
 }
 
-/** True when the SPA is being served by Vite's dev server on localhost. The
- *  Vite proxy already routes `/api/*` to the local agent at 127.0.0.1:8787,
- *  so cross-origin discovery is never the right path in dev — even when
- *  `VITE_DISCOVERY_URL` is set in `.env` for production builds. Without this
- *  gate `bun dev` would hit the production discovery worker and fail to pair
- *  against the local agent. */
-function isLocalDevHost(): boolean {
-  if (typeof window === 'undefined') return false
-  const h = window.location.hostname
-  return h === 'localhost' || h === '127.0.0.1' || h === '0.0.0.0' || h === '::1'
+/** True only when the bundle is running under `vite dev` (HMR server). Vite
+ *  injects `DEV` at build time — it stays false for `vite build` artifacts
+ *  regardless of where they're served from (Cloudflare Pages, the embedded
+ *  agent, `vite preview` on localhost). The dev server proxies `/api/*` to
+ *  the local agent at 127.0.0.1:8787, so the worker round-trip is never the
+ *  right path under HMR even when `VITE_DISCOVERY_URL` is set in `.env`. */
+function isViteDev(): boolean {
+  return import.meta.env.DEV === true
 }
 
 /** Discovery worker base URL injected at SPA build time. Empty / unset means
  *  embedded mode — callers must check `isDiscoveryMode()` before calling
- *  `lookupSession`. Always empty when served from localhost (dev mode).
+ *  `lookupSession`. Always empty under `vite dev` so HMR pairs against the
+ *  local agent through the Vite proxy instead of the production worker.
  */
 export function discoveryBaseUrl(): string {
-  if (isLocalDevHost()) return ''
+  if (isViteDev()) return ''
   const raw = (import.meta.env.VITE_DISCOVERY_URL ?? '').toString().trim()
   return raw.replace(/\/$/, '')
 }
