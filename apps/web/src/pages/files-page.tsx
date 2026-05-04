@@ -5,7 +5,7 @@ import { useWorkspaceStore } from '../state/workspace-store'
 import FileTree, { type FileEntry } from '../components/file-tree'
 import FileActionsMenu, { type FileAction } from '../components/file-actions-menu'
 import FileSearchInput from '../components/file-search-input'
-import { useConfirm, usePrompt } from '../components/ui'
+import { useConfirm, usePrompt, useToast, SkeletonLine } from '../components/ui'
 
 const CodeEditor = lazy(() => import('../components/code-editor'))
 
@@ -26,6 +26,7 @@ export default function FilesPage() {
 
   const [currentPath, setCurrentPath] = useState('')
   const [entries, setEntries] = useState<FileEntry[]>([])
+  const [treeLoading, setTreeLoading] = useState(true)
   const [openFile, setOpenFile] = useState<string | null>(null)
   const [content, setContent] = useState('')
   const [openedMtime, setOpenedMtime] = useState<number>(0)
@@ -38,6 +39,7 @@ export default function FilesPage() {
   const uploadTargetDirRef = useRef<string>('')
   const confirm = useConfirm()
   const prompt = usePrompt()
+  const toast = useToast()
 
   const wsId = activeWs?.id
 
@@ -53,9 +55,11 @@ export default function FilesPage() {
       const res = await fetch(`/api/files/list?${params}`, { credentials: 'include' })
       if (!res.ok) {
         setError(await res.text())
+        setTreeLoading(false)
         return
       }
       setEntries(await res.json())
+      setTreeLoading(false)
     },
     [wsId],
   )
@@ -142,6 +146,7 @@ export default function FilesPage() {
     setOpenedMtime(data.modified)
     setDirty(false)
     setConflict(null)
+    toast.show({ kind: 'success', title: 'Saved' })
     void fetchList(currentPath)
   }
 
@@ -270,7 +275,7 @@ export default function FilesPage() {
   const breadcrumbs = currentPath.split('/').filter(Boolean)
 
   return (
-    <div className="flex flex-col md:flex-row h-[calc(100dvh-8rem)] md:h-dvh font-mono pb-4 gap-2">
+    <div className="flex flex-col md:flex-row h-[calc(100dvh-var(--app-chrome-height,8rem))] md:h-dvh font-mono pb-4 gap-2">
       <div className="w-full md:w-72 border-b md:border-b-0 md:border-r border-border p-2 shrink-0 max-h-[36dvh] md:max-h-none flex flex-col">
         <div className="mb-1 flex items-center gap-1">
           <button
@@ -326,15 +331,23 @@ export default function FilesPage() {
           />
         )}
         <div className="flex-1 min-h-0">
-          <FileTree
-            currentPath={currentPath}
-            entries={entries}
-            selectedPath={openFile}
-            onOpenDir={openDir}
-            onOpenFile={openFileByName}
-            onGoUp={goUp}
-            onContextMenu={onContextMenu}
-          />
+          {treeLoading ? (
+            <div className="p-2 space-y-2" aria-busy="true" aria-label="Loading files">
+              {[70, 55, 85, 60, 75].map((w, i) => (
+                <SkeletonLine key={i} width={`${w}%`} className="h-3 block" />
+              ))}
+            </div>
+          ) : (
+            <FileTree
+              currentPath={currentPath}
+              entries={entries}
+              selectedPath={openFile}
+              onOpenDir={openDir}
+              onOpenFile={openFileByName}
+              onGoUp={goUp}
+              onContextMenu={onContextMenu}
+            />
+          )}
         </div>
       </div>
 

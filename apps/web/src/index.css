@@ -78,6 +78,25 @@ body {
     hover:bg-surface-hover hover:text-text-primary transition-colors cursor-pointer;
 }
 
+/* Sheet/drawer slide-in keyframes — 180ms ease-out matches modal open feel
+   without being sluggish. The panel starts fully off-screen and slides to 0. */
+@keyframes slide-in-right {
+  from { transform: translateX(100%); }
+  to   { transform: translateX(0); }
+}
+@keyframes slide-in-left {
+  from { transform: translateX(-100%); }
+  to   { transform: translateX(0); }
+}
+@keyframes slide-in-bottom {
+  from { transform: translateY(100%); }
+  to   { transform: translateY(0); }
+}
+@keyframes fade-in {
+  from { opacity: 0; }
+  to   { opacity: 1; }
+}
+
 @layer utilities {
   .pb-safe { padding-bottom: env(safe-area-inset-bottom, 0px); }
   .pt-safe { padding-top: env(safe-area-inset-top, 0px); }
@@ -93,6 +112,20 @@ body {
      helper textarea inherits the terminal's small font, so iOS Safari zooms
      the page when the on-screen keyboard appears. Force 16px to suppress. */
   .xterm-helper-textarea { font-size: 16px !important; }
+
+  /* Sheet slide-in animations. Duration kept at 180ms to feel snappy. */
+  .animate-slide-in-right {
+    animation: slide-in-right 180ms ease-out;
+  }
+  .animate-slide-in-left {
+    animation: slide-in-left 180ms ease-out;
+  }
+  .animate-slide-in-bottom {
+    animation: slide-in-bottom 180ms ease-out;
+  }
+  .animate-fade-in {
+    animation: fade-in 150ms ease-out;
+  }
 
   /* Warm dot-grid background — coral dots at low opacity over surface.
      Used on calm/empty surfaces (login, welcome, approval-waiting,

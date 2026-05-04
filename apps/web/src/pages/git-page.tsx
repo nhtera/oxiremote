@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { StateView } from '../components/ui'
+import { StateView, SkeletonLine } from '../components/ui'
 
 type GitStatusEntry = {
   path: string
@@ -15,15 +15,19 @@ export default function GitPage() {
   const [commitMsg, setCommitMsg] = useState('')
   const [commitResult, setCommitResult] = useState<string | null>(null)
   const [loading, setLoading] = useState(false)
+  // Tracks whether the initial status fetch has returned.
+  const [statusLoaded, setStatusLoaded] = useState(false)
 
   async function refreshStatus() {
     setErr(null)
     const res = await fetch('/api/git/status')
     if (!res.ok) {
       setErr('Not authorized. Pair first at /login.')
+      setStatusLoaded(true)
       return
     }
     setEntries(await res.json())
+    setStatusLoaded(true)
   }
 
   useEffect(() => {
@@ -102,7 +106,15 @@ export default function GitPage() {
 
       {err && <div className="text-danger text-sm mb-3">{err}</div>}
 
-      {cleanTree ? (
+      {!statusLoaded && (
+        <div className="mb-4 space-y-2" aria-busy="true" aria-label="Loading git status">
+          {[50, 80, 65, 70].map((w, i) => (
+            <SkeletonLine key={i} width={`${w}%`} className="h-4 block" />
+          ))}
+        </div>
+      )}
+
+      {statusLoaded && cleanTree ? (
         <StateView
           icon={
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="h-full w-full" aria-hidden="true">
@@ -114,7 +126,7 @@ export default function GitPage() {
         />
       ) : null}
 
-      <div className="flex flex-col md:flex-row gap-4 pb-4">
+      {statusLoaded && (<div className="flex flex-col md:flex-row gap-4 pb-4">
         {/* File lists */}
         <div className="flex-1 min-w-0">
           <h3 className="text-xs text-text-muted mb-2">Staged ({staged.length})</h3>
@@ -173,16 +185,14 @@ export default function GitPage() {
           </div>
         </div>
 
-        {/* Diff viewer */}
+        {/* Diff viewer — per-line coloring based on first char (+/-/@) */}
         <div className="flex-1 min-w-0">
           <h3 className="text-xs text-text-muted mb-2">
             Diff {diffPath ? `— ${diffPath}` : ''}
           </h3>
-          <pre className="bg-surface-alt border border-border rounded-lg p-3 text-xs overflow-auto max-h-[500px] whitespace-pre-wrap break-all font-mono text-text-secondary">
-            {diffText ?? 'Select a file to view diff'}
-          </pre>
+          <DiffViewer text={diffText} />
         </div>
-      </div>
+      </div>)}
     </div>
   )
 }
@@ -218,6 +228,35 @@ function FileRow({
       >
         {actionLabel}
       </button>
+    </div>
+  )
+}
+
+// Renders a unified diff with per-line color hints based on the leading char.
+// Pure CSS: no CodeMirror dependency, zero bundle cost.
+function DiffViewer({ text }: { text: string | null }) {
+  if (!text) {
+    return (
+      <div className="bg-surface-alt border border-border rounded-lg p-3 text-xs font-mono text-text-muted max-h-[500px] overflow-auto">
+        Select a file to view diff
+      </div>
+    )
+  }
+
+  const lines = text.split('\n')
+  return (
+    <div className="bg-surface-alt border border-border rounded-lg p-3 text-xs font-mono overflow-auto max-h-[500px]">
+      {lines.map((line, i) => {
+        let cls = 'text-text-secondary'
+        if (line.startsWith('+') && !line.startsWith('+++')) cls = 'text-success'
+        else if (line.startsWith('-') && !line.startsWith('---')) cls = 'text-danger'
+        else if (line.startsWith('@')) cls = 'text-text-muted'
+        return (
+          <div key={i} className={`whitespace-pre-wrap break-all leading-snug ${cls}`}>
+            {line || ' '}
+          </div>
+        )
+      })}
     </div>
   )
 }
