@@ -12,6 +12,8 @@ import GitPage from './pages/git-page'
 import FilesPage from './pages/files-page'
 import WorkspacePickerPage from './pages/workspace-picker-page'
 import PreviewPage from './pages/preview-page'
+import HostDevicesPage from './pages/host-devices-page'
+import HostLogsPage from './pages/host-logs-page'
 import { ToastProvider, ConfirmProvider } from './components/ui'
 import { useHostStore } from './state/host-store'
 import { registerServiceWorker } from './lib/push-client'
@@ -203,6 +205,8 @@ function AppRoutes() {
         <Route path="/h/:hostId/workspaces" element={<HostRoute><WorkspacePickerPage /></HostRoute>} />
         <Route path="/h/:hostId/files" element={<HostRoute><FilesPage /></HostRoute>} />
         <Route path="/h/:hostId/preview" element={<HostRoute><PreviewPage /></HostRoute>} />
+        <Route path="/h/:hostId/devices" element={<HostRoute><HostDevicesPage /></HostRoute>} />
+        <Route path="/h/:hostId/logs" element={<HostRoute><HostLogsPage /></HostRoute>} />
         <Route
           path="/h/:hostId/desktop"
           element={

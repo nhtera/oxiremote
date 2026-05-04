@@ -57,8 +57,8 @@ export default function GearDrawer({ open, hostId, onClose }: Props) {
   ]
   const ops: Item[] = [
     { label: 'Dashboard', description: 'Devices, tunnel, settings', Icon: SettingsIcon, action: { kind: 'route', path: `/h/${hostId}/dashboard` } },
-    { label: 'Devices', Icon: DevicesIcon, action: { kind: 'route', path: `/h/${hostId}/dashboard` } },
-    { label: 'Logs', Icon: LogsIcon, action: { kind: 'route', path: `/h/${hostId}/dashboard` } },
+    { label: 'Devices', description: 'Trusted devices, revoke', Icon: DevicesIcon, action: { kind: 'route', path: `/h/${hostId}/devices` } },
+    { label: 'Logs', description: 'Session activity', Icon: LogsIcon, action: { kind: 'route', path: `/h/${hostId}/logs` } },
   ]
 
   return (
