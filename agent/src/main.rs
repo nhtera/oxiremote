@@ -6,6 +6,7 @@ mod db;
 mod discovery;
 mod events;
 mod files;
+mod files_activity;
 mod files_search;
 mod files_upload;
 mod git;
@@ -25,6 +26,7 @@ mod push;
 mod push_api;
 mod security;
 mod settings;
+mod telemetry;
 mod tracing_setup;
 mod update;
 mod static_files;
@@ -69,11 +71,13 @@ use tower_http::trace::TraceLayer;
 use tracing::{info, warn};
 
 use crate::events::{AgentEvent, EventBus};
+use crate::files_activity::FilesActivityMap;
 use crate::host::HostInfo;
 use crate::local_sites::LocalSitesCache;
 use crate::preview::{PreviewHealth, PreviewTarget};
 use crate::push::VapidKeys;
 use crate::security::rate_limit::RateLimiter;
+use crate::telemetry::TelemetryState;
 use crate::terminal_pty::TerminalSession;
 
 #[cfg(feature = "desktop")]
@@ -139,6 +143,22 @@ pub struct AppState {
     /// tunnel-spawn task selects on this; reaching it kills the child,
     /// emits `TunnelDisconnected`, and returns.
     pub tunnel_shutdown: Arc<tokio::sync::Notify>,
+
+    /// Operator telemetry counters: bytes_proxied, reconnect_count, probe
+    /// latency ring. Written by the bytes_counter middleware and tunnel event
+    /// listener; read by `GET /api/agent/tunnel/telemetry`.
+    pub telemetry: Arc<TelemetryState>,
+
+    /// Per-device last-activity map for the files API. Updated on every
+    /// authenticated file API call; read by `active_sessions_snapshot` to
+    /// classify devices as "files_active" when touched < 30s ago.
+    pub files_activity: Arc<FilesActivityMap>,
+
+    /// Path to the cloudflared binary — used by `GET /api/agent/version` to
+    /// query the cloudflared version string without re-downloading. `None`
+    /// before cloudflared has been located (should not happen in practice since
+    /// `server_main` ensures cloudflared before constructing `AppState`).
+    pub cloudflared_path: Option<PathBuf>,
 }
 
 fn default_data_dir() -> anyhow::Result<PathBuf> {
@@ -483,6 +503,9 @@ async fn server_main(
     #[cfg(not(feature = "desktop"))]
     let desktop_svc: Option<()> = None;
 
+    let telemetry = Arc::new(TelemetryState::new());
+    let files_activity = Arc::new(files_activity::new_map());
+
     let state = Arc::new(AppState {
         db_path,
         signing_key,
@@ -509,6 +532,9 @@ async fn server_main(
         discovery_url: discovery_url.clone(),
         discovery_temp_key: discovery_temp_key.clone(),
         tunnel_shutdown: Arc::new(tokio::sync::Notify::new()),
+        telemetry,
+        files_activity,
+        cloudflared_path: Some(cloudflared.clone()),
     });
 
     // Background: periodic listening-port discovery + preview health checks.
@@ -516,9 +542,10 @@ async fn server_main(
     preview::spawn_health_loop(state.clone());
 
     // Snapshot maintainer — single bus subscriber that mirrors the latest
-    // `TunnelStepChanged` and the last `LOG_RING_CAP` `LogEntry` events into
-    // AppState. SSE late-joiners hydrate from `/api/agent/state` and
-    // `/api/agent/logs/recent` instead of starting empty.
+    // `TunnelStepChanged`, the last `LOG_RING_CAP` `LogEntry` events, and
+    // telemetry tunnel-ready timing into AppState. SSE late-joiners hydrate
+    // from `/api/agent/state` and `/api/agent/logs/recent` instead of
+    // starting empty.
     {
         let snap_state = state.clone();
         let mut rx = state.event_bus.subscribe();
@@ -526,9 +553,19 @@ async fn server_main(
             loop {
                 match rx.recv().await {
                     Ok(ev) => match &ev {
-                        AgentEvent::TunnelStepChanged { .. } => {
+                        AgentEvent::TunnelStepChanged { step, .. } => {
                             if let Ok(mut g) = snap_state.latest_tunnel_step.write() {
                                 *g = Some(ev.clone());
+                            }
+                            // Mark tunnel ready for uptime + reconnect tracking.
+                            if matches!(step, crate::events::TunnelStep::Ready) {
+                                snap_state.telemetry.mark_tunnel_ready();
+                            }
+                        }
+                        AgentEvent::HealthProbe { elapsed_ms, ok, .. } => {
+                            // Record every probe sample (ok or not) for p50 sparkline.
+                            if *ok {
+                                snap_state.telemetry.record_probe_latency(*elapsed_ms);
                             }
                         }
                         AgentEvent::LogEntry { .. } => {
@@ -712,10 +749,16 @@ async fn server_main(
     //   2. rate_limit throttles tunnel callers per (session, route_class)
     //   3. csrf_guard validates header/cookie on state-changing tunnel POSTs
     //   4. api_key_guard requires Bearer on non-exempt tunnel routes
+    //   5. bytes_counter accumulates tunnel 2xx response body bytes (innermost)
     // Axum's `.layer()` applies in REVERSE order of declaration, so we reverse
     // the list visually here.
     let rate_limiter = state.rate_limiter.clone();
+    let telemetry_for_middleware = state.telemetry.clone();
     let app = app
+        .layer(axum::middleware::from_fn_with_state(
+            telemetry_for_middleware,
+            security::bytes_counter::bytes_counter,
+        ))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             security::api_key_guard::api_key_guard,
