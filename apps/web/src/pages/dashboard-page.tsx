@@ -13,7 +13,7 @@ import {
 type IconCmp = (props: { size?: number }) => React.ReactNode
 
 type TerminalSession = { id: string; status: string }
-type SessionSummary = { total: number; running: number; latestId?: string | null }
+type SessionSummary = { total: number; active: number; latestId?: string | null }
 type GitSummary = { staged: number; changed: number }
 type Device = {
   device_id: string
@@ -53,7 +53,7 @@ function fmtRelative(unixSec: number | null | undefined): string {
 export default function DashboardPage() {
   const location = useLocation()
   const { currentHostId } = useHostStore()
-  const [sessions, setSessions] = useState<SessionSummary>({ total: 0, running: 0, latestId: null })
+  const [sessions, setSessions] = useState<SessionSummary>({ total: 0, active: 0, latestId: null })
   const [git, setGit] = useState<GitSummary>({ staged: 0, changed: 0 })
   const [previews, setPreviews] = useState(0)
   const [devices, setDevices] = useState<Device[]>([])
@@ -84,8 +84,8 @@ export default function DashboardPage() {
       const sessionData = (await sessionRes.json()) as TerminalSession[]
       setSessions({
         total: sessionData.length,
-        running: sessionData.filter((s) => s.status === 'running').length,
-        latestId: sessionData.find((s) => s.status === 'running')?.id ?? sessionData[0]?.id ?? null,
+        active: sessionData.filter((s) => s.status === 'active').length,
+        latestId: sessionData.find((s) => s.status === 'active')?.id ?? sessionData[0]?.id ?? null,
       })
     } catch {
       setAuthed(false)
@@ -182,7 +182,7 @@ export default function DashboardPage() {
       <Heading level={1} className="mb-4">Dashboard</Heading>
 
       <div className="grid grid-cols-2 md:grid-cols-3 gap-3 mb-6">
-        <StatCard label="Terminal" value={`${sessions.running} active`} sub={`${sessions.total} total`} to={terminalLink} />
+        <StatCard label="Terminal" value={`${sessions.active} active`} sub={`${sessions.total} total`} to={terminalLink} />
         <StatCard label="Git" value={`${git.staged} staged`} sub={`${git.changed} changed`} to={`${hostPrefix}/git`} />
         <StatCard label="Previews" value={`${previews} active`} to={`${hostPrefix}/preview`} />
       </div>
