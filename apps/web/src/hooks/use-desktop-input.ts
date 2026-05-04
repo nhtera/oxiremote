@@ -101,8 +101,8 @@ interface Props {
 
 const LONG_PRESS_MS = 500
 const DRAG_THRESHOLD_PX = 4
-// 2-finger double-tap window. 9remote-style: tap two fingers, release, tap
-// again with two fingers within 300 ms = double-click at midpoint.
+// 2-finger double-tap window: tap two fingers, release, tap again with two
+// fingers within 300 ms = double-click at midpoint.
 const TWO_FINGER_DTAP_MS = 300
 const TWO_FINGER_DTAP_PX = 30
 

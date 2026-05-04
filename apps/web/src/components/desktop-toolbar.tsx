@@ -51,7 +51,7 @@ interface KeyDef {
 // `navigator.userAgentData.platform` is gated behind permissions and not on
 // every browser. The remote OS is what matters, but the client can't know it
 // without an extra round-trip — assume the user runs the same OS family they
-// remote into. This matches 9remote's behavior.
+// remote into.
 function isMacClient(): boolean {
   if (typeof navigator === 'undefined') return false
   const ua = (navigator.userAgent || '').toLowerCase()

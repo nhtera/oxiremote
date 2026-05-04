@@ -28,9 +28,8 @@ pub const TILE_SIZE: u32 = 64;
 const THUMB_W: u32 = 96;
 const THUMB_H: u32 = 54;
 
-/// Idle ceiling for the capture loop's adaptive backoff. Matches 9remote's
-/// observed 400 ms idle cadence — eyes can detect a mouse-jiggle wake about
-/// this fast and any longer feels stuck.
+/// Idle ceiling for the capture loop's adaptive backoff. Eyes can detect a
+/// mouse-jiggle wake at ~400 ms; any longer feels stuck.
 pub const IDLE_INTERVAL_MAX_MS: u64 = 400;
 
 /// Capture quality / resolution tier.
