@@ -5,6 +5,7 @@
 
 use std::io;
 use std::path::PathBuf;
+use std::process::Stdio;
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -50,6 +51,54 @@ pub fn wake_background_main() {
     BACKGROUND_SHUTDOWN.store(true, Ordering::SeqCst);
     if let Some(t) = BACKGROUND_MAIN.get() {
         t.unpark();
+    }
+}
+
+/// Spawn `oxiremote --tray` as a detached child (setsid + closed stdio) so
+/// the launching shell returns to its prompt while the agent keeps running
+/// in the background with a menu-bar icon. Prints the child's PID for the
+/// `pkill`-from-another-shell escape hatch.
+///
+/// Errors are reported to stderr but never abort — the parent has already
+/// dropped its TerminalGuard, so we can't gracefully fall back to the TUI.
+fn spawn_detached_tray() {
+    let exe = match std::env::current_exe() {
+        Ok(p) => p,
+        Err(err) => {
+            eprintln!("(could not locate oxiremote binary: {err})");
+            return;
+        }
+    };
+    let mut cmd = std::process::Command::new(&exe);
+    cmd.arg("--tray")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        unsafe {
+            cmd.pre_exec(|| {
+                if libc::setsid() == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+    }
+
+    match cmd.spawn() {
+        Ok(child) => {
+            println!(
+                "OxiRemote running. Right-click the menu-bar icon to quit. (PID: {})",
+                child.id()
+            );
+            println!("  Dashboard: http://localhost:8787/agent");
+        }
+        Err(err) => {
+            eprintln!("(failed to spawn detached tray: {err})");
+        }
     }
 }
 
@@ -126,35 +175,16 @@ pub fn run_tui(
     loop {
         match menu::run_menu(&mut term, update_version.as_deref())? {
             MenuChoice::OpenWebUi => {
-                // Restore the host terminal first so the user sees the prompt
-                // and the friendly status line on the normal screen — the
-                // agent then keeps running on its sibling server thread.
+                // Restore the host terminal first so the post-exit text lands
+                // on the normal screen, then daemonize: spawn a detached
+                // `--tray` child and let this process exit. The child owns the
+                // tunnel + tray going forward; the launching shell returns
+                // to its prompt.
                 drop(term);
                 drop(_guard);
+                spawn_detached_tray();
                 let _ = open::that("http://localhost:8787/agent");
-                println!("OxiRemote agent running. Right-click the menu-bar icon to quit.");
-                println!("  Dashboard: http://localhost:8787/agent");
-                // Hand the main thread off to the tray event loop. macOS /
-                // Windows require the tray to live on the main thread; on
-                // Linux this is also the simplest layout. Build failures
-                // fall back to the legacy park-and-wait so the agent stays
-                // reachable even without a tray.
-                match crate::tray::build_tray() {
-                    Ok(handle) => {
-                        crate::tray::run_event_loop(&handle);
-                        // run_event_loop only returns via process::exit — keep
-                        // the compiler happy with an unreachable return.
-                        return Ok(());
-                    }
-                    Err(err) => {
-                        eprintln!("(tray unavailable: {err}) — press Ctrl+C to stop.");
-                        let _ = BACKGROUND_MAIN.set(std::thread::current());
-                        while !BACKGROUND_SHUTDOWN.load(Ordering::SeqCst) {
-                            std::thread::park();
-                        }
-                        return Ok(());
-                    }
-                }
+                std::process::exit(0);
             }
             MenuChoice::TerminalUi => {
                 dashboard::run_dashboard(
