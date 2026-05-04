@@ -90,14 +90,24 @@ libc = "0.2"
 objc2 = "0.6"
 objc2-app-kit = { version = "0.3", features = ["NSApplication", "NSResponder"] }
 
-# Phase 03: remote desktop capture + encode (optional, enabled by default).
-desktop = { path = "crates/desktop", optional = true }
+# Phase 03/04 deps go back in the global [dependencies] table — the macOS
+# target-specific block above ends here. Without this header, the lines
+# below would inherit cfg(target_os = "macos") and silently disappear on
+# Linux/Windows, leaving the `desktop` feature with no crates to enable.
+[dependencies.desktop]
+path = "crates/desktop"
+optional = true
 
 # Phase 04: WebRTC DataChannel transport for remote desktop streaming.
-webrtc = { version = "0.11", optional = true }
+[dependencies.webrtc]
+version = "0.11"
+optional = true
+
 # Phase 03 RTCP feedback parsing (PLI, REMB) — webrtc-rs pulls rtcp 0.11
 # transitively but doesn't re-export the packet types we need to downcast to.
-rtcp = { version = "0.11", optional = true }
+[dependencies.rtcp]
+version = "0.11"
+optional = true
 
 [features]
 default = ["desktop"]
