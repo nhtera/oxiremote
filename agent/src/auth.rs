@@ -835,6 +835,9 @@ mod tests {
             discovery_url: None,
             discovery_temp_key: std::sync::Arc::new(std::sync::RwLock::new(None)),
             tunnel_shutdown: std::sync::Arc::new(tokio::sync::Notify::new()),
+            telemetry: std::sync::Arc::new(crate::telemetry::TelemetryState::new()),
+            files_activity: std::sync::Arc::new(crate::files_activity::new_map()),
+            cloudflared_path: None,
         }
     }
 

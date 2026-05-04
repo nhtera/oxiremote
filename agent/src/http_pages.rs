@@ -145,7 +145,7 @@ pub async fn api_pairing_exchange(
     // Atomic pairing exchange. All five writes (consume code, insert device,
     // insert session, bind session, issue api key) live inside one txn so a
     // mid-flight failure leaves no orphan rows and the code stays unconsumed
-    // for retry. See plans/260427-0511-stability-and-9remote-polish phase-01.
+    // for retry.
     let res: anyhow::Result<(String, String, String, String)> = (|| {
         let mut conn = Connection::open(&state.db_path)?;
         let tx = conn.transaction()?;
@@ -776,6 +776,9 @@ mod tests {
             discovery_url: None,
             discovery_temp_key: Arc::new(std::sync::RwLock::new(None)),
             tunnel_shutdown: Arc::new(tokio::sync::Notify::new()),
+            telemetry: Arc::new(crate::telemetry::TelemetryState::new()),
+            files_activity: Arc::new(crate::files_activity::new_map()),
+            cloudflared_path: None,
         })
     }
 
