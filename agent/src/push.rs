@@ -230,6 +230,108 @@ pub struct SendResult {
     pub gone: bool,
 }
 
+/// Format a duration in milliseconds as a human-readable string like
+/// "2m 30s" or "45s". Used in push notification bodies.
+fn format_duration(ms: u64) -> String {
+    let secs = ms / 1000;
+    if secs < 60 {
+        format!("{secs}s")
+    } else {
+        let m = secs / 60;
+        let s = secs % 60;
+        if s == 0 {
+            format!("{m}m")
+        } else {
+            format!("{m}m {s}s")
+        }
+    }
+}
+
+pub struct AgentFinishedPushParams<'a> {
+    pub host_id: &'a str,
+    pub session_id: &'a str,
+    pub agent_name: &'a str,
+    pub duration_ms: u64,
+    pub exit_code: Option<i32>,
+    pub tail_lines: Vec<String>,
+}
+
+/// Build and send a "agent finished" Web Push to all push subscriptions for
+/// the given host. Called by the notifier when `SessionAgentEnded` fires and
+/// the session has `notify_on_agent_end = true`.
+///
+/// Push payload shape:
+///   title: `<agent_name> finished`
+///   body:  `<duration> · exit <code> · <last 5 lines>`
+///   tag:   `agent-end-<session_id>` (replaces prior push for same session)
+///   data:  `{ url: "/h/<host_id>/workspace?session=<session_id>" }`
+///
+/// The body is hard-capped at 4 KB (web push limit).
+pub async fn send_agent_finished_push(
+    client: &reqwest::Client,
+    keys: &VapidKeys,
+    subscriptions: Vec<PushSubscription>,
+    subject: &str,
+    p: AgentFinishedPushParams<'_>,
+) {
+    if subscriptions.is_empty() {
+        return;
+    }
+
+    let duration_str = format_duration(p.duration_ms);
+    let exit_str = match p.exit_code {
+        Some(c) => format!("exit {c}"),
+        None => "exit ?".to_string(),
+    };
+    let lines_str = p.tail_lines.join(" \u{21b5} ");
+    let body_raw = format!("{duration_str} \u{00b7} {exit_str} \u{00b7} {lines_str}");
+    // Truncate body to 4 KB (conservative limit for FCM / Mozilla push).
+    let body = if body_raw.len() > 4096 {
+        let mut b = body_raw[..4096].to_string();
+        // Avoid splitting a multi-byte UTF-8 codepoint.
+        while !b.is_char_boundary(b.len()) {
+            b.pop();
+        }
+        b
+    } else {
+        body_raw
+    };
+
+    let deep_link = format!("/h/{}/workspace?session={}", p.host_id, p.session_id);
+    let tag = format!("agent-end-{}", p.session_id);
+
+    let payload = serde_json::json!({
+        "title": format!("{} finished", p.agent_name),
+        "body": body,
+        "tag": tag,
+        "data": { "url": deep_link },
+    });
+    let payload_bytes = match serde_json::to_vec(&payload) {
+        Ok(b) => b,
+        Err(_) => return,
+    };
+
+    for sub in &subscriptions {
+        match send_push(client, keys, sub, subject, &payload_bytes, 86400, "normal").await {
+            Ok(r) if r.gone => {
+                // Subscription is stale — caller should remove it. We cannot
+                // do DB ops here without a db_path; log and move on.
+                tracing::warn!(
+                    endpoint = %sub.endpoint,
+                    "push subscription gone (404/410) — should be pruned"
+                );
+            }
+            Ok(r) if r.status >= 400 => {
+                tracing::warn!(status = r.status, "agent-end push returned error status");
+            }
+            Ok(_) => {}
+            Err(err) => {
+                tracing::warn!(error=%err, "agent-end push send failed");
+            }
+        }
+    }
+}
+
 pub async fn send_push(
     client: &reqwest::Client,
     keys: &VapidKeys,
