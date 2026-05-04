@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { Link, Navigate, useLocation } from 'react-router-dom'
 import { useHostStore } from '../state/host-store'
-import { Heading } from '../components/ui'
+import { Heading, SkeletonLine } from '../components/ui'
 import {
   TerminalIcon,
   GitIcon,
@@ -61,6 +61,8 @@ export default function DashboardPage() {
   const [busyDeviceId, setBusyDeviceId] = useState<string | null>(null)
   const [deviceError, setDeviceError] = useState('')
   const [desktopCaps, setDesktopCaps] = useState<DesktopCaps | null>(null)
+  // Tracks whether the initial data load has completed at least once.
+  const [initialLoaded, setInitialLoaded] = useState(false)
   // Inline rename state: maps device_id → draft name string while editing.
   const [renamingId, setRenamingId] = useState<string | null>(null)
   const [renameDraft, setRenameDraft] = useState('')
@@ -108,6 +110,7 @@ export default function DashboardPage() {
       .catch(() => {})
 
     refreshDevices().catch(() => {})
+    setInitialLoaded(true)
   }, [refreshDevices])
 
   useEffect(() => {
@@ -182,9 +185,19 @@ export default function DashboardPage() {
       <Heading level={1} className="mb-4">Dashboard</Heading>
 
       <div className="grid grid-cols-2 md:grid-cols-3 gap-3 mb-6">
-        <StatCard label="Terminal" value={`${sessions.running} active`} sub={`${sessions.total} total`} to={terminalLink} />
-        <StatCard label="Git" value={`${git.staged} staged`} sub={`${git.changed} changed`} to={`${hostPrefix}/git`} />
-        <StatCard label="Previews" value={`${previews} active`} to={`${hostPrefix}/preview`} />
+        {!initialLoaded ? (
+          <>
+            <StatCardSkeleton />
+            <StatCardSkeleton />
+            <StatCardSkeleton />
+          </>
+        ) : (
+          <>
+            <StatCard label="Terminal" value={`${sessions.running} active`} sub={`${sessions.total} total`} to={terminalLink} />
+            <StatCard label="Git" value={`${git.staged} staged`} sub={`${git.changed} changed`} to={`${hostPrefix}/git`} />
+            <StatCard label="Previews" value={`${previews} active`} to={`${hostPrefix}/preview`} />
+          </>
+        )}
       </div>
 
       <Heading level={3} className="mb-3">Quick actions</Heading>
@@ -271,6 +284,15 @@ export default function DashboardPage() {
           </div>
         )}
       </div>
+    </div>
+  )
+}
+
+function StatCardSkeleton() {
+  return (
+    <div className="block bg-surface-alt border border-border rounded-lg p-3" aria-hidden="true">
+      <SkeletonLine width="40%" className="h-2.5 mb-2" />
+      <SkeletonLine width="60%" className="h-3.5" />
     </div>
   )
 }

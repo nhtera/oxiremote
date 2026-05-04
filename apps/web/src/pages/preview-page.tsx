@@ -3,7 +3,7 @@ import { useCallback, useEffect, useMemo, useState } from 'react'
 import PreviewShareModal from '../components/preview-share-modal'
 import { apiFetch } from '../lib/transport'
 import { isDiscoveryMode } from '../lib/discovery-client'
-import { StateView } from '../components/ui'
+import { StateView, SkeletonLine } from '../components/ui'
 
 type Health = 'ok' | 'down' | 'unknown'
 
@@ -37,6 +37,7 @@ export default function PreviewPage() {
   const [label, setLabel] = useState('')
   const [error, setError] = useState('')
   const [shareInfo, setShareInfo] = useState<ShareInfo | null>(null)
+  const [portsLoaded, setPortsLoaded] = useState(false)
 
   const refresh = useCallback(async () => {
     try {
@@ -48,6 +49,8 @@ export default function PreviewPage() {
       if (savedRes.ok) setSaved(await savedRes.json())
     } catch {
       // network blip; keep previous state, next poll recovers
+    } finally {
+      setPortsLoaded(true)
     }
   }, [])
 
@@ -124,9 +127,15 @@ export default function PreviewPage() {
 
       <section className="mb-6">
         <h3 className="text-xs uppercase tracking-wide text-text-muted m-0 mb-2">
-          Discovered ({discoveredNew.length})
+          Discovered ({portsLoaded ? discoveredNew.length : '…'})
         </h3>
-        {discoveredNew.length === 0 ? (
+        {!portsLoaded ? (
+          <div className="space-y-2" aria-busy="true" aria-label="Loading discovered ports">
+            {[60, 45, 55].map((w, i) => (
+              <SkeletonLine key={i} width={`${w}%`} className="h-4 block" />
+            ))}
+          </div>
+        ) : discoveredNew.length === 0 ? (
           <div className="text-text-muted text-xs">No new listening ports.</div>
         ) : (
           <div className="grid gap-1">
