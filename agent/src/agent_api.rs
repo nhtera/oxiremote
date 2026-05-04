@@ -21,7 +21,7 @@ use tracing::{info, warn};
 
 use crate::AppState;
 use crate::events::AgentEvent;
-use crate::{approval, autostart, one_time_keys, settings};
+use crate::{approval, autostart, files_activity, one_time_keys, settings};
 
 pub fn router() -> Router<Arc<AppState>> {
     Router::new()
@@ -55,6 +55,11 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/api/agent/services/desktop", post(api_agent_services_desktop))
         .route("/api/agent/shutdown", post(api_agent_shutdown))
         .route("/api/agent/tunnel/disconnect", post(api_agent_tunnel_disconnect))
+        // --- operator telemetry endpoints (localhost-only via route_scope) ---
+        .route("/api/agent/version", get(api_agent_version))
+        .route("/api/agent/sessions/active", get(api_agent_sessions_active))
+        .route("/api/agent/tunnel/telemetry", get(api_agent_tunnel_telemetry))
+        .route("/api/agent/keys/recent-usage", get(api_agent_keys_recent_usage))
 }
 
 /// POST /api/agent/tunnel/disconnect — stop sharing without exiting the agent.
@@ -682,8 +687,7 @@ async fn api_agent_device_patch(
 /// POST /api/agent/devices/{id}/disconnect — close active live connections
 /// for `id` (desktop session, push subscriptions) without revoking trust.
 /// Distinct from /revoke: the device's API key stays valid, so the user can
-/// rejoin from the same browser without re-pairing. Mirrors 9remote's
-/// "Disconnect" vs "Remove" distinction.
+/// rejoin from the same browser without re-pairing.
 async fn api_agent_device_disconnect(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -738,6 +742,422 @@ async fn api_agent_device_revoke(
     // DeviceRejected is the closest existing event variant for removal of a device.
     state.event_bus.send(AgentEvent::DeviceRejected { device_id: id });
     (StatusCode::OK, Json(json!({ "ok": true }))).into_response()
+}
+
+// ---------------------------------------------------------------------------
+// Operator telemetry endpoints
+// ---------------------------------------------------------------------------
+
+/// GET /api/agent/version — agent build info + cloudflared version.
+///
+/// Returns:
+/// ```json
+/// { "agent": "0.1.0", "cloudflared": "2025.2.1", "build_date": "2026-05-04" }
+/// ```
+/// `cloudflared` is `null` when the binary is not found or `--version` fails.
+/// `build_date` is injected at compile time via `VERGEN_BUILD_DATE` or falls
+/// back to `"unknown"` (always non-null).
+async fn api_agent_version(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let agent_version = env!("CARGO_PKG_VERSION");
+    let build_date = option_env!("VERGEN_BUILD_DATE").unwrap_or("unknown");
+
+    // Query cloudflared --version on-demand. The binary is on the local
+    // filesystem and exits immediately; run on the blocking pool to stay off
+    // the async executor.
+    let cloudflared_path = state.cloudflared_path.clone();
+    let cloudflared_version: Option<String> = if let Some(path) = cloudflared_path {
+        tokio::task::spawn_blocking(move || detect_cloudflared_version(&path))
+            .await
+            .ok()
+            .flatten()
+    } else {
+        None
+    };
+
+    Json(json!({
+        "agent": agent_version,
+        "cloudflared": cloudflared_version,
+        "build_date": build_date,
+    }))
+    .into_response()
+}
+
+/// Run `<cloudflared> --version` and extract the version string.
+/// Returns `None` on any failure (binary not executable, timeout, parse error).
+fn detect_cloudflared_version(path: &std::path::Path) -> Option<String> {
+    let out = std::process::Command::new(path)
+        .arg("--version")
+        .output()
+        .ok()?;
+    // cloudflared prints e.g. "cloudflared version 2025.2.1 (built ...)"
+    // on stdout or stderr depending on version. Check both.
+    let text = String::from_utf8_lossy(&out.stdout).into_owned()
+        + &String::from_utf8_lossy(&out.stderr);
+    // Extract the first token that looks like a semver: digits separated by dots.
+    for word in text.split_whitespace() {
+        if word.contains('.') && word.chars().all(|c| c.is_ascii_digit() || c == '.') {
+            return Some(word.to_string());
+        }
+    }
+    None
+}
+
+/// GET /api/agent/sessions/active — per-client activity snapshot.
+///
+/// Returns up to 50 rows:
+/// ```json
+/// [{ "device_id": "...", "label": "iPhone 15", "platform": "ios",
+///    "doing": "terminal_active"|"desktop"|"files"|"idle",
+///    "last_active_ms": 1234567890 }]
+/// ```
+async fn api_agent_sessions_active(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let rows = active_sessions_snapshot(&state);
+    Json(rows).into_response()
+}
+
+/// Build the active-sessions list from all three activity sources.
+/// Cap at 50 entries — Vec scan is acceptable for operator dashboards.
+pub fn active_sessions_snapshot(state: &AppState) -> Vec<serde_json::Value> {
+    const MAX_SESSIONS: usize = 50;
+
+    // Collect known device_ids from all three sources.
+    let mut device_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    // Terminal: each entry in terminal_sessions uses session_id as key. We
+    // join via the sessions DB table below to get device_id.
+    let live_terminal_session_ids: std::collections::HashSet<String> = state
+        .terminal_sessions
+        .iter()
+        .map(|e| e.key().clone())
+        .collect();
+
+    // Desktop: device_id is the direct key.
+    #[cfg(feature = "desktop")]
+    if let Some(svc) = state.desktop_service.as_ref() {
+        for id in svc.active_device_ids() {
+            device_ids.insert(id);
+        }
+    }
+
+    // Files activity map — device_id keys.
+    for entry in state.files_activity.iter() {
+        device_ids.insert(entry.key().clone());
+    }
+
+    // Resolve device_ids from live terminal sessions via the DB.
+    let terminal_device_ids =
+        resolve_terminal_device_ids(&state.db_path, &live_terminal_session_ids);
+    device_ids.extend(terminal_device_ids.keys().cloned());
+
+    // Also include devices active in the last 5 minutes from trusted_devices
+    // so recently-idle-but-connected devices appear.
+    let recently_active = recently_active_device_ids(&state.db_path);
+    device_ids.extend(recently_active);
+
+    // Cap total entries.
+    let device_ids: Vec<String> = device_ids.into_iter().take(MAX_SESSIONS).collect();
+    if device_ids.is_empty() {
+        return vec![];
+    }
+
+    // Fetch device metadata in one DB query.
+    let meta = fetch_device_meta(&state.db_path, &device_ids);
+
+    // Build response rows.
+    let mut rows = Vec::with_capacity(device_ids.len());
+    for device_id in &device_ids {
+        let (label, platform, last_active_ms) = meta
+            .get(device_id)
+            .cloned()
+            .unwrap_or_else(|| (device_id.chars().take(24).collect(), "unknown".into(), 0));
+
+        // Priority: desktop > terminal_active > files > idle.
+        #[cfg(feature = "desktop")]
+        let doing = {
+            let in_desktop = state
+                .desktop_service
+                .as_ref()
+                .map(|svc| svc.has_session(device_id))
+                .unwrap_or(false);
+            if in_desktop {
+                "desktop"
+            } else if terminal_device_ids.get(device_id).copied().unwrap_or(false) {
+                "terminal_active"
+            } else if files_activity::is_active(&state.files_activity, device_id) {
+                "files"
+            } else {
+                "idle"
+            }
+        };
+        #[cfg(not(feature = "desktop"))]
+        let doing = if terminal_device_ids.get(device_id).copied().unwrap_or(false) {
+            "terminal_active"
+        } else if files_activity::is_active(&state.files_activity, device_id) {
+            "files"
+        } else {
+            "idle"
+        };
+
+        rows.push(json!({
+            "device_id": device_id,
+            "label": label,
+            "platform": platform,
+            "doing": doing,
+            "last_active_ms": last_active_ms,
+        }));
+    }
+    rows
+}
+
+/// Resolve which live terminal sessions belong to which device_id.
+/// Returns `Map<device_id, is_active>` where `is_active` is true when
+/// the session is present in `live_session_ids`.
+fn resolve_terminal_device_ids(
+    db_path: &std::path::PathBuf,
+    live_session_ids: &std::collections::HashSet<String>,
+) -> std::collections::HashMap<String, bool> {
+    if live_session_ids.is_empty() {
+        return std::collections::HashMap::new();
+    }
+    let Ok(conn) = Connection::open(db_path) else {
+        return std::collections::HashMap::new();
+    };
+    let placeholders: Vec<String> = (1..=live_session_ids.len())
+        .map(|i| format!("?{i}"))
+        .collect();
+    let sql = format!(
+        "SELECT ts.terminal_session_id, s.device_id
+         FROM terminal_sessions ts
+         JOIN sessions s ON ts.owner_session_id = s.session_id
+         WHERE ts.terminal_session_id IN ({}) AND s.device_id IS NOT NULL",
+        placeholders.join(",")
+    );
+    let Ok(mut stmt) = conn.prepare(&sql) else {
+        return std::collections::HashMap::new();
+    };
+    let ids_vec: Vec<&str> = live_session_ids.iter().map(String::as_str).collect();
+    let params: Vec<&dyn rusqlite::ToSql> = ids_vec
+        .iter()
+        .map(|s| s as &dyn rusqlite::ToSql)
+        .collect();
+    let Ok(rows) = stmt.query_map(params.as_slice(), |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    }) else {
+        return std::collections::HashMap::new();
+    };
+    let mut out: std::collections::HashMap<String, bool> = std::collections::HashMap::new();
+    for (session_id, device_id) in rows.flatten() {
+        let is_live = live_session_ids.contains(&session_id);
+        out.entry(device_id)
+            .and_modify(|v| *v = *v || is_live)
+            .or_insert(is_live);
+    }
+    out
+}
+
+/// Fetch label, platform, and last_active_at for a list of device_ids.
+/// Returns `Map<device_id, (label, platform, last_active_ms)>`.
+fn fetch_device_meta(
+    db_path: &std::path::PathBuf,
+    device_ids: &[String],
+) -> std::collections::HashMap<String, (String, String, i64)> {
+    if device_ids.is_empty() {
+        return std::collections::HashMap::new();
+    }
+    let Ok(conn) = Connection::open(db_path) else {
+        return std::collections::HashMap::new();
+    };
+    let placeholders: Vec<String> =
+        (1..=device_ids.len()).map(|i| format!("?{i}")).collect();
+    let sql = format!(
+        "SELECT device_id,
+                COALESCE(device_name, label),
+                COALESCE(platform, 'unknown'),
+                COALESCE(last_active_at, 0)
+         FROM trusted_devices WHERE device_id IN ({})",
+        placeholders.join(",")
+    );
+    let Ok(mut stmt) = conn.prepare(&sql) else {
+        return std::collections::HashMap::new();
+    };
+    let ids_ref: Vec<&str> = device_ids.iter().map(String::as_str).collect();
+    let params: Vec<&dyn rusqlite::ToSql> =
+        ids_ref.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
+    let Ok(rows) = stmt.query_map(params.as_slice(), |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, i64>(3)?,
+        ))
+    }) else {
+        return std::collections::HashMap::new();
+    };
+    let mut out = std::collections::HashMap::new();
+    for (device_id, label, platform, last_active_ms) in rows.flatten() {
+        // Truncate label to 24 chars per spec.
+        let label: String = label.chars().take(24).collect();
+        out.insert(device_id, (label, platform, last_active_ms));
+    }
+    out
+}
+
+/// Return device_ids active in the last 5 minutes (trusted_devices table).
+fn recently_active_device_ids(db_path: &std::path::PathBuf) -> Vec<String> {
+    let five_min_ago_ms = chrono::Utc::now().timestamp_millis() - 300_000;
+    Connection::open(db_path)
+        .ok()
+        .and_then(|conn| {
+            conn.prepare(
+                "SELECT device_id FROM trusted_devices
+                 WHERE revoked_at IS NULL AND last_active_at > ?1
+                 ORDER BY last_active_at DESC",
+            )
+            .ok()
+            .and_then(|mut stmt| {
+                stmt.query_map(rusqlite::params![five_min_ago_ms], |row| {
+                    row.get::<_, String>(0)
+                })
+                .ok()
+                .map(|rows| rows.flatten().collect())
+            })
+        })
+        .unwrap_or_default()
+}
+
+/// GET /api/agent/tunnel/telemetry — live tunnel metrics.
+///
+/// Returns:
+/// ```json
+/// { "uptime_s": 4320, "last_reconnect_at": 1746350000000,
+///   "reconnect_count": 2, "bytes_proxied": 1048576,
+///   "probe_latencies_p50_ms": [42, 38, 45] }
+/// ```
+async fn api_agent_tunnel_telemetry(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let t = &state.telemetry;
+    let uptime_s = t.tunnel_uptime_s();
+    let reconnect_count = t.reconnect_count.load(std::sync::atomic::Ordering::Relaxed);
+    let bytes_proxied = t.bytes_proxied.load(std::sync::atomic::Ordering::Relaxed);
+    let last_reconnect_at =
+        t.last_reconnect_at_ms.load(std::sync::atomic::Ordering::Relaxed);
+    let probe_latencies = t.snapshot_latencies();
+
+    Json(json!({
+        "uptime_s": uptime_s,
+        "last_reconnect_at": last_reconnect_at,
+        "reconnect_count": reconnect_count,
+        "bytes_proxied": bytes_proxied,
+        "probe_latencies_p50_ms": probe_latencies,
+    }))
+    .into_response()
+}
+
+/// GET /api/agent/keys/recent-usage — last 10 OTK-used / key-verified events.
+///
+/// Returns:
+/// ```json
+/// [{ "kind": "otk_used"|"key_verified", "device_label": "iPhone 15",
+///    "ip": "1.2.3.4", "at": 1746350000 }]
+/// ```
+async fn api_agent_keys_recent_usage(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let rows = query_recent_key_usage(&state.db_path);
+    Json(rows).into_response()
+}
+
+/// Query the last 10 key-usage events from the database.
+/// Merges OTK `used_at` rows with `trusted_devices.last_seen_at` rows.
+fn query_recent_key_usage(db_path: &std::path::PathBuf) -> Vec<serde_json::Value> {
+    let Ok(conn) = Connection::open(db_path) else {
+        return vec![];
+    };
+
+    // OTK usages: one_time_keys where used_at IS NOT NULL.
+    let otk_rows: Vec<serde_json::Value> = conn
+        .prepare(
+            "SELECT COALESCE(td.device_name, td.label, 'unknown'),
+                    td.first_seen_ip,
+                    ok.used_at
+             FROM one_time_keys ok
+             LEFT JOIN sessions s ON ok.issued_by_session = s.session_id
+             LEFT JOIN trusted_devices td ON s.device_id = td.device_id
+             WHERE ok.used_at IS NOT NULL
+             ORDER BY ok.used_at DESC
+             LIMIT 10",
+        )
+        .ok()
+        .and_then(|mut stmt| {
+            stmt.query_map([], |row| {
+                Ok((
+                    row.get::<_, Option<String>>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            })
+            .ok()
+            .map(|rows| {
+                rows.flatten()
+                    .map(|(label, ip, at)| {
+                        let label: String = label
+                            .unwrap_or_else(|| "unknown".into())
+                            .chars()
+                            .take(24)
+                            .collect();
+                        json!({
+                            "kind": "otk_used",
+                            "device_label": label,
+                            "ip": ip.unwrap_or_default(),
+                            "at": at,
+                        })
+                    })
+                    .collect()
+            })
+        })
+        .unwrap_or_default();
+
+    // Key verifications: trusted_devices sorted by last_seen_at DESC.
+    let key_rows: Vec<serde_json::Value> = conn
+        .prepare(
+            "SELECT COALESCE(device_name, label), first_seen_ip, last_seen_at
+             FROM trusted_devices
+             WHERE revoked_at IS NULL AND last_seen_at IS NOT NULL
+             ORDER BY last_seen_at DESC
+             LIMIT 10",
+        )
+        .ok()
+        .and_then(|mut stmt| {
+            stmt.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            })
+            .ok()
+            .map(|rows| {
+                rows.flatten()
+                    .map(|(label, ip, at)| {
+                        let label: String = label.chars().take(24).collect();
+                        json!({
+                            "kind": "key_verified",
+                            "device_label": label,
+                            "ip": ip.unwrap_or_default(),
+                            "at": at,
+                        })
+                    })
+                    .collect()
+            })
+        })
+        .unwrap_or_default();
+
+    // Merge both lists and return the 10 most recent.
+    let mut merged: Vec<serde_json::Value> = otk_rows.into_iter().chain(key_rows).collect();
+    merged.sort_by(|a, b| {
+        let at_a = a["at"].as_i64().unwrap_or(0);
+        let at_b = b["at"].as_i64().unwrap_or(0);
+        at_b.cmp(&at_a)
+    });
+    merged.truncate(10);
+    merged
 }
 
 #[cfg(test)]
@@ -800,6 +1220,9 @@ mod tests {
             discovery_url: None,
             discovery_temp_key: std::sync::Arc::new(std::sync::RwLock::new(None)),
             tunnel_shutdown: std::sync::Arc::new(tokio::sync::Notify::new()),
+            telemetry: std::sync::Arc::new(crate::telemetry::TelemetryState::new()),
+            files_activity: std::sync::Arc::new(crate::files_activity::new_map()),
+            cloudflared_path: None,
         })
     }
 
@@ -864,5 +1287,217 @@ mod tests {
 
         // Old key no longer authenticates.
         assert!(!auth::verify_permanent_key(&state.db_path, &old_key));
+    }
+
+    // -----------------------------------------------------------------------
+    // Operator telemetry tests
+    // -----------------------------------------------------------------------
+
+    /// bytes_proxied counter accumulates correctly across multiple add_bytes calls.
+    #[test]
+    fn bytes_proxied_counter_accumulates() {
+        use crate::telemetry::TelemetryState;
+        use std::sync::atomic::Ordering;
+
+        let t = TelemetryState::new();
+        t.add_bytes(1024);
+        t.add_bytes(512);
+        assert_eq!(t.bytes_proxied.load(Ordering::Relaxed), 1536);
+    }
+
+    /// reconnect_count stays 0 on the first tunnel-ready, increments on second.
+    #[test]
+    fn reconnect_count_first_ready_is_not_a_reconnect() {
+        use crate::telemetry::TelemetryState;
+        use std::sync::atomic::Ordering;
+
+        let t = TelemetryState::new();
+        t.mark_tunnel_ready();
+        assert_eq!(t.reconnect_count.load(Ordering::Relaxed), 0);
+        t.mark_tunnel_ready();
+        assert_eq!(t.reconnect_count.load(Ordering::Relaxed), 1);
+        t.mark_tunnel_ready();
+        assert_eq!(t.reconnect_count.load(Ordering::Relaxed), 2);
+    }
+
+    /// probe latency ring stores up to 16 samples in insertion order.
+    #[test]
+    fn probe_latency_ring_stores_and_wraps() {
+        use crate::telemetry::{TelemetryState, LATENCY_RING_CAP};
+
+        let t = TelemetryState::new();
+        // Record fewer than cap — returned in order.
+        t.record_probe_latency(10);
+        t.record_probe_latency(20);
+        assert_eq!(t.snapshot_latencies(), vec![10, 20]);
+
+        // Record beyond cap — ring wraps; only last LATENCY_RING_CAP kept.
+        let t2 = TelemetryState::new();
+        for i in 0u64..20 {
+            t2.record_probe_latency(i);
+        }
+        let snaps = t2.snapshot_latencies();
+        assert_eq!(snaps.len(), LATENCY_RING_CAP);
+        // First returned sample is the 5th written (0-indexed: index 4).
+        assert_eq!(snaps[0], 4);
+        assert_eq!(snaps[LATENCY_RING_CAP - 1], 19);
+    }
+
+    /// GET /api/agent/tunnel/telemetry returns the primed counter values.
+    #[tokio::test]
+    async fn tunnel_telemetry_endpoint_reflects_counter_state() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        let state = test_state("telem-endpoint");
+        state.telemetry.add_bytes(8192);
+        state.telemetry.mark_tunnel_ready(); // first connect
+        state.telemetry.record_probe_latency(55);
+        state.telemetry.record_probe_latency(60);
+
+        let app = super::router().with_state(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/agent/tunnel/telemetry")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["bytes_proxied"].as_u64().unwrap(), 8192);
+        assert_eq!(body["reconnect_count"].as_u64().unwrap(), 0);
+        let lats = body["probe_latencies_p50_ms"].as_array().unwrap();
+        assert_eq!(lats.len(), 2);
+        assert_eq!(lats[0].as_u64().unwrap(), 55);
+    }
+
+    /// GET /api/agent/version returns agent version and build_date fields.
+    #[tokio::test]
+    async fn version_endpoint_returns_required_fields() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        let state = test_state("ver-endpoint");
+        let app = super::router().with_state(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/agent/version")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        // agent version must match the Cargo.toml version.
+        assert_eq!(
+            body["agent"].as_str().unwrap(),
+            env!("CARGO_PKG_VERSION")
+        );
+        assert!(body["build_date"].is_string());
+        // cloudflared key must be present (null is acceptable when path is None).
+        assert!(body.get("cloudflared").is_some());
+    }
+
+    /// GET /api/agent/sessions/active returns a JSON array (possibly empty).
+    #[tokio::test]
+    async fn sessions_active_endpoint_returns_array() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        let state = test_state("sess-endpoint");
+        let app = super::router().with_state(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/agent/sessions/active")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(body.is_array(), "sessions/active must return a JSON array");
+    }
+
+    /// GET /api/agent/keys/recent-usage returns a JSON array (possibly empty).
+    #[tokio::test]
+    async fn keys_recent_usage_endpoint_returns_array() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        let state = test_state("keys-endpoint");
+        let app = super::router().with_state(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/agent/keys/recent-usage")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(body.is_array(), "keys/recent-usage must return a JSON array");
+    }
+
+    /// All 4 new telemetry routes classify as Localhost-only via route_scope.
+    #[test]
+    fn new_telemetry_routes_are_localhost_scoped() {
+        use crate::security::route_scope::{scope_for_path, RouteScope};
+
+        let paths = [
+            "/api/agent/version",
+            "/api/agent/sessions/active",
+            "/api/agent/tunnel/telemetry",
+            "/api/agent/keys/recent-usage",
+        ];
+        for path in paths {
+            assert_eq!(
+                scope_for_path(path),
+                RouteScope::Localhost,
+                "{path} must be Localhost-scoped"
+            );
+        }
+    }
+
+    /// files_activity::touch marks a device as active; is_active returns true
+    /// immediately and the snapshot helper classifies the device as "files".
+    #[test]
+    fn files_activity_touch_and_is_active() {
+        use crate::files_activity;
+
+        let map = files_activity::new_map();
+        assert!(!files_activity::is_active(&map, "dev-1"));
+        files_activity::touch(&map, "dev-1");
+        assert!(files_activity::is_active(&map, "dev-1"));
+        // Unknown device is not active.
+        assert!(!files_activity::is_active(&map, "dev-unknown"));
     }
 }

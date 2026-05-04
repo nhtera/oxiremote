@@ -56,4 +56,16 @@ impl DesktopService {
             false
         }
     }
+
+    /// Returns true when there is an active desktop session for `device_id`.
+    /// Used by `active_sessions_snapshot` to classify a device as "desktop".
+    pub fn has_session(&self, device_id: &str) -> bool {
+        self.sessions.contains_key(device_id)
+    }
+
+    /// Return a snapshot of all currently-active device IDs.
+    /// Used by `active_sessions_snapshot` to seed the device-id set.
+    pub fn active_device_ids(&self) -> Vec<String> {
+        self.sessions.iter().map(|e| e.key().clone()).collect()
+    }
 }
