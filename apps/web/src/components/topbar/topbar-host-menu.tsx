@@ -3,16 +3,22 @@ import { useNavigate } from 'react-router-dom'
 import { useHostStore } from '../../state/host-store'
 import { ChevronDownIcon } from '../icons'
 import { clearApiKey } from '../../lib/api-client'
+import KeyboardShortcutOverlay from '../workspace/keyboard-shortcut-overlay'
 
 // Top-bar dropdown surfacing the active host. Click → menu with the host
 // label (green dot for "alive"), Switch host… (welcome screen lists saved
 // pairings), and Logout. Mirrors the messaging-app convention of putting
 // account/workspace switchers in the top-left.
+const LONG_PRESS_MS = 600
+
 export default function TopbarHostMenu() {
   const navigate = useNavigate()
   const { currentHostId, label } = useHostStore()
   const [open, setOpen] = useState(false)
+  const [shortcutOpen, setShortcutOpen] = useState(false)
   const ref = useRef<HTMLDivElement>(null)
+  // Long-press state: timer ID while pointer is held down.
+  const longPressTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
 
   const hostLabel = label ?? (currentHostId ? `${currentHostId.slice(0, 8)}…` : 'No host')
 
@@ -32,6 +38,31 @@ export default function TopbarHostMenu() {
     }
   }, [open])
 
+  // Long-press on logo (600ms) opens the keyboard shortcut overlay on mobile.
+  // `touch-action: manipulation` suppresses the iOS long-press context menu.
+  function handleLogoPointerDown(e: React.PointerEvent) {
+    // Only trigger for primary pointer (left button / touch point).
+    if (e.button !== 0 && e.pointerType !== 'touch') return
+    longPressTimer.current = setTimeout(() => {
+      longPressTimer.current = null
+      setOpen(false)
+      setShortcutOpen(true)
+    }, LONG_PRESS_MS)
+  }
+
+  function handleLogoPointerUp() {
+    if (longPressTimer.current !== null) {
+      clearTimeout(longPressTimer.current)
+      longPressTimer.current = null
+    }
+  }
+
+  // Suppress native context menu on logo (iOS long-press would otherwise
+  // show the "Open Link / Copy Link / Share" sheet).
+  function handleLogoContextMenu(e: React.MouseEvent) {
+    e.preventDefault()
+  }
+
   const handleLogout = async () => {
     await fetch('/api/auth/logout', { method: 'POST' })
     clearApiKey()
@@ -49,7 +80,12 @@ export default function TopbarHostMenu() {
       <button
         type="button"
         onClick={() => setOpen((v) => !v)}
+        onPointerDown={handleLogoPointerDown}
+        onPointerUp={handleLogoPointerUp}
+        onPointerLeave={handleLogoPointerUp}
+        onContextMenu={handleLogoContextMenu}
         className="flex items-center gap-2 px-2 py-1.5 rounded-md hover:bg-surface-hover transition-colors"
+        style={{ touchAction: 'manipulation' }}
         aria-haspopup="menu"
         aria-expanded={open}
       >
@@ -97,6 +133,12 @@ export default function TopbarHostMenu() {
           </button>
         </div>
       )}
+
+      {/* Keyboard shortcut overlay — triggered by long-press on this logo. */}
+      <KeyboardShortcutOverlay
+        open={shortcutOpen}
+        onClose={() => setShortcutOpen(false)}
+      />
     </div>
   )
 }
