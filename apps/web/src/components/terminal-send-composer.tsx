@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
+import { useNavigate } from 'react-router-dom'
 import { useHostStore } from '../state/host-store'
 import { useWorkspaceStore } from '../state/workspace-store'
 import FileAttachSheet from './file-attach-sheet'
@@ -37,10 +38,12 @@ export default function TerminalSendComposer({ onSend }: Props) {
   const [text, setText] = useState('')
   const [showAttach, setShowAttach] = useState(false)
   const inputRef = useRef<HTMLInputElement>(null)
+  const navigate = useNavigate()
 
   const currentHostId = useHostStore((s) => s.currentHostId)
   const activeMap = useWorkspaceStore((s) => s.active)
   const wsId = currentHostId ? activeMap[currentHostId]?.id : undefined
+  const hasWs = wsId != null
 
   if (!isMobile) return null
 
@@ -84,11 +87,22 @@ export default function TerminalSendComposer({ onSend }: Props) {
       >
         <button
           type="button"
-          onClick={() => setShowAttach(true)}
-          disabled={wsId == null}
-          title={wsId == null ? 'Open a workspace to attach files' : 'Attach file'}
-          aria-label="Attach file"
-          className="shrink-0 inline-flex items-center justify-center w-10 h-10 rounded-lg border border-border bg-surface text-accent hover:bg-surface-hover disabled:opacity-40 transition-colors"
+          onClick={() => {
+            // Disabling the button when no active workspace was the original
+            // gate, but a disabled <button> swallows the tap silently — users
+            // saw "click does nothing" with no hint why. Route them to the
+            // workspace picker instead so the affordance is recoverable.
+            if (!hasWs) {
+              if (currentHostId) navigate(`/h/${currentHostId}/workspaces`)
+              return
+            }
+            setShowAttach(true)
+          }}
+          title={hasWs ? 'Attach file' : 'Pick a workspace to attach files'}
+          aria-label={hasWs ? 'Attach file' : 'Pick a workspace to attach files'}
+          className={`shrink-0 inline-flex items-center justify-center w-10 h-10 rounded-lg border bg-surface transition-colors hover:bg-surface-hover ${
+            hasWs ? 'border-border text-accent' : 'border-border/60 text-text-muted'
+          }`}
         >
           <PaperclipIcon size={18} />
         </button>
