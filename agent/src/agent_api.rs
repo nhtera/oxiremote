@@ -7,7 +7,7 @@ use std::{convert::Infallible, sync::Arc, time::Duration};
 use axum::{
     Json, Router,
     extract::{Path, State},
-    http::StatusCode,
+    http::{HeaderValue, StatusCode},
     response::{IntoResponse, Sse, sse::{Event, KeepAlive}},
     routing::{get, patch, post},
 };
@@ -20,6 +20,7 @@ use tokio_stream::{StreamExt, wrappers::BroadcastStream};
 use tracing::{info, warn};
 
 use crate::AppState;
+use crate::db;
 use crate::events::AgentEvent;
 use crate::{approval, autostart, files_activity, one_time_keys, settings};
 
@@ -60,6 +61,41 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/api/agent/sessions/active", get(api_agent_sessions_active))
         .route("/api/agent/tunnel/telemetry", get(api_agent_tunnel_telemetry))
         .route("/api/agent/keys/recent-usage", get(api_agent_keys_recent_usage))
+        .route(
+            "/api/agent/cors/origins",
+            get(api_agent_cors_origins_list).delete(api_agent_cors_origins_delete),
+        )
+}
+
+#[derive(Deserialize)]
+struct DeleteCorsOriginBody {
+    origin: String,
+}
+
+/// GET /api/agent/cors/origins — list the runtime CORS allowlist (DB-backed).
+/// Localhost-only (enforced by route_scope). Used by the host dashboard to
+/// surface and prune accumulated origins.
+async fn api_agent_cors_origins_list(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let list = db::load_cors_allowed_origins(&state.db_path).unwrap_or_default();
+    Json(json!({ "origins": list }))
+}
+
+/// DELETE /api/agent/cors/origins — remove an origin from the allowlist. Body
+/// `{ "origin": "https://..." }`. Returns 204 on success regardless of whether
+/// the origin existed (idempotent).
+async fn api_agent_cors_origins_delete(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<DeleteCorsOriginBody>,
+) -> impl IntoResponse {
+    if let Err(err) = db::remove_cors_origin(&state.db_path, &body.origin) {
+        warn!(error=%err, origin=%body.origin, "failed to remove cors origin from db");
+    }
+    if let Ok(hv) = HeaderValue::from_str(&body.origin)
+        && let Ok(mut set) = state.cors_origins.write()
+    {
+        set.remove(&hv);
+    }
+    StatusCode::NO_CONTENT
 }
 
 /// POST /api/agent/tunnel/disconnect — stop sharing without exiting the agent.
@@ -1251,6 +1287,7 @@ mod tests {
             telemetry: std::sync::Arc::new(crate::telemetry::TelemetryState::new()),
             files_activity: std::sync::Arc::new(crate::files_activity::new_map()),
             cloudflared_path: None,
+            cors_origins: crate::security::cors::seed_origins(&[], &[]),
         })
     }
 

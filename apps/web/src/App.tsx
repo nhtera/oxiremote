@@ -1,4 +1,4 @@
-import { lazy, Suspense, useEffect } from 'react'
+import { lazy, Suspense, useEffect, useRef, useState } from 'react'
 import { Navigate, Route, Routes, useNavigate, useParams } from 'react-router-dom'
 import AppLayout from './components/app-layout'
 import AgentLayout from './components/agent-layout'
@@ -17,6 +17,9 @@ import HostLogsPage from './pages/host-logs-page'
 import { ToastProvider, ConfirmProvider } from './components/ui'
 import { useHostStore } from './state/host-store'
 import { registerServiceWorker } from './lib/push-client'
+import { loadApiKey, loadTunnelBase } from './lib/api-client'
+import { switchActiveHost } from './lib/host-switch-helpers'
+import { listSavedHosts } from './lib/saved-hosts'
 
 // Agent dashboard is localhost-only. Lazy-loaded so it never enters the
 // tunnel-facing bundle for devices that can't reach these routes anyway.
@@ -62,17 +65,44 @@ function WorkspaceRedirect() {
   return <Navigate to={`/h/${hostId}/workspace`} replace />
 }
 
-// Wrapper that validates :hostId against the currently-paired host. Deep links
-// from another host's notifications land here — we show a clear message instead
-// of silently serving the wrong host's data.
+// Wrapper that validates :hostId against the currently-paired host. When the
+// URL hostId is in saved-hosts AND has stored credentials + tunnel base, we
+// auto-initiate a host switch (covers push deep-links from another host).
+// When the host is genuinely unknown, we show the "not paired here" wall.
 function HostRoute({ children }: { children: React.ReactNode }) {
   const { hostId } = useParams<{ hostId: string }>()
   const { currentHostId, loading } = useHostStore()
+  const navigate = useNavigate()
+  const [switching, setSwitching] = useState(false)
+  const [switchError, setSwitchError] = useState<string | null>(null)
+  // Track which hostId we have already attempted on this navigation. Without
+  // this, a failed switch sets switchError, which re-renders, which re-fires
+  // the effect, which triggers another switch — infinite loop. The ref
+  // resets only when the URL hostId changes (different deep-link).
+  const attemptedRef = useRef<string | null>(null)
 
-  if (loading) {
+  useEffect(() => {
+    if (!hostId) return
+    // New hostId in URL → fresh attempt window.
+    if (attemptedRef.current !== hostId) {
+      attemptedRef.current = null
+    }
+    if (hostId === currentHostId || loading || switching) return
+    if (attemptedRef.current === hostId) return
+    if (!loadApiKey(hostId) || !loadTunnelBase(hostId)) return
+    attemptedRef.current = hostId
+    setSwitching(true)
+    setSwitchError(null)
+    switchActiveHost(hostId, navigate).then((result) => {
+      if (!result.ok) setSwitchError(result.error)
+      setSwitching(false)
+    })
+  }, [hostId, currentHostId, loading, navigate, switching])
+
+  if (loading || switching) {
     return (
       <div className="flex items-center justify-center h-full text-text-muted text-sm">
-        Loading…
+        {switching ? 'Switching host…' : 'Loading…'}
       </div>
     )
   }
@@ -80,13 +110,20 @@ function HostRoute({ children }: { children: React.ReactNode }) {
     return <Navigate to="/login" replace />
   }
   if (hostId && hostId !== currentHostId) {
+    const canSwitch = Boolean(loadApiKey(hostId) && loadTunnelBase(hostId))
     return (
       <div className="flex flex-col items-center justify-center h-full gap-2 px-6 py-12 text-center">
-        <div className="text-text-primary font-medium">Host not paired here</div>
-        <div className="text-text-muted text-xs max-w-md">
-          This notification came from a different host ({hostId.slice(0, 8)}…) than the one this device is paired with.
-          Pair with that host from this device, or open the notification on a device paired to it.
+        <div className="text-text-primary font-medium">
+          {switchError === 'session-expired' ? 'Session expired' : canSwitch ? 'Host not reachable' : 'Host not paired here'}
         </div>
+        <div className="text-text-muted text-xs max-w-md">
+          {canSwitch
+            ? 'Could not switch to this host. It may be offline or the session expired.'
+            : `This link is for a different host (${hostId.slice(0, 8)}…) that isn't paired on this device.`}
+        </div>
+        <a href="/welcome" className="text-xs text-accent underline mt-1">
+          {canSwitch ? 'Re-pair this host' : 'Pair a host'}
+        </a>
       </div>
     )
   }
@@ -109,13 +146,27 @@ function App() {
 
   // SW notificationclick posts {type:'oxi:deep-link', path} when it can't
   // call client.navigate(). React-Router handles SPA navigation from here.
+  // For cross-host deep-links (path /h/<other>/...) the HostRoute guard does
+  // the actual switch — we only flash the document title so the user sees
+  // why the page is changing. Toast UI lives below ToastProvider, but this
+  // handler is registered above it; document.title is the safe fallback.
   useEffect(() => {
     if (!('serviceWorker' in navigator)) return
     function onMessage(e: MessageEvent) {
       const data = e.data as { type?: string; path?: string } | null
-      if (data?.type === 'oxi:deep-link' && typeof data.path === 'string' && data.path.startsWith('/')) {
-        navigate(data.path)
+      if (data?.type !== 'oxi:deep-link' || typeof data.path !== 'string' || !data.path.startsWith('/')) return
+      const match = data.path.match(/^\/h\/([^/]+)/)
+      const pathHostId = match?.[1] ?? null
+      const { currentHostId } = useHostStore.getState()
+      if (pathHostId && pathHostId !== currentHostId) {
+        const saved = listSavedHosts().find((h) => h.host_id === pathHostId)
+        if (saved) {
+          const prevTitle = document.title
+          document.title = `Switching to ${saved.label}…`
+          setTimeout(() => { document.title = prevTitle }, 2000)
+        }
       }
+      navigate(data.path)
     }
     navigator.serviceWorker.addEventListener('message', onMessage)
     return () => navigator.serviceWorker.removeEventListener('message', onMessage)

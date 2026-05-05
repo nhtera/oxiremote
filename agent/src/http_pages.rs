@@ -22,6 +22,7 @@ use crate::auth::{
     new_pairing_code, verify_permanent_key, PAIRING_TTL_SECS, SESSION_TTL_SECS,
 };
 use crate::db::now_ts;
+use crate::security::cors_capture::capture_pairing_origin;
 use crate::{approval, one_time_keys};
 use crate::AppState;
 
@@ -127,6 +128,9 @@ pub async fn api_pairing_exchange(
             Ok((session_id, device_id, api_key, api_key_last4))
         })();
 
+        if res.is_ok() {
+            capture_pairing_origin(&headers, &state);
+        }
         return build_pairing_response(res, &state, jar, auto_approve, approval_status, &ip, user_agent);
     }
 
@@ -200,6 +204,9 @@ pub async fn api_pairing_exchange(
         Ok((session_id, device_id, api_key, api_key_last4))
     })();
 
+    if res.is_ok() {
+        capture_pairing_origin(&headers, &state);
+    }
     build_pairing_response(res, &state, jar, auto_approve, approval_status, &ip, user_agent)
 }
 
@@ -493,6 +500,7 @@ pub async fn api_login_one_time(
         Ok(pair) => {
             let prefix: String = token.chars().take(4).collect();
             state.event_bus.send(crate::events::AgentEvent::OtkUsed { token_prefix: prefix });
+            capture_pairing_origin(&headers, &state);
             pair
         }
         Err(OtkErr::Consume(err)) => {
@@ -847,6 +855,7 @@ mod tests {
             telemetry: Arc::new(crate::telemetry::TelemetryState::new()),
             files_activity: Arc::new(crate::files_activity::new_map()),
             cloudflared_path: None,
+            cors_origins: crate::security::cors::seed_origins(&[], &[]),
         })
     }
 

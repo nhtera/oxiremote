@@ -1,7 +1,7 @@
 import { useState } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { useHostStore } from '../../state/host-store'
-import { loadApiKey, storeApiKey } from '../../lib/api-client'
+import { loadApiKey } from '../../lib/api-client'
+import { switchActiveHost } from '../../lib/host-switch-helpers'
 import {
   formatRelative,
   removeSavedHost,
@@ -15,35 +15,36 @@ interface Props {
 }
 
 // Recently-paired devices panel shown above the new-device pair form.
-// Tapping a card revives the saved api_key (cookie + Bearer) and probes
-// /api/me; success → land on /, failure → forget that host and surface
-// an error.
+// Tapping a card switches active host via the shared orchestrator. On
+// failure the entry is NOT removed automatically — only the explicit
+// trash button forgets a host (recoverable: user can re-pair).
 export default function SavedHostsPanel({ hosts, onForget, onError }: Props) {
   const navigate = useNavigate()
   const [reconnectingId, setReconnectingId] = useState<string | null>(null)
+  const [rowErrors, setRowErrors] = useState<Record<string, string>>({})
 
   if (hosts.length === 0) return null
 
-  const tryReconnect = async (h: SavedHost) => {
+  const handleReconnect = async (h: SavedHost) => {
     onError('')
+    setRowErrors((e) => ({ ...e, [h.host_id]: '' }))
     setReconnectingId(h.host_id)
-    const key = loadApiKey(h.host_id)
-    if (key) storeApiKey(h.host_id, key)
-    try {
-      const res = await fetch('/api/me', { credentials: 'include' })
-      if (res.ok) {
-        await useHostStore.getState().fetchHost()
-        navigate('/', { replace: true })
-        return
+    const result = await switchActiveHost(h.host_id, navigate)
+    setReconnectingId(null)
+    if (!result.ok) {
+      if (result.error === 'session-expired') {
+        setRowErrors((e) => ({ ...e, [h.host_id]: 'Session expired — re-pair or forget' }))
+      } else if (result.error === 'mismatch') {
+        setRowErrors((e) => ({ ...e, [h.host_id]: 'Host identity mismatch — re-pair' }))
+      } else {
+        onError('Could not reach that host. Check it is running.')
       }
-    } catch {
-      // Network-level error: treat as session expired below.
-    } finally {
-      setReconnectingId(null)
     }
+  }
+
+  const handleForget = (h: SavedHost) => {
     removeSavedHost(h.host_id)
     onForget(h.host_id)
-    onError('That session expired. Pair this device again.')
   }
 
   return (
@@ -53,35 +54,52 @@ export default function SavedHostsPanel({ hosts, onForget, onError }: Props) {
         {hosts.map((h) => {
           const hasKey = Boolean(loadApiKey(h.host_id))
           const isReconnecting = reconnectingId === h.host_id
+          const rowError = rowErrors[h.host_id]
           return (
-            <button
-              key={h.host_id}
-              type="button"
-              onClick={() => { if (!isReconnecting) void tryReconnect(h) }}
-              disabled={isReconnecting}
-              className="w-full flex items-center gap-2 px-3 py-2 bg-surface-alt border border-border rounded-lg hover:bg-surface-hover transition-colors text-left disabled:opacity-70"
-            >
-              {isReconnecting ? (
-                <span
-                  aria-hidden="true"
-                  className="w-3.5 h-3.5 rounded-full border-2 border-current border-t-transparent animate-spin text-text-muted shrink-0"
-                />
-              ) : (
-                <span
-                  className={[
-                    'w-1.5 h-1.5 rounded-full shrink-0',
-                    hasKey ? 'bg-success' : 'bg-text-muted',
-                  ].join(' ')}
-                />
-              )}
-              <div className="flex-1 min-w-0">
-                <div className="text-sm text-text-primary truncate">{h.label}</div>
-                <div className="text-xs text-text-muted truncate">
-                  {formatRelative(h.last_seen)}
-                  {h.api_key_last4 ? ` · ····${h.api_key_last4}` : ''}
-                </div>
+            <div key={h.host_id} className="flex flex-col">
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  onClick={() => { if (!isReconnecting) void handleReconnect(h) }}
+                  disabled={isReconnecting}
+                  className="flex-1 flex items-center gap-2 px-3 py-2 bg-surface-alt border border-border rounded-lg hover:bg-surface-hover transition-colors text-left disabled:opacity-70"
+                >
+                  {isReconnecting ? (
+                    <span
+                      aria-hidden="true"
+                      className="w-3.5 h-3.5 rounded-full border-2 border-current border-t-transparent animate-spin text-text-muted shrink-0"
+                    />
+                  ) : (
+                    <span
+                      className={[
+                        'w-1.5 h-1.5 rounded-full shrink-0',
+                        hasKey ? 'bg-success' : 'bg-text-muted',
+                      ].join(' ')}
+                    />
+                  )}
+                  <div className="flex-1 min-w-0">
+                    <div className="text-sm text-text-primary truncate">{h.label}</div>
+                    <div className="text-xs text-text-muted truncate">
+                      {formatRelative(h.last_seen)}
+                      {h.api_key_last4 ? ` · ····${h.api_key_last4}` : ''}
+                    </div>
+                  </div>
+                </button>
+                <button
+                  type="button"
+                  aria-label={`Forget ${h.label}`}
+                  onClick={() => handleForget(h)}
+                  className="p-1.5 text-text-muted hover:text-danger transition-colors rounded"
+                >
+                  <svg viewBox="0 0 16 16" className="w-3.5 h-3.5" fill="none" stroke="currentColor" strokeWidth="1.75">
+                    <path d="M3 4h10M6 4V3h4v1M5 4v8h6V4H5zm2 2v4m2-4v4" strokeLinecap="round" strokeLinejoin="round" />
+                  </svg>
+                </button>
               </div>
-            </button>
+              {rowError && (
+                <p className="text-xs text-warning px-1 pt-1">{rowError}</p>
+              )}
+            </div>
           )
         })}
       </div>

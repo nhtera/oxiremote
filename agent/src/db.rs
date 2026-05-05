@@ -150,6 +150,14 @@ pub fn init_db(db_path: &Path) -> anyhow::Result<()> {
         "INSERT OR IGNORE INTO settings(key, value) VALUES ('proxy_allowed_ports', '[]')",
         [],
     );
+    // Multi-host allowlist: SPA origins captured at pairing time so a tab on
+    // host A's tunnel can cross-origin fetch host B's API. Quick Tunnel URLs
+    // rotate, so this allowlist is dynamic — origins are added on every
+    // successful pair and pruned via the localhost CORS API.
+    let _ = conn.execute(
+        "INSERT OR IGNORE INTO settings(key, value) VALUES ('cors_allowed_origins', '[]')",
+        [],
+    );
 
     // Permanent dashboard API key, seeded empty so the row always exists;
     // callers treat an empty hash as "not yet generated".
@@ -247,4 +255,180 @@ pub fn save_proxy_allowed_ports(db_path: &Path, ports: &[u16]) -> anyhow::Result
         rusqlite::params![value],
     )?;
     Ok(())
+}
+
+/// FIFO cap so a misbehaving client can't grow `cors_allowed_origins`
+/// unboundedly. 50 entries covers any realistic deployment (≤5 hosts × a
+/// handful of SPA origins each).
+const CORS_ORIGINS_MAX: usize = 50;
+
+/// Read the persisted CORS allowlist. Stored as a JSON array of origin strings
+/// (e.g. `https://abc-123.trycloudflare.com`). Malformed JSON → empty list so
+/// a hand-edited DB never blocks boot.
+pub fn load_cors_allowed_origins(db_path: &Path) -> anyhow::Result<Vec<String>> {
+    let conn = Connection::open(db_path).context("open db for cors_allowed_origins load")?;
+    let raw: Option<String> = conn
+        .query_row(
+            "SELECT value FROM settings WHERE key = 'cors_allowed_origins'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .ok();
+    let Some(text) = raw else { return Ok(Vec::new()) };
+    Ok(serde_json::from_str(&text).unwrap_or_default())
+}
+
+/// Add `origin` to the allowlist (idempotent). FIFO-evicts the oldest entry
+/// when the list reaches `CORS_ORIGINS_MAX`.
+///
+/// Concurrent pairs racing this function would TOCTOU — two readers see the
+/// same baseline, each appends locally, last `UPDATE` wins, one origin is
+/// lost. Wrapped in `BEGIN IMMEDIATE` so SQLite serializes the read-modify-
+/// write under a write lock and races collapse to sequential.
+pub fn upsert_cors_origin(db_path: &Path, origin: &str) -> anyhow::Result<()> {
+    let mut conn = Connection::open(db_path).context("open db for cors_allowed_origins upsert")?;
+    let tx = conn
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .context("begin immediate")?;
+    let raw: Option<String> = tx
+        .query_row(
+            "SELECT value FROM settings WHERE key = 'cors_allowed_origins'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .ok();
+    let mut list: Vec<String> = raw
+        .as_deref()
+        .and_then(|s| serde_json::from_str(s).ok())
+        .unwrap_or_default();
+    if list.iter().any(|o| o == origin) {
+        return Ok(());
+    }
+    if list.len() >= CORS_ORIGINS_MAX {
+        list.remove(0);
+    }
+    list.push(origin.to_string());
+    let value = serde_json::to_string(&list).context("encode cors origins json")?;
+    tx.execute(
+        "INSERT INTO settings(key, value) VALUES ('cors_allowed_origins', ?1)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        rusqlite::params![value],
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
+/// Remove `origin` from the allowlist. No-op if missing.
+pub fn remove_cors_origin(db_path: &Path, origin: &str) -> anyhow::Result<()> {
+    let mut conn = Connection::open(db_path).context("open db for cors_allowed_origins remove")?;
+    let tx = conn
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .context("begin immediate")?;
+    let raw: Option<String> = tx
+        .query_row(
+            "SELECT value FROM settings WHERE key = 'cors_allowed_origins'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .ok();
+    let mut list: Vec<String> = raw
+        .as_deref()
+        .and_then(|s| serde_json::from_str(s).ok())
+        .unwrap_or_default();
+    let before = list.len();
+    list.retain(|o| o != origin);
+    if list.len() == before {
+        return Ok(());
+    }
+    let value = serde_json::to_string(&list).context("encode cors origins json")?;
+    tx.execute(
+        "INSERT INTO settings(key, value) VALUES ('cors_allowed_origins', ?1)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        rusqlite::params![value],
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fresh_db(name: &str) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "oxi-cors-test-{}-{}.db",
+            name,
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        init_db(&path).unwrap();
+        path
+    }
+
+    #[test]
+    fn upsert_cors_origin_is_idempotent() {
+        let path = fresh_db("idempotent");
+        upsert_cors_origin(&path, "https://a.example.com").unwrap();
+        upsert_cors_origin(&path, "https://a.example.com").unwrap();
+        let list = load_cors_allowed_origins(&path).unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0], "https://a.example.com");
+    }
+
+    #[test]
+    fn upsert_cors_origin_fifo_cap() {
+        let path = fresh_db("fifo");
+        for i in 0..(CORS_ORIGINS_MAX + 5) {
+            upsert_cors_origin(&path, &format!("https://host{i}.example.com")).unwrap();
+        }
+        let list = load_cors_allowed_origins(&path).unwrap();
+        assert_eq!(list.len(), CORS_ORIGINS_MAX);
+        // Most recent must still be present; oldest evicted.
+        let last = format!("https://host{}.example.com", CORS_ORIGINS_MAX + 4);
+        assert!(list.contains(&last));
+        assert!(!list.contains(&"https://host0.example.com".to_string()));
+    }
+
+    #[test]
+    fn remove_cors_origin_removes_entry() {
+        let path = fresh_db("remove");
+        upsert_cors_origin(&path, "https://a.example.com").unwrap();
+        upsert_cors_origin(&path, "https://b.example.com").unwrap();
+        remove_cors_origin(&path, "https://a.example.com").unwrap();
+        let list = load_cors_allowed_origins(&path).unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0], "https://b.example.com");
+    }
+
+    #[test]
+    fn remove_missing_origin_is_noop() {
+        let path = fresh_db("noop");
+        upsert_cors_origin(&path, "https://a.example.com").unwrap();
+        remove_cors_origin(&path, "https://nope.example.com").unwrap();
+        let list = load_cors_allowed_origins(&path).unwrap();
+        assert_eq!(list.len(), 1);
+    }
+
+    /// Regression test for TOCTOU race in upsert_cors_origin. Without the
+    /// IMMEDIATE transaction, two concurrent inserts of distinct origins
+    /// would race: both read the same baseline, both append locally, one
+    /// UPDATE wins, the other origin is dropped.
+    #[test]
+    fn upsert_concurrent_distinct_origins_all_persist() {
+        let path = fresh_db("concurrent");
+        let path_a = path.clone();
+        let path_b = path.clone();
+        let t1 = std::thread::spawn(move || {
+            upsert_cors_origin(&path_a, "https://a.example.com").unwrap();
+        });
+        let t2 = std::thread::spawn(move || {
+            upsert_cors_origin(&path_b, "https://b.example.com").unwrap();
+        });
+        t1.join().unwrap();
+        t2.join().unwrap();
+        let list = load_cors_allowed_origins(&path).unwrap();
+        assert_eq!(list.len(), 2, "both origins must persist after race");
+        assert!(list.contains(&"https://a.example.com".to_string()));
+        assert!(list.contains(&"https://b.example.com".to_string()));
+    }
 }

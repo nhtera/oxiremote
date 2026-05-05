@@ -839,6 +839,7 @@ mod tests {
             telemetry: std::sync::Arc::new(crate::telemetry::TelemetryState::new()),
             files_activity: std::sync::Arc::new(crate::files_activity::new_map()),
             cloudflared_path: None,
+            cors_origins: crate::security::cors::seed_origins(&[], &[]),
         }
     }
 

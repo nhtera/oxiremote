@@ -167,6 +167,13 @@ pub struct AppState {
     /// before cloudflared has been located (should not happen in practice since
     /// `server_main` ensures cloudflared before constructing `AppState`).
     pub cloudflared_path: Option<PathBuf>,
+
+    /// Runtime-mutable CORS allowlist. Seeded at boot from `OXI_CORS_ORIGINS`
+    /// and the `cors_allowed_origins` settings row; mutated by pairing
+    /// handlers (auto-add the SPA's origin) and by `/api/agent/cors/origins`
+    /// (manual prune). Read by the CORS middleware on every cross-origin
+    /// request.
+    pub cors_origins: security::cors::CorsOrigins,
 }
 
 fn default_data_dir() -> anyhow::Result<PathBuf> {
@@ -564,6 +571,15 @@ async fn server_main(
     };
     let proxy_allowed_ports = Arc::new(StdRwLock::new(proxy_allowed_ports));
 
+    // CORS allowlist: env var (backward compat) ∪ persisted DB origins.
+    // Mutable at runtime via pairing handlers (auto-add) and /api/agent/cors.
+    let cors_db_origins = db::load_cors_allowed_origins(&db_path).unwrap_or_else(|err| {
+        warn!(error=%err, "failed to load cors_allowed_origins; defaulting to empty");
+        Vec::new()
+    });
+    let cors_origins =
+        security::cors::seed_origins(&security::cors::env_origins(), &cors_db_origins);
+
     // Probe desktop availability once at boot. On macOS this triggers the TCC
     // Screen Recording prompt on first run — expected behaviour. The probe runs
     // on a blocking thread so the Linux PipeWire D-Bus handshake (up to 3s,
@@ -623,6 +639,7 @@ async fn server_main(
         telemetry,
         files_activity,
         cloudflared_path: Some(cloudflared.clone()),
+        cors_origins: cors_origins.clone(),
     });
 
     // Background: periodic listening-port discovery + preview health checks.
@@ -877,15 +894,14 @@ async fn server_main(
 
     // CORS sits OUTSIDE the security chain so OPTIONS preflights — which
     // arrive without Bearer / cookie / CSRF — get an early answer instead of
-    // hitting `tunnel_guard` / `api_key_guard`. No-op in embedded mode where
-    // OXI_CORS_ORIGINS is unset; same-origin requests have no Origin header,
-    // so the layer is invisible to that flow.
-    let app = if let Some(cors) = security::cors::build_layer() {
-        info!("CORS allowlist active");
-        app.layer(cors)
-    } else {
-        app
-    };
+    // hitting `tunnel_guard` / `api_key_guard`. The runtime allowlist is empty
+    // by default; same-origin requests carry no `Origin` header so the layer
+    // is invisible to embedded same-host flows.
+    {
+        let count = cors_origins.read().map(|s| s.len()).unwrap_or(0);
+        info!(origins = count, "CORS runtime allowlist installed");
+    }
+    let app = app.layer(security::cors::CorsLayer::new(cors_origins.clone()));
 
     let addr: SocketAddr = SocketAddr::from(([127, 0, 0, 1], AGENT_PORT));
     // The tunnel-origin detection in route_scope relies on the agent binding

@@ -3,11 +3,13 @@ import { useNavigate } from 'react-router-dom'
 import { useHostStore } from '../../state/host-store'
 import { ChevronDownIcon } from '../icons'
 import { clearApiKey } from '../../lib/api-client'
+import { switchActiveHost } from '../../lib/host-switch-helpers'
+import { listSavedHosts } from '../../lib/saved-hosts'
 import KeyboardShortcutOverlay from '../workspace/keyboard-shortcut-overlay'
 
 // Top-bar dropdown surfacing the active host. Click → menu with the host
-// label (green dot for "alive"), Switch host… (welcome screen lists saved
-// pairings), and Logout. Mirrors the messaging-app convention of putting
+// label (green dot for "alive"), saved-host list (in-place switch), Pair new
+// host…, and Logout. Mirrors the messaging-app convention of putting
 // account/workspace switchers in the top-left.
 const LONG_PRESS_MS = 600
 
@@ -16,11 +18,16 @@ export default function TopbarHostMenu() {
   const { currentHostId, label } = useHostStore()
   const [open, setOpen] = useState(false)
   const [shortcutOpen, setShortcutOpen] = useState(false)
+  const [switchingId, setSwitchingId] = useState<string | null>(null)
   const ref = useRef<HTMLDivElement>(null)
   // Long-press state: timer ID while pointer is held down.
   const longPressTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
 
   const hostLabel = label ?? (currentHostId ? `${currentHostId.slice(0, 8)}…` : 'No host')
+
+  // Re-read on every render — listSavedHosts is a localStorage read, fine
+  // for a dropdown that only mounts on click.
+  const otherHosts = listSavedHosts().filter((h) => h.host_id !== currentHostId)
 
   useEffect(() => {
     if (!open) return
@@ -41,7 +48,6 @@ export default function TopbarHostMenu() {
   // Long-press on logo (600ms) opens the keyboard shortcut overlay on mobile.
   // `touch-action: manipulation` suppresses the iOS long-press context menu.
   function handleLogoPointerDown(e: React.PointerEvent) {
-    // Only trigger for primary pointer (left button / touch point).
     if (e.button !== 0 && e.pointerType !== 'touch') return
     longPressTimer.current = setTimeout(() => {
       longPressTimer.current = null
@@ -57,8 +63,6 @@ export default function TopbarHostMenu() {
     }
   }
 
-  // Suppress native context menu on logo (iOS long-press would otherwise
-  // show the "Open Link / Copy Link / Share" sheet).
   function handleLogoContextMenu(e: React.MouseEvent) {
     e.preventDefault()
   }
@@ -70,9 +74,11 @@ export default function TopbarHostMenu() {
     navigate('/login')
   }
 
-  const handleSwitch = () => {
+  const handleSwitchTo = async (hostId: string) => {
+    setSwitchingId(hostId)
     setOpen(false)
-    navigate('/welcome')
+    await switchActiveHost(hostId, navigate)
+    setSwitchingId(null)
   }
 
   return (
@@ -115,13 +121,37 @@ export default function TopbarHostMenu() {
             <span className={`w-2 h-2 rounded-full shrink-0 ${currentHostId ? 'bg-success' : 'bg-text-muted'}`} />
             <span className="text-sm text-text-primary truncate">{hostLabel}</span>
           </div>
+          {otherHosts.length > 0 && (
+            <div className="max-h-48 overflow-y-auto border-b border-border">
+              {otherHosts.map((h) => (
+                <button
+                  key={h.host_id}
+                  type="button"
+                  role="menuitem"
+                  disabled={switchingId !== null}
+                  onClick={() => void handleSwitchTo(h.host_id)}
+                  className="w-full text-left px-3 py-2 text-sm text-text-secondary hover:bg-surface-hover hover:text-text-primary transition-colors flex items-center gap-2 disabled:opacity-60"
+                >
+                  {switchingId === h.host_id ? (
+                    <span aria-hidden className="w-3 h-3 rounded-full border-2 border-current border-t-transparent animate-spin shrink-0" />
+                  ) : (
+                    <span className="w-1.5 h-1.5 rounded-full bg-text-muted shrink-0" />
+                  )}
+                  <span className="truncate">{h.label}</span>
+                  {h.api_key_last4 && (
+                    <span className="text-xs text-text-muted ml-auto shrink-0">····{h.api_key_last4}</span>
+                  )}
+                </button>
+              ))}
+            </div>
+          )}
           <button
             type="button"
             role="menuitem"
-            onClick={handleSwitch}
+            onClick={() => { setOpen(false); navigate('/welcome') }}
             className="w-full text-left px-3 py-2 text-sm text-text-secondary hover:bg-surface-hover hover:text-text-primary transition-colors"
           >
-            Switch host…
+            Pair new host…
           </button>
           <button
             type="button"

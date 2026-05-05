@@ -73,10 +73,11 @@ export function clearApiKey(hostId?: string) {
   try {
     if (hostId) {
       localStorage.removeItem(API_KEY_PREFIX + hostId)
+      localStorage.removeItem(TUNNEL_BASE_PREFIX + hostId)
     } else {
       for (let i = localStorage.length - 1; i >= 0; i--) {
         const k = localStorage.key(i)
-        if (k && k.startsWith(API_KEY_PREFIX)) {
+        if (k && (k.startsWith(API_KEY_PREFIX) || k.startsWith(TUNNEL_BASE_PREFIX))) {
           localStorage.removeItem(k)
         }
       }
@@ -178,24 +179,32 @@ export function makeRemoteClient(baseUrl: string, apiKey: string): RemoteClient 
 let warnedMissingTunnelBase = false
 
 /**
- * Build a same-origin /api/<path> URL relative to the active tunnel base.
- * Returns null in embedded mode or when no tunnel base is known yet.
+ * Build an absolute URL pointing at the active host's tunnel base, when the
+ * stored base differs from the current page origin. Returns null when:
+ *   - no tunnel base is stored for the active host (same-origin embedded path), OR
+ *   - the stored base IS the current origin (same-host SPA tab — no rewrite needed).
+ *
+ * The cross-origin path covers two cases with one rule:
+ *   - Discovery mode (SPA on Pages, agent on a tunnel)
+ *   - Embedded multi-host (SPA on host A's tunnel, switched to host B)
  */
 function rewriteToTunnel(url: string): string | null {
-  if (!isDiscoveryMode()) return null
   const base = loadTunnelBase()
   if (!base) {
-    // Discovery mode is on but the SPA has no tunnel for the active host —
-    // happens when the user paired with an old build (pre-tunnel-base
-    // persistence) or wiped only some localStorage keys. Loud one-shot
-    // warning so a stuck tab is debuggable from the console.
-    if (!warnedMissingTunnelBase && typeof console !== 'undefined') {
+    // Discovery mode without a tunnel base means the SPA has no agent to
+    // route to. Surface a one-shot warning so a stuck tab is debuggable.
+    // Embedded mode without a base is normal pre-pair state — silent.
+    if (isDiscoveryMode() && !warnedMissingTunnelBase && typeof console !== 'undefined') {
       warnedMissingTunnelBase = true
       console.warn(
         '[oxiremote] discovery mode is active but no tunnel base is stored for the active host. ' +
           'Same-origin /api/* requests will hit Pages and fail. Re-pair from /login to refresh.',
       )
     }
+    return null
+  }
+  if (typeof window !== 'undefined' && base === window.location.origin) {
+    // Same-host SPA tab: keep the existing same-origin (cookie-bearing) path.
     return null
   }
   let pathname: string

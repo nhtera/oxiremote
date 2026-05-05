@@ -46,6 +46,11 @@ export async function handleOtkSuccess(res: Response, ctx: PairCtx): Promise<voi
       label: hostState.label ?? ctx.deviceLabel.trim() ?? hostState.currentHostId.slice(0, 8),
       api_key_last4: existingKey.slice(-4),
     })
+    // Persist the current page origin as this host's tunnel base so future
+    // cross-origin switches from another host's SPA can route here.
+    if (typeof window !== 'undefined') {
+      storeTunnelBase(hostState.currentHostId, window.location.origin)
+    }
   }
   ctx.navigate('/')
 }
@@ -75,6 +80,11 @@ export async function handlePairingSuccess(res: Response, ctx: PairCtx): Promise
         label: hostState.label ?? ctx.deviceLabel.trim() ?? hostId.slice(0, 8),
         api_key_last4: String(body.api_key).slice(-4),
       })
+      // Persist the current page origin as this host's tunnel base so future
+      // cross-origin switches from another host's SPA can route here.
+      if (typeof window !== 'undefined') {
+        storeTunnelBase(hostId, window.location.origin)
+      }
     } else if (body.api_key && body.device_id) {
       try {
         window.sessionStorage.setItem(
