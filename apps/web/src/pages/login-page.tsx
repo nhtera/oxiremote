@@ -1,6 +1,5 @@
 import { useEffect, useState } from 'react'
 import { useNavigate, useSearchParams } from 'react-router-dom'
-import { useHostStore } from '../state/host-store'
 import { isDiscoveryMode, isLikelyTempKey } from '../lib/discovery-client'
 import { listSavedHosts, type SavedHost } from '../lib/saved-hosts'
 import { sanitizeAccessKey } from '../components/login/access-key-form'
@@ -15,6 +14,13 @@ import { submitAccessKey, submitDiscoveryPair } from '../lib/login-pair-flows'
 //
 // Pair-flow logic (same-origin + discovery-mode cross-origin) lives in
 // `lib/login-pair-flows.ts`. Saved-hosts UI lives in `<SavedHostsPanel>`.
+//
+// Note: this page does NOT auto-redirect when an existing same-origin
+// session cookie is valid. Users land here from the welcome screen or
+// topbar "Pair new host…" with the deliberate intent to add another host;
+// bouncing to the active host's workspace breaks multi-host pairing. The
+// SavedHostsPanel above the form lets returning users jump back without
+// re-pairing.
 
 export default function LoginPage() {
   const [searchParams] = useSearchParams()
@@ -28,7 +34,6 @@ export default function LoginPage() {
   )
   const [error, setError] = useState('')
   const [loading, setLoading] = useState(false)
-  const [checkingAuth, setCheckingAuth] = useState(true)
   // Snapshot the saved-hosts list once on mount — adding a new pair after
   // the form is open shouldn't reorder the panel under the user's finger.
   const [savedHosts, setSavedHosts] = useState<SavedHost[]>(() => listSavedHosts())
@@ -37,35 +42,6 @@ export default function LoginPage() {
     searchParams.get('error') === 'rejected'
       ? 'The host declined this device. You can try again with a fresh key.'
       : null
-
-  // Skip the form entirely if the session cookie is already valid. In
-  // discovery mode the SPA's own origin (Pages) has no /api/me — the agent
-  // is on a separate tunnel origin and we don't know it pre-pair, so probing
-  // here would just hit the SPA fallback. Skip the probe entirely when the
-  // build is configured for discovery; the QR-deep-link path takes over.
-  useEffect(() => {
-    if (isDiscoveryMode()) {
-      setCheckingAuth(false)
-      return
-    }
-    let cancelled = false
-    fetch('/api/me', { credentials: 'include' })
-      .then(async (res) => {
-        if (cancelled) return
-        if (res.ok) {
-          await useHostStore.getState().fetchHost()
-          navigate('/', { replace: true })
-        } else {
-          setCheckingAuth(false)
-        }
-      })
-      .catch(() => {
-        if (!cancelled) setCheckingAuth(false)
-      })
-    return () => {
-      cancelled = true
-    }
-  }, [navigate])
 
   const runSubmit = async (raw: string) => {
     setError('')
@@ -99,7 +75,6 @@ export default function LoginPage() {
   // The URL is scrubbed in the auto-submit branches so the credentials don't
   // sit in browser history.
   useEffect(() => {
-    if (checkingAuth) return
     const k = searchParams.get('k')
     if (!k) return
 
@@ -128,15 +103,7 @@ export default function LoginPage() {
       setAccessKey(cleaned)
     })
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [searchParams, checkingAuth])
-
-  if (checkingAuth) {
-    return (
-      <div className="min-h-dvh flex items-center justify-center text-text-muted text-sm">
-        Loading…
-      </div>
-    )
-  }
+  }, [searchParams])
 
   return (
     <div className="min-h-dvh bg-dot-grid flex items-center justify-center px-6 py-10">
