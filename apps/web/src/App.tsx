@@ -17,7 +17,7 @@ import HostLogsPage from './pages/host-logs-page'
 import { ToastProvider, ConfirmProvider } from './components/ui'
 import { useHostStore } from './state/host-store'
 import { registerServiceWorker } from './lib/push-client'
-import { loadApiKey, loadTunnelBase } from './lib/api-client'
+import { getActiveHost, loadApiKey, loadTunnelBase } from './lib/api-client'
 import { switchActiveHost } from './lib/host-switch-helpers'
 import { listSavedHosts } from './lib/saved-hosts'
 
@@ -90,6 +90,14 @@ function HostRoute({ children }: { children: React.ReactNode }) {
     if (hostId === currentHostId || loading || switching) return
     if (attemptedRef.current === hostId) return
     if (!loadApiKey(hostId) || !loadTunnelBase(hostId)) return
+    // If the active-host pointer already matches the URL hostId, an external
+    // caller (topbar dropdown, saved-hosts panel, login pair flow) flipped
+    // the pointer and navigated us here — they're already running fetch
+    // /api/me + fetchHost. Starting our own parallel switch duplicates every
+    // probe and races on the active-host pointer; with a slow tunnel + the
+    // API rate-limit (`429 Too Many Requests`) the doubling cascades. Trust
+    // the external caller and wait for currentHostId to converge instead.
+    if (getActiveHost() === hostId) return
     attemptedRef.current = hostId
     setSwitching(true)
     setSwitchError(null)
