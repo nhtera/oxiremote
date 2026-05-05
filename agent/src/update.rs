@@ -212,7 +212,9 @@ async fn run_async() -> Result<()> {
         .ok_or_else(|| anyhow!("current_exe has no parent"))?
         .to_path_buf();
 
-    let extracted = extract_binary(&archive_bytes, &target_dir).context("extract archive")?;
+    let archive_stem = format!("oxiremote-{latest_version}-{target}");
+    let extracted = extract_binary(&archive_bytes, &target_dir, &archive_stem)
+        .context("extract archive")?;
 
     atomic_replace(&current_exe, &extracted).context("atomic replace")?;
     println!("Updated to {latest_version}. Restart the agent to pick up the new binary.");
@@ -221,7 +223,11 @@ async fn run_async() -> Result<()> {
 
 /// Pulls the `oxiremote` (or `oxiremote.exe`) binary out of the archive into
 /// `<target_dir>/oxiremote.new`. Returns the new-binary path.
-fn extract_binary(archive: &[u8], target_dir: &Path) -> Result<PathBuf> {
+///
+/// `archive_stem` is the top-level directory inside the archive
+/// (`oxiremote-<version>-<target>`) — release artifacts nest the binary one
+/// level deep, so we strip that prefix during extraction.
+fn extract_binary(archive: &[u8], target_dir: &Path, archive_stem: &str) -> Result<PathBuf> {
     let bin_basename = if cfg!(target_os = "windows") {
         "oxiremote.exe"
     } else {
@@ -236,12 +242,17 @@ fn extract_binary(archive: &[u8], target_dir: &Path) -> Result<PathBuf> {
         // shell out to `tar` (Win10+ ships bsdtar). Cleaner than a new dep.
         let tmp = target_dir.join("oxiremote-update-archive.zip");
         fs::write(&tmp, archive).context("write archive temp")?;
+        // The archive nests the binary under `<archive_stem>/oxiremote.exe`;
+        // pass the full nested path and --strip-components=1 so tar drops
+        // it next to target_dir without recreating the wrapping directory.
+        let nested = format!("{archive_stem}/{bin_basename}");
         let status = std::process::Command::new("tar")
             .args(["-xf"])
             .arg(&tmp)
             .args(["-C"])
             .arg(target_dir)
-            .arg(bin_basename)
+            .arg("--strip-components=1")
+            .arg(&nested)
             .status()
             .context("spawn tar")?;
         let _ = fs::remove_file(&tmp);
