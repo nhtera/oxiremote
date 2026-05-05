@@ -251,13 +251,33 @@ fn main() -> anyhow::Result<()> {
     }
 }
 
+/// Poll loopback `AGENT_PORT` until the listener accepts a TCP connection or
+/// `timeout` elapses. axum's listener binds before any request handler can be
+/// reached, so a successful connect means the SPA at `/agent` will resolve.
+/// Used to gate browser-open after spawning a detached `--tray` child so
+/// `open::that()` doesn't race the child's startup.
+pub fn wait_for_agent_ready(timeout: std::time::Duration) -> bool {
+    use std::net::{SocketAddr, TcpStream};
+    use std::time::{Duration, Instant};
+
+    let addr = SocketAddr::from(([127, 0, 0, 1], AGENT_PORT));
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if TcpStream::connect_timeout(&addr, Duration::from_millis(500)).is_ok() {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(150));
+    }
+    TcpStream::connect_timeout(&addr, Duration::from_millis(500)).is_ok()
+}
+
 /// `oxiremote ui` — spawn the agent detached, wait for /api/health, open
 /// browser to `/agent`. If a server is already running on the port, just
 /// open the browser.
 fn run_ui_command() -> anyhow::Result<()> {
     use std::net::{SocketAddr, TcpStream};
     use std::process::Stdio;
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
 
     let addr = SocketAddr::from(([127, 0, 0, 1], AGENT_PORT));
     let already_running =
@@ -297,14 +317,7 @@ fn run_ui_command() -> anyhow::Result<()> {
         // We deliberately don't wait/reap — child runs independently.
         let pid = child.id();
 
-        let deadline = Instant::now() + Duration::from_secs(15);
-        while Instant::now() < deadline {
-            if TcpStream::connect_timeout(&addr, Duration::from_millis(500)).is_ok() {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(300));
-        }
-        if TcpStream::connect_timeout(&addr, Duration::from_millis(500)).is_err() {
+        if !wait_for_agent_ready(Duration::from_secs(15)) {
             anyhow::bail!(
                 "background agent did not start within 15s (PID {pid}). Check ~/.oxiremote/."
             );

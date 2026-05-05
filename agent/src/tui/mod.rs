@@ -190,6 +190,16 @@ pub fn run_tui(
                 drop(term);
                 drop(_guard);
                 spawn_detached_tray();
+                // Wait for the detached child to bind :8787 before launching
+                // the browser. Without this, Safari/Chrome race the child's
+                // startup and load "can't connect to server", forcing a
+                // manual reload.
+                if !crate::wait_for_agent_ready(std::time::Duration::from_secs(15)) {
+                    eprintln!(
+                        "(agent did not bind :{} within 15s; opening browser anyway — reload after the menu-bar icon appears)",
+                        crate::AGENT_PORT
+                    );
+                }
                 let _ = open::that("http://localhost:8787/agent");
                 std::process::exit(0);
             }
