@@ -170,7 +170,9 @@ pub struct AppState {
 }
 
 fn default_data_dir() -> anyhow::Result<PathBuf> {
-    let home = std::env::var("HOME").context("HOME not set")?;
+    let home = std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .context("HOME or USERPROFILE not set")?;
     Ok(PathBuf::from(home).join(".oxiremote"))
 }
 

@@ -65,7 +65,9 @@ fn parse_args(argv: &[String]) -> Result<Args> {
 }
 
 fn default_data_dir() -> Result<std::path::PathBuf> {
-    let home = std::env::var("HOME").context("HOME not set")?;
+    let home = std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .context("HOME or USERPROFILE not set")?;
     Ok(Path::new(&home).join(".oxiremote"))
 }
 

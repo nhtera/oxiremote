@@ -32,7 +32,9 @@ pub fn seed_defaults(conn: &Connection, host_id: &str) -> anyhow::Result<()> {
     if existing > 0 {
         return Ok(());
     }
-    let home = std::env::var("HOME").ok();
+    let home = std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .ok();
     let now = now_ts();
 
     if let Some(home) = home.as_deref() {
