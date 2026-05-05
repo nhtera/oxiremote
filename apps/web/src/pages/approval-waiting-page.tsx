@@ -57,7 +57,12 @@ export default function ApprovalWaitingPage() {
           signal: controller.signal,
         })
         if (!res.ok) {
-          setPhase('timeout')
+          // Transient HTTP errors (401 race right after the session cookie
+          // is set, 5xx during an agent restart, gateway hiccups) are not
+          // approval timeouts. Keep polling until the actual deadline hits;
+          // a real timeout is decided only by `Date.now() >= deadlineRef`
+          // at the top of this function.
+          setTimeout(poll, POLL_INTERVAL_MS)
           return
         }
         const data: ApprovalStatusResponse = await res.json()
