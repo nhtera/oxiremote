@@ -941,7 +941,31 @@ async fn server_main(
         }
     }
 
-    let listener = tokio::net::TcpListener::bind(addr).await?;
+    let listener = match tokio::net::TcpListener::bind(addr).await {
+        Ok(l) => l,
+        Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+            // Belt-and-braces: instance_lock::acquire already kills the prior
+            // process via pidfile, but a stale/missing pidfile (e.g. crash
+            // without Drop, pre-0.1.1 data_dir bug on Windows) leaves the old
+            // agent holding the port. Sweep the process table once and retry.
+            tracing::warn!(%addr, "port in use — sweeping stale oxiremote processes");
+            let killed = instance_lock::kill_other_oxiremote_processes();
+            if killed == 0 {
+                eprintln!(
+                    "\nError: port {AGENT_PORT} is in use and no stale oxiremote process was found.\n\
+                     Another application is bound to 127.0.0.1:{AGENT_PORT}. Free the port and retry."
+                );
+                return Err(e.into());
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+            tokio::net::TcpListener::bind(addr).await.with_context(|| {
+                format!(
+                    "rebind after killing {killed} stale oxiremote process(es) failed"
+                )
+            })?
+        }
+        Err(e) => return Err(e.into()),
+    };
     notifier::show_startup(addr);
 
     let pairing = http_pages::create_pairing_code(&state).context("create pairing code")?;

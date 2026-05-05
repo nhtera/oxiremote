@@ -51,6 +51,89 @@ impl Drop for InstanceLock {
     }
 }
 
+/// Best-effort fallback when bind() fails with AddrInUse but `acquire()` did
+/// not catch a stale process — usually because the prior instance crashed
+/// without writing a pidfile, or wrote one in a different data_dir (e.g. an
+/// older release with the pre-USERPROFILE env-fallback bug). Scans the
+/// process table for live `oxiremote` processes other than ourselves and
+/// terminates them. Returns the number of processes killed.
+pub fn kill_other_oxiremote_processes() -> u32 {
+    let me = std::process::id() as i32;
+    let mut killed = 0;
+    for pid in list_oxiremote_pids() {
+        if pid == me || !process_alive(pid) || !pid_is_oxiremote(pid) {
+            continue;
+        }
+        let _ = kill_process(pid, false);
+        std::thread::sleep(Duration::from_millis(500));
+        if process_alive(pid) {
+            let _ = kill_process(pid, true);
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        killed += 1;
+    }
+    killed
+}
+
+#[cfg(target_os = "linux")]
+fn list_oxiremote_pids() -> Vec<i32> {
+    std::process::Command::new("pgrep")
+        .args(["-x", "oxiremote"])
+        .output()
+        .ok()
+        .map(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .lines()
+                .filter_map(|l| l.trim().parse().ok())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+#[cfg(target_os = "macos")]
+fn list_oxiremote_pids() -> Vec<i32> {
+    std::process::Command::new("pgrep")
+        .args(["-x", "oxiremote"])
+        .output()
+        .ok()
+        .map(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .lines()
+                .filter_map(|l| l.trim().parse().ok())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
+fn list_oxiremote_pids() -> Vec<i32> {
+    Vec::new()
+}
+
+#[cfg(windows)]
+fn list_oxiremote_pids() -> Vec<i32> {
+    // tasklist CSV row: "oxiremote.exe","1234","Console","1","45,000 K"
+    let out = std::process::Command::new("tasklist")
+        .args([
+            "/FI",
+            "IMAGENAME eq oxiremote.exe",
+            "/FO",
+            "CSV",
+            "/NH",
+        ])
+        .output();
+    let Ok(o) = out else { return Vec::new() };
+    String::from_utf8_lossy(&o.stdout)
+        .lines()
+        .filter_map(|line| {
+            let mut parts = line.split(',');
+            parts.next()?; // image name
+            let pid_field = parts.next()?.trim().trim_matches('"');
+            pid_field.parse().ok()
+        })
+        .collect()
+}
+
 /// Verify the named PID is actually an oxiremote process. Belt-and-braces
 /// against PID reuse: the agent's `agent.pid` file may point at a recycled
 /// PID owned by an unrelated process after a crash + reboot. Conservative on
