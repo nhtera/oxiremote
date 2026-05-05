@@ -32,7 +32,7 @@ export default function MobileBottomTabs({ hostId }: Props) {
 
   return (
     <nav
-      className="lg:hidden border-t border-border bg-surface-alt flex items-stretch shrink-0"
+      className="lg:hidden border-t border-border bg-surface-alt/95 backdrop-blur-md flex items-stretch shrink-0"
       style={{ paddingBottom: 'env(safe-area-inset-bottom, 0px)' }}
       aria-label="Primary"
     >
@@ -41,19 +41,31 @@ export default function MobileBottomTabs({ hostId }: Props) {
           key={tab.to}
           to={tab.to}
           className={({ isActive }) =>
-            `flex-1 min-w-0 flex flex-col items-center justify-center gap-0.5 py-1.5 min-h-11 transition-colors ${
+            `relative flex-1 min-w-0 flex flex-col items-center justify-center gap-0.5 py-1.5 min-h-12 transition-colors ${
               isActive
                 ? 'text-accent'
-                : 'text-text-muted hover:text-text-primary active:bg-surface-hover'
+                : 'text-text-muted active:bg-surface-hover'
             }`
           }
         >
           {({ isActive }) => (
             <>
-              <tab.Icon size={20} />
+              {isActive && (
+                <span
+                  aria-hidden
+                  className="absolute top-0 left-1/2 -translate-x-1/2 w-9 h-0.5 rounded-b-full bg-accent shadow-[0_0_12px_rgba(255,122,64,0.55)]"
+                />
+              )}
+              <span
+                className={`flex items-center justify-center w-9 h-9 rounded-lg transition-colors ${
+                  isActive ? 'bg-accent/15' : ''
+                }`}
+              >
+                <tab.Icon size={20} />
+              </span>
               <span
                 className={`text-[10px] leading-none ${
-                  isActive ? 'font-medium' : ''
+                  isActive ? 'font-semibold tracking-wide' : ''
                 }`}
               >
                 {tab.label}

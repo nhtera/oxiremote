@@ -22,7 +22,7 @@ import MultiPaneGrid from '../components/workspace/multi-pane-grid'
 import KeyboardShortcutOverlay from '../components/workspace/keyboard-shortcut-overlay'
 import SessionStatusBar from '../components/workspace/session-status-bar'
 import { useSessionConnectionState } from '../hooks/use-session-connection-state'
-import { StateView, useConfirm } from '../components/ui'
+import { useConfirm } from '../components/ui'
 
 type CreateSessionReq = { cols: number; rows: number; name?: string }
 type CreateSessionRes = { id: string }
@@ -328,30 +328,45 @@ export default function WorkspacePage() {
           registerGetSelection={registerGetSelection}
         />
       ) : (
-        <div className="flex-1 min-h-0 bg-dot-grid flex flex-col items-center justify-center gap-6 px-4">
-          <StateView
-            icon={
-              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.75" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
-                <polyline points="4 6 10 12 4 18" />
-                <line x1="12" y1="18" x2="20" y2="18" />
-              </svg>
-            }
-            title={hasSessions ? 'No pane assigned' : 'No active sessions'}
-            body={hasSessions
-              ? 'Pick a tab above to load it into a pane, or create a new session.'
-              : 'Create a new session to get started. Each session keeps a persistent PTY so you can detach and resume later.'}
+        <div className="relative flex-1 min-h-0 bg-atmosphere flex flex-col items-center justify-center gap-6 px-4 overflow-hidden">
+          <span
+            aria-hidden
+            className="glow-corona"
+            style={{ width: '320px', height: '320px', top: '40%', left: '50%', transform: 'translate(-50%, -50%)' }}
           />
-          <NewSessionRow onCreate={createSession} />
-          {err && <div className="text-danger text-xs">{err}</div>}
-          {!hasSessions && (
-            <p className="text-xs text-text-muted text-center max-w-xs leading-relaxed">
-              Tip: start{' '}
-              <code className="px-1 py-px rounded bg-surface border border-border text-accent font-mono text-[10px]">
-                claude code
-              </code>{' '}
-              in a session and we&apos;ll notify your phone when it finishes.
-            </p>
-          )}
+          <div className="relative z-10 flex flex-col items-center gap-6 w-full">
+            <div className="flex flex-col items-center gap-3 animate-hero-rise">
+              <span className="inline-flex items-center justify-center w-14 h-14 rounded-2xl bg-surface-alt border border-border text-accent shadow-[0_10px_30px_-12px_rgba(0,0,0,0.6)]">
+                <svg viewBox="0 0 24 24" className="w-7 h-7" fill="none" stroke="currentColor" strokeWidth="1.75" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+                  <polyline points="4 6 10 12 4 18" />
+                  <line x1="12" y1="18" x2="20" y2="18" />
+                </svg>
+              </span>
+              <div className="text-center">
+                <div className="text-base font-semibold text-text-primary tracking-tight">
+                  {hasSessions ? 'No pane assigned' : 'No active sessions'}
+                </div>
+                <div className="text-[13px] text-text-secondary mt-1 max-w-xs">
+                  {hasSessions
+                    ? 'Pick a tab above to load it, or create a new session.'
+                    : 'Each session keeps a persistent shell so you can detach and resume.'}
+                </div>
+              </div>
+            </div>
+            <div className="w-full max-w-md animate-hero-rise stagger-2">
+              <NewSessionRow onCreate={createSession} />
+            </div>
+            {err && <div className="text-danger text-xs">{err}</div>}
+            {!hasSessions && (
+              <p className="text-[11px] text-text-muted text-center max-w-xs leading-relaxed animate-hero-rise stagger-3">
+                Tip: start{' '}
+                <code className="px-1.5 py-0.5 rounded bg-surface border border-border text-accent text-[10px]" style={{ fontFamily: 'var(--font-mono)' }}>
+                  claude code
+                </code>{' '}
+                and we'll ping your phone when it finishes.
+              </p>
+            )}
+          </div>
         </div>
       )}
 

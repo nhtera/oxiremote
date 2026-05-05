@@ -112,17 +112,14 @@ export default function TerminalKeybar({ onSend, onToast, getSelection }: Props)
     }
   }
 
-  function modBtnClass(state: ModState): string {
-    const base = 'btn-secondary text-xs py-1 px-2 min-w-9 text-center'
-    if (state === 'lock') return `${base} !bg-accent !text-white !border-accent`
-    if (state === 'one') return `${base} !bg-accent/20 !text-accent !border-accent/40`
-    return base
+  function modChipClass(state: ModState): string {
+    if (state === 'lock') return 'key-chip key-chip-lock'
+    if (state === 'one')  return 'key-chip key-chip-once'
+    return 'key-chip'
   }
 
-  const baseBtn = 'btn-secondary text-xs py-1 px-2 min-w-9 text-center'
-
   return (
-    <div className="flex flex-col gap-1 shrink-0">
+    <div className="flex flex-col gap-1.5 shrink-0">
       <TerminalKeybarExpanded
         visible={expanded}
         onSend={onSend}
@@ -130,56 +127,58 @@ export default function TerminalKeybar({ onSend, onToast, getSelection }: Props)
         onCopySelection={getSelection ? () => void handleCopySelection() : undefined}
       />
 
-      <div className="flex flex-wrap gap-1">
-        <button className={baseBtn} onClick={() => sendKey('\x1b')}>Esc</button>
-        <button className={baseBtn} onClick={() => sendKey('\x1b[D')} aria-label="Left">←</button>
-        <button className={baseBtn} onClick={() => sendKey('\x1b[A')} aria-label="Up">↑</button>
-        <button className={baseBtn} onClick={() => sendKey('\x1b[B')} aria-label="Down">↓</button>
-        <button className={baseBtn} onClick={() => sendKey('\x1b[C')} aria-label="Right">→</button>
-        <button className={baseBtn} onClick={() => sendKey('\x03')} title="Ctrl+C">^C</button>
+      {/* Row 1 — navigation + interrupt. Always visible. */}
+      <div className="flex gap-1.5 overflow-x-auto -mx-0.5 px-0.5 pb-0.5 [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
+        <button className="key-chip" onClick={() => sendKey('\x1b')}>Esc</button>
+        <button className="key-chip" onClick={() => sendKey('\x1b[D')} aria-label="Left">←</button>
+        <button className="key-chip" onClick={() => sendKey('\x1b[A')} aria-label="Up">↑</button>
+        <button className="key-chip" onClick={() => sendKey('\x1b[B')} aria-label="Down">↓</button>
+        <button className="key-chip" onClick={() => sendKey('\x1b[C')} aria-label="Right">→</button>
+        <button className="key-chip key-chip-accent" onClick={() => sendKey('\x03')} title="Ctrl+C — interrupt">^C</button>
+        <button className="key-chip" onClick={() => sendKey('\t')}>Tab</button>
+        <button className="key-chip" onClick={() => sendKey('\r')} aria-label="Enter">↵</button>
+        <button className="key-chip" onClick={() => sendKey('\x7f')} aria-label="Backspace">⌫</button>
+      </div>
+
+      {/* Row 2 — sticky modifiers + more. */}
+      <div className="flex gap-1.5">
         <button
-          className={modBtnClass(mods.ctrl)}
+          className={modChipClass(mods.ctrl)}
           onClick={() => toggleModifier('ctrl')}
           title="Ctrl modifier — tap once for next key, double-tap to lock"
         >
           Ctrl
         </button>
         <button
-          className={modBtnClass(mods.opt)}
+          className={modChipClass(mods.opt)}
           onClick={() => toggleModifier('opt')}
           title="Option / Alt modifier — sends ESC prefix to next key"
         >
           Opt
         </button>
         <button
-          className={modBtnClass(mods.meta)}
+          className={modChipClass(mods.meta)}
           onClick={() => toggleModifier('meta')}
           title="Command modifier — limited PTY effect"
         >
           ⌘
         </button>
         <button
-          className={modBtnClass(mods.shift)}
+          className={modChipClass(mods.shift)}
           onClick={() => toggleModifier('shift')}
           title="Shift modifier"
         >
           Shift
         </button>
-        <button className={baseBtn} onClick={() => sendKey('\t')}>Tab</button>
-        <button className={baseBtn} onClick={() => sendKey('\r')} aria-label="Enter">↵</button>
-        <button className={baseBtn} onClick={() => sendKey('\x7f')} aria-label="Backspace">⌫</button>
+        <div className="flex-1" />
         <button
-          className={
-            expanded
-              ? `${baseBtn} !bg-accent/20 !text-accent !border-accent/40`
-              : baseBtn
-          }
+          className={expanded ? 'key-chip key-chip-once' : 'key-chip'}
           onClick={() => setExpanded((v) => !v)}
           title="More keys"
           aria-expanded={expanded}
           aria-label="Toggle more keys"
         >
-          …
+          {expanded ? '×' : '…'}
         </button>
       </div>
     </div>

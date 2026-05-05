@@ -122,7 +122,7 @@ export default function TerminalTabBar({
 
   return (
     <>
-      <div className="flex items-center gap-0.5 overflow-x-auto border-b border-border bg-surface-alt shrink-0 min-h-[36px]">
+      <div className="flex items-center gap-0.5 overflow-x-auto border-b border-border bg-surface-alt shrink-0 min-h-[40px] [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
         {sessions.map((s) => {
           const isActive = s.id === activeId
           let dot = resolveDot(s, connectedById, reconnectingById)
@@ -135,12 +135,15 @@ export default function TerminalTabBar({
               onClick={() => onSelect(s.id)}
               onDoubleClick={() => startRename(s)}
               onContextMenu={(e) => openContextMenu(e, s.id)}
-              className={`flex items-center gap-1.5 px-2 py-1 shrink-0 cursor-pointer border-r border-border text-xs select-none min-w-[80px] max-w-[180px] group transition-colors ${
+              className={`relative flex items-center gap-1.5 px-2.5 py-1.5 shrink-0 cursor-pointer text-[13px] select-none min-w-[84px] max-w-[180px] group transition-colors ${
                 isActive
-                  ? 'bg-surface text-text-primary'
-                  : 'text-text-secondary hover:bg-surface-hover'
+                  ? 'text-accent font-medium'
+                  : 'text-text-secondary hover:bg-surface-hover hover:text-text-primary'
               }`}
             >
+              {isActive && (
+                <span aria-hidden className="absolute bottom-0 left-2 right-2 h-0.5 rounded-t-full bg-accent" />
+              )}
               {/* Status dot */}
               <span
                 className={`w-1.5 h-1.5 rounded-full shrink-0 ${dotClass(dot)}`}
@@ -184,24 +187,27 @@ export default function TerminalTabBar({
           )
         })}
 
-        {/* New tab */}
+        {/* New tab — accent-tinted so it's the obvious affordance after tabs run out */}
         <button
           onClick={onNew}
-          className="px-2.5 py-1 shrink-0 text-text-muted hover:text-text-primary hover:bg-surface-hover transition-colors text-sm leading-none"
+          className="ml-1 mr-0.5 shrink-0 inline-flex items-center justify-center w-8 h-8 rounded-md text-accent bg-accent/10 hover:bg-accent/20 transition-colors leading-none"
           title="New session"
+          aria-label="New session"
         >
-          +
+          <svg viewBox="0 0 16 16" className="w-3.5 h-3.5" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+            <path d="M8 3v10" /><path d="M3 8h10" />
+          </svg>
         </button>
 
         {/* Quick-jump to remote desktop */}
         {hostId && desktopAvailable && (
           <Link
             to={`/h/${hostId}/desktop`}
-            className="px-2 py-1 shrink-0 text-text-muted hover:text-text-primary hover:bg-surface-hover transition-colors flex items-center"
+            className="shrink-0 inline-flex items-center justify-center w-8 h-8 rounded-md text-text-muted hover:text-text-primary hover:bg-surface-hover transition-colors"
             title="Open remote desktop"
             aria-label="Open remote desktop"
           >
-            <RemoteDesktopIcon size={14} />
+            <RemoteDesktopIcon size={16} />
           </Link>
         )}
 
@@ -211,10 +217,14 @@ export default function TerminalTabBar({
         {/* Settings gear */}
         <button
           onClick={onOpenSettings}
-          className="px-2.5 py-1 shrink-0 text-text-muted hover:text-text-primary hover:bg-surface-hover transition-colors text-sm leading-none"
+          className="mr-1 shrink-0 inline-flex items-center justify-center w-8 h-8 rounded-md text-text-muted hover:text-text-primary hover:bg-surface-hover transition-colors"
           title="Terminal settings"
+          aria-label="Terminal settings"
         >
-          ⚙
+          <svg viewBox="0 0 16 16" className="w-4 h-4" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+            <circle cx="8" cy="8" r="2" />
+            <path d="M8 1v2 M8 13v2 M1 8h2 M13 8h2 M3 3l1.5 1.5 M11.5 11.5L13 13 M3 13l1.5-1.5 M11.5 4.5L13 3" />
+          </svg>
         </button>
       </div>
 

@@ -74,11 +74,13 @@ export default function TerminalSendComposer({ onSend }: Props) {
     })
   }
 
+  const canSend = text.trim().length > 0
+
   return (
     <>
       <div
-        className="flex gap-2 shrink-0 px-2 py-1.5 border-t border-border bg-surface-alt"
-        style={{ paddingBottom: 'calc(env(safe-area-inset-bottom) + 0.375rem)' }}
+        className="flex items-center gap-1.5 shrink-0 px-2 py-2 border-t border-border bg-surface-alt"
+        style={{ paddingBottom: 'calc(env(safe-area-inset-bottom) + 0.5rem)' }}
       >
         <button
           type="button"
@@ -86,28 +88,39 @@ export default function TerminalSendComposer({ onSend }: Props) {
           disabled={wsId == null}
           title={wsId == null ? 'Open a workspace to attach files' : 'Attach file'}
           aria-label="Attach file"
-          className="btn-secondary text-text-secondary px-2 py-1.5 disabled:opacity-40"
+          className="shrink-0 inline-flex items-center justify-center w-10 h-10 rounded-lg border border-border bg-surface text-accent hover:bg-surface-hover disabled:opacity-40 transition-colors"
         >
           <PaperclipIcon size={18} />
         </button>
-        <input
-          ref={inputRef}
-          type="text"
-          value={text}
-          onChange={(e) => setText(e.target.value)}
-          onKeyDown={handleKeyDown}
-          placeholder="Type command…"
-          className="flex-1 min-w-0 bg-surface border border-border rounded-md px-2 py-1.5 text-sm text-text-primary placeholder:text-text-muted outline-none focus:border-accent/50"
-          autoCapitalize="none"
-          autoCorrect="off"
-          spellCheck={false}
-        />
+        <div className="flex-1 min-w-0 relative">
+          <input
+            ref={inputRef}
+            type="text"
+            value={text}
+            onChange={(e) => setText(e.target.value)}
+            onKeyDown={handleKeyDown}
+            placeholder="Type command and send…"
+            className="w-full h-10 bg-surface border border-border rounded-lg pl-3 pr-3 text-[15px] text-text-primary placeholder:text-text-muted outline-none focus:border-accent/60 focus:bg-surface/80 transition-colors"
+            style={{ fontFamily: 'var(--font-mono)' }}
+            autoCapitalize="none"
+            autoCorrect="off"
+            spellCheck={false}
+          />
+        </div>
         <button
           onClick={send}
-          disabled={!text}
-          className="btn-primary text-xs px-3 py-1.5 disabled:opacity-40"
+          disabled={!canSend}
+          aria-label="Send"
+          className={`shrink-0 inline-flex items-center justify-center w-10 h-10 rounded-lg text-white transition-all ${
+            canSend
+              ? 'bg-accent shadow-[0_4px_12px_-4px_rgba(255,122,64,0.6)] active:scale-95'
+              : 'bg-surface border border-border text-text-muted'
+          }`}
         >
-          Send
+          <svg viewBox="0 0 24 24" className="w-5 h-5" fill="none" stroke="currentColor" strokeWidth="1.75" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+            <path d="M5 12h14" />
+            <path d="M13 5l7 7-7 7" />
+          </svg>
         </button>
       </div>
 

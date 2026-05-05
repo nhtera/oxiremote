@@ -33,7 +33,7 @@ export default function NewSessionRow({ onCreate, disabled, compact }: Props) {
   }
 
   return (
-    <div className={compact ? 'flex items-center gap-2' : 'flex items-center gap-2 w-full max-w-md mx-auto'}>
+    <div className={compact ? 'flex items-center gap-2' : 'flex items-stretch gap-2 w-full max-w-md mx-auto'}>
       <input
         type="text"
         value={name}
@@ -42,7 +42,7 @@ export default function NewSessionRow({ onCreate, disabled, compact }: Props) {
         placeholder="Terminal name (optional)"
         maxLength={64}
         disabled={busy || disabled}
-        className="flex-1 min-w-0 bg-surface border border-border rounded-md px-2.5 py-1.5 text-sm text-text-primary placeholder:text-text-muted outline-none focus:border-accent/60"
+        className={`flex-1 min-w-0 bg-surface-alt border border-border rounded-lg px-3 ${compact ? 'h-9 text-sm' : 'h-11 text-[15px]'} text-text-primary placeholder:text-text-muted outline-none focus:border-accent/60 focus:bg-surface transition-colors`}
         aria-label="New terminal name"
       />
       <Button

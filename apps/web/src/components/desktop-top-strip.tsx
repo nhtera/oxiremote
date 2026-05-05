@@ -27,8 +27,8 @@ export default function DesktopTopStrip({
     typeof zoom === 'number' && zoom > 0 ? `${Math.round(zoom * 100)}%` : '—%'
   const zoomReady = typeof zoom === 'number' && zoom > 0
   return (
-    <div className="lg:hidden fixed top-0 inset-x-0 z-30 pt-safe px-safe bg-surface/95 backdrop-blur border-b border-border">
-      <div className="flex items-center gap-1 px-2 py-1">
+    <div className="lg:hidden fixed top-0 inset-x-0 z-30 pt-safe px-safe bg-surface/85 backdrop-blur-md border-b border-border/80">
+      <div className="flex items-center gap-1 px-2 py-1.5">
       <IconButton onClick={onExit} aria-label="Exit remote desktop" title="Exit">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.75" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
           <line x1="19" y1="12" x2="5" y2="12" />
@@ -36,8 +36,8 @@ export default function DesktopTopStrip({
         </svg>
       </IconButton>
       <span
-        className={`px-1.5 text-[11px] tabular-nums transition-opacity ${
-          zoomReady ? 'text-text-muted' : 'text-text-muted/50'
+        className={`px-2 py-0.5 text-[11px] tabular rounded-md bg-surface-alt border border-border transition-opacity ${
+          zoomReady ? 'text-text-secondary' : 'text-text-muted/50'
         }`}
         aria-label="Current zoom"
       >
@@ -90,7 +90,7 @@ function IconButton({ onClick, children, ...rest }: IconButtonProps) {
   return (
     <button
       onClick={onClick}
-      className="p-1.5 rounded-md text-text-secondary hover:text-text-primary hover:bg-surface-hover transition-colors"
+      className="inline-flex items-center justify-center w-9 h-9 rounded-lg text-text-secondary hover:text-text-primary hover:bg-surface-hover active:scale-95 transition-all"
       {...rest}
     >
       <span className="block w-4 h-4">{children}</span>

@@ -149,15 +149,10 @@ export default function DesktopToolbar({
   }
 
   function keyBtnClass(key: KeyDef) {
-    // 4×2 grid means each cell is ~52 px wide in the lg:w-60 sidebar — enough
-    // for the longest label ("Shift") at text-xs without truncation. Drop
-    // flex-1/min-w-0 since the parent grid handles sizing.
-    const base =
-      'py-2 text-xs font-medium rounded-md border border-border transition-colors select-none active:scale-95'
     if (key.mod && activeModifiers.has(key.mod)) {
-      return `${base} bg-[hsl(var(--accent-primary)/0.2)] text-[hsl(var(--accent-primary))] border-[hsl(var(--accent-primary)/0.4)]`
+      return 'key-chip key-chip-once w-full !min-h-[2.25rem]'
     }
-    return `${base} bg-surface-alt text-text-secondary hover:bg-surface-hover hover:text-text-primary`
+    return 'key-chip w-full !min-h-[2.25rem]'
   }
 
   return (
