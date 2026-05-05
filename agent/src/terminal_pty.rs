@@ -197,16 +197,41 @@ pub fn build_default_command(command: Option<&[String]>) -> Vec<String> {
     }
     #[cfg(target_os = "windows")]
     {
-        // Windows shells have no `-l` (login) concept. PowerShell ships with
-        // Win10+ and is on PATH at %SystemRoot%\System32\WindowsPowerShell\v1.0;
-        // CommandBuilder resolves it via PATH. -NoLogo skips the banner.
-        vec!["powershell.exe".into(), "-NoLogo".into()]
+        windows_default_shell()
     }
     #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
     {
         let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".into());
         vec![shell, "-l".into()]
     }
+}
+
+/// Windows shell resolution mirrors Claude Code (docs.anthropic.com → setup):
+/// Git Bash from Git for Windows is the recommended default; fall back to
+/// PowerShell when Git Bash is absent.
+///   1. $OXI_GIT_BASH_PATH — operator override (mirrors CLAUDE_CODE_GIT_BASH_PATH)
+///   2. Standard Git for Windows install paths (64-bit then 32-bit)
+///   3. powershell.exe — Win10+ always ships PowerShell 5.1; CommandBuilder
+///      resolves it via PATH (%SystemRoot%\System32\WindowsPowerShell\v1.0)
+#[cfg(target_os = "windows")]
+fn windows_default_shell() -> Vec<String> {
+    use std::path::Path;
+
+    if let Ok(custom) = std::env::var("OXI_GIT_BASH_PATH")
+        && Path::new(&custom).exists() {
+            return vec![custom, "-l".into(), "-i".into()];
+        }
+
+    for candidate in [
+        "C:\\Program Files\\Git\\bin\\bash.exe",
+        "C:\\Program Files (x86)\\Git\\bin\\bash.exe",
+    ] {
+        if Path::new(candidate).exists() {
+            return vec![candidate.into(), "-l".into(), "-i".into()];
+        }
+    }
+
+    vec!["powershell.exe".into(), "-NoLogo".into()]
 }
 
 /// Spawn the 5s agent-detection poll loop for a PTY session. On each tick,

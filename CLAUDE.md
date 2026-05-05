@@ -100,6 +100,7 @@ Quick Tunnel (default) spawns `cloudflared --url localhost:<port>`; URL is captu
 | `OXI_HEADLESS=1` | Force headless server even with a TTY. |
 | `OXI_VIDEO_PIPELINE=h264\|jpeg` | Operator preference for remote desktop pipeline. |
 | `OXI_DISCOVERY_URL` | Cloudflare discovery-worker base URL (e.g. `https://oxiremote-discovery.<account>.workers.dev`). When set, the agent registers `discovery_id → tunnelUrl` after every `TunnelUrlChanged` and the QR encodes a cross-origin form. Unset = embedded-SPA mode (no behaviour change). |
+| `OXI_GIT_BASH_PATH` | Windows only. Absolute path to `bash.exe` from Git for Windows when the standard install paths are non-default (e.g. portable Git, scoop). When unset, terminal sessions probe `C:\Program Files\Git\bin\bash.exe` then fall back to `powershell.exe`. |
 | `OXIREMOTE_INSTALL_DIR` | Override install target dir for `scripts/install.sh`. |
 | `OXIREMOTE_BINARY_URL` | npm-wrapper download base URL (corp proxies / mirrors). |
 | `OXIREMOTE_VERSION` | Pin a specific release tag in the install script (`oxiremote update` always tracks `latest`). |
