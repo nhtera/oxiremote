@@ -236,32 +236,44 @@ fn extract_binary(archive: &[u8], target_dir: &Path, archive_stem: &str) -> Resu
     let dest = target_dir.join(format!("{bin_basename}.new"));
 
     if cfg!(target_os = "windows") {
-        // ZIP path — windows asset.
-        let cursor = std::io::Cursor::new(archive);
-        // We don't depend on the `zip` crate elsewhere; for the v0.1 cut
-        // shell out to `tar` (Win10+ ships bsdtar). Cleaner than a new dep.
+        // ZIP path — windows asset. We don't depend on the `zip` crate
+        // elsewhere; shell out to `tar` (Win10+ ships bsdtar). Cleaner
+        // than a new dep.
+        //
+        // The previous version extracted with `-C target_dir
+        // --strip-components=1`, which dropped `oxiremote.exe` directly
+        // beside the running binary. Windows holds an exclusive lock on
+        // the live exe → tar fails with "Can't unlink already-existing
+        // object" before the .new-rename + atomic_replace dance can run.
+        // Extract into a scratch subdir instead so tar never touches the
+        // live exe, then move the binary out and clean up the scratch.
         let tmp = target_dir.join("oxiremote-update-archive.zip");
+        let scratch = target_dir.join("oxiremote-update-scratch");
         fs::write(&tmp, archive).context("write archive temp")?;
-        // The archive nests the binary under `<archive_stem>/oxiremote.exe`;
-        // pass the full nested path and --strip-components=1 so tar drops
-        // it next to target_dir without recreating the wrapping directory.
+        let _ = fs::remove_dir_all(&scratch); // stale leftover from a prior crash
+        fs::create_dir_all(&scratch).context("create scratch dir")?;
+
         let nested = format!("{archive_stem}/{bin_basename}");
         let status = std::process::Command::new("tar")
             .args(["-xf"])
             .arg(&tmp)
             .args(["-C"])
-            .arg(target_dir)
+            .arg(&scratch)
             .arg("--strip-components=1")
             .arg(&nested)
             .status()
             .context("spawn tar")?;
         let _ = fs::remove_file(&tmp);
         if !status.success() {
+            let _ = fs::remove_dir_all(&scratch);
             bail!("tar exited non-zero while extracting {bin_basename}");
         }
-        fs::rename(target_dir.join(bin_basename), &dest)
-            .context("rename extracted binary to .new")?;
-        let _ = cursor;
+
+        if let Err(e) = fs::rename(scratch.join(bin_basename), &dest) {
+            let _ = fs::remove_dir_all(&scratch);
+            return Err(e).context("rename extracted binary to .new");
+        }
+        let _ = fs::remove_dir_all(&scratch);
     } else {
         // tar.gz path.
         let decoder = flate2::read::GzDecoder::new(archive);
