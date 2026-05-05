@@ -717,6 +717,37 @@ async fn server_main(
     if let Some(url) = discovery_url.clone() {
         match discovery::load_discovery_id(&state.db_path) {
             Ok(discovery_id) => {
+                // Heartbeat: refreshes the worker's session record TTL. Quick
+                // Tunnel emits TunnelUrlChanged once per process, so without
+                // this loop the session row falls out of KV (24h TTL) and
+                // every cross-origin OTK / code / sk- lookup would 404 even
+                // with a healthy tunnel. Re-uses the live tunnel_url snapshot.
+                {
+                    let hb_client = state.http_client.clone();
+                    let hb_url = url.clone();
+                    let hb_discovery_id = discovery_id.clone();
+                    let hb_tunnel = state.tunnel_url.clone();
+                    tokio::spawn(async move {
+                        let mut ticker = tokio::time::interval(
+                            std::time::Duration::from_secs(discovery::HEARTBEAT_INTERVAL_SECS),
+                        );
+                        // Skip the immediate first tick; the TunnelUrlChanged
+                        // listener already does the initial registration.
+                        ticker.tick().await;
+                        loop {
+                            ticker.tick().await;
+                            let snapshot = hb_tunnel.read().ok().and_then(|g| g.clone());
+                            if let Some(tu) = snapshot {
+                                discovery::spawn_refresh_session(
+                                    hb_client.clone(),
+                                    hb_url.clone(),
+                                    hb_discovery_id.clone(),
+                                    tu,
+                                );
+                            }
+                        }
+                    });
+                }
                 let bus = state.event_bus.clone();
                 let client = state.http_client.clone();
                 let slot = discovery_temp_key.clone();

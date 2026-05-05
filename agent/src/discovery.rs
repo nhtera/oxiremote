@@ -30,6 +30,13 @@ pub const TEMP_KEY_EXPIRY_MINUTES: u32 = 30;
 /// keeps cross-origin sk-… pairing working in the no-rotation case.
 pub const PERMANENT_LOOKUP_EXPIRY_MINUTES: u32 = 24 * 60;
 
+/// Cadence for the session refresh heartbeat. Quick Tunnel emits
+/// `TunnelUrlChanged` exactly once per process, so without this loop the
+/// session record's KV TTL would expire and every cross-origin lookup would
+/// dangle (tempkey index points at a session that no longer exists). 15 min
+/// gives the worker session record (24h TTL) a generous safety margin.
+pub const HEARTBEAT_INTERVAL_SECS: u64 = 15 * 60;
+
 const RETRY_ATTEMPTS: u32 = 3;
 const RETRY_BASE_MS: u64 = 2_000;
 const JITTER_MAX_MS: u64 = 1_000;
@@ -169,6 +176,42 @@ pub fn spawn_register(
             Err(err) => {
                 warn!(error = %err, "discovery registration failed after retries");
                 event_bus.send(AgentEvent::DiscoveryUnavailable);
+            }
+        }
+    });
+}
+
+/// Re-write the session record with the current tunnel URL so the worker's
+/// KV TTL resets. Called by the heartbeat loop — keeps the `session:` row
+/// alive when Quick Tunnel never emits another `TunnelUrlChanged`. Single
+/// POST to `session/update`; idempotent.
+pub fn spawn_refresh_session(
+    client: Client,
+    discovery_url: String,
+    discovery_id: String,
+    tunnel_url: String,
+) {
+    tokio::spawn(async move {
+        let base = discovery_url.trim_end_matches('/');
+        let normalized = normalize_tunnel_url(&tunnel_url);
+        let body = SessionUpdateBody {
+            api_key: &discovery_id,
+            tunnel_url: &normalized,
+        };
+        match client
+            .post(format!("{base}/api/session/update"))
+            .json(&body)
+            .send()
+            .await
+        {
+            Ok(res) if res.status().is_success() => {
+                debug!("discovery session heartbeat ok");
+            }
+            Ok(res) => {
+                warn!(status = %res.status(), "discovery session heartbeat returned non-success");
+            }
+            Err(e) => {
+                warn!(error = %e, "discovery session heartbeat POST failed");
             }
         }
     });
@@ -477,6 +520,28 @@ mod tests {
         assert_eq!(bodies[0].1["apiKey"], "deadbeef");
         assert_eq!(bodies[0].1["code"], "ABCD1234");
         assert_eq!(bodies[0].1["expiryMinutes"], 5);
+    }
+
+    #[tokio::test]
+    async fn refresh_session_posts_only_session_update() {
+        let mock = MockState::default();
+        let url = spawn_mock(mock.clone()).await;
+        let client = Client::new();
+
+        spawn_refresh_session(
+            client,
+            url.clone(),
+            "deadbeef".into(),
+            "https://t.example".into(),
+        );
+        // Give the spawned task a beat to fire the POST.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        let bodies = mock.bodies.lock().unwrap().clone();
+        assert_eq!(bodies.len(), 1, "heartbeat must hit only session/update");
+        assert_eq!(bodies[0].0, "/api/session/update");
+        assert_eq!(bodies[0].1["apiKey"], "deadbeef");
+        assert_eq!(bodies[0].1["tunnelUrl"], "https://t.example");
     }
 
     #[tokio::test]

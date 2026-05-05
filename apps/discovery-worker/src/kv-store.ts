@@ -11,13 +11,20 @@ export interface KVLike {
 
 const SESSION_PREFIX = 'session:'
 const TEMPKEY_PREFIX = 'tempkey:'
+// Session record is the indirection target for every tempkey/code lookup.
+// Must outlive the longest possible tempkey TTL (24h for permanent-key
+// lookup_id) or stale `tempkey:` indexes will dangle and resolveTempKey()
+// will return null even though the user-typed key is still valid. Agents
+// idempotently overwrite via session/update on each TunnelUrlChanged + a
+// 15-min heartbeat, so this is the cap, not the steady state.
+export const SESSION_DEFAULT_TTL_SECS = 24 * 60 * 60
 export const DEFAULT_TTL_SECS = 1800
 
 export async function putSession(
   kv: KVLike,
   apiKeyHash: string,
   record: SessionRecord,
-  ttlSecs: number = DEFAULT_TTL_SECS,
+  ttlSecs: number = SESSION_DEFAULT_TTL_SECS,
 ): Promise<void> {
   await kv.put(SESSION_PREFIX + apiKeyHash, JSON.stringify(record), { expirationTtl: ttlSecs })
 }
