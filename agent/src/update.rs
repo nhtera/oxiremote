@@ -99,7 +99,22 @@ pub fn check_latest() -> Option<String> {
     })
 }
 
-pub fn run() -> Result<()> {
+/// Result of a single `update::run()` invocation. The TUI uses this to break
+/// out of the menu loop on success — without it the cached
+/// `update_version = Some(latest)` (line in tui/mod.rs) plus the still-old
+/// `env!("CARGO_PKG_VERSION")` of the running process keep the menu showing
+/// "Update available" forever, and users hit Enter again thinking it failed,
+/// re-downloading in a loop.
+#[derive(Debug, Clone)]
+pub enum UpdateOutcome {
+    /// `current_version == latest_version` — no work performed.
+    NotNeeded,
+    /// New binary written; running process still hosts the old code, so the
+    /// caller MUST exit and let the user relaunch to pick up the change.
+    Applied(String),
+}
+
+pub fn run() -> Result<UpdateOutcome> {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -107,7 +122,7 @@ pub fn run() -> Result<()> {
     rt.block_on(run_async())
 }
 
-async fn run_async() -> Result<()> {
+async fn run_async() -> Result<UpdateOutcome> {
     let target = current_target().ok_or_else(|| {
         anyhow!(
             "no prebuilt release for this target ({}/{}) — install from source",
@@ -145,7 +160,7 @@ async fn run_async() -> Result<()> {
     let latest_version = release.tag_name.strip_prefix('v').unwrap_or(&release.tag_name);
     if latest_version == current_version {
         println!("Already on latest ({latest_version}).");
-        return Ok(());
+        return Ok(UpdateOutcome::NotNeeded);
     }
     println!("Latest version:  {latest_version}");
 
@@ -218,7 +233,7 @@ async fn run_async() -> Result<()> {
 
     atomic_replace(&current_exe, &extracted).context("atomic replace")?;
     println!("Updated to {latest_version}. Restart the agent to pick up the new binary.");
-    Ok(())
+    Ok(UpdateOutcome::Applied(latest_version.to_string()))
 }
 
 /// Pulls the `oxiremote` (or `oxiremote.exe`) binary out of the archive into

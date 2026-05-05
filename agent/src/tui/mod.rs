@@ -176,8 +176,9 @@ pub fn run_tui(
 
     // Check for a newer release once at startup. 5s network timeout in
     // `check_latest` keeps it bounded; cached here so re-entering the menu
-    // from the dashboard doesn't re-probe on every loop iteration.
-    let update_version = crate::update::check_latest();
+    // from the dashboard doesn't re-probe on every loop iteration. `mut` so
+    // a successful update or a stale-cache no-op can clear the prompt.
+    let mut update_version = crate::update::check_latest();
 
     loop {
         match menu::run_menu(&mut term, update_version.as_deref())? {
@@ -216,8 +217,42 @@ pub fn run_tui(
                 // Temporarily leave alternate screen so the update output is
                 // visible on the normal scrollback buffer, then restore TUI.
                 drop(_guard);
-                let _ = crate::update::run();
-                // Re-enter TUI after the update completes (or errors out).
+                let outcome = crate::update::run();
+                match &outcome {
+                    Ok(crate::update::UpdateOutcome::Applied(v)) => {
+                        // The running process is still the OLD binary —
+                        // env!("CARGO_PKG_VERSION") and the cached
+                        // update_version both point at the pre-update version.
+                        // Re-entering the menu would re-render "Update to v{v}
+                        // available" forever and any user who hits Enter again
+                        // would re-download. Exit the TUI so main() can drop
+                        // the PID lock and the user relaunches to pick up the
+                        // new binary.
+                        println!();
+                        println!("Update to v{v} applied. Run `oxiremote` again to start the new binary.");
+                        print!("Press Enter to exit…");
+                        use std::io::Write;
+                        let _ = std::io::stdout().flush();
+                        let mut buf = String::new();
+                        let _ = std::io::stdin().read_line(&mut buf);
+                        return Ok(());
+                    }
+                    Ok(crate::update::UpdateOutcome::NotNeeded) => {
+                        // Stale cache (another oxiremote instance updated us
+                        // between startup probe and now) — drop the prompt so
+                        // the menu stops advertising an upgrade that's
+                        // already on disk.
+                        update_version = None;
+                    }
+                    Err(e) => {
+                        eprintln!("update failed: {e:#}");
+                        eprintln!("(menu will retain the upgrade prompt — try again or rerun `oxiremote update`)");
+                        // Brief pause so the error is visible before the
+                        // alternate screen swallows the scrollback.
+                        std::thread::sleep(std::time::Duration::from_millis(1500));
+                    }
+                }
+                // Re-enter TUI after a non-applied outcome (NotNeeded or Err).
                 _guard = TerminalGuard::enter()?;
                 term = new_terminal()?;
             }

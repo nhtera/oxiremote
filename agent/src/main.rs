@@ -200,7 +200,7 @@ fn main() -> anyhow::Result<()> {
             return notify_cli::run(rest);
         }
         if sub == "update" {
-            return update::run();
+            return update::run().map(|_| ());
         }
         if sub == "--version" || sub == "-V" {
             println!("oxiremote {}", env!("CARGO_PKG_VERSION"));
