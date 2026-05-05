@@ -53,7 +53,7 @@ export default function FinalCta() {
             </div>
 
             <div className="lg:col-span-5 flex flex-col gap-4">
-              <CopyCommand command="curl -fsSL get.oxiremote.dev | bash" />
+              <CopyCommand command="curl -fsSL get.oxiremote.erai.dev | bash" />
               <CopyCommand command="npm install -g oxiremote" />
               <div className="rounded-xl border border-border-soft bg-surface/60 backdrop-blur-sm p-4 flex items-start gap-3">
                 <span className="shrink-0 w-9 h-9 rounded-lg bg-accent/15 border border-accent/30 text-accent inline-flex items-center justify-center">

@@ -1,0 +1,10 @@
+name = "oxiremote-get"
+main = "src/worker.ts"
+compatibility_date = "2026-01-01"
+
+# Custom domain — wrangler creates the DNS record + the Workers route the
+# first time `wrangler deploy` runs against an account where erai.dev is
+# already a Cloudflare-hosted zone.
+routes = [
+  { pattern = "get.oxiremote.erai.dev", custom_domain = true },
+]

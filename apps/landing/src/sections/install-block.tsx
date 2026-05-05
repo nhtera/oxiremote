@@ -8,7 +8,7 @@ const TABS: { id: Tab; label: string; cmd: string; note: string }[] = [
   {
     id: 'curl',
     label: 'macOS · Linux',
-    cmd: 'curl -fsSL get.oxiremote.dev | bash',
+    cmd: 'curl -fsSL get.oxiremote.erai.dev | bash',
     note: 'Drops oxiremote into ~/.local/bin · SHA256 verified · OXIREMOTE_INSTALL_DIR overrides target.',
   },
   {

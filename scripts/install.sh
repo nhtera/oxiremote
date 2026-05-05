@@ -51,7 +51,9 @@ main() {
   command -v shasum >/dev/null || command -v sha256sum >/dev/null \
     || err "shasum or sha256sum is required"
 
-  local target version asset manifest base_url tmp
+  local target version asset manifest base_url
+  # `tmp` is intentionally NOT local — the EXIT trap below fires after main()
+  # returns, when locals would be out of scope and `set -u` would error.
   target="$(detect_target)"
   version="$(resolve_version)"
   [ -n "$version" ] || err "could not resolve latest version — has the first release been published?"

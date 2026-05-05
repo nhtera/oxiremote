@@ -78,7 +78,7 @@ export default function Hero() {
             </p>
 
             <div className="mt-6">
-              <CopyCommand command="curl -fsSL get.oxiremote.dev | bash" />
+              <CopyCommand command="curl -fsSL get.oxiremote.erai.dev | bash" />
               <p className="mt-2.5 text-[12px] text-text-muted font-mono">
                 or <span className="text-text-secondary">npm i -g oxiremote</span>{' '}
                 · macOS · Linux · Windows · Codespaces
