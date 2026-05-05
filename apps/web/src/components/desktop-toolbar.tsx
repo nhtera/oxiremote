@@ -157,24 +157,42 @@ export default function DesktopToolbar({
 
   return (
     <div className="flex flex-col gap-2 p-2 bg-surface border-t border-border lg:border-t-0 lg:border-l lg:h-full lg:w-60 lg:p-3">
-      {/* Tools row.
-          Layout (left → right): [Touch/Trackpad mode] [Aa] [▢] [?] [Pipeline ▾]
-          Five controls fit a 240 px lg sidebar because the pipeline chip and
-          the display-popover trigger were merged into a single button —
-          one button per concept (display settings) instead of two. */}
-      <div className="flex items-center gap-1.5 min-w-0">
+      {/* Tools.
+          Row 1 (full width): [Touch/Trackpad mode segmented control]
+              — primary input mode deserves a clean, unambiguous label.
+              Used to share row 2 with icon buttons + JPEG chip but the 240 px
+              lg sidebar squeezed it to "T...". Own row solves it.
+          Row 2: [Aa] [▢] [?] [Pipeline ▾] */}
+      <div className="grid grid-cols-2 gap-1 p-0.5 rounded-md bg-surface-alt border border-border">
         <button
-          onClick={onInputModeToggle}
-          title={
+          onClick={inputMode === 'touch' ? undefined : onInputModeToggle}
+          aria-pressed={inputMode === 'touch'}
+          title="Touch (Direct): tap = click at finger position. Drag with one finger to move the pointer."
+          className={[
+            'h-8 text-xs font-medium rounded transition-colors',
             inputMode === 'touch'
-              ? 'Touch (Direct): tap = click at finger position. Drag with one finger to move the pointer.'
-              : 'Trackpad: relative cursor. Two-finger swipe scrolls; tap clicks at the cursor.'
-          }
-          className="flex-1 min-w-0 text-xs px-2 py-1.5 border border-border rounded-md bg-surface-alt text-text-secondary hover:bg-surface-hover transition-colors truncate"
+              ? 'bg-[hsl(var(--accent-primary)/0.2)] text-[hsl(var(--accent-primary))] shadow-[inset_0_0_0_1px_hsl(var(--accent-primary)/0.4)]'
+              : 'text-text-muted hover:text-text-primary hover:bg-surface-hover',
+          ].join(' ')}
         >
-          {inputMode === 'touch' ? 'Touch' : 'Trackpad'}
+          Touch
         </button>
+        <button
+          onClick={inputMode === 'trackpad' ? undefined : onInputModeToggle}
+          aria-pressed={inputMode === 'trackpad'}
+          title="Trackpad: relative cursor. Two-finger swipe scrolls; tap clicks at the cursor."
+          className={[
+            'h-8 text-xs font-medium rounded transition-colors',
+            inputMode === 'trackpad'
+              ? 'bg-[hsl(var(--accent-primary)/0.2)] text-[hsl(var(--accent-primary))] shadow-[inset_0_0_0_1px_hsl(var(--accent-primary)/0.4)]'
+              : 'text-text-muted hover:text-text-primary hover:bg-surface-hover',
+          ].join(' ')}
+        >
+          Trackpad
+        </button>
+      </div>
 
+      <div className="flex items-center gap-1.5 min-w-0">
         {onToggleTextBatch && (
           <button
             onClick={onToggleTextBatch}
@@ -248,8 +266,10 @@ export default function DesktopToolbar({
           </svg>
         </button>
 
-        {/* Display popover trigger — pipeline label is the visual state. */}
-        <div className="relative shrink-0" ref={settingsContainerRef}>
+        {/* Display popover trigger — pipeline label is the visual state.
+            ml-auto pushes it to the right edge so row 2 reads as
+            [tool icons …] [pipeline]. */}
+        <div className="relative shrink-0 ml-auto" ref={settingsContainerRef}>
           <button
             type="button"
             onClick={() => setSettingsOpen((v) => !v)}
