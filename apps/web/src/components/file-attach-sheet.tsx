@@ -1,4 +1,6 @@
 import { useRef, useState } from 'react'
+import { loadApiKey, loadTunnelBase } from '../lib/api-client'
+import { isDiscoveryMode } from '../lib/discovery-client'
 
 // Bottom sheet opened by the composer's paperclip button.
 // Reuses POST /api/files/upload (multipart: dir + file) — the same endpoint
@@ -9,6 +11,23 @@ import { useRef, useState } from 'react'
 // Files). Each row owns its own <input type="file"> so the file picker shows
 // the right source UI on iOS — `accept` and `capture` only affect the picker
 // when set on the actual input the user clicks.
+
+// XHR is used (not fetch) so we can show upload progress on multi-MB photo
+// uploads. Trade-off: XHR bypasses the window.fetch auth interceptor in
+// api-client.ts, so we replicate its behaviour here — Bearer + CSRF headers,
+// and discovery-mode tunnel-base rewriting for cross-origin SPAs.
+const CSRF_COOKIE = 'oxi_csrf'
+
+function readCsrfCookie(): string | null {
+  if (typeof document === 'undefined') return null
+  for (const part of document.cookie.split(';')) {
+    const trimmed = part.trim()
+    if (trimmed.startsWith(CSRF_COOKIE + '=')) {
+      return trimmed.slice(CSRF_COOKIE.length + 1)
+    }
+  }
+  return null
+}
 
 type Props = {
   wsId: number
@@ -36,9 +55,22 @@ export default function FileAttachSheet({ wsId, dir = '', onPathInsert, onClose 
     form.append('file', file, file.name)
 
     // Use XHR for progress events; `fetch` doesn't expose upload progress.
+    // Discovery mode rewrites /api/* to the tunnel base (cross-origin); embedded
+    // mode keeps the same-origin path and relies on cookies for session auth.
+    const path = `/api/files/upload?ws_id=${wsId}`
+    const tunnelBase = isDiscoveryMode() ? loadTunnelBase() : null
+    const crossOrigin = tunnelBase !== null
+    const url = crossOrigin ? `${tunnelBase}${path}` : path
+
     const xhr = new XMLHttpRequest()
-    xhr.open('POST', `/api/files/upload?ws_id=${wsId}`)
-    xhr.withCredentials = true
+    xhr.open('POST', url)
+    xhr.withCredentials = !crossOrigin
+    const apiKey = loadApiKey()
+    if (apiKey) xhr.setRequestHeader('Authorization', `Bearer ${apiKey}`)
+    if (!crossOrigin) {
+      const csrf = readCsrfCookie()
+      if (csrf) xhr.setRequestHeader('X-OXI-CSRF', csrf)
+    }
     xhr.upload.onprogress = (e) => {
       if (e.lengthComputable) {
         setState({ kind: 'uploading', pct: Math.round((e.loaded / e.total) * 100) })
