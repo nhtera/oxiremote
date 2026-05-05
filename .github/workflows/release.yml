@@ -192,3 +192,30 @@ jobs:
               --title "$tag" \
               --notes "Automated release. Verify downloads with \`oxiremote-${tag#v}-sha256.txt\`."
           fi
+
+  # Publishes the npm-wrapper to npmjs.org once binaries exist on the GitHub
+  # release. The wrapper's `prepublishOnly` (verify-release-assets.js) probes
+  # those release URLs anonymously, so this job must run AFTER `publish`
+  # finishes creating/updating the release. NPM_TOKEN is an automation token
+  # configured in repo secrets — never inline.
+  publish-npm:
+    name: publish npm wrapper
+    needs: publish
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.ref }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: Publish npm-wrapper
+        working-directory: npm-wrapper
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        # `--provenance` would require id-token: write at the workflow level
+        # plus a public repo; skip until those are wired up explicitly.
+        run: npm publish --access public
