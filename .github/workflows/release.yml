@@ -53,7 +53,7 @@ jobs:
             archive_ext: zip
             bin: oxiremote.exe
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Resolve version
         id: version
@@ -69,7 +69,7 @@ jobs:
           echo "tag=$tag"         >> "$GITHUB_OUTPUT"
           echo "version=$version" >> "$GITHUB_OUTPUT"
 
-      - uses: oven-sh/setup-bun@v1
+      - uses: oven-sh/setup-bun@v2
         with:
           bun-version: latest
 
@@ -134,7 +134,7 @@ jobs:
           echo "asset=dist/$asset"      >> "$GITHUB_OUTPUT"
           echo "sha256=dist/$asset.sha256" >> "$GITHUB_OUTPUT"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v5
         with:
           name: oxiremote-${{ matrix.target }}
           path: |
@@ -148,7 +148,7 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Resolve version
         id: version
@@ -158,7 +158,7 @@ jobs:
           echo "tag=$tag"            >> "$GITHUB_OUTPUT"
           echo "version=${tag#v}"    >> "$GITHUB_OUTPUT"
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v5
         with:
           path: artifacts
 
