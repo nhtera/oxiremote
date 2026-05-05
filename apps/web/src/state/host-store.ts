@@ -1,6 +1,7 @@
 import { create } from 'zustand'
 import { isDiscoveryMode } from '../lib/discovery-client'
-import { loadTunnelBase } from '../lib/api-client'
+import { loadApiKey, loadTunnelBase } from '../lib/api-client'
+import { listSavedHosts, recordSavedHost } from '../lib/saved-hosts'
 
 type HostState = {
   currentHostId: string | null
@@ -70,6 +71,21 @@ async function doFetchHost(expectedHostId?: string): Promise<void> {
       label: data.label,
       platform: data.platform,
     })
+    // Self-heal saved-hosts: when a saved entry's `label` is the legacy
+    // truncated `host_id.slice(0,8)` placeholder (pre-0.1.15 discovery
+    // pair), refresh it to the real hostname now that we have it. Only
+    // touch entries that already exist — don't materialize a saved-host
+    // for a fresh same-origin tab that hasn't been paired here.
+    if (data.label) {
+      const existing = listSavedHosts().find((h) => h.host_id === data.host_id)
+      if (existing && existing.label !== data.label) {
+        recordSavedHost({
+          host_id: data.host_id,
+          label: data.label,
+          api_key_last4: existing.api_key_last4 || (loadApiKey(data.host_id) ?? '').slice(-4),
+        })
+      }
+    }
   } catch (e) {
     useHostStore.setState({ loading: false, error: String(e) })
   }

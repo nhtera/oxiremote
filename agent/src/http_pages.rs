@@ -258,11 +258,14 @@ fn build_pairing_response(
                     "api_key": api_key,
                     "api_key_last4": api_key_last4,
                     "approval_status": approval_status,
-                    // host_id is included so a cross-origin SPA (Cloudflare
-                    // Pages) can stash the Bearer key without a follow-up
-                    // /api/host call — that endpoint still needs cookie auth
-                    // which doesn't survive cross-origin.
+                    // host_id + label + platform are included so a cross-origin
+                    // SPA (Cloudflare Pages) can stash the Bearer key AND show
+                    // a friendly hostname in saved-hosts / topbar without a
+                    // follow-up /api/host call — that endpoint still needs
+                    // cookie auth which doesn't survive cross-origin.
                     "host_id": state.host_info.host_id,
+                    "label": state.host_info.label,
+                    "platform": state.host_info.platform,
                 })),
             )
                 .into_response()
@@ -535,10 +538,12 @@ pub async fn api_login_one_time(
                 "device_id": device_id,
                 "api_key": api_key,
                 "api_key_last4": api_key_last4,
-                // host_id lets cross-origin SPAs (Cloudflare Pages) stash the
-                // Bearer key under the right host scope without a follow-up
-                // /api/host call.
+                // host_id + label + platform let cross-origin SPAs (Cloudflare
+                // Pages) stash the Bearer key AND show a friendly hostname in
+                // saved-hosts / topbar without a follow-up /api/host call.
                 "host_id": state.host_info.host_id,
+                "label": state.host_info.label,
+                "platform": state.host_info.platform,
             })),
         )
             .into_response();
@@ -562,6 +567,8 @@ pub async fn api_login_one_time(
             "api_key": api_key,
             "api_key_last4": api_key_last4,
             "host_id": state.host_info.host_id,
+            "label": state.host_info.label,
+            "platform": state.host_info.platform,
             "status": "pending",
         })),
     )

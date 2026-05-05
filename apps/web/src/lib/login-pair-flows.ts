@@ -143,9 +143,14 @@ export async function submitDiscoveryPair(
   }
   storeApiKey(body.host_id, body.api_key)
   storeTunnelBase(body.host_id, session.tunnelUrl)
+  // Prefer the agent-supplied hostname (DESKTOP-…, TienNHs-MBP.lan) over
+  // the user-typed device label and the truncated host_id. Older agents
+  // omit `label`; we keep the same fallbacks to stay backward-compatible.
+  const friendlyLabel =
+    body.label?.trim() || ctx.deviceLabel.trim() || body.host_id.slice(0, 8)
   recordSavedHost({
     host_id: body.host_id,
-    label: ctx.deviceLabel.trim() || body.host_id.slice(0, 8),
+    label: friendlyLabel,
     api_key_last4: body.api_key_last4 ?? body.api_key.slice(-4),
   })
   // RootRoute ('/') redirects to /welcome when currentHostId is null. In
@@ -153,8 +158,8 @@ export async function submitDiscoveryPair(
   // the pair response — otherwise the SPA bounces back to /welcome.
   useHostStore.setState({
     currentHostId: body.host_id,
-    label: ctx.deviceLabel.trim() || null,
-    platform: null,
+    label: body.label?.trim() || ctx.deviceLabel.trim() || null,
+    platform: body.platform ?? null,
     loading: false,
     error: null,
   })
@@ -210,15 +215,17 @@ async function submitDiscoveryPermanent(rawKey: string, ctx: PairCtx): Promise<v
   }
   storeApiKey(body.host_id, body.api_key)
   storeTunnelBase(body.host_id, session.tunnelUrl)
+  const friendlyLabel =
+    body.label?.trim() || ctx.deviceLabel.trim() || body.host_id.slice(0, 8)
   recordSavedHost({
     host_id: body.host_id,
-    label: ctx.deviceLabel.trim() || body.host_id.slice(0, 8),
+    label: friendlyLabel,
     api_key_last4: body.api_key_last4 ?? body.api_key.slice(-4),
   })
   useHostStore.setState({
     currentHostId: body.host_id,
-    label: ctx.deviceLabel.trim() || null,
-    platform: null,
+    label: body.label?.trim() || ctx.deviceLabel.trim() || null,
+    platform: body.platform ?? null,
     loading: false,
     error: null,
   })
@@ -292,15 +299,17 @@ async function submitDiscoveryCode(raw: string, ctx: PairCtx): Promise<void> {
   }
   storeApiKey(body.host_id, body.api_key)
   storeTunnelBase(body.host_id, session.tunnelUrl)
+  const friendlyLabel =
+    body.label?.trim() || ctx.deviceLabel.trim() || body.host_id.slice(0, 8)
   recordSavedHost({
     host_id: body.host_id,
-    label: ctx.deviceLabel.trim() || body.host_id.slice(0, 8),
+    label: friendlyLabel,
     api_key_last4: body.api_key_last4 ?? body.api_key.slice(-4),
   })
   useHostStore.setState({
     currentHostId: body.host_id,
-    label: ctx.deviceLabel.trim() || null,
-    platform: null,
+    label: body.label?.trim() || ctx.deviceLabel.trim() || null,
+    platform: body.platform ?? null,
     loading: false,
     error: null,
   })
@@ -373,4 +382,10 @@ interface DiscoveryPairBody {
   device_id?: string
   host_id?: string
   session_id?: string
+  // Friendly hostname (e.g. "DESKTOP-VE3J42Q", "TienNHs-MBP.lan") and OS
+  // platform string. Surfaced by the agent so cross-origin discovery
+  // SPAs can label saved hosts without a follow-up /api/host call. Both
+  // are optional for backward compatibility with pre-0.1.15 agents.
+  label?: string | null
+  platform?: string | null
 }
