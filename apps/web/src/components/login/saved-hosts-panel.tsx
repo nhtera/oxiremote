@@ -1,7 +1,8 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { loadApiKey } from '../../lib/api-client'
 import { switchActiveHost } from '../../lib/host-switch-helpers'
+import { probeHost, type HostReachability } from '../../lib/host-reachability'
 import {
   formatRelative,
   removeSavedHost,
@@ -22,6 +23,28 @@ export default function SavedHostsPanel({ hosts, onForget, onError }: Props) {
   const navigate = useNavigate()
   const [reconnectingId, setReconnectingId] = useState<string | null>(null)
   const [rowErrors, setRowErrors] = useState<Record<string, string>>({})
+  const [reach, setReach] = useState<Record<string, HostReachability>>({})
+
+  // Probe every saved host's tunnel on mount + whenever the list changes
+  // (e.g. after a forget). Surfaces dead tunnels so users see "Unreachable"
+  // before tapping into a Cloudflare 530. The render default for unknown
+  // host_ids is 'probing' so we don't need to seed state synchronously
+  // (avoids set-state-in-effect cascade).
+  useEffect(() => {
+    if (hosts.length === 0) return
+    let cancelled = false
+    void Promise.all(
+      hosts.map(async (h) => [h.host_id, await probeHost(h.host_id)] as const)
+    ).then((results) => {
+      if (cancelled) return
+      setReach((prev) => {
+        const next = { ...prev }
+        for (const [id, status] of results) next[id] = status
+        return next
+      })
+    })
+    return () => { cancelled = true }
+  }, [hosts])
 
   if (hosts.length === 0) return null
 
@@ -55,6 +78,26 @@ export default function SavedHostsPanel({ hosts, onForget, onError }: Props) {
           const hasKey = Boolean(loadApiKey(h.host_id))
           const isReconnecting = reconnectingId === h.host_id
           const rowError = rowErrors[h.host_id]
+          const status: HostReachability = reach[h.host_id] ?? 'probing'
+          // Dot color reflects probe outcome, NOT just key presence:
+          //   alive       → success (origin reachable)
+          //   unreachable → danger  (Cloudflare 5xx / network error)
+          //   probing     → warning pulsing (in-flight)
+          //   unknown     → muted (no probe yet, or no tunnel base saved)
+          // hasKey gates between muted/danger when probe says unreachable —
+          // a "no key" host is just stale-saved, not a dead tunnel.
+          const dotClass =
+            status === 'alive'
+              ? 'bg-success'
+              : status === 'unreachable'
+                ? hasKey
+                  ? 'bg-danger'
+                  : 'bg-text-muted'
+                : status === 'probing'
+                  ? 'bg-warning animate-pulse'
+                  : hasKey
+                    ? 'bg-success/60'
+                    : 'bg-text-muted'
           return (
             <div key={h.host_id} className="flex flex-col">
               <div className="flex items-center gap-2">
@@ -71,15 +114,24 @@ export default function SavedHostsPanel({ hosts, onForget, onError }: Props) {
                     />
                   ) : (
                     <span
-                      className={[
-                        'w-1.5 h-1.5 rounded-full shrink-0',
-                        hasKey ? 'bg-success' : 'bg-text-muted',
-                      ].join(' ')}
+                      aria-label={
+                        status === 'alive'
+                          ? 'Online'
+                          : status === 'unreachable'
+                            ? 'Unreachable'
+                            : status === 'probing'
+                              ? 'Checking'
+                              : 'Unknown status'
+                      }
+                      className={['w-1.5 h-1.5 rounded-full shrink-0', dotClass].join(' ')}
                     />
                   )}
                   <div className="flex-1 min-w-0">
                     <div className="text-sm text-text-primary truncate">{h.label}</div>
                     <div className="text-xs text-text-muted truncate">
+                      {status === 'unreachable' ? (
+                        <span className="text-danger">Unreachable · </span>
+                      ) : null}
                       {formatRelative(h.last_seen)}
                       {h.api_key_last4 ? ` · ····${h.api_key_last4}` : ''}
                     </div>
