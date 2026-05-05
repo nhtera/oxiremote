@@ -1,12 +1,14 @@
 {
   "name": "oxiremote",
   "version": "0.1.0",
+  "oxiremoteBinaryVersion": "0.1.0",
   "description": "Self-hosted remote-access agent — terminal, files, preview, remote desktop over a Cloudflare tunnel.",
   "bin": {
     "oxiremote": "bin/oxiremote.js"
   },
   "scripts": {
-    "postinstall": "node scripts/install.js"
+    "postinstall": "node scripts/install.js",
+    "prepublishOnly": "node scripts/verify-release-assets.js"
   },
   "files": [
     "bin/",

@@ -20,7 +20,10 @@
     "lint:web": "bun --cwd apps/web lint",
     "test:web": "bun --cwd apps/web test",
     "e2e": "playwright test --config=tests/e2e/playwright.config.ts",
-    "check:bundle": "bun run scripts/check-bundle-size.ts"
+    "check:bundle": "bun run scripts/check-bundle-size.ts",
+    "check:versions": "bash scripts/release/check-versions.sh",
+    "check:release-assets": "node npm-wrapper/scripts/verify-release-assets.js",
+    "smoke:npm-wrapper": "node scripts/release/npm-wrapper-smoke.js"
   },
   "devDependencies": {
     "@playwright/test": "^1.48.0"

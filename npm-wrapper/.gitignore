@@ -1,0 +1,5 @@
+# Postinstall artifacts — fetched per-platform from GitHub Releases.
+oxiremote
+oxiremote.exe
+oxiremote.version
+_archive.*

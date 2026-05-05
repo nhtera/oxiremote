@@ -1,154 +1,191 @@
 #!/usr/bin/env node
-// Postinstall: download the GitHub release artifact for this platform,
-// verify SHA256 against the published manifest, extract the binary into
-// `bin/`. Skipped during `npm publish` itself (npm sets npm_config_global
-// to `false` and there's no install lifecycle then).
-//
-// Override the binary URL with OXIREMOTE_BINARY_URL — useful for corp proxies
-// or air-gapped installs.
-
 'use strict'
+
+// Postinstall: download the GitHub release archive for this platform,
+// SHA256-verify against the published manifest, extract the binary into bin/.
+// Re-running with the same version is a no-op via a `bin/oxiremote.version`
+// marker file.
+//
+// Env overrides:
+//   OXIREMOTE_BINARY_URL          Mirror base URL (e.g. corp proxy).
+//   OXIREMOTE_GITHUB_REPO         Repo override (default nhtera/oxiremote).
+//   OXIREMOTE_VERSION             Pin a specific binary version.
+//   OXIREMOTE_DISABLE_INSTALL=1   Skip postinstall (CI / pure-JS consumers).
+//   OXIREMOTE_FORCE_DOWNLOAD=1    Re-download even if marker matches.
+//   OXIREMOTE_OPTIONAL_INSTALL=1  Exit 0 on failure (don't fail npm install).
+//   OXIREMOTE_SKIP_INSTALL=1      Legacy alias for DISABLE_INSTALL.
+//   OXIREMOTE_SKIP_GLIBC_CHECK=1  Skip glibc compat check on Linux.
 
 const fs = require('node:fs')
 const path = require('node:path')
 const crypto = require('node:crypto')
 const https = require('node:https')
+const http = require('node:http')
 const { execSync } = require('node:child_process')
 
-const REPO = 'nhtera/oxiremote'
-const VERSION = require('../package.json').version
-const BIN_DIR = path.join(__dirname, '..', 'bin')
+const {
+  archiveBasename,
+  archiveExt,
+  checksumManifestName,
+  checksumManifestUrl,
+  detectTarget,
+  executableName,
+  releaseAssetUrl,
+  releaseBinaryDirectory,
+  resolveRepo,
+} = require('./artifacts')
+const { preflightGlibc } = require('./preflight-glibc')
+const pkg = require('../package.json')
 
-function detectTarget() {
-  const platform = process.platform
-  const arch = process.arch
-  const map = {
-    'darwin/arm64': 'aarch64-apple-darwin',
-    // 'darwin/x64' temporarily unsupported — see .github/workflows/release.yml.
-    // Falls through to the "no prebuilt binary" path below.
-    'linux/x64': 'x86_64-unknown-linux-gnu',
-    'linux/arm64': 'aarch64-unknown-linux-gnu',
-    'win32/x64': 'x86_64-pc-windows-msvc',
-  }
-  const key = `${platform}/${arch}`
-  if (!map[key]) {
-    console.error(
-      `[oxiremote] no prebuilt binary for ${key}; install from source: https://github.com/${REPO}`,
-    )
-    process.exit(1)
-  }
-  return map[key]
-}
-
-function archiveExt() {
-  return process.platform === 'win32' ? 'zip' : 'tar.gz'
-}
-
-function binaryName() {
-  return process.platform === 'win32' ? 'oxiremote.exe' : 'oxiremote'
+function resolveVersion() {
+  const configured =
+    process.env.OXIREMOTE_VERSION ||
+    pkg.oxiremoteBinaryVersion ||
+    pkg.version
+  return String(configured).trim()
 }
 
 function get(url, redirectsLeft = 5) {
   return new Promise((resolve, reject) => {
-    https
-      .get(url, { headers: { 'User-Agent': `oxiremote-npm/${VERSION}` } }, (res) => {
-        if (
-          res.statusCode &&
-          res.statusCode >= 300 &&
-          res.statusCode < 400 &&
-          res.headers.location
-        ) {
-          if (redirectsLeft <= 0) {
-            reject(new Error(`too many redirects fetching ${url}`))
+    const client = url.startsWith('https:') ? https : http
+    client
+      .get(
+        url,
+        { headers: { 'User-Agent': `oxiremote-npm/${pkg.version}` } },
+        (res) => {
+          const status = res.statusCode || 0
+          if (status >= 300 && status < 400 && res.headers.location) {
+            if (redirectsLeft <= 0) {
+              reject(new Error(`too many redirects fetching ${url}`))
+              return
+            }
+            res.resume()
+            resolve(get(new URL(res.headers.location, url).toString(), redirectsLeft - 1))
             return
           }
-          res.resume()
-          resolve(get(res.headers.location, redirectsLeft - 1))
-          return
-        }
-        if (res.statusCode !== 200) {
-          reject(new Error(`HTTP ${res.statusCode} fetching ${url}`))
-          return
-        }
-        const chunks = []
-        res.on('data', (c) => chunks.push(c))
-        res.on('end', () => resolve(Buffer.concat(chunks)))
-        res.on('error', reject)
-      })
+          if (status !== 200) {
+            res.resume()
+            reject(new Error(`HTTP ${status} fetching ${url}`))
+            return
+          }
+          const chunks = []
+          res.on('data', (c) => chunks.push(c))
+          res.on('end', () => resolve(Buffer.concat(chunks)))
+          res.on('error', reject)
+        },
+      )
       .on('error', reject)
   })
 }
 
-async function main() {
-  const target = detectTarget()
-  const ext = archiveExt()
-  const stem = `oxiremote-${VERSION}-${target}`
-  const assetName = `${stem}.${ext}`
-  const manifestName = `oxiremote-${VERSION}-sha256.txt`
-  const baseUrl =
-    process.env.OXIREMOTE_BINARY_URL ||
-    `https://github.com/${REPO}/releases/download/v${VERSION}`
+function readMarker(file) {
+  try {
+    return fs.readFileSync(file, 'utf8').trim()
+  } catch {
+    return ''
+  }
+}
 
-  console.log(`[oxiremote] downloading ${assetName} from ${baseUrl}`)
-  const [archive, manifest] = await Promise.all([
-    get(`${baseUrl}/${assetName}`),
-    get(`${baseUrl}/${manifestName}`),
-  ])
+function isAlreadyInstalled(binDir, version) {
+  if (process.env.OXIREMOTE_FORCE_DOWNLOAD === '1') return false
+  const finalPath = path.join(binDir, executableName())
+  if (!fs.existsSync(finalPath)) return false
+  const marker = readMarker(path.join(binDir, 'oxiremote.version'))
+  return marker === version
+}
 
-  const expected = manifest
-    .toString('utf8')
+function parseManifest(manifestText, archiveName) {
+  const expected = manifestText
     .split('\n')
     .map((line) => line.trim().split(/\s+/))
-    .find(([, name]) => name === assetName)?.[0]
+    .find(([, name]) => name === archiveName)?.[0]
   if (!expected) {
-    throw new Error(`manifest ${manifestName} does not list ${assetName}`)
+    throw new Error(`SHA256 manifest does not list ${archiveName}`)
   }
+  return expected.toLowerCase()
+}
 
+async function downloadAndExtract({ version, target, repo, binDir }) {
+  const ext = archiveExt()
+  const archiveName = archiveBasename(version, target)
+  const stem = `oxiremote-${version}-${target}`
+  const archiveUrl = releaseAssetUrl(archiveName, version, repo)
+  const manifestUrl = checksumManifestUrl(version, repo)
+
+  console.log(`[oxiremote] downloading ${archiveName}`)
+  const [archive, manifest] = await Promise.all([get(archiveUrl), get(manifestUrl)])
+
+  const expected = parseManifest(manifest.toString('utf8'), archiveName)
   const actual = crypto.createHash('sha256').update(archive).digest('hex')
   if (expected !== actual) {
-    throw new Error(`checksum mismatch for ${assetName}: expected ${expected}, got ${actual}`)
+    throw new Error(`checksum mismatch for ${archiveName}: expected ${expected}, got ${actual}`)
   }
   console.log('[oxiremote] checksum verified')
 
-  fs.mkdirSync(BIN_DIR, { recursive: true })
-  const tmp = path.join(BIN_DIR, `_archive.${ext}`)
+  fs.mkdirSync(binDir, { recursive: true })
+  const stagingDir = fs.mkdtempSync(path.join(binDir, '_extract-'))
+  const tmp = path.join(stagingDir, `archive.${ext}`)
   fs.writeFileSync(tmp, archive)
 
-  // Extract using tar (ships with macOS, Linux, and Windows 10+ via bsdtar).
-  // Strip the top-level `oxiremote-<version>-<target>/` directory so the
-  // binary lands directly in bin/.
-  if (ext === 'zip') {
-    execSync(`tar -xf "${tmp}" -C "${BIN_DIR}"`, { stdio: 'inherit' })
-    // tar leaves the binary inside the stem dir; flatten it.
-    const nested = path.join(BIN_DIR, stem, binaryName())
-    fs.renameSync(nested, path.join(BIN_DIR, binaryName()))
-    fs.rmSync(path.join(BIN_DIR, stem), { recursive: true, force: true })
-  } else {
-    execSync(`tar -xzf "${tmp}" -C "${BIN_DIR}" --strip-components=1`, { stdio: 'inherit' })
+  try {
+    execSync(
+      ext === 'zip'
+        ? `tar -xf "${tmp}" -C "${stagingDir}"`
+        : `tar -xzf "${tmp}" -C "${stagingDir}"`,
+      { stdio: 'inherit' },
+    )
+    const extracted = path.join(stagingDir, stem, executableName())
+    if (!fs.existsSync(extracted)) {
+      throw new Error(`archive did not contain ${stem}/${executableName()}`)
+    }
+    const finalPath = path.join(binDir, executableName())
+    fs.rmSync(finalPath, { force: true })
+    fs.renameSync(extracted, finalPath)
+  } finally {
+    fs.rmSync(stagingDir, { recursive: true, force: true })
   }
-  fs.unlinkSync(tmp)
 
-  const finalPath = path.join(BIN_DIR, binaryName())
+  const finalPath = path.join(binDir, executableName())
+  preflightGlibc(finalPath)
+
   if (process.platform !== 'win32') {
     fs.chmodSync(finalPath, 0o755)
   }
+  fs.writeFileSync(path.join(binDir, 'oxiremote.version'), version, 'utf8')
   console.log(`[oxiremote] installed ${finalPath}`)
 }
 
-// Skip during the `npm publish` lifecycle itself — there's nothing to install
-// when running inside the package's own checkout. Heuristic: if the binary
-// already exists OR we're inside the repo tree (release workflow runs
-// `npm pack`), bail out quietly.
-if (process.env.OXIREMOTE_SKIP_INSTALL === '1') {
-  console.log('[oxiremote] OXIREMOTE_SKIP_INSTALL=1 — skipping postinstall')
-  process.exit(0)
+async function main() {
+  if (
+    process.env.OXIREMOTE_DISABLE_INSTALL === '1' ||
+    process.env.OXIREMOTE_SKIP_INSTALL === '1'
+  ) {
+    console.log('[oxiremote] OXIREMOTE_DISABLE_INSTALL=1 — skipping postinstall')
+    return
+  }
+
+  const version = resolveVersion()
+  const repo = resolveRepo()
+  const binDir = releaseBinaryDirectory()
+
+  if (isAlreadyInstalled(binDir, version)) {
+    console.log(`[oxiremote] v${version} already installed — skipping download`)
+    return
+  }
+
+  const { target } = detectTarget()
+  await downloadAndExtract({ version, target, repo, binDir })
 }
 
 main().catch((err) => {
   console.error(`[oxiremote] install failed: ${err.message}`)
   console.error(
     '  Set OXIREMOTE_BINARY_URL to a custom mirror, or download manually from\n' +
-      `  https://github.com/${REPO}/releases`,
+      `  https://github.com/${resolveRepo()}/releases`,
   )
+  if (process.env.OXIREMOTE_OPTIONAL_INSTALL === '1') {
+    console.error('  OXIREMOTE_OPTIONAL_INSTALL=1 set — exiting 0 anyway.')
+    process.exit(0)
+  }
   process.exit(1)
 })
