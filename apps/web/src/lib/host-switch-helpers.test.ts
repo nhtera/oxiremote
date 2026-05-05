@@ -15,6 +15,10 @@ afterEach(() => {
 })
 
 describe('switchActiveHost', () => {
+  // Navigate happens eagerly (before /api/me / fetchHost) to avoid the
+  // race where HostRoute starts its own switch off the transient state
+  // mismatch. On failure the URL still flips, then HostRoute renders the
+  // "Host not reachable" / "Session expired" panel for the new URL.
   it('returns session-expired on 401 without removing saved host', async () => {
     storeApiKey('host1', 'key')
     storeTunnelBase('host1', 'https://host1.tunnel.cf')
@@ -27,7 +31,7 @@ describe('switchActiveHost', () => {
     const result = await switchActiveHost('host1', navigate)
     expect(result).toEqual({ ok: false, error: 'session-expired' })
     expect(listSavedHosts().find((h) => h.host_id === 'host1')).toBeDefined()
-    expect(navigate).not.toHaveBeenCalled()
+    expect(navigate).toHaveBeenCalledWith('/h/host1/workspace', { replace: true })
   })
 
   it('returns network on fetch rejection without removing saved host', async () => {
@@ -37,7 +41,7 @@ describe('switchActiveHost', () => {
     const result = await switchActiveHost('host1', navigate)
     expect(result).toEqual({ ok: false, error: 'network' })
     expect(listSavedHosts().find((h) => h.host_id === 'host1')).toBeDefined()
-    expect(navigate).not.toHaveBeenCalled()
+    expect(navigate).toHaveBeenCalledWith('/h/host1/workspace', { replace: true })
   })
 
   it('navigates and resolves ok on successful host switch', async () => {
