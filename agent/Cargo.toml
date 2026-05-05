@@ -90,6 +90,14 @@ libc = "0.2"
 objc2 = "0.6"
 objc2-app-kit = { version = "0.3", features = ["NSApplication", "NSResponder"] }
 
+# Windows: tray-icon 0.19 dispatches mouse/menu events through the standard
+# Win32 message queue, so the thread owning the tray (main, on Windows) must
+# pump WM_* messages or every click is silently dropped. windows-sys already
+# rides into the dep tree transitively; pinning it here is just to expose
+# GetMessageW/TranslateMessage/DispatchMessageW for the loop in tray.rs.
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_UI_WindowsAndMessaging"] }
+
 # Phase 03/04 deps go back in the global [dependencies] table — the macOS
 # target-specific block above ends here. Without this header, the lines
 # below would inherit cfg(target_os = "macos") and silently disappear on

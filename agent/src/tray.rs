@@ -5,7 +5,7 @@
 // Menu layout: a non-clickable status header showing the agent port, plus
 // "Open Web UI" and "Shutdown" — minimal so the operator never has to dig.
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
 use std::time::Duration;
 
 use anyhow::Result;
@@ -110,7 +110,15 @@ pub fn run_event_loop(handle: &TrayHandle) {
         macos_run();
     }
 
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "windows")]
+    {
+        windows_run();
+    }
+
+    // Linux fallback. tray-icon dispatches click events via its own thread
+    // on Linux (gtk/libappindicator), so a no-op park keeps the process
+    // alive without burning CPU; menu callbacks fire from `set_event_handler`.
+    #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
     {
         loop {
             std::thread::sleep(Duration::from_secs(60));
@@ -133,5 +141,34 @@ fn macos_run() {
     // Block forever — `[NSApp run]` returns only on terminate. Menu clicks
     // fire via the global `MenuEvent::set_event_handler` installed above.
     app.run();
+}
+
+/// Standard Win32 message pump. tray-icon 0.19 creates a hidden window class
+/// behind the status icon; mouse clicks and menu commands arrive as WM_*
+/// messages on the same thread that built the icon, and only get dispatched
+/// to `MenuEvent::set_event_handler` when this loop runs. Without it the icon
+/// renders but every click is silently dropped — the symptom that motivated
+/// this code path on Windows.
+#[cfg(target_os = "windows")]
+fn windows_run() {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        DispatchMessageW, GetMessageW, MSG, TranslateMessage,
+    };
+
+    // Safety: GetMessageW writes into `msg`; the std::mem::zeroed init is the
+    // documented pattern. Loop exits on WM_QUIT (return value 0) or error
+    // (-1) — Shutdown menu item calls process::exit(0) directly so a normal
+    // shutdown short-circuits this loop entirely.
+    unsafe {
+        let mut msg: MSG = std::mem::zeroed();
+        loop {
+            let ret = GetMessageW(&mut msg, std::ptr::null_mut(), 0, 0);
+            if ret <= 0 {
+                break;
+            }
+            let _ = TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+    }
 }
 
