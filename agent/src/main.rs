@@ -52,6 +52,8 @@ mod tray;
 mod tui;
 mod tunnel;
 mod tunnel_named;
+#[cfg(target_os = "windows")]
+mod win_jobs;
 mod workspaces;
 
 use std::{

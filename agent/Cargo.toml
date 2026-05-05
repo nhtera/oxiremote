@@ -96,7 +96,17 @@ objc2-app-kit = { version = "0.3", features = ["NSApplication", "NSResponder"] }
 # rides into the dep tree transitively; pinning it here is just to expose
 # GetMessageW/TranslateMessage/DispatchMessageW for the loop in tray.rs.
 [target.'cfg(target_os = "windows")'.dependencies]
-windows-sys = { version = "0.59", features = ["Win32_UI_WindowsAndMessaging"] }
+# Win32_UI_WindowsAndMessaging — tray.rs message pump.
+# Win32_System_JobObjects + Win32_System_Threading — child-process job
+#   object so cloudflared dies with the agent (panic, taskkill /f, OS
+#   shutdown) instead of orphaning. See win_jobs.rs.
+# Win32_Foundation — HANDLE / CloseHandle / GetLastError / FALSE.
+windows-sys = { version = "0.59", features = [
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_System_JobObjects",
+    "Win32_System_Threading",
+    "Win32_Foundation",
+] }
 
 # Phase 03/04 deps go back in the global [dependencies] table — the macOS
 # target-specific block above ends here. Without this header, the lines

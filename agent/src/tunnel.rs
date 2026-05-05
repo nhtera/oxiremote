@@ -282,6 +282,18 @@ pub async fn ensure_quick_tunnel(
         .spawn()
         .context("spawn cloudflared")?;
 
+    // Windows: tie the child to a kill-on-job-close job object so cloudflared
+    // dies with the agent even when Drop never runs (taskkill /f, panic, OS
+    // reboot, kernel-level termination). kill_on_drop only fires on graceful
+    // unwind. Best-effort — failure here means we lose the auto-cleanup
+    // guarantee for THIS spawn but the rest of the supervision still works.
+    #[cfg(target_os = "windows")]
+    if let Some(pid) = child.id()
+        && let Err(err) = crate::win_jobs::add_to_kill_on_exit_job(pid)
+    {
+        tracing::warn!(error = %err, pid, "could not assign cloudflared to kill-on-exit job");
+    }
+
     let stderr = child.stderr.take().context("no stderr")?;
     let stdout = child.stdout.take().context("no stdout")?;
 
@@ -495,6 +507,15 @@ pub async fn ensure_named_tunnel(
             return Err(err);
         }
     };
+
+    // Same kill-on-exit job assignment as the quick-tunnel path — see
+    // ensure_quick_tunnel for rationale.
+    #[cfg(target_os = "windows")]
+    if let Some(pid) = child.id()
+        && let Err(err) = crate::win_jobs::add_to_kill_on_exit_job(pid)
+    {
+        tracing::warn!(error = %err, pid, "could not assign cloudflared to kill-on-exit job");
+    }
 
     let stderr = child.stderr.take().context("no stderr")?;
     let stdout = child.stdout.take().context("no stdout")?;
