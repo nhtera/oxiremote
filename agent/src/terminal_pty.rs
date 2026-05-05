@@ -191,9 +191,19 @@ pub fn build_default_command(command: Option<&[String]>) -> Vec<String> {
         && !cmd.is_empty() {
             return cmd.to_vec();
         }
-    if std::env::consts::OS == "macos" {
+    #[cfg(target_os = "macos")]
+    {
         vec!["/bin/zsh".into(), "-l".into()]
-    } else {
+    }
+    #[cfg(target_os = "windows")]
+    {
+        // Windows shells have no `-l` (login) concept. PowerShell ships with
+        // Win10+ and is on PATH at %SystemRoot%\System32\WindowsPowerShell\v1.0;
+        // CommandBuilder resolves it via PATH. -NoLogo skips the banner.
+        vec!["powershell.exe".into(), "-NoLogo".into()]
+    }
+    #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
+    {
         let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".into());
         vec![shell, "-l".into()]
     }
