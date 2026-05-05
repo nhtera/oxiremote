@@ -86,6 +86,47 @@ function readMarker(file) {
   }
 }
 
+// Place the freshly-extracted binary at finalPath. On non-Windows a plain
+// rmSync + rename is fine. On Windows the live oxiremote.exe is locked by
+// the running agent (or by a sibling npm process), so unlink fails with
+// EPERM. Mirror the agent's atomic_replace dance: move the live exe aside
+// to a .bak (rename across handles is allowed even when unlink isn't), then
+// drop the new binary into place. Best-effort cleanup of stale .bak files
+// from prior installs runs first so we never accumulate.
+function swapInBinary(extracted, finalPath) {
+  if (process.platform !== 'win32') {
+    fs.rmSync(finalPath, { force: true })
+    fs.renameSync(extracted, finalPath)
+    return
+  }
+  const bak = `${finalPath}.bak`
+  // Old .bak from a prior swap may still be locked if the agent is mid-shutdown
+  // — ignore EPERM and let the OS reclaim it on next boot / agent restart.
+  try { fs.rmSync(bak, { force: true }) } catch { /* locked, fine */ }
+  if (fs.existsSync(finalPath)) {
+    try {
+      fs.renameSync(finalPath, bak)
+    } catch (e) {
+      if (e && e.code === 'EPERM') {
+        throw new Error(
+          'oxiremote.exe is locked by a running agent — stop it first ' +
+          '(`Stop-Process -Name oxiremote -Force` in PowerShell) and re-run npm install.',
+        )
+      }
+      throw e
+    }
+  }
+  try {
+    fs.renameSync(extracted, finalPath)
+  } catch (e) {
+    // Roll back so we don't leave the user with no binary at all.
+    if (fs.existsSync(bak) && !fs.existsSync(finalPath)) {
+      try { fs.renameSync(bak, finalPath) } catch { /* worst case: empty bin */ }
+    }
+    throw e
+  }
+}
+
 function isAlreadyInstalled(binDir, version) {
   if (process.env.OXIREMOTE_FORCE_DOWNLOAD === '1') return false
   const finalPath = path.join(binDir, executableName())
@@ -139,8 +180,7 @@ async function downloadAndExtract({ version, target, repo, binDir }) {
       throw new Error(`archive did not contain ${stem}/${executableName()}`)
     }
     const finalPath = path.join(binDir, executableName())
-    fs.rmSync(finalPath, { force: true })
-    fs.renameSync(extracted, finalPath)
+    swapInBinary(extracted, finalPath)
   } finally {
     fs.rmSync(stagingDir, { recursive: true, force: true })
   }
