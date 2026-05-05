@@ -7,7 +7,6 @@ use flate2::read::GzDecoder;
 use futures_util::StreamExt;
 use regex::Regex;
 use reqwest::Client;
-use sha2::{Digest, Sha256};
 use tar::Archive;
 use tokio::io::AsyncBufReadExt;
 use tokio::sync::Notify;
@@ -39,8 +38,6 @@ fn cloudflared_path(data_dir: &Path) -> PathBuf {
 struct Artifact {
     /// Filename in the GitHub release (`cloudflared-linux-amd64`, etc.).
     release_filename: String,
-    /// Filename on the checksums line.
-    checksum_filename: String,
     /// Is the downloaded asset a tgz archive (macos) or a bare binary (linux/windows)?
     is_tarball: bool,
 }
@@ -51,27 +48,22 @@ fn artifact_for_current_host() -> anyhow::Result<Artifact> {
     match (os, arch) {
         ("macos", "aarch64") => Ok(Artifact {
             release_filename: "cloudflared-darwin-arm64.tgz".into(),
-            checksum_filename: "cloudflared-darwin-arm64.tgz".into(),
             is_tarball: true,
         }),
         ("macos", "x86_64") => Ok(Artifact {
             release_filename: "cloudflared-darwin-amd64.tgz".into(),
-            checksum_filename: "cloudflared-darwin-amd64.tgz".into(),
             is_tarball: true,
         }),
         ("linux", "x86_64") => Ok(Artifact {
             release_filename: "cloudflared-linux-amd64".into(),
-            checksum_filename: "cloudflared-linux-amd64".into(),
             is_tarball: false,
         }),
         ("linux", "aarch64") => Ok(Artifact {
             release_filename: "cloudflared-linux-arm64".into(),
-            checksum_filename: "cloudflared-linux-arm64".into(),
             is_tarball: false,
         }),
         ("windows", "x86_64") => Ok(Artifact {
             release_filename: "cloudflared-windows-amd64.exe".into(),
-            checksum_filename: "cloudflared-windows-amd64.exe".into(),
             is_tarball: false,
         }),
         _ => anyhow::bail!("unsupported cloudflared host: {os}/{arch}"),
@@ -79,6 +71,25 @@ fn artifact_for_current_host() -> anyhow::Result<Artifact> {
 }
 
 pub async fn ensure_cloudflared(data_dir: &Path, bus: Arc<EventBus>) -> anyhow::Result<PathBuf> {
+    // Surface any failure as a Failed step event before bubbling up. Without
+    // this, an HTTP/TLS error during "finding latest release" leaves the TUI
+    // wedged on the Active "Preparing" row with no visible reason — the
+    // underlying error only lands in the log ring.
+    match try_ensure_cloudflared(data_dir, bus.clone()).await {
+        Ok(p) => Ok(p),
+        Err(err) => {
+            bus.send(AgentEvent::TunnelStepChanged {
+                step: TunnelStep::Failed,
+                attempt: 1,
+                info: None,
+                reason: Some(format!("{err:#}")),
+            });
+            Err(err)
+        }
+    }
+}
+
+async fn try_ensure_cloudflared(data_dir: &Path, bus: Arc<EventBus>) -> anyhow::Result<PathBuf> {
     emit_prep(&bus, "checking cloudflared");
     let path = cloudflared_path(data_dir);
     if path.exists() {
@@ -94,9 +105,6 @@ pub async fn ensure_cloudflared(data_dir: &Path, bus: Arc<EventBus>) -> anyhow::
         "https://github.com/cloudflare/cloudflared/releases/download/{version}/{}",
         art.release_filename
     );
-    let checksums_url = format!(
-        "https://github.com/cloudflare/cloudflared/releases/download/{version}/cloudflared-{version}-checksums.txt"
-    );
 
     let tmp_dir = data_dir.join("tmp");
     std::fs::create_dir_all(&tmp_dir).context("create tmp dir")?;
@@ -107,16 +115,12 @@ pub async fn ensure_cloudflared(data_dir: &Path, bus: Arc<EventBus>) -> anyhow::
         .connect_timeout(Duration::from_secs(10))
         .build()?;
 
-    let checksums_text = client
-        .get(&checksums_url)
-        .send()
-        .await
-        .context("download checksums")?
-        .error_for_status()
-        .context("download checksums status")?
-        .text()
-        .await
-        .context("read checksums")?;
+    // No SHA256 manifest: Cloudflare does not publish a checksums file in their
+    // GitHub releases (verified across 2024.x → 2026.x). Earlier code fetched
+    // `cloudflared-{version}-checksums.txt` and 404'd on every fresh install
+    // that didn't already have a cached binary. We rely on TLS to github.com +
+    // their CDN for transport integrity, matching how Cloudflare's own install
+    // scripts handle it.
 
     emit_prep(&bus, "downloading cloudflared");
     let resp = client
@@ -154,14 +158,6 @@ pub async fn ensure_cloudflared(data_dir: &Path, bus: Arc<EventBus>) -> anyhow::
     };
     emit_prep(&bus, &final_text);
 
-    emit_prep(&bus, "verifying");
-    let expected = find_expected_sha256(&checksums_text, &art.checksum_filename)
-        .context("find expected sha256")?;
-    let actual = hex::encode(Sha256::digest(&bytes));
-    if actual != expected {
-        anyhow::bail!("cloudflared sha256 mismatch");
-    }
-
     // Set exec bit on the staging file BEFORE renaming into `path`.
     // Otherwise a crash between rename and chmod leaves a non-executable
     // binary at the canonical location, breaking the next startup's
@@ -190,16 +186,6 @@ pub async fn ensure_cloudflared(data_dir: &Path, bus: Arc<EventBus>) -> anyhow::
     Ok(path)
 }
 
-fn find_expected_sha256(checksums: &str, filename: &str) -> anyhow::Result<String> {
-    for line in checksums.lines() {
-        let parts: Vec<&str> = line.split_whitespace().collect();
-        if parts.len() == 2 && parts[1] == filename {
-            return Ok(parts[0].to_string());
-        }
-    }
-    anyhow::bail!("sha256 not found for {filename}")
-}
-
 fn extract_cloudflared_tgz(bytes: &[u8], dest: &Path) -> anyhow::Result<PathBuf> {
     let decoder = GzDecoder::new(bytes);
     let mut archive = Archive::new(decoder);
@@ -224,20 +210,41 @@ async fn cloudflared_latest_version() -> anyhow::Result<String> {
         .connect_timeout(Duration::from_secs(10))
         .build()?;
 
+    // Up to 3 attempts — Windows clients hit transient TLS handshake / DNS
+    // glitches behind corporate networks, and the underlying request timeout
+    // (15s) is long enough that one stuck attempt is enough for an operator
+    // to assume the agent has hung.
+    let mut last_err: Option<anyhow::Error> = None;
+    for attempt in 1..=3 {
+        match fetch_latest_tag(&client).await {
+            Ok(tag) => return Ok(tag),
+            Err(err) => {
+                last_err = Some(err);
+                if attempt < 3 {
+                    tokio::time::sleep(Duration::from_millis(800 * attempt)).await;
+                }
+            }
+        }
+    }
+    Err(last_err.unwrap_or_else(|| anyhow::anyhow!("could not determine latest cloudflared version")))
+}
+
+async fn fetch_latest_tag(client: &Client) -> anyhow::Result<String> {
     let resp = client
         .get("https://github.com/cloudflare/cloudflared/releases/latest")
         .send()
         .await
         .context("request latest release")?;
 
+    let status = resp.status();
     if let Some(loc) = resp.headers().get("location") {
         let loc = loc.to_str().context("location header")?;
-        if let Some(tag) = loc.rsplit('/').next() {
+        if let Some(tag) = loc.rsplit('/').next().filter(|s| !s.is_empty()) {
             return Ok(tag.to_string());
         }
     }
 
-    anyhow::bail!("could not determine latest cloudflared version")
+    anyhow::bail!("could not determine latest cloudflared version (status {status}, no location header — corporate proxy may be stripping redirects)")
 }
 
 pub async fn ensure_quick_tunnel(
@@ -714,13 +721,4 @@ mod tests {
         assert!(art.is_ok(), "current host should be supported: {:?}", art.err());
     }
 
-    #[test]
-    fn checksum_parser_finds_matching_line() {
-        let sample = "abc123  cloudflared-linux-amd64\ndef456  other-file\n";
-        assert_eq!(
-            find_expected_sha256(sample, "cloudflared-linux-amd64").unwrap(),
-            "abc123"
-        );
-        assert!(find_expected_sha256(sample, "nonexistent").is_err());
-    }
 }
