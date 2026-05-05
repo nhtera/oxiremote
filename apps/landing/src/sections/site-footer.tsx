@@ -1,4 +1,5 @@
 import BrandMark from '../components/brand-mark'
+import { VERSION } from '../version'
 
 const COLUMNS = [
   {
@@ -87,7 +88,7 @@ export default function SiteFooter() {
 
         <div className="mt-14 pt-6 border-t border-border-soft flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4">
           <p className="font-mono text-[11.5px] text-text-muted">
-            © {new Date().getFullYear()} OxiRemote · MIT License · v0.4.2
+            © {new Date().getFullYear()} OxiRemote · MIT License · {VERSION}
           </p>
           <div className="flex items-center gap-3">
             <span className="inline-flex items-center gap-1.5 text-[11.5px] text-text-secondary">

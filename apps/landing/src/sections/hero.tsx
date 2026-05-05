@@ -2,6 +2,7 @@ import CtaButton from '../components/cta-button'
 import CopyCommand from '../components/copy-command'
 import HeroTerminal from './hero-terminal'
 import HeroHandset from './hero-handset'
+import { VERSION, VERSION_TAGLINE } from '../version'
 
 export default function Hero() {
   return (
@@ -21,9 +22,9 @@ export default function Hero() {
             >
               <span className="inline-flex items-center gap-1.5 rounded-full bg-accent/15 text-accent px-2 py-0.5 text-[10.5px] font-mono uppercase tracking-wider">
                 <span className="w-1.5 h-1.5 rounded-full bg-accent" />
-                v0.4.2
+                {VERSION}
               </span>
-              <span>H.264 video pipeline · WebPush deep links</span>
+              <span>{VERSION_TAGLINE}</span>
               <svg viewBox="0 0 16 16" className="w-3 h-3 opacity-70" fill="none" stroke="currentColor" strokeWidth="1.6">
                 <path d="M6 4l4 4-4 4" />
               </svg>

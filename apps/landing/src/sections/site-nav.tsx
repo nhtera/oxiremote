@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react'
 import BrandMark from '../components/brand-mark'
+import { VERSION } from '../version'
 
 const NAV_LINKS = [
   { label: 'Features', href: '#features' },
@@ -7,8 +8,6 @@ const NAV_LINKS = [
   { label: 'Compare', href: '#compare' },
   { label: 'Install', href: '#install' },
 ]
-
-const VERSION = 'v0.4.2'
 
 export default function SiteNav() {
   const [scrolled, setScrolled] = useState(false)
