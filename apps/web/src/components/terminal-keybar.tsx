@@ -8,6 +8,10 @@ type Props = {
   /** Returns the focused terminal's current selection text (or empty). When
    *  provided, the expanded drawer renders a "Copy" button next to Paste. */
   getSelection?: () => string
+  /** Called when the user pastes image / file ClipboardItems. The workspace
+   *  uploads + inserts the path into the focused pane. When omitted, image
+   *  clipboard items are ignored and Paste falls back to text-only behaviour. */
+  onPasteFiles?: (files: File[]) => void
 }
 
 type Modifier = 'ctrl' | 'opt' | 'meta' | 'shift'
@@ -56,7 +60,7 @@ function applyModifiers(value: string, mods: ModifierState): string {
   return out
 }
 
-export default function TerminalKeybar({ onSend, onToast, getSelection }: Props) {
+export default function TerminalKeybar({ onSend, onToast, getSelection, onPasteFiles }: Props) {
   const [mods, setMods] = useState<ModifierState>(INITIAL_MODS)
   const [expanded, setExpanded] = useState(false)
   // Tap-detection: same modifier tapped twice within 400 ms = lock.
@@ -90,7 +94,36 @@ export default function TerminalKeybar({ onSend, onToast, getSelection }: Props)
     clearOneShots()
   }, [mods, onSend, clearOneShots])
 
+  // Smart paste — tries `clipboard.read()` first so image/file ClipboardItems
+  // (e.g. iOS screenshot, "Copy image") flow through the workspace upload path.
+  // Falls back to `readText()` for plain text. Both branches require an HTTPS
+  // / secure context (the tunnel always is) and a fresh user gesture (we are
+  // inside an onClick).
   async function handlePaste() {
+    // Capability gate. Safari < 16 / older Android Chrome lack `read()`;
+    // skip straight to text fallback there.
+    const supportsRead =
+      typeof navigator !== 'undefined' && typeof navigator.clipboard?.read === 'function'
+    if (supportsRead && onPasteFiles) {
+      try {
+        const items = await navigator.clipboard.read()
+        const files: File[] = []
+        for (const item of items) {
+          // Pick the first image-ish type per item. iOS exposes png / jpeg.
+          const imageType = item.types.find((t) => t.startsWith('image/'))
+          if (!imageType) continue
+          const blob = await item.getType(imageType)
+          const ext = imageType.split('/')[1] ?? 'png'
+          files.push(new File([blob], `pasted-${Date.now()}.${ext}`, { type: imageType }))
+        }
+        if (files.length > 0) {
+          onPasteFiles(files)
+          return
+        }
+      } catch {
+        // Permission denied or no clipboard access — fall through to text.
+      }
+    }
     try {
       const text = await navigator.clipboard.readText()
       if (text) onSend(text)

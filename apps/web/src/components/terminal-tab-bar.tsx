@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import { Link } from 'react-router-dom'
 import type { Session } from '../state/terminal-store'
-import { RemoteDesktopIcon } from './icons'
+import { PaperclipIcon, RemoteDesktopIcon } from './icons'
 import AgentDetectedBadge from './agent-detected-badge'
 import NotifyOnFinishToggle from './notify-on-finish-toggle'
 
@@ -27,6 +27,13 @@ type Props = {
   desktopAvailable?: boolean
   /** Called when the notify-on-finish toggle changes so the parent can persist. */
   onNotifyToggle?: (sessionId: string, enabled: boolean) => void
+  /** Desktop attach affordance — opens the picker (modal variant) so PC users
+   *  have parity with the mobile composer's paperclip. Hidden when no
+   *  workspace is active or the handler is omitted (mobile uses the composer). */
+  onOpenAttach?: () => void
+  /** Set false when there's no active workspace; renders the paperclip
+   *  disabled with a tooltip. Defaults to true. */
+  attachAvailable?: boolean
 }
 
 type DotKind = 'connected' | 'reconnecting' | 'exited' | 'idle'
@@ -67,6 +74,7 @@ export default function TerminalTabBar({
   onSelect, onClose, onNew, onRename, onOpenSettings,
   hostId, desktopAvailable = true,
   onNotifyToggle,
+  onOpenAttach, attachAvailable = true,
 }: Props) {
   const [editingId, setEditingId] = useState<string | null>(null)
   const [editValue, setEditValue] = useState('')
@@ -213,6 +221,26 @@ export default function TerminalTabBar({
 
         {/* Spacer pushes gear to the right */}
         <div className="flex-1" />
+
+        {/* Desktop-only attach paperclip. Mobile uses the composer's paperclip;
+            hide here below md so the affordance isn't duplicated on the bottom
+            edge. Disabled state still shows the button so users see the
+            affordance and learn to pick a workspace. */}
+        {onOpenAttach && (
+          <button
+            onClick={onOpenAttach}
+            disabled={!attachAvailable}
+            className={`hidden md:inline-flex shrink-0 items-center justify-center w-8 h-8 rounded-md transition-colors ${
+              attachAvailable
+                ? 'text-text-muted hover:text-accent hover:bg-surface-hover'
+                : 'text-text-muted/40 cursor-not-allowed'
+            }`}
+            title={attachAvailable ? 'Attach file (paste / drag also works)' : 'Pick a workspace first'}
+            aria-label="Attach file"
+          >
+            <PaperclipIcon size={16} />
+          </button>
+        )}
 
         {/* Settings gear */}
         <button

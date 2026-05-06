@@ -1,121 +1,79 @@
-import { useRef, useState } from 'react'
-import { loadApiKey, loadTunnelBase } from '../lib/api-client'
-import { isDiscoveryMode } from '../lib/discovery-client'
+import { useRef } from 'react'
+import { useFileUpload } from '../hooks/use-file-upload'
+import { ATTACHMENTS_DIR, ensureAttachmentsDir } from '../lib/ensure-attachments-dir'
 
-// Bottom sheet opened by the composer's paperclip button.
-// Reuses POST /api/files/upload (multipart: dir + file) — the same endpoint
-// the FilesPage upload flow uses. On success, inserts `"<workspace-relative path>"`
-// into the composer via `onPathInsert`.
+// Bottom sheet (mobile) / centered modal (desktop) opened by the composer's
+// paperclip button. Reuses POST /api/files/upload (multipart: dir + file)
+// via the shared `useFileUpload` hook — same path used by paste/drop.
 //
 // Three distinct rows match the iOS share-sheet pattern (Photos / Camera /
 // Files). Each row owns its own <input type="file"> so the file picker shows
 // the right source UI on iOS — `accept` and `capture` only affect the picker
 // when set on the actual input the user clicks.
 
-// XHR is used (not fetch) so we can show upload progress on multi-MB photo
-// uploads. Trade-off: XHR bypasses the window.fetch auth interceptor in
-// api-client.ts, so we replicate its behaviour here — Bearer + CSRF headers,
-// and discovery-mode tunnel-base rewriting for cross-origin SPAs.
-const CSRF_COOKIE = 'oxi_csrf'
-
-function readCsrfCookie(): string | null {
-  if (typeof document === 'undefined') return null
-  for (const part of document.cookie.split(';')) {
-    const trimmed = part.trim()
-    if (trimmed.startsWith(CSRF_COOKIE + '=')) {
-      return trimmed.slice(CSRF_COOKIE.length + 1)
-    }
-  }
-  return null
-}
-
 type Props = {
   wsId: number
   dir?: string
   onPathInsert: (path: string) => void
   onClose: () => void
+  /** Layout variant. `sheet` (default): bottom sheet for mobile.
+   *  `modal`: centered card for desktop. */
+  variant?: 'sheet' | 'modal'
 }
 
-type UploadState =
-  | { kind: 'idle' }
-  | { kind: 'uploading'; pct: number }
-  | { kind: 'error'; msg: string }
-
-export default function FileAttachSheet({ wsId, dir = '', onPathInsert, onClose }: Props) {
+export default function FileAttachSheet({
+  wsId,
+  dir = '',
+  onPathInsert,
+  onClose,
+  variant = 'sheet',
+}: Props) {
   const photoInputRef = useRef<HTMLInputElement>(null)
   const cameraInputRef = useRef<HTMLInputElement>(null)
   const fileInputRef = useRef<HTMLInputElement>(null)
-  const [state, setState] = useState<UploadState>({ kind: 'idle' })
+  const { upload, reset, state, progress, error } = useFileUpload(wsId, dir)
 
-  function uploadFile(file: File) {
-    setState({ kind: 'uploading', pct: 0 })
-
-    const form = new FormData()
-    form.append('dir', dir)
-    form.append('file', file, file.name)
-
-    // Use XHR for progress events; `fetch` doesn't expose upload progress.
-    // Discovery mode rewrites /api/* to the tunnel base (cross-origin); embedded
-    // mode keeps the same-origin path and relies on cookies for session auth.
-    const path = `/api/files/upload?ws_id=${wsId}`
-    const tunnelBase = isDiscoveryMode() ? loadTunnelBase() : null
-    const crossOrigin = tunnelBase !== null
-    const url = crossOrigin ? `${tunnelBase}${path}` : path
-
-    const xhr = new XMLHttpRequest()
-    xhr.open('POST', url)
-    xhr.withCredentials = !crossOrigin
-    const apiKey = loadApiKey()
-    if (apiKey) xhr.setRequestHeader('Authorization', `Bearer ${apiKey}`)
-    if (!crossOrigin) {
-      const csrf = readCsrfCookie()
-      if (csrf) xhr.setRequestHeader('X-OXI-CSRF', csrf)
-    }
-    xhr.upload.onprogress = (e) => {
-      if (e.lengthComputable) {
-        setState({ kind: 'uploading', pct: Math.round((e.loaded / e.total) * 100) })
-      }
-    }
-    xhr.onload = () => {
-      if (xhr.status >= 200 && xhr.status < 300) {
-        try {
-          const data = JSON.parse(xhr.responseText) as { path: string; size: number }
-          onPathInsert(data.path)
-          onClose()
-        } catch {
-          setState({ kind: 'error', msg: 'Upload succeeded but response was invalid' })
-        }
-      } else {
-        setState({ kind: 'error', msg: xhr.responseText || `Upload failed (${xhr.status})` })
-      }
-    }
-    xhr.onerror = () => setState({ kind: 'error', msg: 'Network error' })
-    xhr.send(form)
-  }
-
-  function handleFileChange(e: React.ChangeEvent<HTMLInputElement>) {
+  async function handleFileChange(e: React.ChangeEvent<HTMLInputElement>) {
     const file = e.target.files?.[0]
     e.target.value = ''
-    if (file) uploadFile(file)
+    if (!file) return
+    // For `.attachments/` uploads, make sure the dir exists before posting.
+    // Closes the race window where the picker resolves faster than the
+    // workspace-page's fire-and-forget mkdir on a slow tunnel.
+    if (dir === ATTACHMENTS_DIR) {
+      await ensureAttachmentsDir(wsId)
+    }
+    upload(file)
+      .then((res) => {
+        onPathInsert(res.path)
+        onClose()
+      })
+      .catch(() => {
+        // Hook already populated `error`; UI renders below.
+      })
   }
 
+  // Modal variant centers a card; sheet variant pins to bottom + adds a grab
+  // handle and safe-area padding. Picker rows + auth/upload logic are identical.
+  const isModal = variant === 'modal'
+  const outerCls = isModal
+    ? 'fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4'
+    : 'fixed inset-0 z-50 flex flex-col justify-end bg-black/60'
+  const innerCls = isModal
+    ? 'w-full max-w-md bg-surface border border-border rounded-2xl p-4 shadow-xl'
+    : 'w-full bg-surface border-t border-border rounded-t-xl p-4 pb-8'
+  const innerStyle: React.CSSProperties | undefined = isModal
+    ? undefined
+    : { paddingBottom: 'calc(env(safe-area-inset-bottom, 0px) + 1.5rem)' }
+
   return (
-    <div
-      role="dialog"
-      aria-modal="true"
-      className="fixed inset-0 z-50 flex flex-col justify-end bg-black/60"
-      onClick={onClose}
-    >
-      <div
-        className="w-full bg-surface border-t border-border rounded-t-xl p-4 pb-8"
-        onClick={(e) => e.stopPropagation()}
-        style={{ paddingBottom: 'calc(env(safe-area-inset-bottom, 0px) + 1.5rem)' }}
-      >
-        <div className="mx-auto mb-3 h-1 w-10 rounded-full bg-border" />
+    <div role="dialog" aria-modal="true" className={outerCls} onClick={onClose}>
+      <div className={innerCls} onClick={(e) => e.stopPropagation()} style={innerStyle}>
+        {!isModal && <div className="mx-auto mb-3 h-1 w-10 rounded-full bg-border" />}
 
         <div className="text-sm font-semibold text-text-primary mb-3">Attach file</div>
 
-        {state.kind === 'idle' && (
+        {state === 'idle' && (
           <div className="flex flex-col gap-1">
             <SheetOption
               icon={<PhotoIcon />}
@@ -144,26 +102,26 @@ export default function FileAttachSheet({ wsId, dir = '', onPathInsert, onClose 
           </div>
         )}
 
-        {state.kind === 'uploading' && (
+        {state === 'uploading' && (
           <div className="flex flex-col gap-2 py-3">
-            <div className="text-xs text-text-muted">Uploading… {state.pct}%</div>
+            <div className="text-xs text-text-muted">Uploading… {progress}%</div>
             <div className="h-1.5 w-full rounded-full bg-surface-alt overflow-hidden">
               <div
                 className="h-full bg-accent transition-all"
-                style={{ width: `${state.pct}%` }}
+                style={{ width: `${progress}%` }}
               />
             </div>
           </div>
         )}
 
-        {state.kind === 'error' && (
+        {state === 'error' && (
           <div className="flex flex-col gap-2 py-3">
             <div className="text-xs text-danger bg-danger/10 border border-danger/30 rounded px-2 py-1">
-              {state.msg}
+              {error?.msg ?? 'Upload failed'}
             </div>
             <div className="flex gap-2">
               <button
-                onClick={() => setState({ kind: 'idle' })}
+                onClick={reset}
                 className="btn-secondary flex-1 text-sm py-2"
               >
                 Retry

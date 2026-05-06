@@ -151,3 +151,10 @@ export const EyeOffIcon = ({ size = 16, ...rest }: IconProps) => (
     <line x1="1" y1="1" x2="23" y2="23" />
   </svg>
 )
+
+export const XIcon = ({ size = 16, ...rest }: IconProps) => (
+  <svg {...base(size)} {...rest}>
+    <line x1="6" y1="6" x2="18" y2="18" />
+    <line x1="18" y1="6" x2="6" y2="18" />
+  </svg>
+)

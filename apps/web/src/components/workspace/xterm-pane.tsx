@@ -7,9 +7,14 @@ import { terminalThemes } from '../../lib/terminal-themes'
 import type { TerminalPrefs } from '../../lib/terminal-prefs'
 import { useTerminalWs, destroyHandle, type SessionHandle } from '../../lib/terminal-ws-hook'
 import { useVisualViewport } from '../../hooks/use-visual-viewport'
+import type { PaneIndex } from '../../state/terminal-store'
+import { UploadChip } from '../upload-chip'
+import { UploadPreviewChip } from '../upload-preview-chip'
+import type { PaneUpload, PanePreview } from './multi-pane-grid'
 
 type Props = {
   sessionId: string
+  paneIdx: PaneIndex
   prefs: TerminalPrefs
   isFocused: boolean
   onFocus: () => void
@@ -27,6 +32,17 @@ type Props = {
   registerGetSelection?: (sessionId: string, fn: (() => string) | null) => void
   /** Bumped by the workspace's manual-reconnect button; forwarded to the hook. */
   reconnectNonce: number
+  /** Called when the user drops files onto this pane. Page handles upload +
+   *  inserts the path into the focused pane via sendInput. Optional so legacy
+   *  hosts that don't wire it stay intact. */
+  onAttachFiles?: (files: File[], paneIdx?: PaneIndex) => void
+  /** Active uploads + recent previews scoped to this pane. */
+  uploads?: PaneUpload[]
+  previews?: PanePreview[]
+  onCancelUpload?: (id: string) => void
+  onDismissUpload?: (id: string) => void
+  onRetryUpload?: (id: string) => void
+  onDismissPreview?: (id: string) => void
 }
 
 function debounce<F extends (...args: unknown[]) => void>(fn: F, ms: number) {
@@ -38,10 +54,17 @@ function debounce<F extends (...args: unknown[]) => void>(fn: F, ms: number) {
 }
 
 export default function XtermPane({
-  sessionId, prefs, isFocused, onFocus,
+  sessionId, paneIdx, prefs, isFocused, onFocus,
   onConnectedChange, onReconnectAttempt, onReconnectExhausted, onError,
   registerSend, registerGetSelection, reconnectNonce,
+  onAttachFiles,
+  uploads, previews,
+  onCancelUpload, onDismissUpload, onRetryUpload, onDismissPreview,
 }: Props) {
+  // Drop-target highlight while the user drags files over this pane.
+  const [dropActive, setDropActive] = useState(false)
+  // Counter so nested children's dragenter/dragleave don't flicker the overlay.
+  const dragDepthRef = useRef(0)
   const containerRef = useRef<HTMLDivElement | null>(null)
   // Each pane owns its own handles map keyed by its single sessionId. Keeps
   // the existing useTerminalWs hook (designed for a single activeId) reusable
@@ -196,13 +219,128 @@ export default function XtermPane({
   }, [sessionId])
   useVisualViewport(refitOnViewport)
 
+  // Drag-drop wiring. Only kicks in when the parent passed `onAttachFiles`
+  // (workspace-page does; legacy hosts may not). `dataTransfer.types`
+  // includes 'Files' when the user is dragging from the OS file manager;
+  // ignore in-page text drags (xterm's own text-drop behaviour stays).
+  const hasFilesPayload = useCallback((dt: DataTransfer | null): boolean => {
+    if (!dt) return false
+    return Array.from(dt.types ?? []).includes('Files')
+  }, [])
+
+  // Window-level safety net: Escape mid-drag, drag exit to a non-pane region,
+  // or a Firefox quirk where dragleave's dataTransfer.types is empty can all
+  // strand the depth counter > 0 and leave the overlay visible. `dragend` on
+  // the window force-resets so the next drag starts clean (review H2).
+  useEffect(() => {
+    if (!onAttachFiles) return
+    const reset = () => {
+      dragDepthRef.current = 0
+      setDropActive(false)
+    }
+    window.addEventListener('dragend', reset)
+    return () => window.removeEventListener('dragend', reset)
+  }, [onAttachFiles])
+
+  const onDragEnter = useCallback(
+    (e: React.DragEvent) => {
+      if (!onAttachFiles || !hasFilesPayload(e.dataTransfer)) return
+      e.preventDefault()
+      dragDepthRef.current += 1
+      setDropActive(true)
+    },
+    [onAttachFiles, hasFilesPayload],
+  )
+  const onDragOver = useCallback(
+    (e: React.DragEvent) => {
+      if (!onAttachFiles || !hasFilesPayload(e.dataTransfer)) return
+      e.preventDefault()
+      e.dataTransfer.dropEffect = 'copy'
+    },
+    [onAttachFiles, hasFilesPayload],
+  )
+  const onDragLeave = useCallback(
+    (e: React.DragEvent) => {
+      if (!onAttachFiles || !hasFilesPayload(e.dataTransfer)) return
+      e.preventDefault()
+      dragDepthRef.current = Math.max(0, dragDepthRef.current - 1)
+      if (dragDepthRef.current === 0) setDropActive(false)
+    },
+    [onAttachFiles, hasFilesPayload],
+  )
+  const onDrop = useCallback(
+    (e: React.DragEvent) => {
+      if (!onAttachFiles || !hasFilesPayload(e.dataTransfer)) return
+      e.preventDefault()
+      e.stopPropagation()
+      dragDepthRef.current = 0
+      setDropActive(false)
+      const files = Array.from(e.dataTransfer.files)
+      if (files.length > 0) onAttachFiles(files, paneIdx)
+    },
+    [onAttachFiles, hasFilesPayload, paneIdx],
+  )
+
   return (
     <div
-      ref={containerRef}
-      onClick={onFocus}
-      className={`flex-1 min-w-0 min-h-0 overflow-hidden ${
+      className={`relative flex-1 min-w-0 min-h-0 overflow-hidden ${
         isFocused ? 'ring-1 ring-inset ring-accent/40' : ''
       }`}
-    />
+      onDragEnter={onDragEnter}
+      onDragOver={onDragOver}
+      onDragLeave={onDragLeave}
+      onDrop={onDrop}
+    >
+      <div
+        ref={containerRef}
+        onClick={onFocus}
+        className="absolute inset-0"
+      />
+      {dropActive && (
+        <div
+          className="absolute inset-0 z-10 flex items-center justify-center bg-accent/15 border-2 border-dashed border-accent/60 pointer-events-none"
+          aria-hidden
+        >
+          <div className="px-3 py-1.5 rounded-md bg-surface border border-accent/40 text-accent text-sm font-medium shadow">
+            Drop to attach
+          </div>
+        </div>
+      )}
+      {uploads && uploads.length > 0 && (
+        <div className="pointer-events-none absolute right-2 top-2 z-20 flex flex-col gap-1.5">
+          {uploads.slice(0, 3).map((u) => (
+            <UploadChip
+              key={u.id}
+              fileName={u.fileName}
+              pct={u.pct}
+              state={u.state}
+              error={u.error}
+              onCancel={onCancelUpload ? () => onCancelUpload(u.id) : undefined}
+              onDismiss={onDismissUpload ? () => onDismissUpload(u.id) : undefined}
+              onRetry={onRetryUpload ? () => onRetryUpload(u.id) : undefined}
+            />
+          ))}
+          {uploads.length > 3 && (
+            <div className="pointer-events-auto self-end rounded-full border border-border bg-surface px-2 py-0.5 text-[10px] text-text-muted">
+              +{uploads.length - 3} more
+            </div>
+          )}
+        </div>
+      )}
+      {previews && previews.length > 0 && (
+        <div className="pointer-events-none absolute left-2 top-2 z-20 flex flex-col gap-1.5">
+          {previews.slice(0, 3).map((p) => (
+            <UploadPreviewChip
+              key={p.id}
+              fileName={p.fileName}
+              file={p.file}
+              onDismiss={
+                onDismissPreview ? () => onDismissPreview(p.id) : () => undefined
+              }
+            />
+          ))}
+        </div>
+      )}
+    </div>
   )
 }

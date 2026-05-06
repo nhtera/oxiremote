@@ -23,6 +23,32 @@ import KeyboardShortcutOverlay from '../components/workspace/keyboard-shortcut-o
 import SessionStatusBar from '../components/workspace/session-status-bar'
 import { useSessionConnectionState } from '../hooks/use-session-connection-state'
 import { useConfirm } from '../components/ui'
+import { useWorkspaceStore } from '../state/workspace-store'
+import { useHostStore } from '../state/host-store'
+import { uploadFile, type UploadError } from '../hooks/use-file-upload'
+import { shellQuote } from '../lib/shell-quote'
+import FileAttachSheet from '../components/file-attach-sheet'
+import { ATTACHMENTS_DIR, ensureAttachmentsDir } from '../lib/ensure-attachments-dir'
+
+type UploadEntry = {
+  id: string
+  fileName: string
+  file: File
+  paneIdx: PaneIndex
+  pct: number
+  state: 'uploading' | 'error'
+  error?: UploadError | null
+  abort: AbortController
+}
+
+type PreviewEntry = {
+  id: string
+  fileName: string
+  file: File
+  paneIdx: PaneIndex
+}
+
+const PREVIEW_AUTO_DISMISS_MS = 8000
 
 type CreateSessionReq = { cols: number; rows: number; name?: string }
 type CreateSessionRes = { id: string }
@@ -45,6 +71,8 @@ export default function WorkspacePage() {
   const [shortcutOverlayOpen, setShortcutOverlayOpen] = useState(false)
   // Brief toast for clipboard-deny feedback from the mobile Paste button.
   const [keybarToast, setKeybarToast] = useState<string | null>(null)
+  // Desktop attach modal (mobile uses the composer's bottom-sheet variant).
+  const [attachModalOpen, setAttachModalOpen] = useState(false)
   const {
     connectedById,
     reconnectAttemptById,
@@ -56,6 +84,12 @@ export default function WorkspacePage() {
     clearSession,
     resetReconnect,
   } = useSessionConnectionState()
+
+  // Active workspace id is needed for paste/drop uploads. Mirrors the lookup
+  // in TerminalSendComposer so paste/drop and the picker share one source.
+  const currentHostId = useHostStore((s) => s.currentHostId)
+  const activeWsMap = useWorkspaceStore((s) => s.active)
+  const activeWsId = currentHostId ? activeWsMap[currentHostId]?.id : undefined
 
   // Map<sessionId, sendFn> registered by each XtermPane while it's mounted.
   // The bottom composer dispatches to the focused pane via this map.
@@ -261,6 +295,187 @@ export default function WorkspacePage() {
     return selectionFnsRef.current.get(focusedSessionId)?.() ?? ''
   }, [focusedSessionId])
 
+  // Per-pane upload + preview chip stacks. Paste/drop/desktop-attach push a
+  // chip onto the focused (or drop-target) pane while the XHR streams; on
+  // success the chip is replaced with a preview chip that auto-expires.
+  const [uploads, setUploads] = useState<UploadEntry[]>([])
+  const [previews, setPreviews] = useState<PreviewEntry[]>([])
+  // Mirror of `uploads` for retryUpload — keeps the callback identity stable
+  // across XHR progress events. Without this, deps include `uploads` and
+  // every progress tick rebuilds the callback → re-renders all chips.
+  const uploadsRef = useRef<UploadEntry[]>([])
+  useEffect(() => { uploadsRef.current = uploads }, [uploads])
+  // Track preview auto-dismiss timers so unmount can clear them and avoid
+  // setState-on-unmounted warnings.
+  const previewTimersRef = useRef<Set<number>>(new Set())
+  useEffect(() => () => {
+    previewTimersRef.current.forEach((t) => window.clearTimeout(t))
+    previewTimersRef.current.clear()
+  }, [])
+  // Dedupe by (name, size, lastModified) — Safari sometimes fires `paste`
+  // twice for one Cmd+V; retrying a second upload would create
+  // `name (1).png` on the workspace.
+  const inFlightAttachRef = useRef<Set<string>>(new Set())
+  // Mirror of focusedSessionId for the multi-file loop. Without this, a slow
+  // upload that resolves AFTER the user switches panes would write the path
+  // into the stale pane (review H1). The ref reads live every iteration.
+  const focusedSessionRef = useRef<string | null>(focusedSessionId)
+  useEffect(() => { focusedSessionRef.current = focusedSessionId }, [focusedSessionId])
+
+  function dismissPreview(id: string) {
+    setPreviews((list) => list.filter((p) => p.id !== id))
+  }
+
+  function dismissUpload(id: string) {
+    setUploads((list) => list.filter((u) => u.id !== id))
+  }
+
+  function cancelUpload(id: string) {
+    setUploads((list) => {
+      const target = list.find((u) => u.id === id)
+      target?.abort.abort()
+      return list.filter((u) => u.id !== id)
+    })
+  }
+
+  // Run a single upload, push chips, and on success drain → preview.
+  // Extracted so the chip's Retry button can re-fire without re-traversing
+  // attachFiles' dedup gate.
+  const runOneUpload = useCallback(
+    async (entry: { id: string; file: File; paneIdx: PaneIndex; abort: AbortController }) => {
+      if (activeWsId == null) return
+      // Best-effort mkdir; ignore failure → upload falls back to ws root.
+      const ok = await ensureAttachmentsDir(activeWsId)
+      const dir = ok ? ATTACHMENTS_DIR : ''
+      try {
+        const res = await uploadFile({
+          wsId: activeWsId,
+          dir,
+          file: entry.file,
+          signal: entry.abort.signal,
+          onProgress: (pct) =>
+            setUploads((list) =>
+              list.map((u) => (u.id === entry.id ? { ...u, pct } : u)),
+            ),
+        })
+        // Race guard: cancel ✕ may have fired AFTER xhr.onload completed
+        // synchronously. Skip side-effects (path insert, preview chip) when
+        // the user has already cancelled — they expect a clean abort.
+        if (entry.abort.signal.aborted) {
+          setUploads((list) => list.filter((u) => u.id !== entry.id))
+          return
+        }
+        const quoted = shellQuote(res.path) + ' '
+        const target = focusedSessionRef.current
+        if (target) sendFnsRef.current.get(target)?.(quoted)
+        // Drop the upload chip, push a preview chip + auto-expire timer.
+        setUploads((list) => list.filter((u) => u.id !== entry.id))
+        const previewId = entry.id
+        setPreviews((list) => [
+          ...list,
+          { id: previewId, fileName: entry.file.name, file: entry.file, paneIdx: entry.paneIdx },
+        ])
+        const timerId = window.setTimeout(() => {
+          previewTimersRef.current.delete(timerId)
+          dismissPreview(previewId)
+        }, PREVIEW_AUTO_DISMISS_MS)
+        previewTimersRef.current.add(timerId)
+      } catch (e) {
+        const err = e as Partial<UploadError>
+        if (err?.kind === 'cancelled') {
+          setUploads((list) => list.filter((u) => u.id !== entry.id))
+          return
+        }
+        setUploads((list) =>
+          list.map((u) =>
+            u.id === entry.id ? { ...u, state: 'error', error: err as UploadError } : u,
+          ),
+        )
+      }
+    },
+    [activeWsId],
+  )
+
+  const retryUpload = useCallback(
+    (id: string) => {
+      // Gate: only retry from the error state. Stops a double-click from
+      // launching a second in-flight XHR that would push duplicate previews.
+      const target = uploadsRef.current.find((u) => u.id === id)
+      if (!target || target.state !== 'error') return
+      const abort = new AbortController()
+      setUploads((list) =>
+        list.map((u) =>
+          u.id === id ? { ...u, state: 'uploading', pct: 0, error: null, abort } : u,
+        ),
+      )
+      void runOneUpload({ id, file: target.file, paneIdx: target.paneIdx, abort })
+    },
+    [runOneUpload],
+  )
+
+  const attachFiles = useCallback(
+    async (files: File[], paneIdx?: PaneIndex) => {
+      if (files.length === 0) return
+      if (activeWsId == null) {
+        setKeybarToast('Pick a workspace before attaching files')
+        return
+      }
+      const targetPane: PaneIndex = paneIdx ?? focusedPane
+      for (const file of files) {
+        const key = `${file.name}|${file.size}|${file.lastModified}`
+        if (inFlightAttachRef.current.has(key)) continue
+        inFlightAttachRef.current.add(key)
+        const id =
+          (typeof crypto !== 'undefined' && 'randomUUID' in crypto)
+            ? crypto.randomUUID()
+            : `up_${Date.now()}_${Math.random().toString(36).slice(2)}`
+        const abort = new AbortController()
+        setUploads((list) => [
+          ...list,
+          { id, fileName: file.name, file, paneIdx: targetPane, pct: 0, state: 'uploading', abort },
+        ])
+        try {
+          await runOneUpload({ id, file, paneIdx: targetPane, abort })
+        } finally {
+          inFlightAttachRef.current.delete(key)
+        }
+      }
+    },
+    [activeWsId, focusedPane, runOneUpload],
+  )
+
+  // Document-level paste listener: hijacks paste only when the clipboard
+  // carries a file payload, the workspace has an active sessions, and the
+  // current focus is not inside an editable surface (rename input, settings
+  // popover, modal). Text-only pastes pass through to xterm/inputs untouched.
+  useEffect(() => {
+    function isInEditable(target: EventTarget | null): boolean {
+      const el = target as HTMLElement | null
+      if (!el) return false
+      const tag = el.tagName
+      if (tag === 'INPUT' || tag === 'TEXTAREA') return true
+      if ((el as HTMLElement).isContentEditable) return true
+      return false
+    }
+    function onPaste(e: ClipboardEvent) {
+      if (!e.clipboardData) return
+      const items = Array.from(e.clipboardData.items ?? [])
+      const fileItems = items.filter((it) => it.kind === 'file')
+      if (fileItems.length === 0) return
+      // If the user is pasting INTO an input, let it through (image-paste into
+      // a text input is unusual, but safer to default to non-hijack).
+      if (isInEditable(e.target)) return
+      const files = fileItems
+        .map((it) => it.getAsFile())
+        .filter((f): f is File => f != null)
+      if (files.length === 0) return
+      e.preventDefault()
+      void attachFiles(files)
+    }
+    document.addEventListener('paste', onPaste)
+    return () => document.removeEventListener('paste', onPaste)
+  }, [attachFiles])
+
   const focusedAttempt = focusedSessionId ? (reconnectAttemptById[focusedSessionId] ?? 0) : 0
   const focusedExhausted = focusedSessionId ? !!reconnectExhaustedById[focusedSessionId] : false
 
@@ -283,6 +498,11 @@ export default function WorkspacePage() {
           onOpenSettings={() => setShowSettings((v) => !v)}
           hostId={hostId}
           onNotifyToggle={(sessionId, enabled) => setNotifyOnAgentEnd(sessionId, enabled)}
+          onOpenAttach={() => {
+            if (activeWsId != null) void ensureAttachmentsDir(activeWsId)
+            setAttachModalOpen(true)
+          }}
+          attachAvailable={activeWsId != null}
         />
         {showSettings && (
           <TerminalSettingsPopover
@@ -326,6 +546,13 @@ export default function WorkspacePage() {
           onError={setErr}
           registerSend={registerSend}
           registerGetSelection={registerGetSelection}
+          onAttachFiles={attachFiles}
+          uploads={uploads}
+          previews={previews}
+          onCancelUpload={cancelUpload}
+          onDismissUpload={dismissUpload}
+          onRetryUpload={retryUpload}
+          onDismissPreview={dismissPreview}
         />
       ) : (
         <div className="relative flex-1 min-h-0 bg-atmosphere flex flex-col items-center justify-center gap-6 px-4 overflow-hidden">
@@ -379,6 +606,7 @@ export default function WorkspacePage() {
             onSend={sendInput}
             onToast={(msg) => setKeybarToast(msg)}
             getSelection={getFocusedSelection}
+            onPasteFiles={attachFiles}
           />
         </div>
       )}
@@ -413,6 +641,21 @@ export default function WorkspacePage() {
         open={shortcutOverlayOpen}
         onClose={() => setShortcutOverlayOpen(false)}
       />
+
+      {attachModalOpen && activeWsId != null && (
+        <FileAttachSheet
+          variant="modal"
+          wsId={activeWsId}
+          dir={ATTACHMENTS_DIR}
+          onPathInsert={(path) => {
+            const quoted = shellQuote(path) + ' '
+            if (focusedSessionId) {
+              sendFnsRef.current.get(focusedSessionId)?.(quoted)
+            }
+          }}
+          onClose={() => setAttachModalOpen(false)}
+        />
+      )}
 
     </div>
   )

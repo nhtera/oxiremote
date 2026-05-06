@@ -4,15 +4,7 @@ import { useHostStore } from '../state/host-store'
 import { useWorkspaceStore } from '../state/workspace-store'
 import FileAttachSheet from './file-attach-sheet'
 import { PaperclipIcon } from './icons'
-
-// POSIX-style shell quoting. If the path has nothing dangerous, returns it
-// bare; otherwise wraps in single quotes and escapes embedded single quotes
-// via the standard `'\''` terminate-escape-restart trick. Backslashes (Windows
-// paths) are preserved verbatim by single-quote rules.
-function shellQuote(path: string): string {
-  if (!/[\s'"\\$`(){}[\]<>|&;*?#~!]/.test(path)) return path
-  return `'${path.replace(/'/g, `'\\''`)}'`
-}
+import { shellQuote } from '../lib/shell-quote'
 
 type Props = {
   onSend: (bytes: string) => void
@@ -65,13 +57,19 @@ export default function TerminalSendComposer({ onSend }: Props) {
       setText((t) => (t ? `${t} ${quoted}` : quoted))
       return
     }
+    const wasEmpty = text.length === 0
     const start = el.selectionStart ?? text.length
     const end = el.selectionEnd ?? text.length
-    const next = text.slice(0, start) + quoted + text.slice(end)
+    // When the composer was empty, prefix a space so the typed command verb
+    // doesn't smash into the path (`catimage.jpg`). Caret then parks at 0 so
+    // the user types the verb before the path — without this, an empty
+    // composer + attach + Send sends the bare path, which the shell tries
+    // to execute as a command (`zsh: command not found: image.jpg`).
+    const insertion = wasEmpty ? ` ${quoted}` : quoted
+    const next = text.slice(0, start) + insertion + text.slice(end)
     setText(next)
-    // restore caret after the inserted text
     requestAnimationFrame(() => {
-      const pos = start + quoted.length
+      const pos = wasEmpty ? 0 : start + insertion.length
       el.focus()
       el.setSelectionRange(pos, pos)
     })
