@@ -5,6 +5,7 @@ import { useWorkspaceStore } from '../state/workspace-store'
 import FileAttachSheet from './file-attach-sheet'
 import { PaperclipIcon } from './icons'
 import { shellQuote } from '../lib/shell-quote'
+import { ATTACHMENTS_DIR } from '../lib/ensure-attachments-dir'
 
 type Props = {
   onSend: (bytes: string) => void
@@ -29,6 +30,7 @@ export default function TerminalSendComposer({ onSend }: Props) {
   const isMobile = useIsMobile()
   const [text, setText] = useState('')
   const [showAttach, setShowAttach] = useState(false)
+  const [needsVerbFlash, setNeedsVerbFlash] = useState(false)
   const inputRef = useRef<HTMLInputElement>(null)
   const navigate = useNavigate()
 
@@ -41,6 +43,19 @@ export default function TerminalSendComposer({ onSend }: Props) {
 
   function send() {
     if (!text) return
+    // Whitespace-prefix means insertPath put a path into an empty composer
+    // and the user hit Send without typing a command verb. Sending the bare
+    // path executes it as a command (`zsh: command not found: image.jpg`).
+    // Refuse, park the caret at position 0, and flash a hint so the user
+    // types a verb before the path.
+    if (/^\s/.test(text)) {
+      const el = inputRef.current
+      el?.focus()
+      el?.setSelectionRange(0, 0)
+      setNeedsVerbFlash(true)
+      window.setTimeout(() => setNeedsVerbFlash(false), 1400)
+      return
+    }
     onSend(text + '\r')
     setText('')
     inputRef.current?.focus()
@@ -112,12 +127,24 @@ export default function TerminalSendComposer({ onSend }: Props) {
             onChange={(e) => setText(e.target.value)}
             onKeyDown={handleKeyDown}
             placeholder="Type command and send…"
-            className="w-full h-10 bg-surface border border-border rounded-lg pl-3 pr-3 text-[15px] text-text-primary placeholder:text-text-muted outline-none focus:border-accent/60 focus:bg-surface/80 transition-colors"
+            className={`w-full h-10 bg-surface border rounded-lg pl-3 pr-3 text-[15px] text-text-primary placeholder:text-text-muted outline-none focus:bg-surface/80 transition-colors ${
+              needsVerbFlash
+                ? 'border-warning ring-1 ring-warning/40'
+                : 'border-border focus:border-accent/60'
+            }`}
             style={{ fontFamily: 'var(--font-mono)' }}
             autoCapitalize="none"
             autoCorrect="off"
             spellCheck={false}
           />
+          {needsVerbFlash && (
+            <div
+              role="status"
+              className="absolute -top-7 left-0 right-0 text-[11px] text-warning bg-surface border border-warning/30 rounded px-2 py-1 shadow-sm pointer-events-none"
+            >
+              Type a command before the path (e.g. <span className="font-mono">cat</span>)
+            </div>
+          )}
         </div>
         <button
           onClick={send}
@@ -139,6 +166,7 @@ export default function TerminalSendComposer({ onSend }: Props) {
       {showAttach && wsId != null && (
         <FileAttachSheet
           wsId={wsId}
+          dir={ATTACHMENTS_DIR}
           onPathInsert={insertPath}
           onClose={() => setShowAttach(false)}
         />

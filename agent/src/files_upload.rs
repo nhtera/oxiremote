@@ -96,6 +96,23 @@ pub async fn api_files_upload(
                         Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "workspace invalid").into_response(),
                     }
                 } else {
+                    // Auto-mkdir for chat-style attach flows. The SPA used to
+                    // POST /api/files/create first, then upload — but the
+                    // pre-flight silently failed cross-origin (CORS, transient
+                    // 5xx, race) and the upload fell back to workspace root,
+                    // scattering screenshots there. Reject ".." traversal up
+                    // front, then create_dir_all and re-resolve so canonical
+                    // form is checked against workspace root.
+                    if let Err(msg) = validate_rel_path(&dir_rel) {
+                        return (StatusCode::BAD_REQUEST, msg).into_response();
+                    }
+                    let candidate = root.join(&dir_rel);
+                    if !candidate.exists()
+                        && let Err(e) = fs::create_dir_all(&candidate).await
+                    {
+                        warn!(error = %e, "auto-mkdir upload dir failed");
+                        return (StatusCode::INTERNAL_SERVER_ERROR, "mkdir failed").into_response();
+                    }
                     match resolve_existing(root, &dir_rel) {
                         Ok(p) if p.is_dir() => p,
                         Ok(_) => return (StatusCode::BAD_REQUEST, "dir is not a directory").into_response(),
