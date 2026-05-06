@@ -446,12 +446,24 @@ export default function WorkspacePage() {
 
   // Document-level paste listener: hijacks paste only when the clipboard
   // carries a file payload, the workspace has an active sessions, and the
-  // current focus is not inside an editable surface (rename input, settings
-  // popover, modal). Text-only pastes pass through to xterm/inputs untouched.
+  // current focus is not inside a real editable surface (rename input,
+  // settings popover, modal). Text-only pastes pass through to xterm/inputs
+  // untouched.
+  //
+  // Capture phase + stopImmediatePropagation: xterm.js installs its own paste
+  // handler on its hidden helper textarea. Without capture-phase interception
+  // both handlers would fire on the same event — xterm sends the clipboard's
+  // text/plain payload to the PTY and we also upload + insert the path,
+  // producing two `[Image #1]` attachments inside Claude-Code-style TUIs.
   useEffect(() => {
-    function isInEditable(target: EventTarget | null): boolean {
+    function isInRealEditable(target: EventTarget | null): boolean {
       const el = target as HTMLElement | null
       if (!el) return false
+      // xterm.js's helper textarea is a transparent off-screen capture target,
+      // not a real editable surface from the user's POV. Treat a paste landing
+      // there as a paste into the pane.
+      if (el.classList.contains('xterm-helper-textarea')) return false
+      if (el.closest('.xterm')) return false
       const tag = el.tagName
       if (tag === 'INPUT' || tag === 'TEXTAREA') return true
       if ((el as HTMLElement).isContentEditable) return true
@@ -462,18 +474,17 @@ export default function WorkspacePage() {
       const items = Array.from(e.clipboardData.items ?? [])
       const fileItems = items.filter((it) => it.kind === 'file')
       if (fileItems.length === 0) return
-      // If the user is pasting INTO an input, let it through (image-paste into
-      // a text input is unusual, but safer to default to non-hijack).
-      if (isInEditable(e.target)) return
+      if (isInRealEditable(e.target)) return
       const files = fileItems
         .map((it) => it.getAsFile())
         .filter((f): f is File => f != null)
       if (files.length === 0) return
       e.preventDefault()
+      e.stopImmediatePropagation()
       void attachFiles(files)
     }
-    document.addEventListener('paste', onPaste)
-    return () => document.removeEventListener('paste', onPaste)
+    document.addEventListener('paste', onPaste, { capture: true })
+    return () => document.removeEventListener('paste', onPaste, { capture: true })
   }, [attachFiles])
 
   const focusedAttempt = focusedSessionId ? (reconnectAttemptById[focusedSessionId] ?? 0) : 0
