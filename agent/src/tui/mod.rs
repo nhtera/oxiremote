@@ -72,6 +72,12 @@ fn spawn_detached_tray() {
     };
     let mut cmd = std::process::Command::new(&exe);
     cmd.arg("--tray")
+        // Ask the child to open the browser AFTER its own /api/health
+        // responds. Opening from the parent races the parent's exit and
+        // Safari ends up at "Can't Connect to the Server" because the
+        // parent's listener has already dropped while the child is still
+        // booting.
+        .env(crate::ENV_OPEN_BROWSER_ON_READY, "1")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
@@ -95,7 +101,7 @@ fn spawn_detached_tray() {
                 "OxiRemote running. Right-click the menu-bar icon to quit. (PID: {})",
                 child.id()
             );
-            println!("  Dashboard: http://localhost:8787/agent");
+            println!("  Dashboard will open at http://localhost:8787/agent once the agent is ready.");
         }
         Err(err) => {
             eprintln!("(failed to spawn detached tray: {err})");
@@ -188,20 +194,18 @@ pub fn run_tui(
                 // `--tray` child and let this process exit. The child owns the
                 // tunnel + tray going forward; the launching shell returns
                 // to its prompt.
+                //
+                // The child opens the browser itself — see `spawn_detached_tray`,
+                // which sets `OXI_OPEN_BROWSER_ON_READY=1`. Doing the open from
+                // the parent races the parent's exit: the parent's TCP probe
+                // succeeds against the parent's *own* listener, the parent
+                // opens Safari, the parent exits and releases :8787, and
+                // Safari hits the dead window before the child finishes
+                // booting. The child polls its own /api/health and opens the
+                // browser only once the response succeeds.
                 drop(term);
                 drop(_guard);
                 spawn_detached_tray();
-                // Wait for the detached child to bind :8787 before launching
-                // the browser. Without this, Safari/Chrome race the child's
-                // startup and load "can't connect to server", forcing a
-                // manual reload.
-                if !crate::wait_for_agent_ready(std::time::Duration::from_secs(15)) {
-                    eprintln!(
-                        "(agent did not bind :{} within 15s; opening browser anyway — reload after the menu-bar icon appears)",
-                        crate::AGENT_PORT
-                    );
-                }
-                let _ = open::that("http://localhost:8787/agent");
                 std::process::exit(0);
             }
             MenuChoice::TerminalUi => {

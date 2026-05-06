@@ -253,82 +253,124 @@ fn main() -> anyhow::Result<()> {
     }
 }
 
-/// Poll loopback `AGENT_PORT` until the listener accepts a TCP connection or
-/// `timeout` elapses. axum's listener binds before any request handler can be
-/// reached, so a successful connect means the SPA at `/agent` will resolve.
-/// Used to gate browser-open after spawning a detached `--tray` child so
-/// `open::that()` doesn't race the child's startup.
+/// Poll loopback `AGENT_PORT` with `GET /api/health` until the handler
+/// responds 200, or `timeout` elapses. Returns true on first 200, false if
+/// the deadline lapses with no successful probe.
+///
+/// Why HTTP, not raw TCP: `axum::serve` binds the TCP socket *before*
+/// `Router::merge` finishes wiring routes, and the Drop on the parent's
+/// listener can finish *after* the child has spawned. A pure TCP probe
+/// returns true while either of those windows is open, so the caller opens
+/// the browser into a "Can't connect" / "Service Unavailable" gap. Hitting
+/// `/api/health` confirms (a) the listener is bound, (b) the router knows
+/// about the route, and (c) the handler returns. False positives are
+/// impossible — only the agent serves "ok" at that path.
 pub fn wait_for_agent_ready(timeout: std::time::Duration) -> bool {
-    use std::net::{SocketAddr, TcpStream};
     use std::time::{Duration, Instant};
 
-    let addr = SocketAddr::from(([127, 0, 0, 1], AGENT_PORT));
+    let url = format!("http://127.0.0.1:{AGENT_PORT}/api/health");
+    let client = match reqwest::blocking::Client::builder()
+        .timeout(Duration::from_millis(500))
+        .build()
+    {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
-        if TcpStream::connect_timeout(&addr, Duration::from_millis(500)).is_ok() {
+        if let Ok(resp) = client.get(&url).send()
+            && resp.status().is_success()
+        {
             return true;
         }
         std::thread::sleep(Duration::from_millis(150));
     }
-    TcpStream::connect_timeout(&addr, Duration::from_millis(500)).is_ok()
+    false
 }
 
-/// `oxiremote ui` — spawn the agent detached, wait for /api/health, open
-/// browser to `/agent`. If a server is already running on the port, just
-/// open the browser.
+/// Env var consumed by `run_with_tray` (and any other server-mode entry):
+/// when set, spawn a side thread that polls `/api/health` and opens the
+/// system browser on the agent dashboard once the handler responds. Lets
+/// the launcher (TUI menu, `oxiremote ui`) hand off the browser-open to
+/// the long-lived child instead of racing the parent's exit.
+pub const ENV_OPEN_BROWSER_ON_READY: &str = "OXI_OPEN_BROWSER_ON_READY";
+
+/// Spawn a background thread that waits for `/api/health` to respond and
+/// then opens the browser on the agent dashboard. Idempotent; safe to call
+/// even when `OXI_OPEN_BROWSER_ON_READY` is unset (returns immediately).
+fn maybe_open_browser_when_ready() {
+    if std::env::var(ENV_OPEN_BROWSER_ON_READY).is_err() {
+        return;
+    }
+    std::thread::Builder::new()
+        .name("oxiremote-browser-launcher".into())
+        .spawn(|| {
+            // 30s deadline accommodates first-run cloudflared download.
+            if wait_for_agent_ready(std::time::Duration::from_secs(30)) {
+                let _ = open::that(format!("http://127.0.0.1:{AGENT_PORT}/agent"));
+            }
+        })
+        .ok();
+}
+
+/// `oxiremote ui` — spawn the agent detached and let the child open the
+/// browser on `/agent` once its own `/api/health` responds. If a server is
+/// already running on the port, open the browser from this process directly
+/// (no race — the existing server is already serving).
 fn run_ui_command() -> anyhow::Result<()> {
-    use std::net::{SocketAddr, TcpStream};
     use std::process::Stdio;
     use std::time::Duration;
 
-    let addr = SocketAddr::from(([127, 0, 0, 1], AGENT_PORT));
-    let already_running =
-        TcpStream::connect_timeout(&addr, Duration::from_millis(500)).is_ok();
+    // Probe via /api/health (not raw TCP) so a half-bound listener from a
+    // tearing-down sibling process doesn't trip a false positive.
+    let already_running = wait_for_agent_ready(Duration::from_millis(750));
 
-    if !already_running {
-        let exe = std::env::current_exe().context("current_exe")?;
-        let mut cmd = std::process::Command::new(&exe);
-        cmd.arg("--tray")
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
-
-        #[cfg(unix)]
-        {
-            // setsid() detaches from the controlling TTY so the child survives
-            // the parent shell exiting and doesn't share signals.
-            use std::os::unix::process::CommandExt;
-            unsafe {
-                cmd.pre_exec(|| {
-                    if libc::setsid() == -1 {
-                        return Err(std::io::Error::last_os_error());
-                    }
-                    Ok(())
-                });
-            }
-        }
-        #[cfg(windows)]
-        {
-            use std::os::windows::process::CommandExt;
-            const DETACHED_PROCESS: u32 = 0x00000008;
-            const CREATE_NO_WINDOW: u32 = 0x08000000;
-            cmd.creation_flags(DETACHED_PROCESS | CREATE_NO_WINDOW);
-        }
-
-        let child = cmd.spawn().context("spawn detached agent")?;
-        // We deliberately don't wait/reap — child runs independently.
-        let pid = child.id();
-
-        if !wait_for_agent_ready(Duration::from_secs(15)) {
-            anyhow::bail!(
-                "background agent did not start within 15s (PID {pid}). Check ~/.oxiremote/."
-            );
-        }
+    if already_running {
+        let agent_root = format!("http://127.0.0.1:{AGENT_PORT}/agent");
+        let _ = open::that(&agent_root);
+        println!("OxiRemote already running at {agent_root}");
+        return Ok(());
     }
 
+    let exe = std::env::current_exe().context("current_exe")?;
+    let mut cmd = std::process::Command::new(&exe);
+    cmd.arg("--tray")
+        // Hand browser-open off to the child so it fires AFTER the child's
+        // own /api/health responds — eliminates the parent-exit race that
+        // dropped Safari into "Can't Connect to the Server".
+        .env(ENV_OPEN_BROWSER_ON_READY, "1")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+
+    #[cfg(unix)]
+    {
+        // setsid() detaches from the controlling TTY so the child survives
+        // the parent shell exiting and doesn't share signals.
+        use std::os::unix::process::CommandExt;
+        unsafe {
+            cmd.pre_exec(|| {
+                if libc::setsid() == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const DETACHED_PROCESS: u32 = 0x00000008;
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+        cmd.creation_flags(DETACHED_PROCESS | CREATE_NO_WINDOW);
+    }
+
+    let child = cmd.spawn().context("spawn detached agent")?;
+    let pid = child.id();
     let agent_root = format!("http://127.0.0.1:{AGENT_PORT}/agent");
-    let _ = open::that(&agent_root);
-    println!("OxiRemote running at {agent_root}");
+    println!("OxiRemote starting in background (PID: {pid}).");
+    println!("  Dashboard will open at {agent_root} once the agent is ready.");
     Ok(())
 }
 
@@ -494,6 +536,15 @@ fn run_with_tray() -> anyhow::Result<()> {
             }
         })
         .context("spawn server thread")?;
+
+    // If launched with `OXI_OPEN_BROWSER_ON_READY=1` (TUI menu hand-off or
+    // `oxiremote ui`), poll our own /api/health and open the browser when it
+    // responds. Doing this from the child — not the launcher — closes the
+    // race where the launcher's TCP probe of the *parent's* listener
+    // returned true, the launcher opened the browser, the launcher exited
+    // (port released), and Safari hit "Can't Connect to the Server" before
+    // this child finished binding.
+    maybe_open_browser_when_ready();
 
     // Build the tray on the main thread, then drive its event loop. The loop
     // never returns under normal use — `Shutdown` from the menu calls
