@@ -20,6 +20,12 @@ interface RouterState {
   session_id?: string
   device_id?: string
   device_label?: string
+  // Set by login-pair-flows.ts when the SPA is on a different origin than
+  // the agent (Cloudflare Pages discovery mode). The page polls the agent
+  // tunnel directly because the SameSite=Lax session cookie issued during
+  // OTK login won't ride a cross-origin fetch — auth falls back to the
+  // device_id query param the agent now accepts.
+  tunnel_base?: string
 }
 
 // "Waiting for Approval" screen shown after OTK login returns 202.
@@ -45,6 +51,16 @@ export default function ApprovalWaitingPage() {
     deadlineRef.current = Date.now() + MAX_POLL_MS
     const controller = new AbortController()
 
+    // Cross-origin (discovery): hit the agent tunnel directly with the
+    // device_id fallback. Same-origin (embedded): keep the relative URL
+    // and rely on the session cookie like before.
+    const tunnelBase = routerState.tunnel_base?.replace(/\/+$/, '') ?? ''
+    const deviceId = routerState.device_id ?? ''
+    const crossOrigin = Boolean(tunnelBase && deviceId)
+    const pollUrl = crossOrigin
+      ? `${tunnelBase}/api/auth/approval-status?device_id=${encodeURIComponent(deviceId)}`
+      : '/api/auth/approval-status'
+
     const poll = async () => {
       if (stoppedRef.current) return
       if (Date.now() >= deadlineRef.current) {
@@ -52,10 +68,18 @@ export default function ApprovalWaitingPage() {
         return
       }
       try {
-        const res = await fetch('/api/auth/approval-status', {
-          credentials: 'include',
+        const res = await fetch(pollUrl, {
+          credentials: crossOrigin ? 'omit' : 'include',
           signal: controller.signal,
         })
+        // Cross-origin agent returns 404 if it doesn't recognise the
+        // device_id — usually means the user forgot the device on the host
+        // side or pointed the SPA at the wrong agent. Stop polling so the
+        // user gets a clear timeout rather than silently spinning.
+        if (crossOrigin && res.status === 404) {
+          setPhase('timeout')
+          return
+        }
         if (!res.ok) {
           // Transient HTTP errors (401 race right after the session cookie
           // is set, 5xx during an agent restart, gateway hiccups) are not
@@ -125,7 +149,7 @@ export default function ApprovalWaitingPage() {
       clearInterval(tick)
       controller.abort()
     }
-  }, [navigate])
+  }, [navigate, routerState.tunnel_base, routerState.device_id])
 
   if (phase === 'rejected') {
     return (

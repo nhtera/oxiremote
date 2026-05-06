@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 #[cfg(debug_assertions)]
@@ -577,40 +577,90 @@ pub async fn api_login_one_time(
 
 // ─── Approval status poll (tunnel-accessible) ──────────────────────────────
 
-/// GET /api/auth/approval-status — returns the approval_status for the session's device.
-/// Uses require_auth (session validity only) so pending clients can still poll.
+#[derive(Deserialize)]
+pub struct ApprovalStatusQuery {
+    /// Discovery-mode fallback: cross-origin SPAs cannot send the
+    /// SameSite=Lax session cookie set on the tunnel domain, so the SPA
+    /// passes the device_id (which it received in the OTK login response)
+    /// here. Embedded mode keeps using the cookie path; this is purely
+    /// additive.
+    pub device_id: Option<String>,
+}
+
+/// GET /api/auth/approval-status — returns the approval_status for the device.
+///
+/// Auth strategy is dual-track:
+///   1. Session cookie (`oxiremote_session`) → look up the device the cookie's
+///      session is bound to. Embedded same-origin path.
+///   2. `?device_id=<id>` → cross-origin discovery-mode fallback. Reads the
+///      device row directly. The device_id is a public identifier (the SPA
+///      already received it in the OTK pairing response), so disclosure is
+///      bounded to the lifecycle state of a known device — no credentials,
+///      no enumeration of *other* devices.
+///
+/// Route is in `api_key_guard::EXEMPT_PREFIXES`, so pending clients without a
+/// valid API key can still poll.
 pub async fn api_auth_approval_status(
     State(state): State<Arc<AppState>>,
     jar: CookieJar,
+    Query(q): Query<ApprovalStatusQuery>,
 ) -> impl IntoResponse {
-    let Some(session_id) = require_auth(&state.signing_key, &jar) else {
-        return StatusCode::UNAUTHORIZED.into_response();
-    };
-
-    let result: anyhow::Result<String> = (|| {
-        let conn = Connection::open(&state.db_path)?;
-        let status: String = conn.query_row(
-            "SELECT COALESCE(d.approval_status, 'approved')
-             FROM sessions s
-             LEFT JOIN trusted_devices d ON d.device_id = s.device_id
-             WHERE s.session_id = ?1",
-            params![session_id],
-            |row| row.get(0),
-        )?;
-        Ok(status)
-    })();
-
-    match result {
-        Ok(status) => (
-            StatusCode::OK,
-            Json(serde_json::json!({ "status": status, "session_id": session_id })),
-        )
-            .into_response(),
-        Err(err) => {
-            warn!(error=%err, "approval-status lookup failed");
-            StatusCode::INTERNAL_SERVER_ERROR.into_response()
-        }
+    if let Some(session_id) = require_auth(&state.signing_key, &jar) {
+        let result: anyhow::Result<String> = (|| {
+            let conn = Connection::open(&state.db_path)?;
+            let status: String = conn.query_row(
+                "SELECT COALESCE(d.approval_status, 'approved')
+                 FROM sessions s
+                 LEFT JOIN trusted_devices d ON d.device_id = s.device_id
+                 WHERE s.session_id = ?1",
+                params![session_id],
+                |row| row.get(0),
+            )?;
+            Ok(status)
+        })();
+        return match result {
+            Ok(status) => (
+                StatusCode::OK,
+                Json(serde_json::json!({ "status": status, "session_id": session_id })),
+            )
+                .into_response(),
+            Err(err) => {
+                warn!(error=%err, "approval-status lookup (cookie) failed");
+                StatusCode::INTERNAL_SERVER_ERROR.into_response()
+            }
+        };
     }
+
+    if let Some(device_id) = q.device_id.as_deref().filter(|s| !s.is_empty()) {
+        let result: anyhow::Result<Option<String>> = (|| {
+            let conn = Connection::open(&state.db_path)?;
+            let row: Option<String> = conn
+                .query_row(
+                    "SELECT approval_status FROM trusted_devices WHERE device_id = ?1",
+                    params![device_id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            Ok(row)
+        })();
+        return match result {
+            Ok(Some(status)) => (
+                StatusCode::OK,
+                Json(serde_json::json!({ "status": status })),
+            )
+                .into_response(),
+            // Unknown device_id — likely the SPA polling against the wrong
+            // agent or a forgotten/revoked device. Surface as 404 so the SPA
+            // can decide to bail rather than spin until timeout.
+            Ok(None) => StatusCode::NOT_FOUND.into_response(),
+            Err(err) => {
+                warn!(error=%err, "approval-status lookup (device_id) failed");
+                StatusCode::INTERNAL_SERVER_ERROR.into_response()
+            }
+        };
+    }
+
+    StatusCode::UNAUTHORIZED.into_response()
 }
 
 #[cfg(debug_assertions)]
@@ -1312,6 +1362,86 @@ mod tests {
             )
             .unwrap();
         assert_eq!(platform.as_deref(), Some("ios"));
+    }
+
+    /// Discovery-mode SPAs cannot send the SameSite=Lax session cookie set
+    /// on the agent's tunnel domain. The handler MUST accept `?device_id=`
+    /// as a fallback so the cross-origin "Waiting for approval" page can
+    /// poll the agent directly. Without this the page spins until timeout.
+    #[tokio::test]
+    async fn approval_status_query_param_returns_pending_then_approved() {
+        let state = test_state("approval-discovery-fallback");
+        let pairing = create_pairing_code(state.as_ref()).unwrap();
+
+        // Pair without auto-approve → device row has approval_status='pending'.
+        let resp = api_pairing_exchange(
+            State(state.clone()),
+            HeaderMap::new(),
+            CookieJar::new(),
+            Json(ExchangePairingRequest {
+                code: Some(pairing.code),
+                permanent_key: None,
+                device_label: None,
+            }),
+        )
+        .await
+        .into_response();
+        let body_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+        let device_id: String = body["device_id"].as_str().unwrap().into();
+
+        // Cookie-less, device_id-only call mimics a cross-origin SPA poll.
+        let resp = api_auth_approval_status(
+            State(state.clone()),
+            CookieJar::new(),
+            Query(ApprovalStatusQuery { device_id: Some(device_id.clone()) }),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+        assert_eq!(body["status"], "pending");
+
+        // Approve the device, then re-poll — same path must observe the flip.
+        approval::approve_device(&state.db_path, &device_id).unwrap();
+        let resp = api_auth_approval_status(
+            State(state.clone()),
+            CookieJar::new(),
+            Query(ApprovalStatusQuery { device_id: Some(device_id.clone()) }),
+        )
+        .await
+        .into_response();
+        let body_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+        assert_eq!(body["status"], "approved");
+    }
+
+    #[tokio::test]
+    async fn approval_status_unknown_device_id_returns_404() {
+        let state = test_state("approval-unknown-device");
+        let resp = api_auth_approval_status(
+            State(state),
+            CookieJar::new(),
+            Query(ApprovalStatusQuery { device_id: Some("ghost-device-id".into()) }),
+        )
+        .await
+        .into_response();
+        // 404 lets the SPA short-circuit instead of polling until 5-min timeout.
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn approval_status_no_cookie_no_device_returns_401() {
+        let state = test_state("approval-no-auth");
+        let resp = api_auth_approval_status(
+            State(state),
+            CookieJar::new(),
+            Query(ApprovalStatusQuery { device_id: None }),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
 }
 
