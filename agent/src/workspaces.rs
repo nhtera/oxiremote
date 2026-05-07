@@ -22,7 +22,12 @@ pub struct Workspace {
     pub pinned: bool,
 }
 
-/// Seed the workspaces table with HOME and root on first boot for a given host.
+/// Seed the workspaces table on first boot for a given host. Inserts HOME
+/// only — the legacy "/" root-workspace seed was dropped in v0.1.26 (C3):
+/// any approved tunnel device would otherwise gain read/write/delete on the
+/// entire host filesystem. Existing DBs are NOT migrated; the dashboard
+/// banner (see `has_root_workspace` + `/api/agent/hints`) prompts the
+/// operator to remove it manually.
 pub fn seed_defaults(conn: &Connection, host_id: &str) -> anyhow::Result<()> {
     let existing: i64 = conn.query_row(
         "SELECT COUNT(*) FROM workspaces WHERE host_id = ?1",
@@ -44,12 +49,21 @@ pub fn seed_defaults(conn: &Connection, host_id: &str) -> anyhow::Result<()> {
             params![host_id, home, "Home", now],
         );
     }
-    let _ = conn.execute(
-        "INSERT OR IGNORE INTO workspaces(host_id, path, label, last_used_at, pinned)
-         VALUES (?1, ?2, ?3, ?4, 1)",
-        params![host_id, "/", "Root (/)", now],
-    );
     Ok(())
+}
+
+/// Detect a pre-existing `/` (or Windows `C:\`) workspace row from a legacy
+/// install. Drives the dashboard `root-workspace-present` hint so the
+/// operator is prompted to delete it. Existing rows are intentionally NOT
+/// auto-removed (would invalidate device sessions referencing them).
+pub fn has_root_workspace(conn: &Connection, host_id: &str) -> rusqlite::Result<bool> {
+    let n: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM workspaces
+         WHERE host_id = ?1 AND (path = '/' OR path = 'C:\\')",
+        params![host_id],
+        |row| row.get(0),
+    )?;
+    Ok(n > 0)
 }
 
 /// Resolve a registered workspace path by id, scoped to the given host.
@@ -299,4 +313,103 @@ pub async fn api_workspaces_touch(
         params![now_ts(), id, state.host_info.host_id],
     );
     StatusCode::OK.into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::init_db;
+
+    fn fresh_db(name: &str) -> PathBuf {
+        let p = std::env::temp_dir().join(format!(
+            "oxi-ws-{}-{}-{name}.sqlite",
+            std::process::id(),
+            now_ts()
+        ));
+        let _ = std::fs::remove_file(&p);
+        init_db(&p).unwrap();
+        p
+    }
+
+    #[test]
+    fn fresh_install_does_not_seed_root_workspace() {
+        let p = fresh_db("no-root");
+        let conn = Connection::open(&p).unwrap();
+        seed_defaults(&conn, "host-a").unwrap();
+
+        let count_root: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM workspaces WHERE host_id = 'host-a' AND path = '/'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count_root, 0, "v0.1.26+ must not seed `/` (C3)");
+
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn existing_root_workspace_is_preserved_on_reseed() {
+        let p = fresh_db("existing-root");
+        let conn = Connection::open(&p).unwrap();
+        // Simulate a legacy install with the `/` row.
+        conn.execute(
+            "INSERT INTO workspaces(host_id, path, label, last_used_at, pinned)
+             VALUES (?1, '/', 'Root (/)', ?2, 1)",
+            params!["host-a", now_ts()],
+        )
+        .unwrap();
+
+        // Re-seeding (idempotent boot) must not error and must not delete
+        // the existing row.
+        seed_defaults(&conn, "host-a").unwrap();
+
+        let still_there: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM workspaces WHERE host_id = 'host-a' AND path = '/'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(still_there, 1, "existing `/` row must be preserved");
+
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn has_root_workspace_detects_unix_root() {
+        let p = fresh_db("detect-root");
+        let conn = Connection::open(&p).unwrap();
+
+        assert!(!has_root_workspace(&conn, "host-a").unwrap());
+
+        conn.execute(
+            "INSERT INTO workspaces(host_id, path, label, last_used_at, pinned)
+             VALUES ('host-a', '/', 'Root', ?1, 1)",
+            params![now_ts()],
+        )
+        .unwrap();
+        assert!(has_root_workspace(&conn, "host-a").unwrap());
+        // Other hosts not affected.
+        assert!(!has_root_workspace(&conn, "host-b").unwrap());
+
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn has_root_workspace_detects_windows_root() {
+        let p = fresh_db("detect-root-win");
+        let conn = Connection::open(&p).unwrap();
+
+        conn.execute(
+            "INSERT INTO workspaces(host_id, path, label, last_used_at, pinned)
+             VALUES ('host-a', 'C:\\', 'Root', ?1, 1)",
+            params![now_ts()],
+        )
+        .unwrap();
+        assert!(has_root_workspace(&conn, "host-a").unwrap());
+
+        let _ = std::fs::remove_file(&p);
+    }
 }

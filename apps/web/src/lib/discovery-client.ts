@@ -8,8 +8,12 @@
  *
  * Worker contract:
  *   GET /api/session/lookup?k=<tempKey>
- *     200 { tunnelUrl: string, localIp: string | null }
+ *     200 { tunnelUrl: string }
  *     404 { error: 'not found' }   // unknown / expired
+ *
+ * `localIp` was removed in Phase 04 / H3 — the SPA was reaching the agent over
+ * the public tunnel URL anyway, the LAN IP was never useful, and exposing it
+ * leaked the operator's home network shape to anyone who could land a lookup.
  */
 
 const TEMP_KEY_PATTERN = /^[a-f0-9]{32}$/
@@ -27,7 +31,6 @@ const PERMANENT_KEY_PATTERN = /^sk-[A-Za-z0-9_-]{4,}$/
 
 export type LookupResult = {
   tunnelUrl: string
-  localIp: string | null
 }
 
 /** True only when the bundle is running under `vite dev` (HMR server). Vite
@@ -142,9 +145,19 @@ async function rawLookup(key: string): Promise<LookupResult | null> {
     if (!res.ok) return null
     const body = (await res.json()) as Partial<LookupResult>
     if (typeof body.tunnelUrl !== 'string' || body.tunnelUrl.length === 0) return null
+    // Phase 05 / H2 (SPA-side): defence-in-depth scheme guard. The worker
+    // already rejects non-https tunnelUrl writes, but a compromised or
+    // misconfigured worker shouldn't be the only thing standing between the
+    // SPA and an http:// downgrade. Parse + check protocol explicitly.
+    let parsed: URL
+    try {
+      parsed = new URL(body.tunnelUrl)
+    } catch {
+      return null
+    }
+    if (parsed.protocol !== 'https:') return null
     return {
       tunnelUrl: body.tunnelUrl.replace(/\/$/, ''),
-      localIp: typeof body.localIp === 'string' ? body.localIp : null,
     }
   } catch {
     return null

@@ -8,10 +8,12 @@ import InlineLogsPanel from '../../components/agent/inline-logs-panel'
 import OnboardingView from '../../components/agent/onboarding-view'
 import OtkConfirmModal from '../../components/agent/otk-confirm-modal'
 import HostShell from '../../components/agent/host-shell'
+import HintBanners from '../../components/agent/hint-banners'
 import ServicesStrip from '../../components/agent/services-strip'
 import ActiveSessionsList from '../../components/active-sessions-list'
 import TunnelTelemetryBlock from '../../components/tunnel-telemetry-block'
 import RecentKeyUsage from '../../components/recent-key-usage'
+import RecentShellSessions from '../../components/recent-shell-sessions'
 
 // Host-dashboard home. Live-updates via the `/api/agent/events` SSE stream;
 // initial snapshot from `/api/agent/state`. Both endpoints are localhost-only.
@@ -290,6 +292,8 @@ export default function AgentHomePage() {
         }
         main={
           <>
+            <HintBanners />
+
             {tunnelDown && (
               <div className="px-4 py-3 rounded-md bg-danger/10 border border-danger/40 text-danger text-sm font-medium">
                 Tunnel went down — connections will fail. Restart the agent to reconnect.
@@ -304,6 +308,7 @@ export default function AgentHomePage() {
             />
 
             <ActiveSessionsList />
+            <RecentShellSessions />
             <TunnelTelemetryBlock />
             <RecentKeyUsage />
 

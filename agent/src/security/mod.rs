@@ -3,6 +3,7 @@ pub mod bytes_counter;
 pub mod cors;
 pub mod cors_capture;
 pub mod csrf;
+pub mod headers;
 pub mod rate_limit;
 pub mod route_scope;
 

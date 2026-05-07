@@ -186,6 +186,20 @@ pub struct ResizeTerminalRequest {
     pub rows: u16,
 }
 
+/// Privacy-safe rendering of the spawned argv for the `ShellOpened` audit
+/// event. Plan §H11 forbids logging args because users routinely pass
+/// secrets via flags (`python manage.py reset --password=…`). We retain only
+/// argv[0] (the program path) so the dashboard can show "what was opened"
+/// without surfacing those secrets through SSE / the recent-sessions ring
+/// buffer. The DB row + OS-level audit (`ps`, etc.) remain the source of
+/// truth for the actual command line.
+fn audit_command_string(command: &[String]) -> String {
+    command
+        .first()
+        .cloned()
+        .unwrap_or_else(|| "<empty>".to_string())
+}
+
 pub fn build_default_command(command: Option<&[String]>) -> Vec<String> {
     if let Some(cmd) = command
         && !cmd.is_empty() {
@@ -360,9 +374,15 @@ pub fn spawn_agent_detector(
 /// the session from the map on PTY exit so the count gate in
 /// `terminal_api::api_terminal_sessions_create` stays in sync with reality
 /// (DB rows are the audit log; the map is the source of truth for "alive").
+///
+/// Emits `AgentEvent::ShellOpened` immediately after the PTY is registered
+/// and `AgentEvent::ShellClosed` from the reader thread when the child exits.
+/// Phase 06c / H11 — surfaces shell activity to the host dashboard audit log
+/// and the desktop tray notifier.
 pub fn spawn_terminal_session(
     id: &str,
     owner_session_id: &str,
+    device_id: &str,
     cwd: Option<&str>,
     command: Vec<String>,
     cols: u16,
@@ -409,6 +429,11 @@ pub fn spawn_terminal_session(
     let id = id.to_string();
     let id_for_reader = id.clone();
     let sessions_for_reader = sessions.clone();
+    let device_id = device_id.to_string();
+    let device_id_for_reader = device_id.clone();
+    let event_bus_for_reader = event_bus.clone();
+    let command_str = audit_command_string(&command);
+    let cwd_for_event = cwd.map(str::to_string);
 
     let last_activity = Arc::new(std::sync::Mutex::new(Instant::now()));
     let last_activity2 = last_activity.clone();
@@ -444,6 +469,18 @@ pub fn spawn_terminal_session(
         master_fd,
     });
     sessions.insert(id.clone(), session.clone());
+
+    // H11: shell-spawn audit event. Emitted after the session is registered
+    // so a dashboard subscriber that wakes up on this event and looks the
+    // session up by id finds it. Sent before the agent-detector kicks off
+    // because that path consumes `event_bus`.
+    event_bus.send(AgentEvent::ShellOpened {
+        device_id: device_id.clone(),
+        session_id: id.clone(),
+        command: command_str,
+        cwd: cwd_for_event,
+        ts: now_ts(),
+    });
 
     // Start the 5s agent-detection polling loop (Unix only).
     #[cfg(unix)]
@@ -572,7 +609,54 @@ pub fn spawn_terminal_session(
 
         let _ = output_tx2.send(WsOut::State { state: "exited".into() });
         let _ = output_tx2.send(WsOut::Exit { code });
+
+        // H11: shell-close audit event. Mirrors `ShellOpened` so the
+        // dashboard renders a complete (open, close) pair per session.
+        event_bus_for_reader.send(AgentEvent::ShellClosed {
+            device_id: device_id_for_reader.clone(),
+            session_id: id_for_reader.clone(),
+            exit_code: code.map(|c| c as i32),
+            ts: now,
+        });
     });
 
     Ok(session)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn audit_command_string_strips_arguments() {
+        // Plan §H11 explicitly: `command` field on `ShellOpened` events must
+        // carry argv[0] only — never user-supplied flags. A regression that
+        // restored `command.join(" ")` would echo `--password=...` into the
+        // dashboard SSE / ring buffer.
+        let argv = vec![
+            "python".to_string(),
+            "manage.py".to_string(),
+            "reset".to_string(),
+            "--password=hunter2".to_string(),
+        ];
+        let rendered = audit_command_string(&argv);
+        assert_eq!(rendered, "python");
+        assert!(!rendered.contains("hunter2"));
+        assert!(!rendered.contains("--password"));
+        assert!(!rendered.contains("manage.py"));
+    }
+
+    #[test]
+    fn audit_command_string_handles_empty_argv() {
+        let rendered = audit_command_string(&[]);
+        assert_eq!(rendered, "<empty>");
+    }
+
+    #[test]
+    fn audit_command_string_preserves_full_program_path() {
+        // The shell binary path is intentionally retained — operators want
+        // to distinguish `/bin/zsh` from `/usr/local/bin/fish`.
+        let argv = vec!["/bin/zsh".to_string(), "-l".to_string()];
+        assert_eq!(audit_command_string(&argv), "/bin/zsh");
+    }
 }

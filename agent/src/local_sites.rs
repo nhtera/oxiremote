@@ -137,11 +137,27 @@ pub async fn api_local_sites(
     jar: CookieJar,
     headers: HeaderMap,
 ) -> impl IntoResponse {
+    // Auth required for ALL callers — including loopback. Defence-in-depth
+    // against DNS rebinding: a malicious page on a paired-origin (auto-added
+    // to `cors_origins` during pairing) would otherwise be able to enumerate
+    // listening ports through a rebound localhost lookup, since the agent
+    // does not validate the `Host` header. The `is_tunnel_request` filter
+    // below still differentiates response shape per §H12.
     let bearer = crate::auth::extract_bearer(&headers);
     if crate::auth::require_tunnel_auth(&state.db_path, &state.signing_key, &jar, bearer.as_deref()).await.is_none() {
         return (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
     }
     let read = state.local_sites.read().await;
+
+    // §H12: Tunnel-origin callers see only the proxy-allowlist intersection.
+    // Loopback callers (TUI, dashboard, CLI) keep the full unfiltered view —
+    // they're already authenticated above.
+    if crate::security::route_scope::is_tunnel_request(&headers) {
+        let allowed = state.proxy_allowed_ports.read().unwrap();
+        let filtered: Vec<u16> = read.iter().copied().filter(|p| allowed.contains(p)).collect();
+        return Json(filtered).into_response();
+    }
+
     Json(read.clone()).into_response()
 }
 
@@ -168,6 +184,28 @@ mod tests {
         let sample = "nnoport\nn*:notaport\nn:1234\n";
         let ports = parse_lsof_output(sample);
         assert_eq!(ports, vec![1234]);
+    }
+
+    #[test]
+    fn filter_to_allowed_ports_intersects_correctly() {
+        // Tunnel callers should only see the intersection of (listening,
+        // proxy_allowed). Empty allowlist = empty result. Off-allowlist ports
+        // are silently dropped, not 403'd — same UX as having no listener at
+        // all from the SPA's perspective.
+        use std::collections::HashSet;
+        let listening: [u16; 3] = [3000, 5173, 8080];
+        let allowed: HashSet<u16> = [3000_u16, 5173].into_iter().collect();
+        let filtered: Vec<u16> = listening
+            .iter()
+            .copied()
+            .filter(|p| allowed.contains(p))
+            .collect();
+        assert_eq!(filtered, vec![3000, 5173]);
+
+        // Empty allowlist hides everything.
+        let empty: HashSet<u16> = HashSet::new();
+        let none: Vec<u16> = listening.iter().copied().filter(|p| empty.contains(p)).collect();
+        assert!(none.is_empty());
     }
 
     #[cfg(target_os = "windows")]

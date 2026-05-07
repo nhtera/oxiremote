@@ -179,6 +179,119 @@ jobs:
           done
           echo "Manifest:"; cat "$manifest"
 
+      # Phase 03 / C4 — minisign Ed25519 signature manifest. Verified on
+      # the agent side via `update_signing::verify` against the embedded
+      # `TRUSTED_PUBKEYS` array. Must run AFTER `Combine SHA256 manifest`
+      # so the SHA file is also signed end-to-end with the rest of the
+      # release archives. See `docs/release-signing.md` for custodian +
+      # rotation rules.
+
+      # CI gate (Red Team R5) — refuse to publish if the source still
+      # carries the placeholder pubkey. verify_with_keys would skip it at
+      # runtime, but the publisher would only learn after every client's
+      # `oxiremote update` started failing.
+      - name: Verify TRUSTED_PUBKEYS has been provisioned
+        shell: bash
+        run: |
+          set -euo pipefail
+          if grep -q 'REPLACE_WITH_PRODUCTION_PUBKEY_BEFORE_RELEASE' \
+                  agent/src/update_signing.rs; then
+            echo "ERROR: agent/src/update_signing.rs::TRUSTED_PUBKEYS still contains the placeholder." >&2
+            echo "       Generate the K1 keypair (see docs/release-signing.md) and commit the public key before tagging." >&2
+            exit 1
+          fi
+
+      - name: Install minisign + expect
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y minisign expect
+
+      - name: Sign artifacts with minisign
+        timeout-minutes: 10
+        env:
+          # Bound to the env table so expect can read them via $env(NAME)
+          # without bash interpolating into the heredoc body (Red Team R1).
+          MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
+          MINISIGN_PASSPHRASE: ${{ secrets.MINISIGN_PASSPHRASE }}
+        shell: bash
+        run: |
+          # Reliability: -e fails the step on any non-zero exit (so a stuck
+          # expect or missing minisig file cannot leave us with a partial
+          # manifest, Red Team R4); -u catches typos in env var names; -o
+          # pipefail propagates failures through the find|sort pipeline.
+          set -euo pipefail
+
+          if [ -z "${MINISIGN_SECRET_KEY:-}" ] || [ -z "${MINISIGN_PASSPHRASE:-}" ]; then
+            echo "ERROR: MINISIGN_SECRET_KEY and MINISIGN_PASSPHRASE must be configured." >&2
+            echo "       See docs/release-signing.md for setup." >&2
+            exit 1
+          fi
+          version="${{ steps.version.outputs.version }}"
+
+          # Write secret key to a chmod-600 temp file. shredded on EXIT
+          # regardless of the step's success/failure.
+          seckey="$(mktemp -t oxi-minisign-XXXXXX)"
+          chmod 600 "$seckey"
+          trap 'shred -u "$seckey" 2>/dev/null || rm -f "$seckey"' EXIT
+          printf '%s' "$MINISIGN_SECRET_KEY" > "$seckey"
+          export MINISIGN_SECKEY_PATH="$seckey"
+
+          sig_manifest="release/oxiremote-${version}-minisig.txt"
+          : > "$sig_manifest"
+
+          # Sign each archive (tar.gz + zip). We deliberately do NOT sign
+          # the SHA manifest — verifiers chain SHA → archive → sig and
+          # signing the SHA file separately would just add a useless layer.
+          for asset in $(find release -maxdepth 1 -type f \( -name '*.tar.gz' -o -name '*.zip' \) | sort); do
+            base="$(basename "$asset")"
+            echo "Signing $base"
+
+            # `expect -c '...'` instead of a heredoc: a heredoc terminator
+            # has to sit at column 0 and that breaks the surrounding YAML
+            # `run: |` block scalar (column 0 ends the scalar). Single-quoted
+            # bash preserves the Tcl `$env(...)` lookups verbatim so the
+            # passphrase still never expands in the bash layer (Red Team R1).
+            export MINISIGN_ASSET_PATH="$asset"
+            export MINISIGN_ASSET_BASE="$base"
+            expect -c '
+              set timeout 60
+              spawn minisign -S -s $env(MINISIGN_SECKEY_PATH) \
+                             -m $env(MINISIGN_ASSET_PATH) \
+                             -t "timestamp:[clock seconds]\tfile:$env(MINISIGN_ASSET_BASE)"
+              expect {
+                "Password:"     { send -- "$env(MINISIGN_PASSPHRASE)\r" }
+                "password:"     { send -- "$env(MINISIGN_PASSPHRASE)\r" }
+                "Passphrase:"   { send -- "$env(MINISIGN_PASSPHRASE)\r" }
+                timeout         { puts stderr "minisign passphrase prompt did not appear within 60s"; exit 1 }
+              }
+              expect {
+                eof             { }
+                timeout         { puts stderr "minisign sign did not finish within 60s"; exit 1 }
+              }
+              catch wait result
+              set status [lindex $result 3]
+              if {$status != 0} {
+                puts stderr "minisign exited non-zero: $status"
+                exit 1
+              }
+            '
+            # Confirm the .minisig file actually exists before appending — a
+            # silent expect failure cannot now produce a half-written manifest.
+            if [ ! -f "$asset.minisig" ]; then
+              echo "ERROR: minisign did not produce $asset.minisig" >&2
+              exit 1
+            fi
+            cat "$asset.minisig" >> "$sig_manifest"
+            # Blank-line separator between blocks so the parser can split
+            # cleanly (see `parse_minisig_manifest`).
+            printf '\n' >> "$sig_manifest"
+          done
+
+          echo "--- Signature manifest ---"
+          cat "$sig_manifest"
+
       - name: Create / update release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

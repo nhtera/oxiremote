@@ -18,8 +18,9 @@ use crate::auth::{
     bind_session_to_device_tx, clear_stale_pairing_attempts, client_ip_key,
     is_valid_pairing_attempt, issue_api_key_tx, list_trusted_devices, platform_from_ua,
     random_device_id, rate_limit_key, require_active_auth, require_auth, revoke_device,
-    sanitize_device_label, should_allow_pairing_attempt, sign_session, touch_session_and_device,
-    new_pairing_code, verify_permanent_key, PAIRING_TTL_SECS, SESSION_TTL_SECS,
+    run_dummy_pairing_verify, sanitize_device_label, should_allow_pairing_attempt, sign_session,
+    touch_session_and_device, new_pairing_code, verify_permanent_key_async,
+    PAIRING_TTL_SECS, SESSION_TTL_SECS,
 };
 use crate::db::now_ts;
 use crate::security::cors_capture::capture_pairing_origin;
@@ -67,6 +68,30 @@ pub struct ExchangePairingRequest {
     device_label: Option<String>,
 }
 
+/// Result of consuming a pairing code. Each rejection branch is mapped to
+/// the same 401 body (Phase 06a / H8 + Red Team F7) so an attacker can't
+/// distinguish "code never existed" from "code expired" / "code reused".
+/// `Internal` is the only variant that surfaces a 500.
+#[derive(Debug)]
+enum PairingExchangeError {
+    /// Code does not exist in the DB. Caller MUST run an Argon2 verify on a
+    /// dummy hash before responding so timing matches the legitimate paths.
+    InvalidCode,
+    /// Code exists, was unused, but past its TTL.
+    Expired,
+    /// Code exists and was already consumed.
+    Consumed,
+    /// IO / DB / hash failure — surface as 500. Code is NOT consumed (the
+    /// rolled-back transaction preserves it for retry).
+    Internal,
+}
+
+/// Identical 401 used for every pairing rejection. Static body string keeps
+/// response bytes byte-equal across all three reject branches.
+fn reject_pairing() -> axum::response::Response {
+    (StatusCode::UNAUTHORIZED, "pairing failed").into_response()
+}
+
 pub async fn api_pairing_exchange(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -93,26 +118,24 @@ pub async fn api_pairing_exchange(
 
     if let Some(pkey) = pkey_val {
         // --- Permanent-key path ---
-        let pkey_owned = pkey.to_string();
-        let db_path = state.db_path.clone();
-        // Argon2id is CPU-intensive; run on the blocking thread pool.
-        let valid = tokio::task::spawn_blocking(move || verify_permanent_key(&db_path, &pkey_owned))
-            .await
-            .unwrap_or(false);
+        // Argon2id verify is CPU-intensive; the async wrapper gates it
+        // through ARGON2_SEMAPHORE so transient memory stays bounded.
+        let valid = verify_permanent_key_async(state.db_path.clone(), pkey.to_string()).await;
         if !valid {
-            return StatusCode::UNAUTHORIZED.into_response();
+            return reject_pairing();
         }
 
-        let res: anyhow::Result<(String, String, String, String)> = (|| {
-            let mut conn = Connection::open(&state.db_path)?;
-            let tx = conn.transaction()?;
+        let res: Result<(String, String, String, String), ()> = (|| {
+            let mut conn = Connection::open(&state.db_path).map_err(|_| ())?;
+            let tx = conn.transaction().map_err(|_| ())?;
             let now = now_ts();
             let session_id = Uuid::new_v4().to_string();
             let device_id = random_device_id();
             tx.execute(
                 "INSERT INTO sessions(session_id, created_at, last_seen_at, device_id) VALUES (?1, ?2, ?2, ?3)",
                 params![session_id, now, device_id],
-            )?;
+            )
+            .map_err(|_| ())?;
             approval::insert_device_with_approval_tx(
                 &tx,
                 &device_id,
@@ -121,17 +144,29 @@ pub async fn api_pairing_exchange(
                 &ip,
                 approval_status,
                 platform.as_deref(),
-            )?;
-            bind_session_to_device_tx(&tx, &session_id, &device_id)?;
-            let (api_key, api_key_last4) = issue_api_key_tx(&tx, &device_id)?;
-            tx.commit()?;
+            )
+            .map_err(|_| ())?;
+            bind_session_to_device_tx(&tx, &session_id, &device_id).map_err(|_| ())?;
+            let (api_key, api_key_last4) = issue_api_key_tx(&tx, &device_id).map_err(|_| ())?;
+            tx.commit().map_err(|_| ())?;
             Ok((session_id, device_id, api_key, api_key_last4))
         })();
 
-        if res.is_ok() {
-            capture_pairing_origin(&headers, &state);
-        }
-        return build_pairing_response(res, &state, jar, auto_approve, approval_status, &ip, user_agent);
+        return match res {
+            Ok(tuple) => {
+                capture_pairing_origin(&headers, &state);
+                build_pairing_success(
+                    tuple,
+                    &state,
+                    jar,
+                    auto_approve,
+                    approval_status,
+                    &ip,
+                    user_agent,
+                )
+            }
+            Err(()) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        };
     }
 
     // --- OTK / pairing-code path (unchanged) ---
@@ -150,35 +185,44 @@ pub async fn api_pairing_exchange(
     // insert session, bind session, issue api key) live inside one txn so a
     // mid-flight failure leaves no orphan rows and the code stays unconsumed
     // for retry.
-    let res: anyhow::Result<(String, String, String, String)> = (|| {
-        let mut conn = Connection::open(&state.db_path)?;
-        let tx = conn.transaction()?;
+    let res: Result<(String, String, String, String), PairingExchangeError> = (|| {
+        let mut conn = Connection::open(&state.db_path)
+            .map_err(|_| PairingExchangeError::Internal)?;
+        let tx = conn.transaction().map_err(|_| PairingExchangeError::Internal)?;
         let now = now_ts();
 
-        let mut stmt =
-            tx.prepare("SELECT expires_at, used_at FROM pairing_codes WHERE code = ?1")?;
-        let mut rows = stmt.query(params![code])?;
+        let mut stmt = tx
+            .prepare("SELECT expires_at, used_at FROM pairing_codes WHERE code = ?1")
+            .map_err(|_| PairingExchangeError::Internal)?;
+        let mut rows = stmt
+            .query(params![code])
+            .map_err(|_| PairingExchangeError::Internal)?;
         let row = rows
-            .next()?
-            .ok_or_else(|| anyhow::anyhow!("code not found"))?;
-        let expires_at: i64 = row.get(0)?;
-        let used_at: Option<i64> = row.get(1)?;
+            .next()
+            .map_err(|_| PairingExchangeError::Internal)?
+            .ok_or(PairingExchangeError::InvalidCode)?;
+        let expires_at: i64 = row.get(0).map_err(|_| PairingExchangeError::Internal)?;
+        let used_at: Option<i64> = row.get(1).map_err(|_| PairingExchangeError::Internal)?;
 
         if used_at.is_some() {
-            anyhow::bail!("code already used");
+            return Err(PairingExchangeError::Consumed);
         }
         if now > expires_at {
-            anyhow::bail!("code expired");
+            return Err(PairingExchangeError::Expired);
         }
         drop(rows);
         drop(stmt);
 
-        let updated = tx.execute(
-            "UPDATE pairing_codes SET used_at = ?2 WHERE code = ?1 AND used_at IS NULL",
-            params![code, now],
-        )?;
+        let updated = tx
+            .execute(
+                "UPDATE pairing_codes SET used_at = ?2 WHERE code = ?1 AND used_at IS NULL",
+                params![code, now],
+            )
+            .map_err(|_| PairingExchangeError::Internal)?;
         if updated != 1 {
-            anyhow::bail!("code already used");
+            // Concurrent claim won the race — surface as Consumed (which
+            // returns the same body as InvalidCode/Expired anyway).
+            return Err(PairingExchangeError::Consumed);
         }
 
         let session_id = Uuid::new_v4().to_string();
@@ -186,7 +230,8 @@ pub async fn api_pairing_exchange(
         tx.execute(
             "INSERT INTO sessions(session_id, created_at, last_seen_at, device_id) VALUES (?1, ?2, ?2, ?3)",
             params![session_id, now, device_id],
-        )?;
+        )
+        .map_err(|_| PairingExchangeError::Internal)?;
 
         approval::insert_device_with_approval_tx(
             &tx,
@@ -196,23 +241,49 @@ pub async fn api_pairing_exchange(
             &ip,
             approval_status,
             platform.as_deref(),
-        )?;
-        bind_session_to_device_tx(&tx, &session_id, &device_id)?;
-        let (api_key, api_key_last4) = issue_api_key_tx(&tx, &device_id)?;
+        )
+        .map_err(|_| PairingExchangeError::Internal)?;
+        bind_session_to_device_tx(&tx, &session_id, &device_id)
+            .map_err(|_| PairingExchangeError::Internal)?;
+        let (api_key, api_key_last4) =
+            issue_api_key_tx(&tx, &device_id).map_err(|_| PairingExchangeError::Internal)?;
 
-        tx.commit()?;
+        tx.commit().map_err(|_| PairingExchangeError::Internal)?;
         Ok((session_id, device_id, api_key, api_key_last4))
     })();
 
-    if res.is_ok() {
-        capture_pairing_origin(&headers, &state);
+    match res {
+        Ok(tuple) => {
+            capture_pairing_origin(&headers, &state);
+            build_pairing_success(tuple, &state, jar, auto_approve, approval_status, &ip, user_agent)
+        }
+        Err(PairingExchangeError::InvalidCode
+        | PairingExchangeError::Expired
+        | PairingExchangeError::Consumed) => {
+            // Timing parity (Phase 06a / H8 + Red Team F7): all three
+            // rejection branches must take roughly the same wall-clock time
+            // so an attacker can't distinguish "code never existed" from
+            // "code expired" / "code reused". The fast paths (Consumed,
+            // Expired, InvalidCode) all return in microseconds without this;
+            // running the dummy Argon2 verify on each rejection arm levels
+            // them at ~64ms (our pinned m=64MiB / t=3 params). The verify
+            // also amplifies brute-force cost.
+            run_dummy_pairing_verify(&code).await;
+            reject_pairing()
+        }
+        Err(PairingExchangeError::Internal) => {
+            warn!("pairing exchange failed: internal error");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
     }
-    build_pairing_response(res, &state, jar, auto_approve, approval_status, &ip, user_agent)
 }
 
-/// Shared response builder for both the pairing-code and permanent-key paths.
-fn build_pairing_response(
-    res: anyhow::Result<(String, String, String, String)>,
+/// Build the 200/202 success response for a completed pairing exchange.
+/// Phase 06a / H8: rejection branches no longer route through here — they
+/// return a uniform 401 via `reject_pairing()` so an attacker can't tell the
+/// rejection sub-class from the response.
+fn build_pairing_success(
+    tuple: (String, String, String, String),
     state: &crate::AppState,
     jar: CookieJar,
     auto_approve: bool,
@@ -220,70 +291,54 @@ fn build_pairing_response(
     ip: &str,
     user_agent: Option<&str>,
 ) -> axum::response::Response {
-    match res {
-        Ok((session_id, device_id, api_key, api_key_last4)) => {
-            let cookie_value = sign_session(&state.signing_key, &session_id);
-            let cookie = Cookie::build(("oxiremote_session", cookie_value))
-                .http_only(true)
-                .secure(state.secure_cookies)
-                .same_site(SameSite::Lax)
-                .path("/")
-                .max_age(TimeDuration::seconds(SESSION_TTL_SECS))
-                .build();
+    let (session_id, device_id, api_key, api_key_last4) = tuple;
+    let cookie_value = sign_session(&state.signing_key, &session_id);
+    let cookie = Cookie::build(("oxiremote_session", cookie_value))
+        .http_only(true)
+        .secure(state.secure_cookies)
+        .same_site(SameSite::Lax)
+        .path("/")
+        .max_age(TimeDuration::seconds(SESSION_TTL_SECS))
+        .build();
 
-            // When pending, emit DevicePending so the TUI/dashboard approval
-            // queue shows the paired device.
-            if !auto_approve {
-                let first_seen = crate::db::now_ts();
-                state.event_bus.send(crate::events::AgentEvent::DevicePending {
-                    device_id: device_id.clone(),
-                    ip: ip.to_string(),
-                    ua_parsed: user_agent.unwrap_or("").to_string(),
-                    first_seen,
-                });
-            }
-
-            let http_status = if auto_approve {
-                StatusCode::OK
-            } else {
-                StatusCode::ACCEPTED
-            };
-
-            (
-                http_status,
-                jar.add(cookie),
-                Json(serde_json::json!({
-                    "ok": true,
-                    "device_id": device_id,
-                    "api_key": api_key,
-                    "api_key_last4": api_key_last4,
-                    "approval_status": approval_status,
-                    // host_id + label + platform are included so a cross-origin
-                    // SPA (Cloudflare Pages) can stash the Bearer key AND show
-                    // a friendly hostname in saved-hosts / topbar without a
-                    // follow-up /api/host call — that endpoint still needs
-                    // cookie auth which doesn't survive cross-origin.
-                    "host_id": state.host_info.host_id,
-                    "label": state.host_info.label,
-                    "platform": state.host_info.platform,
-                })),
-            )
-                .into_response()
-        }
-        Err(err) => {
-            // Code-validation failures (not found / used / expired) stay 401.
-            // Insert/hash failures surface as 500 — txn rolled back, credential
-            // is still usable for retry.
-            let msg = err.to_string();
-            let code_invalid = msg.contains("code");
-            warn!(error=%err, "pairing exchange failed");
-            if code_invalid {
-                StatusCode::UNAUTHORIZED.into_response()
-            } else {
-                StatusCode::INTERNAL_SERVER_ERROR.into_response()
-            }
-        }
+    // When pending, emit DevicePending so the TUI/dashboard approval
+    // queue shows the paired device.
+    if !auto_approve {
+        let first_seen = crate::db::now_ts();
+        state.event_bus.send(crate::events::AgentEvent::DevicePending {
+            device_id: device_id.clone(),
+            ip: ip.to_string(),
+            ua_parsed: user_agent.unwrap_or("").to_string(),
+            first_seen,
+        });
     }
+
+    let http_status = if auto_approve {
+        StatusCode::OK
+    } else {
+        StatusCode::ACCEPTED
+    };
+
+    (
+        http_status,
+        jar.add(cookie),
+        Json(serde_json::json!({
+            "ok": true,
+            "device_id": device_id,
+            "api_key": api_key,
+            "api_key_last4": api_key_last4,
+            "approval_status": approval_status,
+            // host_id + label + platform are included so a cross-origin
+            // SPA (Cloudflare Pages) can stash the Bearer key AND show
+            // a friendly hostname in saved-hosts / topbar without a
+            // follow-up /api/host call — that endpoint still needs
+            // cookie auth which doesn't survive cross-origin.
+            "host_id": state.host_info.host_id,
+            "label": state.host_info.label,
+            "platform": state.host_info.platform,
+        })),
+    )
+        .into_response()
 }
 
 #[derive(Serialize)]
@@ -906,6 +961,7 @@ mod tests {
             desktop_available: false,
             desktop_service: None,
             discovery_url: None,
+            discovery_secret: None,
             web_url: None,
             discovery_temp_key: Arc::new(std::sync::RwLock::new(None)),
             tunnel_shutdown: Arc::new(tokio::sync::Notify::new()),
@@ -913,6 +969,8 @@ mod tests {
             files_activity: Arc::new(crate::files_activity::new_map()),
             cloudflared_path: None,
             cors_origins: crate::security::cors::seed_origins(&[], &[]),
+            ws_tickets: crate::ws_ticket::new_store(),
+            recent_sessions: crate::recent_sessions::new_buffer(),
         })
     }
 
@@ -1442,6 +1500,136 @@ mod tests {
         .await
         .into_response();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    // ── Phase 06a / H8: pairing rejection branch parity ────────────────
+
+    /// All three rejection branches (InvalidCode / Expired / Consumed) MUST
+    /// produce byte-identical 401 response bodies. An attacker timing the
+    /// rejection should also be unable to read the sub-class out of the body.
+    #[tokio::test]
+    async fn pairing_rejection_bodies_byte_identical() {
+        async fn body_of_rejection(slug: &str, setup: impl FnOnce(&Connection)) -> Vec<u8> {
+            let state = test_state(&format!("rej-{slug}"));
+            let conn = Connection::open(&state.db_path).unwrap();
+            setup(&conn);
+            drop(conn);
+            let resp = api_pairing_exchange(
+                State(state),
+                HeaderMap::new(),
+                CookieJar::new(),
+                Json(ExchangePairingRequest {
+                    code: Some(format!("REJTEST{slug}").to_uppercase()),
+                    permanent_key: None,
+                    device_label: None,
+                }),
+            )
+            .await
+            .into_response();
+            assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+            axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .to_vec()
+        }
+
+        // InvalidCode — no row exists for the submitted code.
+        let invalid = body_of_rejection("a", |_conn| { /* no insert */ }).await;
+
+        // Expired — row exists but past TTL.
+        let expired = body_of_rejection("b", |conn| {
+            conn.execute(
+                "INSERT INTO pairing_codes(code, expires_at, used_at) VALUES (?1, ?2, NULL)",
+                params!["REJTESTB", now_ts() - 60],
+            )
+            .unwrap();
+        })
+        .await;
+
+        // Consumed — row exists, valid TTL, but already used.
+        let consumed = body_of_rejection("c", |conn| {
+            conn.execute(
+                "INSERT INTO pairing_codes(code, expires_at, used_at) VALUES (?1, ?2, ?3)",
+                params!["REJTESTC", now_ts() + 300, now_ts() - 5],
+            )
+            .unwrap();
+        })
+        .await;
+
+        assert_eq!(invalid, expired, "InvalidCode vs Expired body diverged");
+        assert_eq!(invalid, consumed, "InvalidCode vs Consumed body diverged");
+        // Sanity: the body should be the static reject string. Don't pin the
+        // exact bytes here so a future copy edit doesn't break the test —
+        // just check it's non-empty and doesn't leak the sub-class.
+        let body_str = String::from_utf8_lossy(&invalid);
+        assert!(!body_str.contains("expired"));
+        assert!(!body_str.contains("used"));
+        assert!(!body_str.contains("not found"));
+    }
+
+    /// All three rejection branches MUST take comparable wall-clock time —
+    /// otherwise a pre-Phase-06a-style timing oracle survives. Each branch
+    /// runs the same dummy Argon2 verify (~64ms with our pinned params).
+    /// CI hosts vary wildly, so we use a generous 3× upper-bound rather than
+    /// the plan's 20% — the goal is to catch a regression where one branch
+    /// short-circuits, not to pin sub-millisecond parity.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn pairing_rejection_branches_have_similar_timing() {
+        async fn time_rejection(slug: &str, setup: impl FnOnce(&Connection)) -> std::time::Duration {
+            let state = test_state(&format!("timing-{slug}"));
+            let conn = Connection::open(&state.db_path).unwrap();
+            setup(&conn);
+            drop(conn);
+            let start = std::time::Instant::now();
+            let _ = api_pairing_exchange(
+                State(state),
+                HeaderMap::new(),
+                CookieJar::new(),
+                Json(ExchangePairingRequest {
+                    code: Some(format!("TIMING{slug}").to_uppercase()),
+                    permanent_key: None,
+                    device_label: None,
+                }),
+            )
+            .await
+            .into_response();
+            start.elapsed()
+        }
+
+        // Warm the dummy-hash OnceLock so the first measurement isn't biased.
+        crate::auth::run_dummy_pairing_verify("warmup").await;
+
+        let invalid = time_rejection("a", |_conn| { /* no row */ }).await;
+        let expired = time_rejection("b", |conn| {
+            conn.execute(
+                "INSERT INTO pairing_codes(code, expires_at, used_at) VALUES (?1, ?2, NULL)",
+                params!["TIMINGB", now_ts() - 60],
+            )
+            .unwrap();
+        })
+        .await;
+        let consumed = time_rejection("c", |conn| {
+            conn.execute(
+                "INSERT INTO pairing_codes(code, expires_at, used_at) VALUES (?1, ?2, ?3)",
+                params!["TIMINGC", now_ts() + 300, now_ts() - 5],
+            )
+            .unwrap();
+        })
+        .await;
+
+        let times = [invalid, expired, consumed];
+        let min = times.iter().min().unwrap();
+        let max = times.iter().max().unwrap();
+        // All three must be at least ~10ms (proves the dummy verify ran).
+        assert!(
+            *min >= std::time::Duration::from_millis(10),
+            "fastest rejection took {min:?} — dummy Argon2 verify must run on every reject branch"
+        );
+        // And within 3× of each other so no branch short-circuits.
+        assert!(
+            *max <= *min * 3,
+            "rejection timings diverge: invalid={invalid:?} expired={expired:?} consumed={consumed:?}"
+        );
     }
 }
 

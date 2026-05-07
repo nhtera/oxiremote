@@ -4,7 +4,7 @@
 // encryption, hkdf + sha2 for key derivation. JWT is hand-rolled (just
 // base64url(header).base64url(payload).base64url(sig)).
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use anyhow::{anyhow, Context, Result};
 use base64::{
@@ -34,6 +34,11 @@ impl VapidKeys {
 pub fn load_or_create_vapid(data_dir: &Path) -> Result<VapidKeys> {
     let path = data_dir.join("vapid.key");
     let secret = if path.exists() {
+        // Self-heal owner-only perms in case a legacy install left them wide
+        // (Windows-significant — pre-helper writes had no ACL hardening).
+        if let Err(err) = crate::secure_file::ensure_owner_only(&path) {
+            tracing::warn!(error=%err, path=%path.display(), "could not enforce owner-only on vapid.key");
+        }
         let bytes = std::fs::read(&path).context("read vapid.key")?;
         if bytes.len() != 32 {
             return Err(anyhow!("vapid.key: expected 32 bytes, got {}", bytes.len()));
@@ -41,7 +46,8 @@ pub fn load_or_create_vapid(data_dir: &Path) -> Result<VapidKeys> {
         SecretKey::from_slice(&bytes).context("parse vapid secret")?
     } else {
         let sk = SecretKey::random(&mut OsRng);
-        write_secret(&path, &sk.to_bytes())?;
+        crate::secure_file::write_secret(&path, &sk.to_bytes())
+            .with_context(|| format!("write {}", path.display()))?;
         sk
     };
 
@@ -49,27 +55,6 @@ pub fn load_or_create_vapid(data_dir: &Path) -> Result<VapidKeys> {
     let public_b64url = URL_SAFE_NO_PAD.encode(encoded.as_bytes());
 
     Ok(VapidKeys { secret, public_b64url })
-}
-
-fn write_secret(path: &PathBuf, data: &[u8]) -> Result<()> {
-    #[cfg(unix)]
-    {
-        use std::io::Write;
-        use std::os::unix::fs::OpenOptionsExt;
-        let mut f = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(path)
-            .with_context(|| format!("create {}", path.display()))?;
-        f.write_all(data).context("write vapid.key")?;
-    }
-    #[cfg(not(unix))]
-    {
-        std::fs::write(path, data).context("write vapid.key")?;
-    }
-    Ok(())
 }
 
 /// Decode base64url (with or without padding) or standard base64.
@@ -203,6 +188,9 @@ fn encrypt_payload(p256dh_raw: &[u8], auth_secret: &[u8], payload: &[u8]) -> Res
 pub fn load_or_create_notify_token(data_dir: &Path) -> Result<String> {
     let path = data_dir.join("notify.token");
     if path.exists() {
+        if let Err(err) = crate::secure_file::ensure_owner_only(&path) {
+            tracing::warn!(error=%err, path=%path.display(), "could not enforce owner-only on notify.token");
+        }
         let raw = std::fs::read_to_string(&path).context("read notify.token")?;
         let token = raw.trim().to_string();
         if !token.is_empty() {
@@ -213,7 +201,8 @@ pub fn load_or_create_notify_token(data_dir: &Path) -> Result<String> {
     use p256::elliptic_curve::rand_core::RngCore;
     OsRng.fill_bytes(&mut bytes);
     let token = URL_SAFE_NO_PAD.encode(bytes);
-    write_secret(&path, token.as_bytes())?;
+    crate::secure_file::write_secret(&path, token.as_bytes())
+        .with_context(|| format!("write {}", path.display()))?;
     Ok(token)
 }
 

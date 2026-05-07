@@ -7,11 +7,11 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { isDiscoveryMode } from '../lib/discovery-client'
 import { loadApiKey, loadTunnelBase } from '../lib/api-client'
+import { mintWsTicket, WS_TICKET_PROTOCOL } from '../lib/ws-ticket-client'
 
-/// Subprotocol marker used to carry a Bearer api_key on WS upgrade in
-/// discovery (cross-origin) mode. Browsers can't set `Authorization` on
-/// the WS handshake, but they can offer subprotocols. The agent picks the
-/// marker (response header) and reads the api_key from the second value.
+/// Legacy subprotocol marker — replaced by `oxi-ticket-v1` in Phase 05 / H14.
+/// Kept for one release as a fallback so a stale SPA tab keeps working when
+/// the agent updates first; removed in v0.1.27.
 const WS_BEARER_PROTOCOL = 'oxi-bearer-v1'
 
 export type DesktopStatus =
@@ -78,7 +78,14 @@ function wsUrl(deviceId: string): string {
   return `${proto}//${location.host}${path}`
 }
 
-function wsProtocols(): string[] | undefined {
+/** Resolve subprotocols for a fresh WS open. Tries to mint a single-use
+ *  ticket first (Phase 05 / H14); falls back to the legacy bearer flow when
+ *  the agent doesn't yet expose `/api/ws-ticket` (older release) or the
+ *  request fails for transient reasons. Same-origin embedded mode without a
+ *  ticket skips this — cookie auth is enough. */
+async function wsProtocols(): Promise<string[] | undefined> {
+  const ticket = await mintWsTicket()
+  if (ticket) return [WS_TICKET_PROTOCOL, ticket]
   if (!isDiscoveryMode()) return undefined
   const key = loadApiKey()
   if (!key) return undefined
@@ -147,12 +154,22 @@ export function useDesktopSession(
 
     setStatus('connecting')
 
-    const protocols = wsProtocols()
-    const ws = protocols
-      ? new WebSocket(wsUrl(deviceId), protocols)
-      : new WebSocket(wsUrl(deviceId))
-    ws.binaryType = 'arraybuffer'
-    wsRef.current = ws
+    // Mint the single-use ticket BEFORE opening the WS so the upgrade
+    // handshake carries a fresh 60s token. The HTTP round-trip is short and
+    // the SPA reconnect logic already tolerates a small delay before `ws`
+    // becomes non-null.
+    void wsProtocols().then((protocols) => {
+      if (destroyedRef.current) return
+      const ws = protocols
+        ? new WebSocket(wsUrl(deviceId), protocols)
+        : new WebSocket(wsUrl(deviceId))
+      ws.binaryType = 'arraybuffer'
+      wsRef.current = ws
+      wireWs(ws)
+    })
+  }, [deviceId, onTile, teardown]) // eslint-disable-line react-hooks/exhaustive-deps
+
+  const wireWs = useCallback((ws: WebSocket) => {
 
     const pc = new RTCPeerConnection(STUN_CONFIG)
     pcRef.current = pc

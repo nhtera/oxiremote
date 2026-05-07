@@ -64,6 +64,29 @@ pub async fn proxy_handler(
     proxy_dispatch(state, jar, port_str, rest, req).await
 }
 
+/// Precedence verdict for `/proxy/{port}` gating. Auth precedes allowlist
+/// (Phase 01) so unauthenticated tunnel callers see an identical 401
+/// regardless of which port they probe — no allowlist-membership oracle.
+#[derive(Debug, PartialEq, Eq)]
+enum GateVerdict {
+    Allow,
+    Unauthorized,
+    PortNotEnabled,
+}
+
+fn evaluate_gate(is_tunnel: bool, authenticated: bool, port_allowed: bool) -> GateVerdict {
+    // 1. Auth FIRST. Loopback callers (is_tunnel = false) skip auth — the
+    //    agent binds loopback-only so they're already on the host.
+    if is_tunnel && !authenticated {
+        return GateVerdict::Unauthorized;
+    }
+    // 2. Allowlist SECOND.
+    if !port_allowed {
+        return GateVerdict::PortNotEnabled;
+    }
+    GateVerdict::Allow
+}
+
 async fn proxy_dispatch(
     State(state): State<Arc<AppState>>,
     jar: CookieJar,
@@ -75,17 +98,21 @@ async fn proxy_dispatch(
         return (StatusCode::BAD_REQUEST, "invalid port").into_response();
     };
 
-    if !state.proxy_allowed_ports.read().unwrap().contains(&port) {
-        return (StatusCode::FORBIDDEN, "port not enabled").into_response();
-    }
-
-    // Tunnel-side callers must have a valid session cookie or Bearer api_key.
-    // Loopback callers are trusted (they're already on the host).
+    let is_tunnel = is_tunnel_request(req.headers());
     let bearer = crate::auth::extract_bearer(req.headers());
-    if is_tunnel_request(req.headers())
-        && crate::auth::require_tunnel_auth(&state.db_path, &state.signing_key, &jar, bearer.as_deref()).await.is_none()
-    {
-        return (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
+    let authenticated = if is_tunnel {
+        crate::auth::require_tunnel_auth(&state.db_path, &state.signing_key, &jar, bearer.as_deref())
+            .await
+            .is_some()
+    } else {
+        true
+    };
+    let port_allowed = state.proxy_allowed_ports.read().unwrap().contains(&port);
+
+    match evaluate_gate(is_tunnel, authenticated, port_allowed) {
+        GateVerdict::Unauthorized => return (StatusCode::UNAUTHORIZED, "unauthorized").into_response(),
+        GateVerdict::PortNotEnabled => return (StatusCode::FORBIDDEN, "port not enabled").into_response(),
+        GateVerdict::Allow => {}
     }
 
     let is_ws = req
@@ -101,6 +128,14 @@ async fn proxy_dispatch(
                 return (StatusCode::BAD_REQUEST, format!("ws upgrade: {e}")).into_response()
             }
         };
+        // H13 enforcement at the framing layer: cap inbound (client → agent)
+        // axum messages BEFORE buffering. Without this, the application-level
+        // `pump_ws` byte cap fires only after axum has already buffered up to
+        // its default 64 MiB max_message_size — leaving a memory-DoS window
+        // proportional to concurrent connections.
+        let ws = ws
+            .max_message_size(PROXY_FRAME_MAX_BYTES)
+            .max_frame_size(PROXY_FRAME_MAX_BYTES);
         return proxy_ws_upgrade(ws, port, rest);
     }
 
@@ -180,22 +215,102 @@ fn proxy_ws_upgrade(
     })
 }
 
+/// Per-frame ceiling for the proxy WS pump. RFC 6455 has no built-in cap;
+/// 4 MB matches the upstream Vite/HMR ceiling and is far above any sensible
+/// HMR / dev-tool payload. On overflow we close with code 1009 (Message Too
+/// Big) — the client-side EventSource / WS reconnect logic handles that as a
+/// transient error and will retry with a smaller payload.
+const PROXY_FRAME_MAX_BYTES: usize = 4 * 1024 * 1024;
+/// Cumulative bytes (sum of both directions) per WS session before we drop
+/// the connection. 256 MB is generous for HMR / file-watch pumps but a clear
+/// red flag for a runaway producer or a malicious file-exfil pipe through the
+/// `/proxy` route. On overflow we close with code 1008 (Policy Violation) so
+/// the client distinguishes it from per-frame overflow.
+const PROXY_SESSION_MAX_BYTES: u64 = 256 * 1024 * 1024;
+
+fn axum_msg_len(msg: &axum::extract::ws::Message) -> usize {
+    use axum::extract::ws::Message as M;
+    match msg {
+        M::Text(t) => t.len(),
+        M::Binary(b) => b.len(),
+        M::Ping(p) | M::Pong(p) => p.len(),
+        M::Close(_) => 0,
+    }
+}
+
+fn tung_msg_len(msg: &tokio_tungstenite::tungstenite::Message) -> usize {
+    use tokio_tungstenite::tungstenite::Message as M;
+    match msg {
+        M::Text(t) => t.len(),
+        M::Binary(b) => b.len(),
+        M::Ping(p) | M::Pong(p) => p.len(),
+        M::Close(_) | M::Frame(_) => 0,
+    }
+}
+
 async fn pump_ws(
     port: u16,
     rest: String,
     client_ws: axum::extract::ws::WebSocket,
 ) -> anyhow::Result<()> {
-    use axum::extract::ws::Message as AxumMsg;
+    use axum::extract::ws::{CloseFrame, Message as AxumMsg};
     use futures_util::{SinkExt, StreamExt};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use tokio::sync::Mutex;
     use tokio_tungstenite::tungstenite::Message as TungMsg;
+    use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 
     let origin_url = format!("ws://127.0.0.1:{port}/{rest}");
-    let (origin_ws, _) = tokio_tungstenite::connect_async(&origin_url).await?;
+    // Cap inbound (origin → agent) frames at the framing layer. Tungstenite's
+    // default `max_message_size` is 64 MiB; without this override a hostile
+    // origin could force the agent to buffer 64 MiB before our application
+    // cap (`tung_msg_len > PROXY_FRAME_MAX_BYTES`) ever fires.
+    let mut tung_config = WebSocketConfig::default();
+    tung_config.max_message_size = Some(PROXY_FRAME_MAX_BYTES);
+    tung_config.max_frame_size = Some(PROXY_FRAME_MAX_BYTES);
+    let (origin_ws, _) =
+        tokio_tungstenite::connect_async_with_config(&origin_url, Some(tung_config), false).await?;
     let (mut origin_tx, mut origin_rx) = origin_ws.split();
-    let (mut client_tx, mut client_rx) = client_ws.split();
+    let (client_tx, mut client_rx) = client_ws.split();
 
-    let client_to_origin = async {
+    // H13: cumulative byte counter shared across both pump directions. A
+    // single hostile producer in either direction trips the same cap.
+    let bytes = Arc::new(AtomicU64::new(0));
+    let bytes_c2o = bytes.clone();
+    let bytes_o2c = bytes.clone();
+
+    // Client sink wrapped in a tokio mutex so both arms can write the close
+    // frame on overflow. In the steady state only `origin_to_client` writes,
+    // so contention is essentially zero — only the close path acquires it
+    // from the other arm.
+    let client_tx = Arc::new(Mutex::new(client_tx));
+    let client_tx_c = client_tx.clone();
+    let client_tx_o = client_tx.clone();
+
+    async fn send_close(
+        sink: &Mutex<futures_util::stream::SplitSink<axum::extract::ws::WebSocket, AxumMsg>>,
+        code: u16,
+        reason: &'static str,
+    ) {
+        let frame = CloseFrame {
+            code,
+            reason: reason.into(),
+        };
+        let _ = sink.lock().await.send(AxumMsg::Close(Some(frame))).await;
+    }
+
+    let client_to_origin = async move {
         while let Some(Ok(msg)) = client_rx.next().await {
+            let len = axum_msg_len(&msg);
+            if len > PROXY_FRAME_MAX_BYTES {
+                send_close(&client_tx_c, 1009, "frame-too-big").await;
+                break;
+            }
+            let total = bytes_c2o.fetch_add(len as u64, Ordering::Relaxed) + len as u64;
+            if total > PROXY_SESSION_MAX_BYTES {
+                send_close(&client_tx_c, 1008, "session-byte-limit").await;
+                break;
+            }
             let tung_msg = match msg {
                 AxumMsg::Text(t) => TungMsg::Text(t.as_str().into()),
                 AxumMsg::Binary(b) => TungMsg::Binary(b),
@@ -209,8 +324,18 @@ async fn pump_ws(
         }
     };
 
-    let origin_to_client = async {
+    let origin_to_client = async move {
         while let Some(Ok(msg)) = origin_rx.next().await {
+            let len = tung_msg_len(&msg);
+            if len > PROXY_FRAME_MAX_BYTES {
+                send_close(&client_tx_o, 1009, "frame-too-big").await;
+                break;
+            }
+            let total = bytes_o2c.fetch_add(len as u64, Ordering::Relaxed) + len as u64;
+            if total > PROXY_SESSION_MAX_BYTES {
+                send_close(&client_tx_o, 1008, "session-byte-limit").await;
+                break;
+            }
             let axum_msg = match msg {
                 TungMsg::Text(t) => AxumMsg::Text(t.as_str().into()),
                 TungMsg::Binary(b) => AxumMsg::Binary(b),
@@ -219,7 +344,7 @@ async fn pump_ws(
                 TungMsg::Close(_) => break,
                 _ => continue,
             };
-            if client_tx.send(axum_msg).await.is_err() {
+            if client_tx_o.lock().await.send(axum_msg).await.is_err() {
                 break;
             }
         }
@@ -396,5 +521,89 @@ mod tests {
         );
         strip_self_session_cookie(&mut headers);
         assert!(headers.get(header::COOKIE).is_none());
+    }
+
+    // Phase 01 — auth precedes allowlist. An unauthenticated tunnel caller
+    // hitting an allowlisted port gets the SAME 401 as one hitting a
+    // not-allowlisted port: no allowlist-membership oracle.
+
+    /// No-oracle invariant: result must NOT depend on `port_allowed`.
+    /// Passes under both old (allowlist-first) and new (auth-first) ordering;
+    /// here for documentation, not for ordering regression detection.
+    #[test]
+    fn gate_unauth_tunnel_returns_unauthorized_regardless_of_allowlist() {
+        // Both inputs differ only in the allowlist bit — both must yield 401.
+        assert_eq!(evaluate_gate(true, false, true), GateVerdict::Unauthorized);
+        assert_eq!(
+            evaluate_gate(true, false, false),
+            GateVerdict::Unauthorized
+        );
+    }
+
+    /// **Ordering regression test.** Under the OLD (allowlist-first) order,
+    /// `(is_tunnel=true, authed=false, port_allowed=false)` returns
+    /// `PortNotEnabled` (403). Under the NEW (auth-first) order it must
+    /// return `Unauthorized` (401). This is the test that fails if the
+    /// precedence is ever reverted.
+    #[test]
+    fn gate_auth_check_runs_before_allowlist_check() {
+        assert_eq!(
+            evaluate_gate(true, false, false),
+            GateVerdict::Unauthorized,
+            "auth must precede allowlist — reversing the order leaks allowlist membership via the 401/403 split"
+        );
+    }
+
+    #[test]
+    fn gate_authed_tunnel_returns_403_when_port_not_allowed() {
+        assert_eq!(
+            evaluate_gate(true, true, false),
+            GateVerdict::PortNotEnabled
+        );
+    }
+
+    #[test]
+    fn gate_loopback_skips_auth_check() {
+        // is_tunnel=false → caller is loopback; skip auth and proceed to
+        // allowlist check. With port allowed → Allow.
+        assert_eq!(evaluate_gate(false, false, true), GateVerdict::Allow);
+        // …without port allowed → PortNotEnabled.
+        assert_eq!(
+            evaluate_gate(false, false, false),
+            GateVerdict::PortNotEnabled
+        );
+    }
+
+    #[test]
+    fn gate_authed_tunnel_with_allowed_port_returns_allow() {
+        assert_eq!(evaluate_gate(true, true, true), GateVerdict::Allow);
+    }
+
+    // H13 — proxy WS byte-cap accounting.
+
+    #[test]
+    fn axum_msg_len_tracks_payload_size() {
+        use axum::extract::ws::Message as M;
+        assert_eq!(axum_msg_len(&M::Text("hello".into())), 5);
+        assert_eq!(axum_msg_len(&M::Binary(vec![0u8; 1024].into())), 1024);
+        assert_eq!(axum_msg_len(&M::Ping(vec![1, 2, 3].into())), 3);
+        assert_eq!(axum_msg_len(&M::Close(None)), 0);
+    }
+
+    #[test]
+    fn tung_msg_len_tracks_payload_size() {
+        use tokio_tungstenite::tungstenite::Message as M;
+        assert_eq!(tung_msg_len(&M::Text("hello".into())), 5);
+        assert_eq!(tung_msg_len(&M::Binary(vec![0u8; 2048].into())), 2048);
+        assert_eq!(tung_msg_len(&M::Close(None)), 0);
+    }
+
+    #[test]
+    fn proxy_caps_match_plan() {
+        // These are documented in release notes — bumping them is a
+        // user-visible change. If a future PR raises them, this test breaks
+        // first so the docs/changelog get touched too.
+        assert_eq!(PROXY_FRAME_MAX_BYTES, 4 * 1024 * 1024);
+        assert_eq!(PROXY_SESSION_MAX_BYTES, 256 * 1024 * 1024);
     }
 }

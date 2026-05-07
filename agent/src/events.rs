@@ -48,6 +48,16 @@ pub enum LogLevel {
     Error,
 }
 
+/// Severity for `AgentEvent::SettingsHint`. `Error` hints surface as a
+/// blocking banner; `Warn`/`Info` are dismissible.
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum HintSeverity {
+    Info,
+    Warn,
+    Error,
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AgentEvent {
@@ -137,6 +147,18 @@ pub enum AgentEvent {
     /// transport are torn down. SPA listeners use this to transition the
     /// dashboard back to the onboarding card without a full reload.
     TunnelDisconnected,
+    /// Operational hint surfaced as a Localhost-scoped dashboard banner.
+    /// `code` is a stable identifier the SPA uses for per-hint dismiss
+    /// state (local-storage). Examples: `signing-key-perms-failed`,
+    /// `root-workspace-present`. Dashboard polls `/api/agent/hints` on
+    /// mount + listens to this event for live updates so a hint emitted
+    /// before subscription is not lost.
+    SettingsHint {
+        code: String,
+        severity: HintSeverity,
+        /// Short, actionable message rendered inside the banner.
+        message: String,
+    },
     /// An AI coding agent CLI (claude/codex/cursor/opencode) was detected as
     /// the foreground process in a terminal session. Emitted at most once per
     /// state change — repeated polls that see the same agent are no-ops.
@@ -152,6 +174,30 @@ pub enum AgentEvent {
         agent_name: String,
         duration_ms: u64,
         exit_code: Option<i32>,
+    },
+    /// A new terminal shell was spawned via `terminal_pty::spawn_terminal_session`.
+    /// Drives the dashboard audit log and the desktop tray notifier so the
+    /// operator sees every shell that opens — even ones spawned after the
+    /// dashboard mounted via the `/api/agent/sessions/recent` ring buffer.
+    /// `command` is the program path only (argv[0]); arguments are deliberately
+    /// excluded so user-supplied flags like `--password=…` never reach this
+    /// audit channel (§H11 privacy clause).
+    ShellOpened {
+        device_id: String,
+        session_id: String,
+        command: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cwd: Option<String>,
+        ts: i64,
+    },
+    /// PTY for a previously-opened shell exited. `exit_code` is None when the
+    /// child reaper failed (rare; the PTY typically reports a code).
+    ShellClosed {
+        device_id: String,
+        session_id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        exit_code: Option<i32>,
+        ts: i64,
     },
     /// Granular tunnel progress — emitted at each lifecycle step so the TUI
     /// and WebUI can render a 5-row checklist with live sub-text.

@@ -14,3 +14,15 @@ preview_id = "68ec5cd43eba473ea72017d7daa103c2"
 
 # Custom-domain routing is wired in Phase 5. Until then, the worker is
 # reachable at https://oxiremote-discovery.<account>.workers.dev.
+
+# Required secret (Phase 04 / H1):
+#   wrangler secret put AGENT_REGISTRATION_SECRET
+# The agent attaches this as `Authorization: Bearer <secret>` on every
+# mutating POST. Lookup endpoints stay open. The worker fails closed (503)
+# when this secret is unset — a misdeployed worker will refuse all writes
+# rather than silently accept arbitrary registrations.
+#
+# The agent generates its own 64-hex secret in `~/.oxiremote/discovery_secret`
+# on first boot. Copy the EXACT value (no trailing newline, no extra spaces)
+# into wrangler's secret prompt:
+#   oxiremote config discovery-secret | wrangler secret put AGENT_REGISTRATION_SECRET

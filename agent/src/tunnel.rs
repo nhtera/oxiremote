@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -7,10 +8,11 @@ use flate2::read::GzDecoder;
 use futures_util::StreamExt;
 use regex::Regex;
 use reqwest::Client;
+use sha2::{Digest, Sha256};
 use tar::Archive;
 use tokio::io::AsyncBufReadExt;
 use tokio::sync::Notify;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::events::{AgentEvent, EventBus, TunnelStep};
 
@@ -98,8 +100,31 @@ async fn try_ensure_cloudflared(data_dir: &Path, bus: Arc<EventBus>) -> anyhow::
     }
 
     emit_prep(&bus, "finding latest release");
-    let version = cloudflared_latest_version().await.context("get latest version")?;
+    let release = fetch_cloudflared_release().await.context("get latest release metadata")?;
+    let version = release.tag_name.clone();
     let art = artifact_for_current_host()?;
+
+    // Phase 03 / C5 — Cloudflare publishes per-asset SHA256 in the release
+    // notes body. Parse it before download so we fail closed on a missing /
+    // unrecognised manifest format rather than installing an unverified
+    // binary. Refusing here surfaces a clear error pointing operators at
+    // manual install (PATH override) instead of silently regressing to
+    // TLS-only trust.
+    let sha_map = parse_sha_manifest(&release.body);
+    if sha_map.is_empty() {
+        anyhow::bail!(
+            "cloudflared release {version}: no SHA256 entries parsed from release notes body. \
+             Format may have changed upstream — refusing to install unverified binary. \
+             Install cloudflared manually + put it on PATH, then restart oxiremote.\n\
+             Release page: https://github.com/cloudflare/cloudflared/releases/tag/{version}"
+        );
+    }
+    let expected_sha = sha_map.get(&art.release_filename).ok_or_else(|| {
+        anyhow::anyhow!(
+            "cloudflared release {version} manifest does not list asset `{}`",
+            art.release_filename
+        )
+    })?;
 
     let asset_url = format!(
         "https://github.com/cloudflare/cloudflared/releases/download/{version}/{}",
@@ -114,13 +139,6 @@ async fn try_ensure_cloudflared(data_dir: &Path, bus: Arc<EventBus>) -> anyhow::
         .timeout(Duration::from_secs(60))
         .connect_timeout(Duration::from_secs(10))
         .build()?;
-
-    // No SHA256 manifest: Cloudflare does not publish a checksums file in their
-    // GitHub releases (verified across 2024.x → 2026.x). Earlier code fetched
-    // `cloudflared-{version}-checksums.txt` and 404'd on every fresh install
-    // that didn't already have a cached binary. We rely on TLS to github.com +
-    // their CDN for transport integrity, matching how Cloudflare's own install
-    // scripts handle it.
 
     emit_prep(&bus, "downloading cloudflared");
     let resp = client
@@ -157,6 +175,22 @@ async fn try_ensure_cloudflared(data_dir: &Path, bus: Arc<EventBus>) -> anyhow::
         None => format!("downloaded cloudflared ({} MB)", bytes.len() / 1_000_000),
     };
     emit_prep(&bus, &final_text);
+
+    // Phase 03 / C5 — verify SHA256 against the Cloudflare release-notes
+    // manifest BEFORE writing/exec-bitting the binary. The expected SHA is
+    // public (it's in the release notes), so timing-safe comparison adds no
+    // value here — a plain `!=` is clearer and matches `update.rs`.
+    let actual_sha = hex::encode(Sha256::digest(&bytes));
+    if actual_sha != *expected_sha {
+        let exp_short = expected_sha.get(..16).unwrap_or(expected_sha.as_str());
+        let act_short = actual_sha.get(..16).unwrap_or(actual_sha.as_str());
+        warn!(expected = %exp_short, actual = %act_short, "cloudflared SHA mismatch");
+        anyhow::bail!(
+            "cloudflared SHA256 mismatch — refusing to install.\n  \
+             expected: {expected_sha}\n  actual:   {actual_sha}"
+        );
+    }
+    info!("cloudflared SHA256 verified");
 
     // Set exec bit on the staging file BEFORE renaming into `path`.
     // Otherwise a crash between rename and chmod leaves a non-executable
@@ -202,22 +236,32 @@ fn extract_cloudflared_tgz(bytes: &[u8], dest: &Path) -> anyhow::Result<PathBuf>
     anyhow::bail!("cloudflared binary not found in archive")
 }
 
-async fn cloudflared_latest_version() -> anyhow::Result<String> {
+/// GitHub release metadata shape we care about — tag for asset URL
+/// resolution + body for SHA manifest extraction (Phase 03 / C5).
+#[derive(Debug, Clone)]
+struct CloudflaredRelease {
+    tag_name: String,
+    body: String,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct GhCloudflaredReleaseRaw {
+    tag_name: String,
+    #[serde(default)]
+    body: String,
+}
+
+async fn fetch_cloudflared_release() -> anyhow::Result<CloudflaredRelease> {
     let client = Client::builder()
         .user_agent("oxiremote/0.1")
-        .redirect(reqwest::redirect::Policy::none())
         .timeout(Duration::from_secs(15))
         .connect_timeout(Duration::from_secs(10))
         .build()?;
 
-    // Up to 3 attempts — Windows clients hit transient TLS handshake / DNS
-    // glitches behind corporate networks, and the underlying request timeout
-    // (15s) is long enough that one stuck attempt is enough for an operator
-    // to assume the agent has hung.
     let mut last_err: Option<anyhow::Error> = None;
     for attempt in 1..=3 {
-        match fetch_latest_tag(&client).await {
-            Ok(tag) => return Ok(tag),
+        match fetch_cloudflared_release_once(&client).await {
+            Ok(r) => return Ok(r),
             Err(err) => {
                 last_err = Some(err);
                 if attempt < 3 {
@@ -226,25 +270,65 @@ async fn cloudflared_latest_version() -> anyhow::Result<String> {
             }
         }
     }
-    Err(last_err.unwrap_or_else(|| anyhow::anyhow!("could not determine latest cloudflared version")))
+    Err(last_err.unwrap_or_else(|| anyhow::anyhow!("could not fetch cloudflared release metadata")))
 }
 
-async fn fetch_latest_tag(client: &Client) -> anyhow::Result<String> {
-    let resp = client
-        .get("https://github.com/cloudflare/cloudflared/releases/latest")
+async fn fetch_cloudflared_release_once(client: &Client) -> anyhow::Result<CloudflaredRelease> {
+    let body = client
+        .get("https://api.github.com/repos/cloudflare/cloudflared/releases/latest")
+        .header("Accept", "application/vnd.github+json")
         .send()
         .await
-        .context("request latest release")?;
+        .context("fetch latest cloudflared release")?
+        .error_for_status()
+        .context("github API returned non-2xx for cloudflared release")?
+        .text()
+        .await
+        .context("read cloudflared release body")?;
+    let parsed: GhCloudflaredReleaseRaw =
+        serde_json::from_str(&body).context("parse cloudflared release JSON")?;
+    Ok(CloudflaredRelease {
+        tag_name: parsed.tag_name,
+        body: parsed.body,
+    })
+}
 
-    let status = resp.status();
-    if let Some(loc) = resp.headers().get("location") {
-        let loc = loc.to_str().context("location header")?;
-        if let Some(tag) = loc.rsplit('/').next().filter(|s| !s.is_empty()) {
-            return Ok(tag.to_string());
+/// Parse Cloudflare's release-notes SHA256 manifest into a
+/// `asset_name -> sha256_hex` map. Cloudflare's body uses entries shaped
+/// like:
+///
+/// ```text
+/// cloudflared-darwin-arm64.tgz: 633cee0fd41fd2020e17498beecc54811bf4fc99f891c080dc9343eb0f449c60
+/// cloudflared-linux-amd64: 4a9e50e6d6d798e90fcd01933151a90bf7edd99a0a55c28ad18f2e16263a5c30
+/// ```
+///
+/// The asset-name char class `[A-Za-z0-9._+~-]` accommodates current
+/// suffixes (`.tgz`, `.exe`) and forward-compat ones (`+` / `~`). Lines
+/// that don't match are silently skipped — the manifest may interleave
+/// commentary with checksum rows. Empty result on parse failure forces
+/// the caller to fail closed (no install).
+pub fn parse_sha_manifest(body: &str) -> HashMap<String, String> {
+    // Anchor at start-of-line; trailing CR is stripped via `body.lines()`.
+    // Static so the pattern is compiled once across all calls.
+    static RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    let re = RE.get_or_init(|| {
+        Regex::new(r"^([A-Za-z0-9._+~-]+):\s*([0-9a-fA-F]{64})\s*$")
+            .expect("static SHA manifest regex must compile")
+    });
+
+    let mut out = HashMap::new();
+    for raw in body.lines() {
+        // body.lines() handles both `\n` and `\r\n` endings (trims `\r`).
+        // Use the raw line directly.
+        if let Some(caps) = re.captures(raw) {
+            let asset = caps.get(1).map(|m| m.as_str().to_string());
+            let sha = caps.get(2).map(|m| m.as_str().to_lowercase());
+            if let (Some(asset), Some(sha)) = (asset, sha) {
+                out.insert(asset, sha);
+            }
         }
     }
-
-    anyhow::bail!("could not determine latest cloudflared version (status {status}, no location header — corporate proxy may be stripping redirects)")
+    out
 }
 
 pub async fn ensure_quick_tunnel(
@@ -719,6 +803,81 @@ mod tests {
         assert!(
             matches!(event, AgentEvent::TunnelDisconnected),
             "expected TunnelDisconnected, got {event:?}"
+        );
+    }
+
+    // Phase 03 / C5 — SHA manifest parsing must tolerate the formatting
+    // variations Cloudflare's release notes have shipped historically and
+    // any plausible forward-compat suffixes (per Red Team F11).
+
+    const SAMPLE_LF: &str = "Some intro line\n\n\
+        cloudflared-darwin-arm64.tgz: 633cee0fd41fd2020e17498beecc54811bf4fc99f891c080dc9343eb0f449c60\n\
+        cloudflared-linux-amd64: 4a9e50e6d6d798e90fcd01933151a90bf7edd99a0a55c28ad18f2e16263a5c30\n";
+
+    #[test]
+    fn parse_sha_manifest_handles_lf() {
+        let map = parse_sha_manifest(SAMPLE_LF);
+        assert_eq!(
+            map.get("cloudflared-darwin-arm64.tgz").map(String::as_str),
+            Some("633cee0fd41fd2020e17498beecc54811bf4fc99f891c080dc9343eb0f449c60")
+        );
+        assert_eq!(
+            map.get("cloudflared-linux-amd64").map(String::as_str),
+            Some("4a9e50e6d6d798e90fcd01933151a90bf7edd99a0a55c28ad18f2e16263a5c30")
+        );
+    }
+
+    #[test]
+    fn parse_sha_manifest_handles_crlf() {
+        let crlf = SAMPLE_LF.replace('\n', "\r\n");
+        let map = parse_sha_manifest(&crlf);
+        assert_eq!(map.len(), 2);
+        assert!(map.contains_key("cloudflared-linux-amd64"));
+    }
+
+    #[test]
+    fn parse_sha_manifest_handles_mixed_line_endings() {
+        let mixed = SAMPLE_LF.replacen('\n', "\r\n", 2);
+        let map = parse_sha_manifest(&mixed);
+        assert_eq!(map.len(), 2);
+    }
+
+    #[test]
+    fn parse_sha_manifest_accepts_plus_and_tilde_in_asset_names() {
+        let body = "cloudflared-linux-amd64+fips: 1111111111111111111111111111111111111111111111111111111111111111\n\
+                    cloudflared-linux-amd64~beta: 2222222222222222222222222222222222222222222222222222222222222222\n";
+        let map = parse_sha_manifest(body);
+        assert_eq!(map.len(), 2);
+        assert!(map.contains_key("cloudflared-linux-amd64+fips"));
+        assert!(map.contains_key("cloudflared-linux-amd64~beta"));
+    }
+
+    #[test]
+    fn parse_sha_manifest_returns_empty_when_no_lines_match() {
+        let body = "## Release notes\n\nNo SHA table this time around.\n\nGoodbye.\n";
+        let map = parse_sha_manifest(body);
+        assert!(map.is_empty(), "parser must NOT invent entries: {map:?}");
+    }
+
+    #[test]
+    fn parse_sha_manifest_skips_malformed_lines() {
+        let body = "cloudflared-linux-amd64: notenoughhex\n\
+                    cloudflared-darwin-arm64.tgz: 633cee0fd41fd2020e17498beecc54811bf4fc99f891c080dc9343eb0f449c60\n\
+                    cloudflared-windows-amd64.exe: 5151515151515151515151515151515151515151515151515151515151515151extra\n";
+        let map = parse_sha_manifest(body);
+        // Only the well-formed line is kept.
+        assert_eq!(map.len(), 1);
+        assert!(map.contains_key("cloudflared-darwin-arm64.tgz"));
+    }
+
+    #[test]
+    fn parse_sha_manifest_accepts_uppercase_hex() {
+        let body = "cloudflared-linux-amd64: ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789\n";
+        let map = parse_sha_manifest(body);
+        // Stored as lowercase for stable comparison.
+        assert_eq!(
+            map.get("cloudflared-linux-amd64").map(String::as_str),
+            Some("abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789")
         );
     }
 

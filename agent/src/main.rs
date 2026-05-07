@@ -13,6 +13,7 @@ mod files_upload;
 mod git;
 mod host;
 mod health_check;
+mod hints;
 mod host_api;
 mod http_pages;
 mod instance_lock;
@@ -23,13 +24,16 @@ mod one_time_keys;
 mod preview;
 mod preview_token;
 mod proxy;
+mod recent_sessions;
 mod push;
 mod push_api;
+mod secure_file;
 mod security;
 mod settings;
 mod telemetry;
 mod tracing_setup;
 mod update;
+mod update_signing;
 mod static_files;
 #[cfg(feature = "desktop")]
 mod desktop_service;
@@ -52,6 +56,7 @@ mod tray;
 mod tui;
 mod tunnel;
 mod tunnel_named;
+mod ws_ticket;
 #[cfg(target_os = "windows")]
 mod win_jobs;
 mod workspaces;
@@ -137,6 +142,11 @@ pub struct AppState {
     /// the agent runs in single-binary embedded mode and emits `<tunnel>/login`
     /// QR payloads exactly as before.
     pub discovery_url: Option<String>,
+    /// Shared secret the agent attaches as `Authorization: Bearer <secret>`
+    /// on every mutating discovery-worker POST (Phase 04 / H1). `None` when
+    /// `discovery_url` is unset (embedded mode); always `Some` when the worker
+    /// is configured.
+    pub discovery_secret: Option<String>,
     /// Public web app base URL (`OXI_WEB_URL`). When set, QR payloads and the
     /// dashboard share-link point here (e.g.
     /// `https://remote.example.com/login?k=<otk>`) instead of the per-host
@@ -176,6 +186,17 @@ pub struct AppState {
     /// (manual prune). Read by the CORS middleware on every cross-origin
     /// request.
     pub cors_origins: security::cors::CorsOrigins,
+
+    /// Single-use WebSocket upgrade ticket store (Phase 05 / H14). Replaces
+    /// long-lived api_key-in-subprotocol with a 60s one-shot token minted via
+    /// `POST /api/ws-ticket`. See `ws_ticket.rs`.
+    pub ws_tickets: ws_ticket::TicketStore,
+
+    /// Bounded ring buffer of recent shell-lifecycle events (Phase 06c / H11).
+    /// Populated by a background subscriber to the event bus; queried by the
+    /// host dashboard via `GET /api/agent/sessions/recent` so a tab opened
+    /// after a shell already spawned still sees it.
+    pub recent_sessions: recent_sessions::RecentSessions,
 }
 
 fn default_data_dir() -> anyhow::Result<PathBuf> {
@@ -216,6 +237,33 @@ fn main() -> anyhow::Result<()> {
             eprintln!("Usage: oxiremote tunnel use <name>");
             std::process::exit(2);
         }
+        if sub == "config" {
+            // `oxiremote config discovery-secret` — Phase 04 / H1.
+            // Operator recovery for the discovery-worker write secret. The
+            // file is 0o600 / owner-only; calling `cat` directly works too
+            // but this subcommand is a stable, documented path that survives
+            // future filename / location changes.
+            let action = argv.get(2).map(String::as_str).unwrap_or("");
+            if action == "discovery-secret" {
+                let data_dir = default_data_dir()?;
+                let path = discovery::discovery_secret_path(&data_dir);
+                if !path.exists() {
+                    eprintln!(
+                        "no discovery secret configured at {}",
+                        path.display()
+                    );
+                    eprintln!(
+                        "set OXI_DISCOVERY_URL and run the agent once to generate it."
+                    );
+                    std::process::exit(1);
+                }
+                let content = std::fs::read_to_string(&path).context("read discovery_secret")?;
+                println!("{}", content.trim());
+                return Ok(());
+            }
+            eprintln!("Usage: oxiremote config discovery-secret");
+            std::process::exit(2);
+        }
         if sub == "serve" || sub == "--headless" || sub == "--auto" {
             return run_server_headless();
         }
@@ -238,7 +286,7 @@ fn main() -> anyhow::Result<()> {
         }
         if sub == "--help" || sub == "-h" {
             println!(
-                "Usage:\n  oxiremote                     Run agent + TUI (if TTY) or headless server\n  oxiremote tui                 Force TUI mode (server in background)\n  oxiremote ui                  Spawn agent in background with menu-bar tray, open browser\n  oxiremote serve               Force headless server mode\n  oxiremote --auto              Headless start (alias of `serve`, useful for Codespaces postStartCommand)\n  oxiremote update              Self-update from the latest GitHub release\n  oxiremote --version           Print version and exit\n  oxiremote notify --title <text> [--body <text>] [--deep-link </h/...>]\n  oxiremote tunnel use <name>   Write ~/.config/oxiremote/tunnel.toml"
+                "Usage:\n  oxiremote                     Run agent + TUI (if TTY) or headless server\n  oxiremote tui                 Force TUI mode (server in background)\n  oxiremote ui                  Spawn agent in background with menu-bar tray, open browser\n  oxiremote serve               Force headless server mode\n  oxiremote --auto              Headless start (alias of `serve`, useful for Codespaces postStartCommand)\n  oxiremote update              Self-update from the latest GitHub release\n  oxiremote --version           Print version and exit\n  oxiremote notify --title <text> [--body <text>] [--deep-link </h/...>]\n  oxiremote tunnel use <name>   Write ~/.config/oxiremote/tunnel.toml\n  oxiremote config discovery-secret\n                                Print the discovery-worker shared secret"
             );
             return Ok(());
         }
@@ -580,13 +628,29 @@ async fn server_main(
     }
 
     let key_path = data_dir.join("signing.key");
-    let signing_key = auth::load_or_create_key(&key_path).context("load signing key")?;
+    let signing_key =
+        auth::load_or_create_key(&key_path, Some(&event_bus)).context("load signing key")?;
 
     // Derive + persist stable host identity (hostname + install salt → blake3 hash).
     let host_info = {
         let conn = rusqlite::Connection::open(&db_path).context("open db for host init")?;
         let info = host::ensure_host(&data_dir, &conn).context("ensure host")?;
         workspaces::seed_defaults(&conn, &info.host_id).context("seed workspaces")?;
+
+        // Phase 02 (C3) — broadcast hint when a legacy `/` workspace row
+        // is detected so the dashboard can prompt the operator to delete
+        // it. Pull endpoint /api/agent/hints is the source of truth; this
+        // event is the live-update channel for already-open dashboards.
+        if let Ok(true) = workspaces::has_root_workspace(&conn, &info.host_id) {
+            event_bus.send(events::AgentEvent::SettingsHint {
+                code: hints::CODE_ROOT_WORKSPACE_PRESENT.to_string(),
+                severity: events::HintSeverity::Warn,
+                message: "A root-filesystem workspace is configured. Devices with file \
+                          access can read your entire disk. Review or delete it under \
+                          Settings → Workspaces."
+                    .to_string(),
+            });
+        }
         info
     };
 
@@ -600,6 +664,37 @@ async fn server_main(
 
     let vapid_keys = Arc::new(push::load_or_create_vapid(&data_dir).context("init vapid")?);
     let notify_token = push::load_or_create_notify_token(&data_dir).context("init notify token")?;
+
+    // Discovery worker secret (Phase 04 / H1) — load or generate when the
+    // worker URL is configured. We pass the event_bus so the first-boot
+    // generation surfaces a dashboard banner with the secret. Failure here is
+    // a hard error: without the secret, every mutating POST to the worker
+    // would 401 and the agent would be unreachable cross-origin anyway.
+    let discovery_secret: Option<String> = if discovery_url.is_some() {
+        match discovery::load_or_create_discovery_secret(&data_dir, Some(&event_bus)) {
+            Ok(s) => Some(s),
+            Err(err) => {
+                // M3 from Phase 04 review — also surface as an Error-severity
+                // SettingsHint so the dashboard banner makes the silent
+                // degradation visible. Cross-origin pairing is now broken
+                // until the operator unblocks the file (e.g. fix perms,
+                // restore from backup, or `rm` to trigger regeneration).
+                warn!(error=%err, "discovery secret load/generate failed; cross-origin worker calls disabled");
+                event_bus.send(events::AgentEvent::SettingsHint {
+                    code: hints::CODE_DISCOVERY_SECRET_FAILED.to_string(),
+                    severity: events::HintSeverity::Error,
+                    message: format!(
+                        "Discovery secret could not be loaded ({err}). Cross-origin pairing \
+                         is disabled. Inspect ~/.oxiremote/discovery_secret or remove it to \
+                         regenerate."
+                    ),
+                });
+                None
+            }
+        }
+    } else {
+        None
+    };
     let http_client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(15))
         .build()
@@ -699,6 +794,7 @@ async fn server_main(
         desktop_available: desktop_avail,
         desktop_service: desktop_svc,
         discovery_url: discovery_url.clone(),
+        discovery_secret: discovery_secret.clone(),
         web_url: read_web_url(),
         discovery_temp_key: discovery_temp_key.clone(),
         tunnel_shutdown: Arc::new(tokio::sync::Notify::new()),
@@ -706,7 +802,18 @@ async fn server_main(
         files_activity,
         cloudflared_path: Some(cloudflared.clone()),
         cors_origins: cors_origins.clone(),
+        ws_tickets: ws_ticket::new_store(),
+        recent_sessions: recent_sessions::new_buffer(),
     });
+
+    // Periodic GC sweeps expired WS tickets so the map stays bounded even if
+    // mints aren't followed by an upgrade (network drop between mint + open).
+    let _ws_ticket_gc = ws_ticket::spawn_gc(state.ws_tickets.clone());
+
+    // Phase 06c / H11: subscribe the recent-sessions ring buffer to the event
+    // bus before any shell can spawn so we never miss the very first
+    // `ShellOpened` of a session.
+    recent_sessions::spawn_subscriber(state.recent_sessions.clone(), state.event_bus.clone());
 
     // Background: periodic listening-port discovery + preview health checks.
     local_sites::spawn_discovery_loop(local_sites_cache);
@@ -765,7 +872,9 @@ async fn server_main(
     // and re-register with the worker on every `TunnelUrlChanged`. Subscribed
     // BEFORE the tunnel task spawns below so the first URL emit is not missed
     // (tokio broadcast has no replay).
-    if let Some(url) = discovery_url.clone() {
+    if let (Some(url), Some(discovery_secret)) =
+        (discovery_url.clone(), state.discovery_secret.clone())
+    {
         match discovery::load_discovery_id(&state.db_path) {
             Ok(discovery_id) => {
                 // Heartbeat: refreshes the worker's session record TTL. Quick
@@ -777,6 +886,7 @@ async fn server_main(
                     let hb_client = state.http_client.clone();
                     let hb_url = url.clone();
                     let hb_discovery_id = discovery_id.clone();
+                    let hb_secret = discovery_secret.clone();
                     let hb_tunnel = state.tunnel_url.clone();
                     tokio::spawn(async move {
                         let mut ticker = tokio::time::interval(
@@ -793,6 +903,7 @@ async fn server_main(
                                     hb_client.clone(),
                                     hb_url.clone(),
                                     hb_discovery_id.clone(),
+                                    hb_secret.clone(),
                                     tu,
                                 );
                             }
@@ -803,6 +914,7 @@ async fn server_main(
                 let client = state.http_client.clone();
                 let slot = discovery_temp_key.clone();
                 let db_path = state.db_path.clone();
+                let secret = discovery_secret.clone();
                 let mut rx = state.event_bus.subscribe();
                 tokio::spawn(async move {
                     loop {
@@ -824,6 +936,7 @@ async fn server_main(
                                     client.clone(),
                                     url.clone(),
                                     discovery_id.clone(),
+                                    secret.clone(),
                                     tunnel_url,
                                     slot.clone(),
                                     bus.clone(),
@@ -843,6 +956,8 @@ async fn server_main(
                 warn!(error=%err, "discovery_id load failed; discovery client disabled");
             }
         }
+    } else if discovery_url.is_some() && state.discovery_secret.is_none() {
+        warn!("OXI_DISCOVERY_URL is set but discovery_secret could not be loaded — worker calls disabled");
     }
 
     // Desktop notifications + agent-end Web Push. Tray runtime is not yet
@@ -863,6 +978,8 @@ async fn server_main(
 
     let app = Router::new()
         .route("/api/health", get(api_health))
+        .route("/api/version", get(api_version))
+        .route("/api/ws-ticket", post(api_ws_ticket))
         .route("/api/me", get(http_pages::api_me))
         .route("/api/pairing/exchange", post(http_pages::api_pairing_exchange))
         .route("/api/login/one-time", post(http_pages::api_login_one_time))
@@ -986,6 +1103,14 @@ async fn server_main(
             security::rate_limit::rate_limit,
         ))
         .layer(axum::middleware::from_fn(security::tunnel_guard))
+        // CSP + companion headers on every Public response. Sits OUTSIDE the
+        // auth chain so 401/403 responses are also locked down (no inline-
+        // script error pages, no framing). Localhost-scoped routes are
+        // skipped by the middleware itself.
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            security::headers::security_headers,
+        ))
         .with_state(state.clone())
         .layer(TraceLayer::new_for_http());
 
@@ -1001,9 +1126,20 @@ async fn server_main(
     let app = app.layer(security::cors::CorsLayer::new(cors_origins.clone()));
 
     let addr: SocketAddr = SocketAddr::from(([127, 0, 0, 1], AGENT_PORT));
-    // The tunnel-origin detection in route_scope relies on the agent binding
-    // loopback-only. If this assert fires the threat model breaks.
-    debug_assert!(addr.ip().is_loopback(), "agent must bind loopback only");
+    // Forward-guard against future refactors that thread a configurable bind
+    // address through here. Today `addr` is a compile-time literal so this
+    // branch is unreachable, but tunnel-origin detection in route_scope, the
+    // proxy.rs auth bypass-on-loopback shortcut, and every Localhost-only
+    // handler all assume loopback-only bind. The check stays as a runtime
+    // bail (not debug_assert) so even a release build with a regressed bind
+    // path aborts at startup rather than exposing `/agent/*` + `/api/agent/*`
+    // to the LAN. No `OXI_BIND_NON_LOOPBACK` escape hatch (Red Team F9).
+    if !addr.ip().is_loopback() {
+        anyhow::bail!(
+            "refusing to bind agent server to non-loopback address {addr}: \
+             the security model requires a loopback-only bind"
+        );
+    }
     info!(%addr, "starting agent server");
 
     // Dev affordance: tell the operator which URL to open. If the SPA has
@@ -1197,4 +1333,46 @@ async fn shutdown_signal() {
 
 async fn api_health() -> &'static str {
     "ok"
+}
+
+/// `GET /api/version` — returns the running agent's version. The SPA fetches
+/// this on mount and force-reloads when the embedded `__APP_VERSION__` differs,
+/// closing the cache window where a stale SPA could keep using the legacy
+/// api_key-in-subprotocol auth path. Public + unauthenticated; the version
+/// string is already disclosed in the `oxiremote/x.y.z` user-agent and the
+/// embedded SPA bundle.
+async fn api_version() -> axum::Json<serde_json::Value> {
+    axum::Json(serde_json::json!({
+        "version": env!("CARGO_PKG_VERSION"),
+    }))
+}
+
+/// `POST /api/ws-ticket` — mints a 60s single-use WebSocket upgrade ticket
+/// scoped to the caller's `device_id` + `session_id`. Bearer + CSRF gated
+/// upstream by the middleware chain. SPA passes the ticket as the second
+/// `Sec-WebSocket-Protocol` value (`["oxi-ticket-v1", <ticket>]`); WS upgrade
+/// handlers atomically claim it via `DashMap::remove`. See `ws_ticket.rs`.
+async fn api_ws_ticket(
+    axum::extract::State(state): axum::extract::State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    jar: axum_extra::extract::cookie::CookieJar,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let bearer = crate::auth::extract_bearer(&headers);
+    let Some((session_id, device_id)) = crate::auth::require_owner_session_with_device_dual(
+        &state.db_path,
+        &state.signing_key,
+        &jar,
+        bearer.as_deref(),
+    )
+    .await
+    else {
+        return axum::http::StatusCode::UNAUTHORIZED.into_response();
+    };
+    let (ticket, expires_at) = ws_ticket::mint_ticket(&state.ws_tickets, &device_id, &session_id);
+    axum::Json(serde_json::json!({
+        "ticket": ticket,
+        "expires_at": expires_at,
+    }))
+    .into_response()
 }

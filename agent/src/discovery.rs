@@ -21,6 +21,15 @@ use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
 use crate::events::{AgentEvent, EventBus};
+use crate::secure_file;
+
+/// File name (under the agent data dir) holding the shared secret that the
+/// agent attaches as `Authorization: Bearer <secret>` on every mutating
+/// discovery-worker POST. 0o600 on Unix; ACL-restricted on Windows. Phase 04
+/// / H1 — decouples the routing key (`discovery_id`) from the write
+/// credential.
+pub const DISCOVERY_SECRET_FILENAME: &str = "discovery_secret";
+const DISCOVERY_SECRET_BYTES: usize = 32;
 
 /// Worker-side TTL on the temp key (matches `phase-01-discovery-worker.md`).
 pub const TEMP_KEY_EXPIRY_MINUTES: u32 = 30;
@@ -78,6 +87,85 @@ struct TempKeyResponse {
     temp_key: String,
 }
 
+/// Path to the shared discovery-worker secret. Lives in `data_dir` next to
+/// other 0o600 files (`signing.key`, `notify.token`).
+pub fn discovery_secret_path(data_dir: &Path) -> std::path::PathBuf {
+    data_dir.join(DISCOVERY_SECRET_FILENAME)
+}
+
+/// Load or first-boot generate the agent's discovery-worker write secret.
+///
+/// On first call (file absent): generate 32 random bytes, hex-encode, persist
+/// 0o600 via `secure_file::write_secret`, log INFO with the value once and
+/// emit a `SettingsHint` so the dashboard surfaces a one-time banner. The
+/// operator copies it and the worker's `wrangler secret put
+/// AGENT_REGISTRATION_SECRET` is set to the same value.
+///
+/// Subsequent calls: read the existing file. Self-heal mode via
+/// `ensure_owner_only` (no-op when permissions are already correct). Never
+/// re-logs the value.
+pub fn load_or_create_discovery_secret(
+    data_dir: &Path,
+    event_bus: Option<&Arc<EventBus>>,
+) -> Result<String> {
+    let path = discovery_secret_path(data_dir);
+    if path.exists() {
+        let content = std::fs::read_to_string(&path)
+            .with_context(|| format!("read discovery secret at {}", path.display()))?;
+        let secret = content.trim().to_string();
+        if secret.is_empty() {
+            return Err(anyhow!(
+                "discovery secret at {} is empty — delete it and restart to regenerate",
+                path.display()
+            ));
+        }
+        // Self-heal mode if the file is somehow widened by a backup tool.
+        if let Err(err) = secure_file::ensure_owner_only(&path) {
+            warn!(
+                error=%err,
+                path=%path.display(),
+                "could not enforce owner-only perms on discovery_secret"
+            );
+        }
+        return Ok(secret);
+    }
+
+    // First boot: generate 32 random bytes, hex-encode.
+    let mut bytes = [0u8; DISCOVERY_SECRET_BYTES];
+    rand::rng().fill(&mut bytes);
+    let mut secret = String::with_capacity(DISCOVERY_SECRET_BYTES * 2);
+    for b in bytes {
+        use std::fmt::Write as _;
+        let _ = write!(secret, "{b:02x}");
+    }
+    secure_file::write_secret(&path, secret.as_bytes())
+        .with_context(|| format!("persist discovery secret to {}", path.display()))?;
+
+    // Surface the freshly-generated value via three channels so the operator
+    // doesn't have to re-fetch via the recovery subcommand:
+    //   1. log INFO (visible in TUI / journalctl / docker logs)
+    //   2. SettingsHint (dashboard banner — Phase 02 hint plumbing)
+    //   3. file at 0o600 (recoverable via `oxiremote config discovery-secret`)
+    info!(
+        secret = %secret,
+        path = %path.display(),
+        "discovery_secret generated — copy this value to the worker via \
+         `wrangler secret put AGENT_REGISTRATION_SECRET`. \
+         Recover later with `oxiremote config discovery-secret`."
+    );
+    if let Some(bus) = event_bus {
+        bus.send(AgentEvent::SettingsHint {
+            code: crate::hints::CODE_DISCOVERY_SECRET_GENERATED.to_string(),
+            severity: crate::events::HintSeverity::Info,
+            message: format!(
+                "Discovery worker secret generated. Configure the worker with this value, \
+                 then dismiss: {secret}"
+            ),
+        });
+    }
+    Ok(secret)
+}
+
 /// Read the agent's stable discovery identity from the `settings` table.
 /// Seeded by `db::init_db` on first boot; survives key rotations.
 pub fn load_discovery_id(db_path: &Path) -> Result<String> {
@@ -130,11 +218,15 @@ pub fn active_pairing_code(db_path: &Path) -> Result<Option<(String, u32)>> {
 /// the manual-entry flow. `permanent_lookup_id` is the SHA-256 prefix the SPA
 /// derives from a user-typed `sk-…` to resolve the same way. Both registrations
 /// are best-effort — failure leaves QR-scan / OTK paths working.
+///
+/// `discovery_secret` is the Bearer credential the worker validates (Phase 04
+/// / H1). Sent on every POST.
 #[allow(clippy::too_many_arguments)]
 pub fn spawn_register(
     client: Client,
     discovery_url: String,
     discovery_id: String,
+    discovery_secret: String,
     tunnel_url: String,
     temp_key_slot: Arc<StdRwLock<Option<String>>>,
     event_bus: Arc<EventBus>,
@@ -142,7 +234,15 @@ pub fn spawn_register(
     permanent_lookup_id: Option<String>,
 ) {
     tokio::spawn(async move {
-        match register_with_retry(&client, &discovery_url, &discovery_id, &tunnel_url).await {
+        match register_with_retry(
+            &client,
+            &discovery_url,
+            &discovery_id,
+            &discovery_secret,
+            &tunnel_url,
+        )
+        .await
+        {
             Ok(temp_key) => {
                 let prefix: String = temp_key.chars().take(4).collect();
                 if let Ok(mut g) = temp_key_slot.write() {
@@ -152,7 +252,16 @@ pub fn spawn_register(
                 event_bus.send(AgentEvent::DiscoveryTempKeyIssued { key_prefix: prefix });
 
                 if let Some((code, mins)) = pairing_code {
-                    match register_code(&client, &discovery_url, &discovery_id, &code, mins).await {
+                    match register_code(
+                        &client,
+                        &discovery_url,
+                        &discovery_id,
+                        &discovery_secret,
+                        &code,
+                        mins,
+                    )
+                    .await
+                    {
                         Ok(()) => debug!(mins, "pairing code registered with discovery worker"),
                         Err(e) => warn!(error = %e, "code/register failed (manual code-entry will fall back to QR)"),
                     }
@@ -163,6 +272,7 @@ pub fn spawn_register(
                         &client,
                         &discovery_url,
                         &discovery_id,
+                        &discovery_secret,
                         &lookup_id,
                         PERMANENT_LOOKUP_EXPIRY_MINUTES,
                     )
@@ -189,6 +299,7 @@ pub fn spawn_refresh_session(
     client: Client,
     discovery_url: String,
     discovery_id: String,
+    discovery_secret: String,
     tunnel_url: String,
 ) {
     tokio::spawn(async move {
@@ -200,6 +311,7 @@ pub fn spawn_refresh_session(
         };
         match client
             .post(format!("{base}/api/session/update"))
+            .bearer_auth(&discovery_secret)
             .json(&body)
             .send()
             .await
@@ -224,11 +336,21 @@ pub fn spawn_register_code(
     client: Client,
     discovery_url: String,
     discovery_id: String,
+    discovery_secret: String,
     code: String,
     expiry_minutes: u32,
 ) {
     tokio::spawn(async move {
-        match register_code(&client, &discovery_url, &discovery_id, &code, expiry_minutes).await {
+        match register_code(
+            &client,
+            &discovery_url,
+            &discovery_id,
+            &discovery_secret,
+            &code,
+            expiry_minutes,
+        )
+        .await
+        {
             Ok(()) => debug!(expiry_minutes, "lookup code registered with discovery worker"),
             Err(e) => warn!(error = %e, "discovery code/register failed (cross-origin manual entry will fail until next rotation)"),
         }
@@ -242,12 +364,14 @@ async fn register_code(
     client: &Client,
     base: &str,
     discovery_id: &str,
+    discovery_secret: &str,
     code: &str,
     expiry_minutes: u32,
 ) -> Result<()> {
     let base = base.trim_end_matches('/');
     let res = client
         .post(format!("{base}/api/code/register"))
+        .bearer_auth(discovery_secret)
         .json(&CodeRegisterBody {
             api_key: discovery_id,
             code,
@@ -266,11 +390,12 @@ async fn register_with_retry(
     client: &Client,
     base: &str,
     discovery_id: &str,
+    discovery_secret: &str,
     tunnel_url: &str,
 ) -> Result<String> {
     let mut last_err: Option<anyhow::Error> = None;
     for attempt in 1..=RETRY_ATTEMPTS {
-        match register_session(client, base, discovery_id, tunnel_url).await {
+        match register_session(client, base, discovery_id, discovery_secret, tunnel_url).await {
             Ok(temp_key) => return Ok(temp_key),
             Err(err) => {
                 debug!(attempt, error = %err, "discovery attempt failed");
@@ -304,6 +429,7 @@ async fn register_session(
     client: &Client,
     base: &str,
     discovery_id: &str,
+    discovery_secret: &str,
     tunnel_url: &str,
 ) -> Result<String> {
     let base = base.trim_end_matches('/');
@@ -313,6 +439,7 @@ async fn register_session(
     // 1) session/create — idempotent upsert.
     let res = client
         .post(format!("{base}/api/session/create"))
+        .bearer_auth(discovery_secret)
         .json(&SessionCreateBody { api_key: discovery_id })
         .send()
         .await
@@ -324,6 +451,7 @@ async fn register_session(
     // 2) session/update — write the current tunnel URL.
     let res = client
         .post(format!("{base}/api/session/update"))
+        .bearer_auth(discovery_secret)
         .json(&SessionUpdateBody {
             api_key: discovery_id,
             tunnel_url,
@@ -338,6 +466,7 @@ async fn register_session(
     // 3) temp-key/create — mint a fresh 30-minute temp key.
     let res = client
         .post(format!("{base}/api/temp-key/create"))
+        .bearer_auth(discovery_secret)
         .json(&TempKeyBody {
             api_key: discovery_id,
             expiry_minutes: TEMP_KEY_EXPIRY_MINUTES,
@@ -450,13 +579,17 @@ mod tests {
         );
     }
 
+    const TEST_SECRET: &str = "test-secret-aaaaaaaaaaaaaaaaaaaaaaaa";
+
     #[tokio::test]
     async fn register_session_normalizes_bare_hostname() {
         let mock = MockState::default();
         let url = spawn_mock(mock.clone()).await;
         let client = Client::new();
 
-        register_session(&client, &url, "id", "oxiremote.erai.dev").await.unwrap();
+        register_session(&client, &url, "id", TEST_SECRET, "oxiremote.erai.dev")
+            .await
+            .unwrap();
 
         let bodies = mock.bodies.lock().unwrap().clone();
         assert_eq!(bodies[1].1["tunnelUrl"], "https://oxiremote.erai.dev");
@@ -468,7 +601,10 @@ mod tests {
         let url = spawn_mock(mock.clone()).await;
         let client = Client::new();
 
-        let temp_key = register_session(&client, &url, "deadbeef", "https://t.example").await.unwrap();
+        let temp_key =
+            register_session(&client, &url, "deadbeef", TEST_SECRET, "https://t.example")
+                .await
+                .unwrap();
         assert_eq!(temp_key, "deadbeefcafe1234deadbeefcafe1234");
 
         let bodies = mock.bodies.lock().unwrap().clone();
@@ -491,7 +627,9 @@ mod tests {
         let url = spawn_mock(mock.clone()).await;
         let client = Client::new();
 
-        let temp_key = register_with_retry(&client, &url, "id", "https://t").await.unwrap();
+        let temp_key = register_with_retry(&client, &url, "id", TEST_SECRET, "https://t")
+            .await
+            .unwrap();
         assert_eq!(temp_key, "deadbeefcafe1234deadbeefcafe1234");
     }
 
@@ -502,7 +640,7 @@ mod tests {
         let url = spawn_mock(mock).await;
         let client = Client::new();
 
-        let result = register_with_retry(&client, &url, "id", "https://t").await;
+        let result = register_with_retry(&client, &url, "id", TEST_SECRET, "https://t").await;
         assert!(result.is_err());
     }
 
@@ -512,7 +650,9 @@ mod tests {
         let url = spawn_mock(mock.clone()).await;
         let client = Client::new();
 
-        register_code(&client, &url, "deadbeef", "ABCD1234", 5).await.unwrap();
+        register_code(&client, &url, "deadbeef", TEST_SECRET, "ABCD1234", 5)
+            .await
+            .unwrap();
 
         let bodies = mock.bodies.lock().unwrap().clone();
         assert_eq!(bodies.len(), 1);
@@ -532,6 +672,7 @@ mod tests {
             client,
             url.clone(),
             "deadbeef".into(),
+            TEST_SECRET.into(),
             "https://t.example".into(),
         );
         // Give the spawned task a beat to fire the POST.
@@ -551,7 +692,7 @@ mod tests {
         let url = spawn_mock(mock).await;
         let client = Client::new();
 
-        let r = register_code(&client, &url, "id", "ABCD1234", 5).await;
+        let r = register_code(&client, &url, "id", TEST_SECRET, "ABCD1234", 5).await;
         assert!(r.is_err());
     }
 
@@ -577,7 +718,107 @@ mod tests {
         });
         let client = Client::new();
 
-        let res = register_session(&client, &url, "id", "https://t").await;
+        let res = register_session(&client, &url, "id", TEST_SECRET, "https://t").await;
         assert!(res.is_err());
+    }
+
+    // Phase 04 / H1 — verify Bearer header is attached on every POST.
+    #[tokio::test]
+    async fn bearer_header_attached_on_all_register_posts() {
+        use std::sync::Mutex;
+        let captured: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let cap = captured.clone();
+
+        async fn capture_auth(
+            AxumState(cap): AxumState<Arc<Mutex<Vec<String>>>>,
+            headers: axum::http::HeaderMap,
+            Json(_): Json<Value>,
+        ) -> Json<Value> {
+            let auth = headers
+                .get("authorization")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("")
+                .to_string();
+            cap.lock().unwrap().push(auth);
+            Json(serde_json::json!({
+                "ok": true,
+                "tempKey": "deadbeefcafe1234deadbeefcafe1234"
+            }))
+        }
+
+        let app = Router::new()
+            .route("/api/session/create", post(capture_auth))
+            .route("/api/session/update", post(capture_auth))
+            .route("/api/temp-key/create", post(capture_auth))
+            .route("/api/code/register", post(capture_auth))
+            .with_state(cap);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let client = Client::new();
+
+        // Round trip: 3 POSTs from register_session.
+        register_session(&client, &url, "id", TEST_SECRET, "https://t.example")
+            .await
+            .unwrap();
+        // 4th POST from register_code.
+        register_code(&client, &url, "id", TEST_SECRET, "ABCD1234", 5)
+            .await
+            .unwrap();
+
+        let auths = captured.lock().unwrap().clone();
+        assert_eq!(auths.len(), 4, "expected 4 captured auth headers");
+        let expected = format!("Bearer {TEST_SECRET}");
+        for (i, a) in auths.iter().enumerate() {
+            assert_eq!(a, &expected, "POST {i} missing or wrong Bearer header");
+        }
+    }
+
+    // Phase 04 / H1 — load_or_create_discovery_secret persists + rereads.
+    #[test]
+    fn discovery_secret_first_boot_generates_then_rereads() {
+        let dir = tempdir_for("disc-sec");
+        let first = load_or_create_discovery_secret(&dir, None).unwrap();
+        // 32 bytes hex-encoded = 64 chars.
+        assert_eq!(first.len(), 64);
+        assert!(first.chars().all(|c| c.is_ascii_hexdigit()));
+
+        // Second call returns the same value (no regeneration).
+        let second = load_or_create_discovery_secret(&dir, None).unwrap();
+        assert_eq!(first, second);
+
+        // File exists at the expected path.
+        let p = discovery_secret_path(&dir);
+        assert!(p.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn discovery_secret_persists_with_owner_only_perms() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempdir_for("disc-mode");
+        let _ = load_or_create_discovery_secret(&dir, None).unwrap();
+        let p = discovery_secret_path(&dir);
+        let mode = std::fs::metadata(&p).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "expected 0o600, got {:o}", mode & 0o777);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn tempdir_for(name: &str) -> std::path::PathBuf {
+        let mut p = std::env::temp_dir();
+        p.push(format!(
+            "oxi-disc-{}-{}-{name}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&p).unwrap();
+        p
     }
 }

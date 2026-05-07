@@ -63,6 +63,10 @@ subtle = "2"
 argon2 = "0.5"
 toml = "0.8"
 
+# Phase 03 — self-update Ed25519 signature verification (minisign format).
+# Keeps the trust surface small: pure Rust verifier, no Sigstore/PGP deps.
+minisign-verify = "0.2"
+
 # Phase 01: interactive TUI + system tray + QR codes.
 ratatui = "0.29"
 crossterm = "0.28"
@@ -108,6 +112,10 @@ windows-sys = { version = "0.59", features = [
     "Win32_System_JobObjects",
     "Win32_System_Threading",
     "Win32_Security",
+    # Phase 01 secure_file.rs — DACL on secret files (signing.key, vapid.key).
+    "Win32_Security_Authorization",
+    # FILE_ALL_ACCESS for the explicit ACE rights mask.
+    "Win32_Storage_FileSystem",
     "Win32_Foundation",
 ] }
 

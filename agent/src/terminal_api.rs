@@ -13,7 +13,7 @@ use serde::Deserialize;
 use tracing::warn;
 use uuid::Uuid;
 
-use crate::auth::{extract_bearer, require_owner_session_dual};
+use crate::auth::{extract_bearer, require_owner_session_dual, require_owner_session_with_device_dual};
 use crate::db::now_ts;
 use crate::terminal_pty::{
     build_default_command, spawn_terminal_session, CreateTerminalSessionRequest,
@@ -142,8 +142,13 @@ pub async fn api_terminal_sessions_create(
     Json(req): Json<CreateTerminalSessionRequest>,
 ) -> impl IntoResponse {
     let bearer = extract_bearer(&headers);
-    let Some(owner_session_id) =
-        require_owner_session_dual(&state.db_path, &state.signing_key, &jar, bearer.as_deref()).await
+    let Some((owner_session_id, device_id)) = require_owner_session_with_device_dual(
+        &state.db_path,
+        &state.signing_key,
+        &jar,
+        bearer.as_deref(),
+    )
+    .await
     else {
         return StatusCode::UNAUTHORIZED.into_response();
     };
@@ -194,6 +199,7 @@ pub async fn api_terminal_sessions_create(
     match spawn_terminal_session(
         &id,
         &owner_session_id,
+        &device_id,
         cwd.as_deref(),
         shell_cmd,
         req.cols,

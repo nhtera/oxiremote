@@ -15,7 +15,17 @@ use crate::auth::{
 };
 use crate::db::now_ts;
 use crate::terminal_pty::{WsIn, WsOut, WS_MAX_TEXT_BYTES};
+use crate::ws_ticket::{claim_ticket, extract_ticket_from_ws_protocols, WS_TICKET_PROTOCOL};
 use crate::AppState;
+
+/// Auth modes for WS upgrade. Ticket is the new path (Phase 05 / H14);
+/// bearer-in-subprotocol is the legacy fallback kept for one release so an
+/// older cached SPA doesn't break the moment the operator updates the agent.
+#[derive(Debug, Clone, Copy)]
+enum WsAuthKind {
+    Ticket,
+    Bearer,
+}
 
 pub async fn api_terminal_session_ws(
     State(state): State<Arc<AppState>>,
@@ -24,16 +34,32 @@ pub async fn api_terminal_session_ws(
     AxumPath(id): AxumPath<String>,
     ws: WebSocketUpgrade,
 ) -> impl IntoResponse {
-    let bearer = extract_bearer_from_ws_protocols(&headers);
-    let Some(owner_session_id) = require_owner_session_dual(
-        &state.db_path,
-        &state.signing_key,
-        &jar,
-        bearer.as_deref(),
-    )
-    .await
-    else {
-        return StatusCode::UNAUTHORIZED.into_response();
+    // Ticket auth wins when present — short-lived, single-use. Old SPAs that
+    // still ship `oxi-bearer-v1` fall through to the bearer path with a WARN
+    // log so we can spot residual installs in telemetry.
+    let (owner_session_id, auth_kind) = if let Some(ticket) =
+        extract_ticket_from_ws_protocols(&headers)
+    {
+        let Some(entry) = claim_ticket(&state.ws_tickets, &ticket) else {
+            return StatusCode::UNAUTHORIZED.into_response();
+        };
+        (entry.session_id, WsAuthKind::Ticket)
+    } else {
+        let bearer = extract_bearer_from_ws_protocols(&headers);
+        if bearer.is_some() {
+            warn!("terminal ws using legacy oxi-bearer-v1 subprotocol; upgrade SPA");
+        }
+        let Some(sid) = require_owner_session_dual(
+            &state.db_path,
+            &state.signing_key,
+            &jar,
+            bearer.as_deref(),
+        )
+        .await
+        else {
+            return StatusCode::UNAUTHORIZED.into_response();
+        };
+        (sid, WsAuthKind::Bearer)
     };
 
     let owned: anyhow::Result<bool> = (|| {
@@ -65,14 +91,12 @@ pub async fn api_terminal_session_ws(
             }
 
             let state2 = state.clone();
-            // If the client offered the bearer subprotocol, echo the marker
-            // back so the browser accepts the upgrade. Browsers close the WS
-            // when the negotiated subprotocol isn't in the offered list, so
-            // we only set this when bearer auth was actually used.
-            let upgrade = if bearer.is_some() {
-                ws.protocols([WS_BEARER_PROTOCOL])
-            } else {
-                ws
+            // Echo the negotiated subprotocol back. Browsers close the WS when
+            // the chosen subprotocol isn't in the offered list, so we only set
+            // it when subprotocol-based auth was actually used.
+            let upgrade = match auth_kind {
+                WsAuthKind::Ticket => ws.protocols([WS_TICKET_PROTOCOL]),
+                WsAuthKind::Bearer => ws.protocols([WS_BEARER_PROTOCOL]),
             };
             upgrade.on_upgrade(move |socket| handle_terminal_ws(state2, id, owner_session_id, socket))
         }

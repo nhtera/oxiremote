@@ -28,6 +28,7 @@ use super::route_scope::is_tunnel_request;
 
 const EXEMPT_PREFIXES: &[&str] = &[
     "/api/health",
+    "/api/version", // SPA version-check force-reload (Phase 05 / H14 cache flush)
     "/api/pairing/exchange",
     "/api/login/one-time",       // OTK login issues the session; no key yet
     "/api/auth/approval-status", // pending-device polling; uses cookie auth in handler

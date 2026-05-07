@@ -46,6 +46,13 @@ pub fn ensure_host(data_dir: &Path, db: &Connection) -> anyhow::Result<HostInfo>
 fn load_or_create_salt(data_dir: &Path) -> anyhow::Result<[u8; 32]> {
     let path = data_dir.join("host_salt");
     if path.exists() {
+        // Self-heal: re-apply owner-only on every boot in case a legacy
+        // install left wider perms. Failure is non-fatal here — host_salt is
+        // a stable identity-derivation salt, not an authentication secret;
+        // signing.key (auth.rs) carries the loud-failure SettingsHint hook.
+        if let Err(err) = crate::secure_file::ensure_owner_only(&path) {
+            tracing::warn!(error=%err, path=%path.display(), "could not enforce owner-only on host_salt");
+        }
         let bytes = std::fs::read(&path).context("read host_salt")?;
         if bytes.len() >= 32 {
             let mut arr = [0u8; 32];
@@ -59,25 +66,6 @@ fn load_or_create_salt(data_dir: &Path) -> anyhow::Result<[u8; 32]> {
     use rand::RngCore;
     rand::rng().fill_bytes(&mut arr);
 
-    // Create file with owner-only perms in a single syscall on unix to avoid a
-    // world-readable window between write and chmod.
-    #[cfg(unix)]
-    {
-        use std::io::Write;
-        use std::os::unix::fs::OpenOptionsExt;
-        let mut f = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(&path)
-            .context("create host_salt")?;
-        f.write_all(&arr).context("write host_salt")?;
-    }
-    #[cfg(not(unix))]
-    {
-        std::fs::write(&path, arr).context("write host_salt")?;
-    }
-
+    crate::secure_file::write_secret(&path, &arr).context("write host_salt")?;
     Ok(arr)
 }

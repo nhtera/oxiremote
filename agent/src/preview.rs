@@ -531,6 +531,7 @@ mod tests {
             desktop_available: false,
             desktop_service: None,
             discovery_url: None,
+            discovery_secret: None,
             web_url: None,
             discovery_temp_key: Arc::new(std::sync::RwLock::new(None)),
             tunnel_shutdown: Arc::new(tokio::sync::Notify::new()),
@@ -538,6 +539,8 @@ mod tests {
             files_activity: Arc::new(crate::files_activity::new_map()),
             cloudflared_path: None,
             cors_origins: crate::security::cors::seed_origins(&[], &[]),
+            ws_tickets: crate::ws_ticket::new_store(),
+            recent_sessions: crate::recent_sessions::new_buffer(),
         })
     }
 

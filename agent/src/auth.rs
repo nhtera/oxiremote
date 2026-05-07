@@ -1,17 +1,21 @@
 use std::path::PathBuf;
+use std::sync::{Arc, OnceLock};
 
 use argon2::{
     password_hash::{
         rand_core::{OsRng, RngCore},
         PasswordHash, PasswordHasher, PasswordVerifier, SaltString,
     },
-    Argon2,
+    Algorithm, Argon2, Params, Version,
 };
 use hmac::{Hmac, Mac};
 use rusqlite::{params, Connection};
 use sha2::{Digest, Sha256};
+use tokio::sync::Semaphore;
 
 use crate::db::now_ts;
+use crate::events::{AgentEvent, EventBus, HintSeverity};
+use crate::secure_file;
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -19,12 +23,120 @@ pub const PAIRING_CODE_LEN: usize = 8;
 pub const PAIRING_TTL_SECS: i64 = 5 * 60;
 pub const SESSION_TTL_SECS: i64 = 30 * 24 * 60 * 60;
 
-pub fn load_or_create_key(path: &PathBuf) -> anyhow::Result<Vec<u8>> {
+/// Pinned Argon2id parameters (Phase 06a / H6). 64 MiB memory, 3 iterations,
+/// 1 lane — the OWASP 2023 recommended baseline. `argon2::Params::new` is not
+/// `const fn` in 0.5, so we lazy-init via `OnceLock` and panic on bad params
+/// (the constants are hard-coded; failure here is a compile-time bug, not a
+/// runtime config issue).
+///
+/// Argon2's PHC string format embeds the per-hash params, so legacy hashes
+/// minted with `Argon2::default()` still verify against this configured
+/// instance — the verifier reads params from the encoded hash, not from the
+/// `Argon2` struct.
+const ARGON2_M_COST_KIB: u32 = 64 * 1024;
+const ARGON2_T_COST: u32 = 3;
+const ARGON2_P_COST: u32 = 1;
+
+fn argon2_id() -> &'static Argon2<'static> {
+    static ARGON2: OnceLock<Argon2<'static>> = OnceLock::new();
+    ARGON2.get_or_init(|| {
+        let params = Params::new(ARGON2_M_COST_KIB, ARGON2_T_COST, ARGON2_P_COST, None)
+            .expect("hardcoded argon2 params must be valid");
+        Argon2::new(Algorithm::Argon2id, Version::V0x13, params)
+    })
+}
+
+/// Cap concurrent Argon2 verifies at 2 (Phase 06a / H6 + Red Team F12).
+/// Each Argon2id verify with our pinned params transiently allocates 64 MiB,
+/// so the worst-case memory ceiling is 128 MiB even under burst. Excess
+/// callers queue on the semaphore; combined with the per-IP pairing rate
+/// limit (Phase 06b), DoS budget is bounded on small VMs.
+static ARGON2_SEMAPHORE: Semaphore = Semaphore::const_new(2);
+
+/// Pre-baked hash used by the pairing exchange to keep the timing of the
+/// `InvalidCode` rejection branch identical to the `Consumed` / `Expired`
+/// branches that legitimately run a verify (Phase 06a / H8 + Red Team F7).
+/// Lazy-initialised on first use because `SaltString::generate` is not const.
+fn dummy_pairing_hash() -> &'static str {
+    static HASH: OnceLock<String> = OnceLock::new();
+    HASH.get_or_init(|| {
+        let salt = SaltString::generate(&mut OsRng);
+        argon2_id()
+            .hash_password(b"dummy-pairing-not-a-real-secret", &salt)
+            .expect("dummy pairing hash must succeed")
+            .to_string()
+    })
+}
+
+/// Run an Argon2 verify on `dummy_pairing_hash` so a caller exits on the
+/// `InvalidCode` branch with the same wall-clock cost as a legitimate
+/// rejection. Returns nothing — the result is discarded; the side-effect IS
+/// the timing.
+pub async fn run_dummy_pairing_verify(presented: &str) {
+    let presented = presented.to_string();
+    let _ = verify_argon2_async(presented, dummy_pairing_hash().to_string()).await;
+}
+
+/// Async Argon2 verify gated by `ARGON2_SEMAPHORE`. All paths that verify a
+/// password-equivalent secret (api keys, permanent keys, pairing dummy)
+/// route through this so the concurrency cap is shared.
+async fn verify_argon2_async(presented: String, hash_encoded: String) -> bool {
+    // `acquire()` only fails if the semaphore is closed — we never close it.
+    // Same shape as `verify_api_key_async` / `verify_permanent_key_async` so
+    // the permit-then-spawn_blocking pattern stays uniform.
+    let Ok(permit) = ARGON2_SEMAPHORE.acquire().await else {
+        return false;
+    };
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit; // hold the permit for the full blocking call
+        match PasswordHash::new(&hash_encoded) {
+            Ok(parsed) => argon2_id()
+                .verify_password(presented.as_bytes(), &parsed)
+                .is_ok(),
+            Err(_) => false,
+        }
+    })
+    .await
+    .unwrap_or(false)
+}
+
+/// Load (or, on first boot, create) the HMAC signing key. The key is
+/// persisted with owner-only permissions via `secure_file::write_secret`.
+///
+/// **Self-heal (Red Team F5):** when the file already exists we re-apply
+/// 0o600 / owner-only DACL on every boot in case a legacy install (pre
+/// secure-file helper) left it world-readable. On chmod success we log
+/// INFO; on failure we log ERROR and broadcast a Settings Hint at
+/// severity `Error` so the dashboard surfaces it prominently with an
+/// actionable message. Buried-WARN was rejected by Red Team F5.
+pub fn load_or_create_key(
+    path: &PathBuf,
+    event_bus: Option<&Arc<EventBus>>,
+) -> anyhow::Result<Vec<u8>> {
     if path.exists() {
+        match secure_file::ensure_owner_only(path) {
+            Ok(()) => {
+                tracing::info!(path = %path.display(), "signing.key permissions confirmed owner-only");
+            }
+            Err(err) => {
+                let path_disp = path.display().to_string();
+                tracing::error!(error=%err, path=%path_disp, "failed to enforce owner-only permissions on signing.key");
+                if let Some(bus) = event_bus {
+                    bus.send(AgentEvent::SettingsHint {
+                        code: crate::hints::CODE_SIGNING_KEY_PERMS_FAILED.to_string(),
+                        severity: HintSeverity::Error,
+                        message: format!(
+                            "OxiRemote could not enforce owner-only permissions on {path_disp}. \
+                             Manually run: chmod 0600 \"{path_disp}\" (or apply equivalent ACL on Windows)."
+                        ),
+                    });
+                }
+            }
+        }
         return Ok(std::fs::read(path)?);
     }
     let key: Vec<u8> = (0..32).map(|_| rand::random::<u8>()).collect();
-    std::fs::write(path, &key)?;
+    secure_file::write_secret(path, &key)?;
     Ok(key)
 }
 
@@ -426,7 +538,7 @@ pub fn issue_api_key_tx(conn: &Connection, device_id: &str) -> anyhow::Result<(S
     let last4: String = key.chars().rev().take(4).collect::<Vec<_>>().into_iter().rev().collect();
 
     let salt = SaltString::generate(&mut OsRng);
-    let hash = Argon2::default()
+    let hash = argon2_id()
         .hash_password(key.as_bytes(), &salt)
         .map_err(|e| anyhow::anyhow!("argon2 hash: {e}"))?
         .to_string();
@@ -475,7 +587,7 @@ pub fn verify_api_key(db_path: &PathBuf, presented: &str) -> Option<String> {
     for row in rows.flatten() {
         let (device_id, hash) = row;
         if let Ok(parsed) = PasswordHash::new(&hash)
-            && Argon2::default().verify_password(presented.as_bytes(), &parsed).is_ok() {
+            && argon2_id().verify_password(presented.as_bytes(), &parsed).is_ok() {
                 return Some(device_id);
             }
     }
@@ -483,12 +595,18 @@ pub fn verify_api_key(db_path: &PathBuf, presented: &str) -> Option<String> {
 }
 
 /// Async wrapper: runs the Argon2 verify on the blocking thread pool so it
-/// doesn't stall the Tokio runtime.
+/// doesn't stall the Tokio runtime. Phase 06a / H6 routes the verify through
+/// `ARGON2_SEMAPHORE` so transient memory stays bounded; the DB row lookup
+/// itself stays fast and is done eagerly on the blocking thread.
 pub async fn verify_api_key_async(db_path: PathBuf, presented: String) -> Option<String> {
-    tokio::task::spawn_blocking(move || verify_api_key(&db_path, &presented))
-        .await
-        .ok()
-        .flatten()
+    let permit = ARGON2_SEMAPHORE.acquire().await.ok()?;
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        verify_api_key(&db_path, &presented)
+    })
+    .await
+    .ok()
+    .flatten()
 }
 
 /// SHA-256 prefix used as the cross-origin lookup id for the permanent key.
@@ -520,7 +638,7 @@ pub fn rotate_permanent_key(
     let lookup_id = permanent_key_lookup_id(&key);
 
     let salt = SaltString::generate(&mut OsRng);
-    let hash = Argon2::default()
+    let hash = argon2_id()
         .hash_password(key.as_bytes(), &salt)
         .map_err(|e| anyhow::anyhow!("argon2 hash: {e}"))?
         .to_string();
@@ -611,7 +729,9 @@ pub fn get_permanent_key_meta(db_path: &PathBuf) -> anyhow::Result<Option<(Strin
 
 /// Verify the permanent dashboard key against the stored Argon2id hash.
 /// Returns `true` when the presented key matches.  Blocking — call from
-/// `spawn_blocking` in async contexts.
+/// `spawn_blocking` in async contexts. Async callers should prefer
+/// `verify_permanent_key_async` so the per-process Argon2 concurrency cap
+/// applies (Phase 06a / H6).
 pub fn verify_permanent_key(db_path: &PathBuf, presented: &str) -> bool {
     let conn = match Connection::open(db_path) {
         Ok(c) => c,
@@ -628,8 +748,23 @@ pub fn verify_permanent_key(db_path: &PathBuf, presented: &str) -> bool {
         return false;
     };
     PasswordHash::new(&h)
-        .map(|parsed| Argon2::default().verify_password(presented.as_bytes(), &parsed).is_ok())
+        .map(|parsed| argon2_id().verify_password(presented.as_bytes(), &parsed).is_ok())
         .unwrap_or(false)
+}
+
+/// Async wrapper that gates the verify through `ARGON2_SEMAPHORE`. Use this
+/// from request handlers so concurrent permanent-key login attempts cannot
+/// blow the memory ceiling.
+pub async fn verify_permanent_key_async(db_path: PathBuf, presented: String) -> bool {
+    let Ok(permit) = ARGON2_SEMAPHORE.acquire().await else {
+        return false;
+    };
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        verify_permanent_key(&db_path, &presented)
+    })
+    .await
+    .unwrap_or(false)
 }
 
 pub fn is_valid_pairing_attempt(code: &str) -> bool {
@@ -833,6 +968,7 @@ mod tests {
             desktop_available: false,
             desktop_service: None,
             discovery_url: None,
+            discovery_secret: None,
             web_url: None,
             discovery_temp_key: std::sync::Arc::new(std::sync::RwLock::new(None)),
             tunnel_shutdown: std::sync::Arc::new(tokio::sync::Notify::new()),
@@ -840,6 +976,8 @@ mod tests {
             files_activity: std::sync::Arc::new(crate::files_activity::new_map()),
             cloudflared_path: None,
             cors_origins: crate::security::cors::seed_origins(&[], &[]),
+            ws_tickets: crate::ws_ticket::new_store(),
+            recent_sessions: crate::recent_sessions::new_buffer(),
         }
     }
 
@@ -1045,5 +1183,102 @@ mod tests {
         revoke_device(&state.db_path, "device-1").unwrap();
 
         assert_eq!(require_active_auth(&state.db_path, &state.signing_key, &jar), None);
+    }
+
+    // ── Phase 06a / H6: pinned Argon2 params + concurrency cap ──────────
+
+    /// Hash + verify roundtrip on the pinned configuration.
+    #[test]
+    fn pinned_argon2_hash_verifies() {
+        let salt = SaltString::generate(&mut OsRng);
+        let hash = argon2_id()
+            .hash_password(b"test-secret", &salt)
+            .unwrap()
+            .to_string();
+        let parsed = PasswordHash::new(&hash).unwrap();
+        assert!(argon2_id()
+            .verify_password(b"test-secret", &parsed)
+            .is_ok());
+        assert!(argon2_id()
+            .verify_password(b"wrong-secret", &parsed)
+            .is_err());
+    }
+
+    /// Argon2 PHC string carries params per-hash, so a hash minted with the
+    /// crate's `default()` (memory=19MiB, t=2, p=1) MUST still verify under
+    /// the new pinned-params instance — protects existing api_keys minted
+    /// pre-Phase-06a from being orphaned by the param tightening.
+    #[test]
+    fn legacy_default_argon2_hash_still_verifies() {
+        let salt = SaltString::generate(&mut OsRng);
+        let legacy = Argon2::default()
+            .hash_password(b"legacy-key", &salt)
+            .unwrap()
+            .to_string();
+        let parsed = PasswordHash::new(&legacy).unwrap();
+        assert!(argon2_id()
+            .verify_password(b"legacy-key", &parsed)
+            .is_ok());
+        assert!(argon2_id()
+            .verify_password(b"different", &parsed)
+            .is_err());
+    }
+
+    /// Permits cap concurrent verifies at 2. Four simultaneous async verifies
+    /// against a known-bad hash should serialise into ≥2 batches — the total
+    /// wall-clock time exceeds twice a single verify. The test uses a real
+    /// Argon2 verify (≥10ms even on fast hardware) so the cap is observable.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn argon2_semaphore_caps_concurrency() {
+        let salt = SaltString::generate(&mut OsRng);
+        let hash = argon2_id()
+            .hash_password(b"correct", &salt)
+            .unwrap()
+            .to_string();
+
+        // Single-call baseline.
+        let start = std::time::Instant::now();
+        assert!(verify_argon2_async("correct".into(), hash.clone()).await);
+        let single = start.elapsed();
+
+        // 4 concurrent verifies — semaphore cap=2 forces 2 sequential
+        // batches. We expect ≥ ~1.5× single (some overlap on the second
+        // batch + scheduler noise).
+        let start = std::time::Instant::now();
+        let h1 = tokio::spawn(verify_argon2_async("correct".into(), hash.clone()));
+        let h2 = tokio::spawn(verify_argon2_async("correct".into(), hash.clone()));
+        let h3 = tokio::spawn(verify_argon2_async("correct".into(), hash.clone()));
+        let h4 = tokio::spawn(verify_argon2_async("correct".into(), hash.clone()));
+        for h in [h1, h2, h3, h4] {
+            assert!(h.await.unwrap());
+        }
+        let four = start.elapsed();
+        assert!(
+            four >= single * 3 / 2,
+            "4-way concurrent verify took {four:?} but single was {single:?} — \
+             semaphore cap=2 should serialise into 2 batches"
+        );
+    }
+
+    /// `run_dummy_pairing_verify` MUST actually exercise Argon2 — otherwise
+    /// the InvalidCode timing oracle survives. A 64 MiB / 3-iter Argon2id
+    /// verify takes well over 10 ms even on fast hardware; a no-op or
+    /// short-circuit would return in microseconds. Absolute lower bound is
+    /// the simplest robust assertion (relative measurement is brittle on
+    /// CI hosts with variable load).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dummy_pairing_verify_runs_full_cost() {
+        // Prime the dummy-hash OnceLock so the first measurement isn't
+        // dominated by the one-time hash generation.
+        run_dummy_pairing_verify("warmup").await;
+
+        let start = std::time::Instant::now();
+        run_dummy_pairing_verify("attacker-input").await;
+        let dummy = start.elapsed();
+
+        assert!(
+            dummy >= std::time::Duration::from_millis(10),
+            "dummy verify took {dummy:?} — must run a real Argon2 verify"
+        );
     }
 }

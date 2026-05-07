@@ -1,12 +1,12 @@
 export interface SessionRecord {
   tunnelUrl: string
-  localIp?: string
   updatedAt: number
 }
 
 export interface KVLike {
   get(key: string): Promise<string | null>
   put(key: string, value: string, opts?: { expirationTtl?: number }): Promise<void>
+  delete(key: string): Promise<void>
 }
 
 const SESSION_PREFIX = 'session:'
@@ -22,15 +22,15 @@ export const DEFAULT_TTL_SECS = 1800
 
 export async function putSession(
   kv: KVLike,
-  apiKeyHash: string,
+  discoveryId: string,
   record: SessionRecord,
   ttlSecs: number = SESSION_DEFAULT_TTL_SECS,
 ): Promise<void> {
-  await kv.put(SESSION_PREFIX + apiKeyHash, JSON.stringify(record), { expirationTtl: ttlSecs })
+  await kv.put(SESSION_PREFIX + discoveryId, JSON.stringify(record), { expirationTtl: ttlSecs })
 }
 
-export async function getSession(kv: KVLike, apiKeyHash: string): Promise<SessionRecord | null> {
-  const raw = await kv.get(SESSION_PREFIX + apiKeyHash)
+export async function getSession(kv: KVLike, discoveryId: string): Promise<SessionRecord | null> {
+  const raw = await kv.get(SESSION_PREFIX + discoveryId)
   if (!raw) return null
   try {
     return JSON.parse(raw) as SessionRecord
@@ -42,14 +42,14 @@ export async function getSession(kv: KVLike, apiKeyHash: string): Promise<Sessio
 export async function putTempKey(
   kv: KVLike,
   tempKey: string,
-  apiKeyHash: string,
+  discoveryId: string,
   ttlSecs: number = DEFAULT_TTL_SECS,
 ): Promise<void> {
-  await kv.put(TEMPKEY_PREFIX + tempKey, apiKeyHash, { expirationTtl: ttlSecs })
+  await kv.put(TEMPKEY_PREFIX + tempKey, discoveryId, { expirationTtl: ttlSecs })
 }
 
 export async function resolveTempKey(kv: KVLike, tempKey: string): Promise<SessionRecord | null> {
-  const apiKeyHash = await kv.get(TEMPKEY_PREFIX + tempKey)
-  if (!apiKeyHash) return null
-  return getSession(kv, apiKeyHash)
+  const discoveryId = await kv.get(TEMPKEY_PREFIX + tempKey)
+  if (!discoveryId) return null
+  return getSession(kv, discoveryId)
 }

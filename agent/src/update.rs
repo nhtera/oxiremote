@@ -1,12 +1,16 @@
 // `oxiremote update` — pull the latest GitHub release for our target triple,
-// verify SHA256 against the release manifest, and atomic-replace the running
-// binary. No long-lived signing key (cargo-dist–style hash chain only) for
-// v0.1; ed25519 verification is on the v0.2 hit list.
+// verify SHA256 + Ed25519 minisign signature, and atomic-replace the running
+// binary.
 //
 // Wire-format expectations (must stay in sync with `.github/workflows/release.yml`):
-// - Asset name: `oxiremote-<version>-<target>.tar.gz` (mac/linux) or `.zip` (windows)
-// - Manifest:   `oxiremote-<version>-sha256.txt` containing one line per asset
-//                `<hex-sha256>  <asset-filename>`
+// - Asset name:    `oxiremote-<version>-<target>.tar.gz` (mac/linux) or `.zip` (windows)
+// - SHA manifest:  `oxiremote-<version>-sha256.txt` containing one line per asset
+//                  `<hex-sha256>  <asset-filename>`
+// - Sig manifest:  `oxiremote-<version>-minisig.txt` — concatenated minisign
+//                  blocks (one per asset, blank-line separated). Verified
+//                  against `update_signing::TRUSTED_PUBKEYS` (Phase 03 / C4).
+//                  Enforcement is unconditional from v0.1.26 onward — no env
+//                  opt-out (Red Team F1).
 
 use std::fs;
 use std::io::Read;
@@ -166,6 +170,7 @@ async fn run_async() -> Result<UpdateOutcome> {
 
     let asset_name = format!("oxiremote-{latest_version}-{target}.{}", asset_extension());
     let manifest_name = format!("oxiremote-{latest_version}-sha256.txt");
+    let sig_manifest_name = format!("oxiremote-{latest_version}-minisig.txt");
 
     let asset = release
         .assets
@@ -177,6 +182,16 @@ async fn run_async() -> Result<UpdateOutcome> {
         .iter()
         .find(|a| a.name == manifest_name)
         .ok_or_else(|| anyhow!("release {latest_version} has no manifest {manifest_name}"))?;
+    let sig_manifest_asset = release
+        .assets
+        .iter()
+        .find(|a| a.name == sig_manifest_name)
+        .ok_or_else(|| {
+            anyhow!(
+                "release {latest_version} has no signature manifest {sig_manifest_name} — \
+                 refusing to update an unsigned release (Phase 03 / C4)"
+            )
+        })?;
 
     println!("Downloading {asset_name}…");
     let archive_bytes = client
@@ -220,6 +235,26 @@ async fn run_async() -> Result<UpdateOutcome> {
         );
     }
     println!("Checksum verified.");
+
+    // Phase 03 / C4 — Ed25519 (minisign) signature verification. SHA pre-check
+    // above is the cheap filter; signature is the trust root. Both must pass.
+    let sig_manifest_text = client
+        .get(&sig_manifest_asset.browser_download_url)
+        .send()
+        .await
+        .context("download minisign manifest")?
+        .error_for_status()?
+        .text()
+        .await
+        .context("read minisign manifest body")?;
+    let sig_map = crate::update_signing::parse_minisig_manifest(&sig_manifest_text)
+        .context("parse minisign manifest")?;
+    let sig_block = sig_map
+        .get(&asset_name)
+        .ok_or_else(|| anyhow!("minisig manifest does not list {asset_name}"))?;
+    crate::update_signing::verify(&archive_bytes, sig_block)
+        .context("minisign signature verification failed — refusing to replace binary")?;
+    println!("Signature verified.");
 
     let current_exe = std::env::current_exe().context("current_exe")?;
     let target_dir = current_exe

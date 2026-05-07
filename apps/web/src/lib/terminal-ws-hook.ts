@@ -4,6 +4,7 @@ import { FitAddon } from 'xterm-addon-fit'
 import { useTerminalStore, type Session } from '../state/terminal-store'
 import { isDiscoveryMode } from './discovery-client'
 import { loadApiKey, loadTunnelBase } from './api-client'
+import { mintWsTicket, WS_TICKET_PROTOCOL } from './ws-ticket-client'
 
 export type SessionHandle = {
   term: Terminal
@@ -16,11 +17,10 @@ export type SessionHandle = {
   closedByUser: boolean
 }
 
-/// Subprotocol marker used to carry a Bearer api_key on WS upgrade in
-/// discovery (cross-origin) mode. Browsers can't set `Authorization` on
-/// the WS handshake, but they can offer subprotocols. The agent picks the
-/// marker (response header) and reads the api_key from the second value.
-/// Same pattern Kubernetes uses for `kubectl exec`.
+/// Legacy subprotocol marker — carried the api_key on WS upgrade in
+/// discovery mode. Phase 05 / H14 replaced it with `oxi-ticket-v1`; this
+/// fallback stays for one release so an old SPA tab doesn't break the
+/// moment the agent updates. Removed in v0.1.27.
 const WS_BEARER_PROTOCOL = 'oxi-bearer-v1'
 
 function wsUrl(path: string): string {
@@ -35,7 +35,14 @@ function wsUrl(path: string): string {
   return `${proto}//${location.host}${path}`
 }
 
-function wsProtocols(): string[] | undefined {
+/** Resolve subprotocols for a fresh WS open. Tries to mint a single-use
+ *  ticket first (Phase 05 / H14); falls back to the legacy bearer flow when
+ *  the agent doesn't yet expose `/api/ws-ticket` (older release) or the
+ *  request fails for transient reasons. Same-origin embedded mode skips
+ *  this entirely — cookie auth is enough. */
+async function wsProtocols(): Promise<string[] | undefined> {
+  const ticket = await mintWsTicket()
+  if (ticket) return [WS_TICKET_PROTOCOL, ticket]
   if (!isDiscoveryMode()) return undefined
   const key = loadApiKey()
   if (!key) return undefined
@@ -148,11 +155,31 @@ function connect(
     return
   }
 
-  const protocols = wsProtocols()
-  const ws = protocols
-    ? new WebSocket(wsUrl(`/api/terminal/sessions/${sessionId}/ws`), protocols)
-    : new WebSocket(wsUrl(`/api/terminal/sessions/${sessionId}/ws`))
-  handle.ws = ws
+  // Mint the ticket BEFORE opening the WS so the upgrade handshake carries
+  // the freshest 60s token. The mint is async (HTTP round-trip); guard
+  // against teardown happening between mint and open — `closedByUser` is
+  // set by `destroyHandle` and `useTerminalWs`'s exit-state branch, so
+  // checking it here covers the unmount-during-mint race.
+  void wsProtocols().then((protocols) => {
+    if (handle.closedByUser) return
+    if (handle.ws && handle.ws.readyState < WebSocket.CLOSING) return
+    const ws = protocols
+      ? new WebSocket(wsUrl(`/api/terminal/sessions/${sessionId}/ws`), protocols)
+      : new WebSocket(wsUrl(`/api/terminal/sessions/${sessionId}/ws`))
+    handle.ws = ws
+    wireWs(ws, handle, sessionId, onConnected, activeIdRef, onReconnectExhausted, onReconnectAttempt)
+  })
+}
+
+function wireWs(
+  ws: WebSocket,
+  handle: SessionHandle,
+  sessionId: string,
+  onConnected: (c: boolean) => void,
+  activeIdRef: React.MutableRefObject<string | null>,
+  onReconnectExhausted?: () => void,
+  onReconnectAttempt?: (attempt: number) => void,
+) {
 
   ws.onopen = () => {
     handle.connected = true

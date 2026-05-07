@@ -58,8 +58,8 @@ pub fn scope_for_path(path: &str) -> RouteScope {
 /// loopback interface (`127.0.0.1`). If the agent were exposed on a
 /// non-loopback address, an adversary on the same LAN could forge the
 /// `cf-connecting-ip` header and bypass the Localhost route guard.
-/// A `debug_assert!` in `main` enforces the loopback-only invariant at
-/// startup so deviations are caught immediately during development.
+/// `main()` enforces the loopback-only invariant at startup with a hard
+/// runtime check (not `debug_assert!`) — a non-loopback bind aborts boot.
 pub fn is_tunnel_request(headers: &HeaderMap) -> bool {
     headers
         .get("cf-connecting-ip")

@@ -59,12 +59,35 @@ pub fn router() -> Router<Arc<AppState>> {
         // --- operator telemetry endpoints (localhost-only via route_scope) ---
         .route("/api/agent/version", get(api_agent_version))
         .route("/api/agent/sessions/active", get(api_agent_sessions_active))
+        // Phase 06c / H11: bounded ring buffer of ShellOpened/ShellClosed
+        // events. Dashboard polls on mount to backfill events that fired
+        // before the SSE subscription opened.
+        .route("/api/agent/sessions/recent", get(api_agent_sessions_recent))
         .route("/api/agent/tunnel/telemetry", get(api_agent_tunnel_telemetry))
         .route("/api/agent/keys/recent-usage", get(api_agent_keys_recent_usage))
         .route(
             "/api/agent/cors/origins",
             get(api_agent_cors_origins_list).delete(api_agent_cors_origins_delete),
         )
+        // Phase 02 — operational hint banners (root-workspace-present, …).
+        // Pull endpoint avoids the broadcast-race for a dashboard opened
+        // after boot-time SettingsHint events fired (Red Team F14).
+        .route("/api/agent/hints", get(api_agent_hints))
+}
+
+/// GET /api/agent/hints — derived list of currently-active hints.
+/// Localhost-scoped via `LOCALHOST_PREFIXES` (`/api/agent` parent prefix).
+async fn api_agent_hints(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    // The db lives inside the agent data dir; derive it for filesystem-shaped
+    // hint probes (e.g. presence of the discovery secret file).
+    let data_dir = state.db_path.parent();
+    match crate::hints::active_hints(&state.db_path, &state.host_info.host_id, data_dir) {
+        Ok(hints) => (StatusCode::OK, Json(json!({ "hints": hints }))).into_response(),
+        Err(err) => {
+            warn!(error=%err, "hints derivation failed");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -325,14 +348,16 @@ async fn api_agent_keys_one_time(State(state): State<Arc<AppState>>) -> impl Int
             // SPA can resolve it via /api/session/lookup?k=<otk>. No-op in
             // embedded mode (discovery_url unset). Best-effort; failure here
             // doesn't block the OTK response.
-            if let (Some(durl), Ok(disc_id)) = (
+            if let (Some(durl), Some(secret), Ok(disc_id)) = (
                 state.discovery_url.clone(),
+                state.discovery_secret.clone(),
                 crate::discovery::load_discovery_id(&state.db_path),
             ) {
                 crate::discovery::spawn_register_code(
                     state.http_client.clone(),
                     durl,
                     disc_id,
+                    secret,
                     rec.token.clone(),
                     // OTK_TTL_SECS = 1800 = 30 min — matches worker upper bound.
                     30,
@@ -593,14 +618,16 @@ async fn api_agent_keys_permanent_post(
             // Register the new lookup_id with the discovery worker so the
             // cross-origin SPA can resolve sk-… → tunnelUrl. No-op when
             // discovery is unset; failure here doesn't block the response.
-            if let (Some(durl), Ok(disc_id)) = (
+            if let (Some(durl), Some(secret), Ok(disc_id)) = (
                 state.discovery_url.clone(),
+                state.discovery_secret.clone(),
                 crate::discovery::load_discovery_id(&state.db_path),
             ) {
                 crate::discovery::spawn_register_code(
                     state.http_client.clone(),
                     durl,
                     disc_id,
+                    secret,
                     lookup_id.clone(),
                     crate::discovery::PERMANENT_LOOKUP_EXPIRY_MINUTES,
                 );
@@ -863,6 +890,16 @@ fn detect_cloudflared_version(path: &std::path::Path) -> Option<String> {
 async fn api_agent_sessions_active(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let rows = active_sessions_snapshot(&state);
     Json(rows).into_response()
+}
+
+/// GET /api/agent/sessions/recent — last 50 ShellOpened/ShellClosed events.
+///
+/// Backfill endpoint for the host dashboard's audit-log view. Without this,
+/// a tab opened after a shell already spawned never sees the event because
+/// the broadcast bus has no replay (Red Team F14 — same broadcast-race fix
+/// as the hints endpoint).
+async fn api_agent_sessions_recent(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    Json(crate::recent_sessions::snapshot(&state.recent_sessions)).into_response()
 }
 
 /// Build the active-sessions list from all three activity sources.
@@ -1281,6 +1318,7 @@ mod tests {
             desktop_available: false,
             desktop_service: None,
             discovery_url: None,
+            discovery_secret: None,
             web_url: None,
             discovery_temp_key: std::sync::Arc::new(std::sync::RwLock::new(None)),
             tunnel_shutdown: std::sync::Arc::new(tokio::sync::Notify::new()),
@@ -1288,6 +1326,8 @@ mod tests {
             files_activity: std::sync::Arc::new(crate::files_activity::new_map()),
             cloudflared_path: None,
             cors_origins: crate::security::cors::seed_origins(&[], &[]),
+            ws_tickets: crate::ws_ticket::new_store(),
+            recent_sessions: crate::recent_sessions::new_buffer(),
         })
     }
 

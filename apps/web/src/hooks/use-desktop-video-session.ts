@@ -21,7 +21,10 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import type { DesktopInputEvent, DesktopStatus, QualityTier } from './use-desktop-session'
 import { isDiscoveryMode } from '../lib/discovery-client'
 import { loadApiKey, loadTunnelBase } from '../lib/api-client'
+import { mintWsTicket, WS_TICKET_PROTOCOL } from '../lib/ws-ticket-client'
 
+/// Legacy bearer subprotocol — replaced by `oxi-ticket-v1` in Phase 05 / H14.
+/// Fallback path stays for one release; removed in v0.1.27.
 const WS_BEARER_PROTOCOL = 'oxi-bearer-v1'
 
 interface VideoSessionApi {
@@ -57,7 +60,11 @@ function wsUrl(deviceId: string): string {
   return `${proto}//${location.host}${path}`
 }
 
-function wsProtocols(): string[] | undefined {
+/** Mint a single-use ticket (Phase 05 / H14); fall back to the legacy
+ *  bearer flow when `/api/ws-ticket` is unavailable. */
+async function wsProtocols(): Promise<string[] | undefined> {
+  const ticket = await mintWsTicket()
+  if (ticket) return [WS_TICKET_PROTOCOL, ticket]
   if (!isDiscoveryMode()) return undefined
   const key = loadApiKey()
   if (!key) return undefined
@@ -193,15 +200,19 @@ export function useDesktopVideoSession(
     teardown()
 
     setStatus('connecting')
-    const protocols = wsProtocols()
-    const ws = protocols
-      ? new WebSocket(wsUrl(deviceId), protocols)
-      : new WebSocket(wsUrl(deviceId))
-    ws.binaryType = 'arraybuffer'
-    wsRef.current = ws
+    // Mint the single-use ticket before the WS open. The HTTP round-trip is
+    // short and the rest of the setup (PC, transceivers, DCs, handlers) all
+    // depend on `ws` being live, so we defer them into the same async block.
+    void wsProtocols().then((protocols) => {
+      if (destroyedRef.current) return
+      const ws = protocols
+        ? new WebSocket(wsUrl(deviceId), protocols)
+        : new WebSocket(wsUrl(deviceId))
+      ws.binaryType = 'arraybuffer'
+      wsRef.current = ws
 
-    const pc = new RTCPeerConnection(STUN_CONFIG)
-    pcRef.current = pc
+      const pc = new RTCPeerConnection(STUN_CONFIG)
+      pcRef.current = pc
 
     // Recvonly video transceiver — phase 03 server expects this in the first
     // offer so it can add its TrackLocalStaticSample without renegotiation.
@@ -323,16 +334,17 @@ export function useDesktopVideoSession(
       }
     }
 
-    ws.onerror = () => {
-      if (wsRef.current !== ws) return
-      handleDisconnect()
-    }
-    ws.onclose = () => {
-      // StrictMode double-mount: a stale WS closing must not abort the live
-      // replacement WS (see use-desktop-session.ts for the full race).
-      if (wsRef.current !== ws) return
-      if (!destroyedRef.current) handleDisconnect()
-    }
+      ws.onerror = () => {
+        if (wsRef.current !== ws) return
+        handleDisconnect()
+      }
+      ws.onclose = () => {
+        // StrictMode double-mount: a stale WS closing must not abort the live
+        // replacement WS (see use-desktop-session.ts for the full race).
+        if (wsRef.current !== ws) return
+        if (!destroyedRef.current) handleDisconnect()
+      }
+    })
   }, [deviceId, teardown, startFrameLoop]) // eslint-disable-line react-hooks/exhaustive-deps
 
   function handleDisconnect() {

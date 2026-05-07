@@ -46,7 +46,15 @@ mod inner {
     use crate::pipeline_selection::{
         choose as choose_pipeline, operator_preference, ClientCapabilities, Pipeline,
     };
+    use crate::ws_ticket::{claim_ticket, extract_ticket_from_ws_protocols, WS_TICKET_PROTOCOL};
     use crate::AppState;
+
+    /// Auth modes for WS upgrade — same shape as `terminal_ws.rs`.
+    #[derive(Debug, Clone, Copy)]
+    enum WsAuthKind {
+        Ticket,
+        Bearer,
+    }
 
     // ── Wire-format types ─────────────────────────────────────────────────────
 
@@ -236,21 +244,33 @@ mod inner {
         jar: CookieJar,
         headers: HeaderMap,
     ) -> impl IntoResponse {
-        // Browsers can't set `Authorization` on a WS upgrade, so the
-        // cross-origin discovery SPA carries the api_key via subprotocols
-        // (`["oxi-bearer-v1", <key>]`). Same-origin embedded mode keeps
-        // using the cookie path — `bearer` is None there and dual-auth
-        // falls through to the cookie session.
-        let bearer = extract_bearer_from_ws_protocols(&headers);
-        let Some((_session_id, session_device_id)) = require_owner_session_with_device_dual(
-            &state.db_path,
-            &state.signing_key,
-            &jar,
-            bearer.as_deref(),
-        )
-        .await
-        else {
-            return StatusCode::UNAUTHORIZED.into_response();
+        // Phase 05 / H14: prefer single-use ticket subprotocol over the
+        // legacy api_key-in-subprotocol path. Same-origin embedded mode keeps
+        // using the cookie path; tickets and bearer fall through to that when
+        // neither subprotocol is present.
+        let (session_device_id, auth_kind) = if let Some(ticket) =
+            extract_ticket_from_ws_protocols(&headers)
+        {
+            let Some(entry) = claim_ticket(&state.ws_tickets, &ticket) else {
+                return StatusCode::UNAUTHORIZED.into_response();
+            };
+            (entry.device_id, WsAuthKind::Ticket)
+        } else {
+            let bearer = extract_bearer_from_ws_protocols(&headers);
+            if bearer.is_some() {
+                tracing::warn!("desktop ws using legacy oxi-bearer-v1 subprotocol; upgrade SPA");
+            }
+            let Some((_session_id, dev)) = require_owner_session_with_device_dual(
+                &state.db_path,
+                &state.signing_key,
+                &jar,
+                bearer.as_deref(),
+            )
+            .await
+            else {
+                return StatusCode::UNAUTHORIZED.into_response();
+            };
+            (dev, WsAuthKind::Bearer)
         };
 
         // The path segment must match the session's own bound device_id —
@@ -283,13 +303,12 @@ mod inner {
         let close_rx = svc.register(&device_id);
         let svc = Arc::clone(svc);
 
-        // Echo the marker subprotocol so the browser accepts the upgrade
-        // when bearer auth was used. Browsers close the WS if the negotiated
-        // subprotocol isn't in the offered list, so only set it for bearer.
-        let upgrade = if bearer.is_some() {
-            ws.protocols([WS_BEARER_PROTOCOL])
-        } else {
-            ws
+        // Echo the negotiated subprotocol so the browser accepts the upgrade.
+        // Browsers close the WS if the chosen subprotocol isn't in the offered
+        // list, so only set it for ticket / bearer paths.
+        let upgrade = match auth_kind {
+            WsAuthKind::Ticket => ws.protocols([WS_TICKET_PROTOCOL]),
+            WsAuthKind::Bearer => ws.protocols([WS_BEARER_PROTOCOL]),
         };
         upgrade.on_upgrade(move |socket| desktop_session(socket, device_id, state, svc, close_rx))
     }
