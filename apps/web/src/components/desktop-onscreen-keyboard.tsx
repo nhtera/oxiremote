@@ -32,11 +32,15 @@ const MODIFIER_KEYS: KeyDef[] = [
   { label: 'Tab', code: 'Tab' },
 ]
 
-const NAV_KEYS: KeyDef[] = [
+// Arrow keys earn their own row — they're the most-used nav and finger-size
+// matters more for them than for Home / End / PgUp / PgDn.
+const ARROW_KEYS: KeyDef[] = [
   { label: '←', code: 'ArrowLeft' },
   { label: '↑', code: 'ArrowUp' },
   { label: '↓', code: 'ArrowDown' },
   { label: '→', code: 'ArrowRight' },
+]
+const NAV_KEYS: KeyDef[] = [
   { label: 'Home', code: 'Home' },
   { label: 'End', code: 'End' },
   { label: 'PgUp', code: 'PageUp' },
@@ -124,6 +128,7 @@ export default function DesktopOnscreenKeyboard({
           activeMods={activeMods}
           onPress={dispatchKey}
         />
+        <KeyRow keys={ARROW_KEYS} activeMods={activeMods} onPress={dispatchKey} />
         <KeyRow keys={NAV_KEYS} activeMods={activeMods} onPress={dispatchKey} />
         <div className="grid grid-cols-6 gap-1">
           {FN_KEYS.map((k) => (

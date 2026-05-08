@@ -27,7 +27,7 @@ test.describe('desktop pinned text strip', () => {
   )
   test.use({ storageState: STORAGE_STATE })
 
-  test('Send dispatches a single {t:"text"} ctrl frame with the literal payload', async ({
+  test('Per-keystroke dispatch: typing emits text frames whose payloads concat to the input', async ({
     page,
     request,
   }) => {
@@ -43,7 +43,9 @@ test.describe('desktop pinned text strip', () => {
     await page.addInitScript(() => {
       const tap = (data: unknown) => {
         if (typeof data !== 'string') return
-        if (data.includes('"t":"text"')) {
+        // Both `{t:"text"}` and `{t:"key"}` frames flow over ctrl — capture
+        // both so we can assert the typed payload and the trailing Enter.
+        if (data.includes('"t":"text"') || data.includes('"t":"key"')) {
           ;(window as unknown as { __captureFrame: (s: string) => void })
             .__captureFrame(data)
         }
@@ -67,6 +69,11 @@ test.describe('desktop pinned text strip', () => {
 
     await page.goto(`/h/${deviceId}/desktop`)
 
+    // The composer is a controlled accessory bar that mounts only after
+    // the operator opens the keyboard via the top strip's ⌨ icon. Open it
+    // first, then assert the bar is visible.
+    await page.getByRole('button', { name: 'Show keyboard' }).tap()
+
     const strip = page.getByRole('group', { name: 'Send text to remote' })
     await expect(strip).toBeVisible({ timeout: 10_000 })
 
@@ -76,14 +83,26 @@ test.describe('desktop pinned text strip', () => {
     await page.keyboard.type(payload)
     await page.keyboard.press('Enter')
 
-    // Field clears on send so the operator can chain another value.
+    // Field stays empty in CRD-style real-time dispatch — the user sees the
+    // placeholder; their typing lands on the host, not in the input.
     await expect(input).toHaveValue('')
 
-    // Exactly one text frame, with the literal payload intact.
+    // Wait until at least one frame has flowed.
     await expect.poll(() => capturedFrames.length, { timeout: 5_000 }).toBeGreaterThan(0)
-    const parsed = capturedFrames.map((f) => JSON.parse(f) as { t: string; s: string })
-    const textFrames = parsed.filter((f) => f.t === 'text')
-    expect(textFrames.length).toBe(1)
-    expect(textFrames[0].s).toBe(payload)
+    type Frame = { t: 'text'; s: string } | { t: 'key'; code: string; action: 'down' | 'up' }
+    const parsed = capturedFrames.map((f) => JSON.parse(f) as Frame)
+
+    // Concatenated text frames must match the typed payload exactly. The
+    // browser MAY batch multiple chars into one beforeinput on fast typing,
+    // so we don't assert one-frame-per-char — only the concatenation.
+    const textFrames = parsed.filter((f): f is Extract<Frame, { t: 'text' }> => f.t === 'text')
+    expect(textFrames.length).toBeGreaterThan(0)
+    const combined = textFrames.map((f) => f.s).join('')
+    expect(combined).toBe(payload)
+
+    // Enter dispatches a key down + key up pair after the text.
+    const keyFrames = parsed.filter((f): f is Extract<Frame, { t: 'key' }> => f.t === 'key')
+    const enterEvents = keyFrames.filter((f) => f.code === 'Enter')
+    expect(enterEvents.map((f) => f.action)).toEqual(['down', 'up'])
   })
 })

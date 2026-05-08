@@ -18,11 +18,18 @@
 //   Trackpad mode:
 //     - 1-finger drag = move a local virtual cursor (no immediate remote
 //       traffic; cursor delta is applied locally + sent as a remote
-//       mouse-move so the host's cursor follows)
+//       mouse-move so the host's cursor follows). When the cursor pushes
+//       past EDGE_PAN_MARGIN with slack on that side, the layer pans to
+//       keep the cursor visible — the only place trackpad mode shifts
+//       the local layer translation by user input.
 //     - 1-finger tap (no drag) = click at the virtual cursor's position
 //     - 1-finger long-press = right-click at cursor position
-//     - 2-finger drag = scroll wheel
-//     - 2-finger pinch = zoom canvas (same as touch mode)
+//     - 2-finger drag = scroll wheel ONLY (the layer never pans on a
+//       2-finger gesture in trackpad mode — pairing a local pan with a
+//       remote-scroll-induced repaint double-counts the finger motion
+//       and makes the screen feel like it's jumping).
+//     - 2-finger pinch = zoom canvas with a finger-distance deadzone so
+//       micro jitter doesn't induce wobble.
 //
 // Coords sent to the agent are normalized 0..1 against the canvas's PAINTED
 // rect (the object-contain letterboxed area inside the canvas box) — not the
@@ -35,6 +42,7 @@
 
 import { useCallback, useEffect, useRef, useState, type RefObject } from 'react'
 import type { DesktopInputEvent } from './use-desktop-session'
+import { paintedRect, clientToRemote } from '../lib/canvas-painted-rect'
 
 export type InputMode = 'touch' | 'trackpad'
 
@@ -70,47 +78,23 @@ const PAN_THRESHOLD_PX = 8
 const TAP_MAX_MS = 300
 const MIN_SCALE = 1
 const MAX_SCALE = 4
+// Pinch only engages once the fingers have spread / contracted by this much
+// from the gesture start. Below the threshold tiny finger jitter would cause
+// the zoom-at-point math to wobble the layer; above it the user is clearly
+// pinching. When crossed, the pinch start values re-anchor to the current
+// distance so the scale doesn't snap.
+const PINCH_DEADZONE_PX = 12
 // Trackpad-mode sensitivity multiplier. CRD/MS-RD ship 1.0× by default and
 // the most common user complaint is "cursor feels too slow" (e.g. RustDesk
 // discussion #12090). 1.5× lets a single finger swipe traverse most of the
 // remote screen without the user feeling the cursor is dragging behind.
 const TRACKPAD_SENSITIVITY = 1.5
-
-/** Compute the canvas's painted rect (object-contain letterboxed area) inside
- *  its bounding box. Reads `width`/`height` attributes for intrinsic dims —
- *  both JPEG and H.264 views resize the canvas attribute to the stream dims
- *  so this is reliable. Falls back to the bounding rect when intrinsics are
- *  unknown (first frame race). */
-function paintedRect(el: HTMLElement) {
-  const r = el.getBoundingClientRect()
-  const iw = (el as HTMLCanvasElement).width ?? 0
-  const ih = (el as HTMLCanvasElement).height ?? 0
-  if (iw <= 0 || ih <= 0 || r.width <= 0 || r.height <= 0) {
-    return { left: r.left, top: r.top, width: r.width, height: r.height }
-  }
-  const boxAspect = r.width / r.height
-  const intAspect = iw / ih
-  if (intAspect > boxAspect) {
-    // Intrinsic wider → fit width, letterbox top/bottom.
-    const height = r.width / intAspect
-    return { left: r.left, top: r.top + (r.height - height) / 2, width: r.width, height }
-  }
-  // Intrinsic taller → fit height, pillarbox left/right.
-  const width = r.height * intAspect
-  return { left: r.left + (r.width - width) / 2, top: r.top, width, height: r.height }
-}
-
-/** Normalize a viewport pixel coord to the canvas's 0..1 remote-screen space.
- *  Uses the painted rect so taps in the letterbox bars map to the nearest
- *  edge of the remote screen instead of being scattered across the middle. */
-function clientToRemote(canvas: HTMLElement, clientX: number, clientY: number) {
-  const r = paintedRect(canvas)
-  if (r.width <= 0 || r.height <= 0) return { x: 0, y: 0 }
-  return {
-    x: Math.max(0, Math.min(1, (clientX - r.left) / r.width)),
-    y: Math.max(0, Math.min(1, (clientY - r.top) / r.height)),
-  }
-}
+// Trackpad-mode edge-pan margin (viewport-local px). When zoomed in and the
+// virtual cursor pushes within this distance of a viewport edge, the layer
+// pans to keep the cursor visible — same model as Chrome Remote Desktop.
+// 60 px ≈ a thumb's width: enough lead-time so the user sees the canvas
+// scroll before the cursor would visually clip the edge.
+const EDGE_PAN_MARGIN = 60
 
 interface PointSnapshot {
   clientX: number
@@ -154,8 +138,17 @@ export function useCanvasGestures({
     moved: boolean
   }
   const pointersRef = useRef<Map<number, Pointer>>(new Map())
-  // Pinch state held while exactly 2 pointers are down.
-  const pinchRef = useRef<{ startDist: number; startScale: number; midX: number; midY: number } | null>(null)
+  // Pinch state held while exactly 2 pointers are down. `pinching` flips
+  // true once the user crosses PINCH_DEADZONE_PX of distance change; before
+  // that the gesture is treated as a pure 2-finger pan / scroll so micro
+  // finger jitter doesn't induce zoom wobble.
+  const pinchRef = useRef<{
+    startDist: number
+    startScale: number
+    midX: number
+    midY: number
+    pinching: boolean
+  } | null>(null)
   // Long-press timer for the touch-mode "drag arm" gesture.
   const longPressRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   // True after a successful long-press: the next 1-finger move emits a remote
@@ -300,6 +293,7 @@ export function useCanvasGestures({
           startScale: scaleRef.current,
           midX: (a.clientX + b.clientX) / 2,
           midY: (a.clientY + b.clientY) / 2,
+          pinching: false,
         }
         return
       }
@@ -356,42 +350,72 @@ export function useCanvasGestures({
         const [a, b] = Array.from(pointersRef.current.values())
         const newDist = dist(a, b)
         if (newDist <= 0) return
-        const ratio = newDist / pinchRef.current.startDist
-        const newScale = Math.min(MAX_SCALE, Math.max(MIN_SCALE, pinchRef.current.startScale * ratio))
-        // Zoom-at-point: keep the midpoint stationary in the parent's coord
-        // space when scale changes.
         const v = viewport.current
         if (!v) return
         const vrect = v.getBoundingClientRect()
         const newMidX = (a.clientX + b.clientX) / 2
         const newMidY = (a.clientY + b.clientY) / 2
-        // Midpoint in the layer's parent (viewport) coord space.
-        const localMidX = newMidX - vrect.left
-        const localMidY = newMidY - vrect.top
-        const oldScale = scaleRef.current
-        const k = newScale / oldScale
-        // newTx = localMidX - (localMidX - oldTx) * k  → keeps the point under
-        // the midpoint stationary.
-        txRef.current = localMidX - (localMidX - txRef.current) * k
-        tyRef.current = localMidY - (localMidY - tyRef.current) * k
-        scaleRef.current = newScale
-        // Plus centroid translation (2-finger pan).
         const lastMidX = pinchRef.current.midX
         const lastMidY = pinchRef.current.midY
-        txRef.current += (newMidX - lastMidX)
-        tyRef.current += (newMidY - lastMidY)
-        pinchRef.current.midX = newMidX
-        pinchRef.current.midY = newMidY
-        applyTransform()
-        // 2-finger drag also scrolls the wheel in trackpad mode (small,
-        // averaged delta — distinct from the pan magnitude).
-        if (modeRef.current === 'trackpad') {
-          const wdx = Math.round((newMidX - lastMidX) / 8)
-          const wdy = Math.round((newMidY - lastMidY) / 8)
+        const midDx = newMidX - lastMidX
+        const midDy = newMidY - lastMidY
+        let transformChanged = false
+
+        // Pinch deadzone — until the user's fingers have moved apart /
+        // together by PINCH_DEADZONE_PX, treat the gesture as a pure
+        // 2-finger pan. This kills the wobble that came from the zoom-at-
+        // point math reacting to every pixel of relative finger jitter
+        // (the (localMidX - txRef) lever amplifies tiny scale errors when
+        // the user is zoomed in or panned far). Once crossed, re-anchor
+        // startDist / startScale so the scale change starts from where
+        // the user is — no snap.
+        if (!pinchRef.current.pinching &&
+            Math.abs(newDist - pinchRef.current.startDist) > PINCH_DEADZONE_PX) {
+          pinchRef.current.pinching = true
+          pinchRef.current.startDist = newDist
+          pinchRef.current.startScale = scaleRef.current
+        }
+
+        if (pinchRef.current.pinching) {
+          const ratio = newDist / pinchRef.current.startDist
+          const newScale = Math.min(MAX_SCALE, Math.max(MIN_SCALE, pinchRef.current.startScale * ratio))
+          const oldScale = scaleRef.current
+          if (newScale !== oldScale) {
+            // Zoom-at-point: keep the world point under the midpoint stationary.
+            const localMidX = newMidX - vrect.left
+            const localMidY = newMidY - vrect.top
+            const k = newScale / oldScale
+            txRef.current = localMidX - (localMidX - txRef.current) * k
+            tyRef.current = localMidY - (localMidY - tyRef.current) * k
+            scaleRef.current = newScale
+            transformChanged = true
+          }
+        }
+
+        // Midpoint translation. Touch mode: pan the layer locally so the
+        // canvas follows the fingers. Trackpad mode: emit scroll wheel
+        // ONLY — never pan the layer. Local layer-pan + remote-scroll
+        // repaint is the double-counting that made trackpad 2-finger
+        // drags feel jumpy: same finger motion shifted the visible image
+        // twice. CRD's trackpad model is "fingers send wheel, screen
+        // updates from the host," and that's what we mirror.
+        if (modeRef.current === 'touch') {
+          if (midDx !== 0 || midDy !== 0) {
+            txRef.current += midDx
+            tyRef.current += midDy
+            transformChanged = true
+          }
+        } else {
+          const wdx = Math.round(midDx / 8)
+          const wdy = Math.round(midDy / 8)
           if (wdx !== 0 || wdy !== 0) {
             sendInputRef.current({ t: 'wheel', dx: -wdx, dy: -wdy })
           }
         }
+
+        pinchRef.current.midX = newMidX
+        pinchRef.current.midY = newMidY
+        if (transformChanged) applyTransform()
         return
       }
 
@@ -412,25 +436,89 @@ export function useCanvasGestures({
           applyTransform()
         }
       } else {
-        // Trackpad mode: 1-finger drag moves the virtual cursor by finger
-        // delta with a sensitivity multiplier so fast finger movements
-        // traverse the screen without the cursor visibly trailing the
-        // finger. Clamped to the PAINTED image bounds (not the viewport)
-        // so the cursor can't drift into the letterbox bars and send
-        // edge-clamped coords to the remote.
+        // Trackpad mode. Two coupled jobs: (1) advance the virtual cursor
+        // by the finger delta * sensitivity, (2) when the cursor would push
+        // past a viewport edge AND the painted rect has slack on that side
+        // (i.e. the user has zoomed in), absorb the overshoot via a layer
+        // pan so the cursor stays visible — Chrome Remote Desktop's mobile
+        // pattern. Remote-coord correctness invariant:
+        //   d(remote_x) = (d(cursor_x) - d(tx)) / pr.width = finger_dx*sens / pr.width
+        // i.e. cursor_delta - tx_delta must equal the desired finger advance.
         if (!trackpadDraggingRef.current) return
         const v = viewport.current
         const c = target.current
         if (!v || !c) return
         const vrect = v.getBoundingClientRect()
         const pr = paintedRect(c)
-        const minX = pr.left - vrect.left
-        const minY = pr.top - vrect.top
-        const maxX = minX + pr.width
-        const maxY = minY + pr.height
+        const pLeft = pr.left - vrect.left
+        const pTop = pr.top - vrect.top
+        const pRight = pLeft + pr.width
+        const pBottom = pTop + pr.height
+        const vw = vrect.width
+        const vh = vrect.height
         const cur = cursorRef.current
-        const nx = Math.max(minX, Math.min(maxX, cur.x + dx * TRACKPAD_SENSITIVITY))
-        const ny = Math.max(minY, Math.min(maxY, cur.y + dy * TRACKPAD_SENSITIVITY))
+        const wantDx = dx * TRACKPAD_SENSITIVITY
+        const wantDy = dy * TRACKPAD_SENSITIVITY
+        let nx = cur.x + wantDx
+        let ny = cur.y + wantDy
+
+        // Edge-pan: when zoomed in, the painted rect's right edge can sit
+        // beyond the viewport right edge (pRight > vw). If the cursor wants
+        // to push past (vw - margin), shift the layer left to "follow" the
+        // cursor — but only by min(overshoot, slack, |wantDelta|). The third
+        // term is critical: cursor can be stranded past the margin from a
+        // prior frame (slack was 0 then, slack > 0 now after a pinch). Without
+        // capping by |wantDelta|, the pan would absorb the cumulative drift
+        // and the cursor would visually move OPPOSITE to the finger. Capping
+        // keeps `cursor_delta = wantDelta + panDelta` ≥ 0 in the same sign
+        // as wantDelta — the cursor can stop or move with the finger, never
+        // against it.
+        let panX = 0
+        let panY = 0
+        if (wantDx > 0 && nx > vw - EDGE_PAN_MARGIN) {
+          const overshoot = nx - (vw - EDGE_PAN_MARGIN)
+          const slack = Math.max(0, pRight - vw)
+          panX = -Math.min(overshoot, slack, wantDx)
+        } else if (wantDx < 0 && nx < EDGE_PAN_MARGIN) {
+          const overshoot = EDGE_PAN_MARGIN - nx
+          const slack = Math.max(0, -pLeft)
+          panX = Math.min(overshoot, slack, -wantDx)
+        }
+        if (wantDy > 0 && ny > vh - EDGE_PAN_MARGIN) {
+          const overshoot = ny - (vh - EDGE_PAN_MARGIN)
+          const slack = Math.max(0, pBottom - vh)
+          panY = -Math.min(overshoot, slack, wantDy)
+        } else if (wantDy < 0 && ny < EDGE_PAN_MARGIN) {
+          const overshoot = EDGE_PAN_MARGIN - ny
+          const slack = Math.max(0, -pTop)
+          panY = Math.min(overshoot, slack, -wantDy)
+        }
+        if (panX !== 0 || panY !== 0) {
+          txRef.current += panX
+          tyRef.current += panY
+          applyTransform()
+          // Pan absorbed |pan|; reduce cursor advancement by the same so the
+          // remote-coord invariant holds (cursor_delta + |pan| = wantDelta).
+          nx += panX
+          ny += panY
+        }
+
+        // Final clamp: cursor must stay inside the painted rect (post-pan)
+        // so it never reports edge-clamped letterbox-bar coords; also stay
+        // inside the viewport so it can't visually escape. After edge-pan,
+        // the painted rect typically covers the viewport on the panning
+        // side, so the painted clamp is the binding one there.
+        const pLeftPost = pLeft + panX
+        const pTopPost = pTop + panY
+        const pRightPost = pRight + panX
+        const pBottomPost = pBottom + panY
+        const minNX = Math.max(0, pLeftPost)
+        const maxNX = Math.min(vw, pRightPost)
+        const minNY = Math.max(0, pTopPost)
+        const maxNY = Math.min(vh, pBottomPost)
+        nx = Math.max(minNX, Math.min(maxNX, nx))
+        ny = Math.max(minNY, Math.min(maxNY, ny))
+
         // Actual position drives the math + the remote mouse-move so the
         // host sees the truth. Visual sprite optionally leads by 1 predicted
         // event for a perceptual frame of lead on iOS Safari 17.4+ / Chrome.
@@ -441,8 +529,8 @@ export function useCanvasGestures({
         if (pred) {
           const pdx = pred.clientX - e.clientX
           const pdy = pred.clientY - e.clientY
-          displayX = Math.max(minX, Math.min(maxX, nx + pdx * TRACKPAD_SENSITIVITY))
-          displayY = Math.max(minY, Math.min(maxY, ny + pdy * TRACKPAD_SENSITIVITY))
+          displayX = Math.max(minNX, Math.min(maxNX, nx + pdx * TRACKPAD_SENSITIVITY))
+          displayY = Math.max(minNY, Math.min(maxNY, ny + pdy * TRACKPAD_SENSITIVITY))
         }
         setCursor({ x: displayX, y: displayY, visible: true })
         sendMove(vrect.left + nx, vrect.top + ny)
@@ -533,8 +621,10 @@ export function useCanvasGestures({
   // erase finger-driven movements after the on-screen keyboard appears /
   // hides.)
 
-  /** Reset the matrix transform — exposed so the toolbar can offer a
-   *  "Reset zoom" button. Not wired by default. */
+  /** Reset the matrix transform — drops any pinch-zoom or edge-pan offset.
+   *  `applyTransform` re-fires `onZoomChange(1)` so the toolbar's zoom %
+   *  indicator follows. The painted size at 1× is whatever `object-fit:
+   *  contain` produces (RVNC behaviour) — pinch out for more detail. */
   const resetZoom = useCallback(() => {
     scaleRef.current = 1
     txRef.current = 0

@@ -25,8 +25,21 @@ export default function AppLayout() {
   // operator is on the dashboard surface (the calm one).
   const isDashboardRoute = /\/h\/[^/]+\/dashboard$/.test(pathname)
 
+  // Remote-desktop session is full-immersion on mobile (matches Chrome Remote
+  // Desktop's pattern). The route renders its own top strip + composer, so
+  // hiding MobileBottomTabs here frees the bottom safe-area for the composer
+  // and stops the tabs from peeking through above it. Exit via ← in the
+  // top strip returns to the host page where the tabs reappear.
+  const isDesktopRoute = /\/h\/[^/]+\/desktop$/.test(pathname)
+  const gridRows = isDesktopRoute
+    ? 'grid-rows-[auto_1fr]'
+    : 'grid-rows-[auto_1fr_auto]'
+
   return (
-    <div data-app-grid className="grid grid-rows-[auto_1fr_auto] h-[100dvh] supports-[not(height:100dvh)]:h-screen">
+    <div
+      data-app-grid
+      className={`grid ${gridRows} h-[100dvh] supports-[not(height:100dvh)]:h-screen`}
+    >
       {currentHostId ? (
         <>
           {/* Desktop top bar */}
@@ -50,11 +63,9 @@ export default function AppLayout() {
         </div>
       </main>
 
-      {currentHostId ? (
+      {currentHostId && !isDesktopRoute ? (
         <MobileBottomTabs hostId={currentHostId} />
-      ) : (
-        <div />
-      )}
+      ) : null}
 
       {currentHostId && (
         <GearDrawer

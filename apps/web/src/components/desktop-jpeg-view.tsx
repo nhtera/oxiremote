@@ -34,6 +34,12 @@ interface SessionApi {
   screenshot?: () => Promise<void>
 }
 
+/** Imperative handle exposed by the canvas's pinch/pan gesture stack. The
+ *  shell consumes it via the Fit menu item to drop user zoom back to 1×. */
+export interface DesktopGestureApi {
+  resetZoom: () => void
+}
+
 interface Props {
   hostId: string
   deviceId: string
@@ -47,6 +53,14 @@ interface Props {
   hostLabel: string
   onSessionChange: (s: SessionSnapshot) => void
   onSessionApi: (api: SessionApi) => void
+  /** Pinch-zoom user scale (1 = unzoomed). Forwarded to the top strip's
+   *  zoom % indicator so it reflects real on-screen scale. */
+  onZoomChange?: (scale: number) => void
+  /** Receives a stable handle for resetting zoom from outside the canvas. */
+  onGestureApi?: (api: DesktopGestureApi) => void
+  /** Bottom-anchor the painted image when the soft keyboard is open so it
+   *  rides up with the keyboard (RVNC-style). Centred otherwise. */
+  bottomAnchor?: boolean
 }
 
 export default function DesktopJpegView({
@@ -61,6 +75,9 @@ export default function DesktopJpegView({
   hostLabel,
   onSessionChange,
   onSessionApi,
+  onZoomChange,
+  onGestureApi,
+  bottomAnchor = false,
 }: Props) {
   const canvasRef = useRef<HTMLCanvasElement>(null)
   const workerRef = useRef<Worker | null>(null)
@@ -188,6 +205,9 @@ export default function DesktopJpegView({
       mode={inputMode}
       gestureMode={gestureMode}
       sendInput={sendInput}
+      onZoomChange={onZoomChange}
+      onGestureApi={onGestureApi}
+      bottomAnchor={bottomAnchor}
     />
   )
 }
@@ -197,11 +217,17 @@ function CanvasWithInput({
   mode,
   gestureMode,
   sendInput,
+  onZoomChange,
+  onGestureApi,
+  bottomAnchor,
 }: {
   canvasRef: React.RefObject<HTMLCanvasElement | null>
   mode: InputMode
   gestureMode: GestureMode
   sendInput: (ev: DesktopInputEvent) => void
+  onZoomChange?: (scale: number) => void
+  onGestureApi?: (api: DesktopGestureApi) => void
+  bottomAnchor: boolean
 }) {
   const overlayRef = useRef<DesktopRectOverlayHandle>(null)
   const layerRef = useRef<HTMLDivElement>(null)
@@ -227,14 +253,20 @@ function CanvasWithInput({
   // Pointer-Events gesture stack owns 1-finger pan, pinch-zoom, and the
   // trackpad-mode virtual cursor. The sprite renders only in trackpad mode;
   // touch mode taps directly without a cursor.
-  const { cursor } = useCanvasGestures({
+  const { cursor, resetZoom } = useCanvasGestures({
     target: canvasRef,
     layer: layerRef,
     viewport: viewportRef,
     mode,
     sendInput,
+    onZoomChange,
     disabled: gestureMode === 'rect',
   })
+  // Hand the reset-zoom handle up. Stable across renders because resetZoom
+  // is memoized in the hook; running this on each render is cheap.
+  useEffect(() => {
+    onGestureApi?.({ resetZoom })
+  }, [onGestureApi, resetZoom])
   return (
     <div
       ref={viewportRef}
@@ -244,8 +276,21 @@ function CanvasWithInput({
       <div ref={layerRef} className="w-full h-full" style={{ willChange: 'transform' }}>
         <canvas
           ref={canvasRef}
-          className="w-full h-full object-contain"
+          // Focusable so clicking the canvas takes the activeElement
+          // away from any previously-focused button/input — without this
+          // the global keyboard-capture hook stays disabled (it skips
+          // BUTTON/INPUT focus). focus() is called from onPointerDown
+          // so a single tap reclaims the keyboard for the remote.
+          tabIndex={0}
+          onPointerDown={(e) => e.currentTarget.focus({ preventScroll: true })}
+          // Anchor the painted desktop to the bottom of the wrap ONLY
+          // while the soft keyboard is open — that way the image rides
+          // up with the keyboard (RVNC pattern). When the keyboard is
+          // closed we fall back to centred so the desktop sits balanced
+          // in the available space (no oddly-empty top half).
+          className={`w-full h-full object-contain outline-none ${bottomAnchor ? 'object-bottom' : ''}`}
           style={{ display: 'block' }}
+          aria-label="Remote desktop canvas"
         />
       </div>
       <DesktopRectOverlay ref={overlayRef} />

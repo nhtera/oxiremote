@@ -34,6 +34,11 @@ interface SessionApi {
   screenshot?: () => Promise<void>
 }
 
+/** Imperative handle exposed by the canvas's pinch/pan gesture stack. */
+export interface DesktopGestureApi {
+  resetZoom: () => void
+}
+
 interface Props {
   hostId: string
   deviceId: string
@@ -46,6 +51,10 @@ interface Props {
   hostLabel: string
   onSessionChange: (s: SessionSnapshot) => void
   onSessionApi: (api: SessionApi) => void
+  onZoomChange?: (scale: number) => void
+  onGestureApi?: (api: DesktopGestureApi) => void
+  /** See JPEG view: bottom-anchor only while the soft keyboard is open. */
+  bottomAnchor?: boolean
 }
 
 export default function DesktopH264View({
@@ -60,6 +69,9 @@ export default function DesktopH264View({
   hostLabel,
   onSessionChange,
   onSessionApi,
+  onZoomChange,
+  onGestureApi,
+  bottomAnchor = false,
 }: Props) {
   const canvasRef = useRef<HTMLCanvasElement>(null)
   const ctx2dRef = useRef<CanvasRenderingContext2D | null>(null)
@@ -136,6 +148,9 @@ export default function DesktopH264View({
       mode={inputMode}
       gestureMode={gestureMode}
       sendInput={sendInput}
+      onZoomChange={onZoomChange}
+      onGestureApi={onGestureApi}
+      bottomAnchor={bottomAnchor}
     />
   )
 }
@@ -145,11 +160,17 @@ function CanvasWithInput({
   mode,
   gestureMode,
   sendInput,
+  onZoomChange,
+  onGestureApi,
+  bottomAnchor,
 }: {
   canvasRef: React.RefObject<HTMLCanvasElement | null>
   mode: InputMode
   gestureMode: GestureMode
   sendInput: (ev: DesktopInputEvent) => void
+  onZoomChange?: (scale: number) => void
+  onGestureApi?: (api: DesktopGestureApi) => void
+  bottomAnchor: boolean
 }) {
   const overlayRef = useRef<DesktopRectOverlayHandle>(null)
   const layerRef = useRef<HTMLDivElement>(null)
@@ -169,14 +190,18 @@ function CanvasWithInput({
     gestureMode,
     rectOverlay: overlayForwarder,
   })
-  const { cursor } = useCanvasGestures({
+  const { cursor, resetZoom } = useCanvasGestures({
     target: canvasRef,
     layer: layerRef,
     viewport: viewportRef,
     mode,
     sendInput,
+    onZoomChange,
     disabled: gestureMode === 'rect',
   })
+  useEffect(() => {
+    onGestureApi?.({ resetZoom })
+  }, [onGestureApi, resetZoom])
   return (
     <div
       ref={viewportRef}
@@ -186,8 +211,19 @@ function CanvasWithInput({
       <div ref={layerRef} className="w-full h-full" style={{ willChange: 'transform' }}>
         <canvas
           ref={canvasRef}
-          className="w-full h-full object-contain"
+          // Focusable so clicking the canvas takes the activeElement
+          // away from any previously-focused button/input — without this
+          // the global keyboard-capture hook stays disabled (it skips
+          // BUTTON/INPUT focus). focus() is called from onPointerDown
+          // so a single tap reclaims the keyboard for the remote.
+          tabIndex={0}
+          onPointerDown={(e) => e.currentTarget.focus({ preventScroll: true })}
+          // See JPEG-view comment — bottom-anchor only while the soft
+          // keyboard is open; centred otherwise so the image sits
+          // balanced when the operator isn't typing.
+          className={`w-full h-full object-contain outline-none ${bottomAnchor ? 'object-bottom' : ''}`}
           style={{ display: 'block' }}
+          aria-label="Remote desktop canvas"
         />
       </div>
       <DesktopRectOverlay ref={overlayRef} />

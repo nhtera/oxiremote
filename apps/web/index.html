@@ -5,7 +5,12 @@
     <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
     <link rel="manifest" href="/manifest.webmanifest" />
     <link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+    <!-- maximum-scale=1, user-scalable=no: lock iOS Safari out of page-level
+         pinch-zoom so our remote-desktop canvas always owns the pinch
+         gesture. Without this, an accidental pinch outside the canvas can
+         leave Safari in a zoomed/panned state that hides our top strip
+         and breaks subsequent in-canvas pinches. -->
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
     <meta name="theme-color" content="#14151a" />
     <meta name="msapplication-TileColor" content="#ff7a40" />
     <meta name="apple-mobile-web-app-capable" content="yes" />

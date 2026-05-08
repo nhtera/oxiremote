@@ -20,6 +20,7 @@ import type { InputMode, GestureMode } from '../hooks/use-desktop-input'
 import { supportsH264Video } from '../hooks/use-desktop-video-session'
 import DesktopJpegView from '../components/desktop-jpeg-view'
 import DesktopH264View from '../components/desktop-h264-view'
+import type { DesktopGestureApi } from '../components/desktop-jpeg-view'
 import DesktopToolbar from '../components/desktop-toolbar'
 import DesktopTopStrip from '../components/desktop-top-strip'
 import DesktopGestureHelp from '../components/desktop-gesture-help'
@@ -30,6 +31,7 @@ import DesktopExitConfirm from '../components/desktop-exit-confirm'
 import ReconnectModal from '../components/reconnect-modal'
 import { useConfirm } from '../components/ui'
 import { useSendTextLiteral } from '../hooks/use-desktop-input'
+import { useDesktopKeyboardCapture } from '../hooks/use-desktop-keyboard-capture'
 
 interface Capabilities {
   available: boolean
@@ -99,6 +101,39 @@ export default function DesktopPage() {
   const [gestureMode, setGestureMode] = useState<GestureMode>('pointer')
   const [showHelp, setShowHelp] = useState(false)
   const [showKeyboard, setShowKeyboard] = useState(false)
+  // Mobile-only RVNC-style accessory bar (focus-catcher + ⌫/↵/▼). Floats
+  // above the soft keyboard via visualViewport. Toggled from the top strip's
+  // ⌨ icon. Distinct from `showKeyboard`, which opens the full modifier /
+  // F-key / arrows sheet — accessible from inside the accessory.
+  const [keyboardOpen, setKeyboardOpen] = useState(false)
+  // Soft-keyboard occluded height in CSS px. iOS / Android keep the layout
+  // viewport at full screen size and overlay the keyboard on top, which
+  // would let the canvas paint into the area behind the keyboard. We pad
+  // the outer container by this height so the flex-1 canvas wrap shrinks
+  // to fit the area visible above the keyboard. Tracks visualViewport
+  // independently of the composer (which has its own listener for the
+  // bar's `bottom` offset) so the page remains responsive even if the
+  // composer is closed by the user dismissing the keyboard via OS gesture.
+  const [keyboardOffset, setKeyboardOffset] = useState(0)
+  useEffect(() => {
+    if (!keyboardOpen) {
+      setKeyboardOffset(0)
+      return
+    }
+    const vp = window.visualViewport
+    if (!vp) return
+    const update = () => {
+      const obscured = Math.max(0, window.innerHeight - vp.height - vp.offsetTop)
+      setKeyboardOffset(obscured)
+    }
+    vp.addEventListener('resize', update)
+    vp.addEventListener('scroll', update)
+    update()
+    return () => {
+      vp.removeEventListener('resize', update)
+      vp.removeEventListener('scroll', update)
+    }
+  }, [keyboardOpen])
   const [showTextBatch, setShowTextBatch] = useState(false)
   const [showExitConfirm, setShowExitConfirm] = useState(false)
   // Forces a remount of the active video view — used by the mobile Reload
@@ -139,14 +174,30 @@ export default function DesktopPage() {
     return () => ro.disconnect()
   }, [])
 
-  // canvas uses `object-contain`, so the displayed scale is the smaller of
-  // the two ratios. Skip when either input is missing.
+  // Pinch-zoom user scale. Updated by useCanvasGestures via onZoomChange so
+  // the indicator below reflects the *effective* on-screen scale, not just
+  // the static letterbox-fit ratio.
+  const [userScale, setUserScale] = useState(1)
+  // Stable handle for the pinch/pan reset. Both views push their handle into
+  // this ref via onGestureApi; the overflow menu's "Fit" item calls it.
+  const gestureApiRef = useRef<DesktopGestureApi | null>(null)
+  const handleGestureApi = useCallback((api: DesktopGestureApi) => {
+    gestureApiRef.current = api
+  }, [])
+  const handleResetZoom = useCallback(() => {
+    gestureApiRef.current?.resetZoom()
+    setUserScale(1)
+  }, [])
+
+  // canvas uses `object-contain`, so the base scale is min(W/sw, H/sh).
+  // Multiply by the user's pinch scale so the zoom % chip in the top strip
+  // shows what the user actually sees on screen.
   const zoom =
     screenDims && containerSize && screenDims.width > 0 && screenDims.height > 0
       ? Math.min(
           containerSize.width / screenDims.width,
           containerSize.height / screenDims.height,
-        )
+        ) * userScale
       : undefined
 
   // Resolve authenticated device_id from /api/me. Agent binds each WS to
@@ -250,6 +301,13 @@ export default function DesktopPage() {
   // 4 KB UTF-8 to stay below the server-side cap). Replaces the old per-char
   // keycode synthesis so punctuation and Unicode land verbatim on the host.
   const handleSendTextLiteral = useSendTextLiteral(sendInput)
+
+  // Desktop physical-keyboard capture. While a stream is up and no form /
+  // button is focused, every keystroke is forwarded to the host — standard
+  // VNC behavior. Skips while overlays own focus so users can still interact
+  // with settings / sheets / the mobile accessory's input.
+  const captureEnabled = status === 'streaming' || status === 'fallback'
+  useDesktopKeyboardCapture(captureEnabled, sendInput)
 
   const handleReload = useCallback(() => {
     sessionApiRef.current.disconnect()
@@ -367,7 +425,10 @@ export default function DesktopPage() {
     status === 'reconnecting' || (status === 'disconnected' && attempt >= 3)
 
   return (
-    <div className="relative flex flex-col lg:flex-row w-full h-full overflow-hidden bg-black">
+    <div
+      className="relative flex flex-col lg:flex-row w-full h-full overflow-hidden bg-black"
+      style={{ paddingBottom: keyboardOffset }}
+    >
       <DesktopTopStrip
         onExit={handleExit}
         onReload={handleReload}
@@ -375,6 +436,20 @@ export default function DesktopPage() {
         onScreenshot={handleScreenshot}
         inFullscreen={inFullscreen}
         zoom={zoom}
+        inputMode={inputMode}
+        onInputModeToggle={() => setInputMode((m) => (m === 'touch' ? 'trackpad' : 'touch'))}
+        onShowKeyboard={() => setKeyboardOpen(true)}
+        onShowTextBatch={() => setShowTextBatch(true)}
+        onResetZoom={handleResetZoom}
+        onShowGestureHelp={() => setShowHelp(true)}
+        gestureMode={gestureMode}
+        onGestureModeToggle={() => setGestureMode((g) => (g === 'pointer' ? 'rect' : 'pointer'))}
+        hidpi={settings.hidpi}
+        smoothScaling={settings.smoothScaling}
+        quality={quality}
+        onQualityChange={handleQualityChange}
+        onSettingsChange={handleSettingsChange}
+        pipeline={useH264 ? 'h264' : 'jpeg'}
       />
 
       {/* Disable touch/pointer events on the canvas while text-batch sheet is open
@@ -394,6 +469,9 @@ export default function DesktopPage() {
             hostLabel={hostLabel}
             onSessionChange={onSessionChange}
             onSessionApi={onSessionApi}
+            onZoomChange={setUserScale}
+            onGestureApi={handleGestureApi}
+            bottomAnchor={keyboardOpen}
           />
         ) : (
           <DesktopJpegView
@@ -409,18 +487,31 @@ export default function DesktopPage() {
             hostLabel={hostLabel}
             onSessionChange={onSessionChange}
             onSessionApi={onSessionApi}
+            onZoomChange={setUserScale}
+            onGestureApi={handleGestureApi}
+            bottomAnchor={keyboardOpen}
           />
         )}
       </div>
 
-      <div className="fixed bottom-0 left-0 right-0 z-20 pb-safe px-safe lg:static lg:w-60 lg:h-full lg:shrink-0 lg:pb-0 lg:px-0">
-        {/* Always-visible text composer pinned above the toolbar on mobile.
-            Hidden on lg+ via the component's own `lg:hidden` so the desktop
-            sidebar (which has its own composer flow) is unchanged. */}
-        <DesktopTextStrip
-          onSend={handleSendTextLiteral}
-          onOpenSheet={() => setShowTextBatch(true)}
-        />
+      {/* Mobile keyboard accessory — RVNC-style. Mounts only when the
+          operator taps the ⌨ icon in the top strip, rides above the soft
+          keyboard via visualViewport, and unmounts when the keyboard goes
+          down. Canvas keeps the full screen the rest of the time. The
+          accessory's "open keyboard sheet" button surfaces the existing
+          modifier / arrow / F-key sheet. */}
+      <DesktopTextStrip
+        open={keyboardOpen}
+        onClose={() => setKeyboardOpen(false)}
+        onSend={handleSendTextLiteral}
+        onKey={sendInput}
+        onOpenSheet={() => setShowKeyboard(true)}
+      />
+
+      {/* Desktop sidebar (lg+) — keeps the full toolbar with modifier grid,
+          input mode segmented control, and inline display popover. The
+          mobile path uses the redesigned top strip + composer + sheet. */}
+      <div className="hidden lg:block lg:w-60 lg:h-full lg:shrink-0">
         <DesktopToolbar
           quality={quality}
           onQualityChange={handleQualityChange}

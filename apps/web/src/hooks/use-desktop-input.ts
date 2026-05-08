@@ -10,6 +10,7 @@
 
 import { type RefObject, useCallback, useEffect, useRef } from 'react'
 import type { DesktopInputEvent } from './use-desktop-session'
+import { clientToRemote } from '../lib/canvas-painted-rect'
 
 export type InputMode = 'touch' | 'trackpad'
 
@@ -109,14 +110,16 @@ const DRAG_THRESHOLD_PX = 4
 const TWO_FINGER_DTAP_MS = 300
 const TWO_FINGER_DTAP_PX = 30
 
+// normX / normY use the painted rect (not the canvas box) so a tap in the
+// object-contain letterbox bars clamps to the nearest edge of the remote
+// screen rather than being scattered across its middle. The canvas styling
+// is `object-position: center bottom` — see canvas-painted-rect.ts.
 function normX(canvas: HTMLCanvasElement, clientX: number): number {
-  const rect = canvas.getBoundingClientRect()
-  return Math.max(0, Math.min(1, (clientX - rect.left) / rect.width))
+  return clientToRemote(canvas, clientX, 0).x
 }
 
 function normY(canvas: HTMLCanvasElement, clientY: number): number {
-  const rect = canvas.getBoundingClientRect()
-  return Math.max(0, Math.min(1, (clientY - rect.top) / rect.height))
+  return clientToRemote(canvas, 0, clientY).y
 }
 
 export function useDesktopInput({

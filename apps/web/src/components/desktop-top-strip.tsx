@@ -1,8 +1,19 @@
-import TransportPill from './transport-pill'
+// Slim top toolbar shown only on small viewports (`lg:hidden`). After the
+// CRD-aligned mobile redesign this is the *primary* control surface: the
+// bottom DesktopToolbar is hidden on mobile, so everything operators reach
+// for during a session lives here or in the composer / sheet.
+//
+// Layout (left → right):
+//   [← back]  [Mode pill]  [⌨ keyboard sheet]  [zoom %]  [transport]  ...  [⋯]
+//
+// The overflow menu owns the long tail: reload, screenshot, fullscreen, fit
+// zoom, marquee toggle, multiline sheet, gesture help, display settings.
 
-// Slim top toolbar shown only on small viewports (`lg:hidden`). Pairs with
-// the bottom DesktopToolbar so a phone user has the full set of controls
-// without leaving the session — back/exit, reload, screenshot, fullscreen.
+import { useState } from 'react'
+import type { QualityTier } from '../hooks/use-desktop-session'
+import type { GestureMode, InputMode } from '../hooks/use-desktop-input'
+import TransportPill from './transport-pill'
+import DesktopOverflowMenu from './desktop-overflow-menu'
 
 interface Props {
   onExit: () => void
@@ -13,6 +24,21 @@ interface Props {
   /** Display scale of the canvas vs the remote's native resolution. 1.0 = 100%.
    *  When undefined we render `—%` as a skeleton so the slot doesn't pop. */
   zoom?: number
+  // CRD-aligned controls promoted from the (now lg-only) DesktopToolbar.
+  inputMode: InputMode
+  onInputModeToggle: () => void
+  onShowKeyboard: () => void
+  onShowTextBatch: () => void
+  onResetZoom: () => void
+  onShowGestureHelp: () => void
+  gestureMode: GestureMode
+  onGestureModeToggle: () => void
+  hidpi: boolean
+  smoothScaling: boolean
+  quality: QualityTier
+  onQualityChange: (tier: QualityTier) => void
+  onSettingsChange: (next: { hidpi: boolean; smoothScaling: boolean }) => void
+  pipeline: 'h264' | 'jpeg'
 }
 
 export default function DesktopTopStrip({
@@ -22,58 +48,111 @@ export default function DesktopTopStrip({
   onScreenshot,
   inFullscreen,
   zoom,
+  inputMode,
+  onInputModeToggle,
+  onShowKeyboard,
+  onShowTextBatch,
+  onResetZoom,
+  onShowGestureHelp,
+  gestureMode,
+  onGestureModeToggle,
+  hidpi,
+  smoothScaling,
+  quality,
+  onQualityChange,
+  onSettingsChange,
+  pipeline,
 }: Props) {
+  const [menuOpen, setMenuOpen] = useState(false)
   const zoomLabel =
     typeof zoom === 'number' && zoom > 0 ? `${Math.round(zoom * 100)}%` : '—%'
   const zoomReady = typeof zoom === 'number' && zoom > 0
   return (
     <div className="lg:hidden fixed top-0 inset-x-0 z-30 pt-safe px-safe bg-surface/85 backdrop-blur-md border-b border-border/80">
-      <div className="flex items-center gap-1 px-2 py-1.5">
-      <IconButton onClick={onExit} aria-label="Exit remote desktop" title="Exit">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.75" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
-          <line x1="19" y1="12" x2="5" y2="12" />
-          <polyline points="12 19 5 12 12 5" />
-        </svg>
-      </IconButton>
-      <span
-        className={`px-2 py-0.5 text-[11px] tabular rounded-md bg-surface-alt border border-border transition-opacity ${
-          zoomReady ? 'text-text-secondary' : 'text-text-muted/50'
-        }`}
-        aria-label="Current zoom"
-      >
-        {zoomLabel}
-      </span>
-      <TransportPill compact />
-      <div className="flex-1" />
-      <IconButton onClick={onReload} aria-label="Reload session" title="Reload">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.75" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
-          <polyline points="1 4 1 10 7 10" />
-          <path d="M3.51 15a9 9 0 1 0 2.13-9.36L1 10" />
-        </svg>
-      </IconButton>
-      {onScreenshot && (
-        <IconButton onClick={onScreenshot} aria-label="Take screenshot" title="Screenshot">
+      <div className="relative flex items-center gap-1 px-2 py-1.5">
+        <IconButton onClick={onExit} aria-label="Exit remote desktop" title="Exit">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.75" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
-            <path d="M4 7h3l2-2h6l2 2h3a1 1 0 0 1 1 1v10a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V8a1 1 0 0 1 1-1z" />
-            <circle cx="12" cy="13" r="3.5" />
+            <line x1="19" y1="12" x2="5" y2="12" />
+            <polyline points="12 19 5 12 12 5" />
           </svg>
         </IconButton>
-      )}
-      <IconButton
-        onClick={onFullscreen}
-        aria-label={inFullscreen ? 'Exit fullscreen' : 'Fullscreen'}
-        title={inFullscreen ? 'Exit fullscreen' : 'Fullscreen'}
-      >
-        {inFullscreen ? (
+
+        {/* Mode toggle — single tap swaps Touch ↔ Trackpad. The label makes
+            the current mode unambiguous; the icon hints at the swap. */}
+        <button
+          onClick={onInputModeToggle}
+          aria-pressed={inputMode === 'trackpad'}
+          title={
+            inputMode === 'touch'
+              ? 'Touch mode — tap = click at finger. Switch to Trackpad.'
+              : 'Trackpad mode — virtual cursor follows finger. Switch to Touch.'
+          }
+          className={[
+            'inline-flex items-center gap-1 h-9 px-2 rounded-lg text-[12px] font-semibold border transition-colors',
+            inputMode === 'trackpad'
+              ? 'bg-[hsl(var(--accent-primary)/0.18)] text-[hsl(var(--accent-primary))] border-[hsl(var(--accent-primary)/0.4)]'
+              : 'bg-surface-alt text-text-secondary border-border hover:text-text-primary',
+          ].join(' ')}
+        >
+          {inputMode === 'touch' ? (
+            <TouchIcon />
+          ) : (
+            <CursorIcon />
+          )}
+          <span>{inputMode === 'touch' ? 'Touch' : 'Trackpad'}</span>
+        </button>
+
+        <IconButton onClick={onShowKeyboard} aria-label="Show keyboard" title="Show keyboard sheet">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.75" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
-            <path d="M9 3v6H3" /><path d="M15 3v6h6" /><path d="M3 15h6v6" /><path d="M21 15h-6v6" />
+            <rect x="2.5" y="6" width="19" height="12" rx="1.5" />
+            <path d="M6 10h.01M9 10h.01M12 10h.01M15 10h.01M18 10h.01M7 14h10" />
           </svg>
-        ) : (
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.75" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
-            <path d="M3 9V3h6" /><path d="M21 9V3h-6" /><path d="M3 15v6h6" /><path d="M21 15v6h-6" />
+        </IconButton>
+
+        <span
+          className={`px-2 py-0.5 text-[11px] tabular rounded-md bg-surface-alt border border-border transition-opacity ${
+            zoomReady ? 'text-text-secondary' : 'text-text-muted/50'
+          }`}
+          aria-label="Current zoom"
+        >
+          {zoomLabel}
+        </span>
+        <TransportPill compact />
+
+        <div className="flex-1" />
+
+        <IconButton
+          onClick={() => setMenuOpen((v) => !v)}
+          aria-label="Open session menu"
+          aria-expanded={menuOpen}
+          title="More"
+        >
+          <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+            <circle cx="5" cy="12" r="1.6" />
+            <circle cx="12" cy="12" r="1.6" />
+            <circle cx="19" cy="12" r="1.6" />
           </svg>
-        )}
-      </IconButton>
+        </IconButton>
+
+        <DesktopOverflowMenu
+          open={menuOpen}
+          onClose={() => setMenuOpen(false)}
+          onReload={onReload}
+          onScreenshot={onScreenshot}
+          onFullscreen={onFullscreen}
+          inFullscreen={inFullscreen}
+          onResetZoom={onResetZoom}
+          onShowGestureHelp={onShowGestureHelp}
+          gestureMode={gestureMode}
+          onGestureModeToggle={onGestureModeToggle}
+          onShowTextBatch={onShowTextBatch}
+          hidpi={hidpi}
+          smoothScaling={smoothScaling}
+          quality={quality}
+          onQualityChange={onQualityChange}
+          onSettingsChange={onSettingsChange}
+          pipeline={pipeline}
+        />
       </div>
     </div>
   )
@@ -84,16 +163,35 @@ interface IconButtonProps {
   children: React.ReactNode
   'aria-label': string
   title: string
+  'aria-expanded'?: boolean
 }
 
 function IconButton({ onClick, children, ...rest }: IconButtonProps) {
   return (
     <button
       onClick={onClick}
+      onMouseDown={(e) => e.preventDefault()}
       className="inline-flex items-center justify-center w-9 h-9 rounded-lg text-text-secondary hover:text-text-primary hover:bg-surface-hover active:scale-95 transition-all"
       {...rest}
     >
       <span className="block w-4 h-4">{children}</span>
     </button>
+  )
+}
+
+function TouchIcon() {
+  return (
+    <svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+      <path d="M7 8.5V4a1.5 1.5 0 1 1 3 0v5" />
+      <path d="M10 6.5a1.5 1.5 0 1 1 3 0V11a3 3 0 0 1-3 3H8.6a3 3 0 0 1-2.5-1.4l-2-3.2a1 1 0 0 1 1-1.5L7 8.5" />
+    </svg>
+  )
+}
+
+function CursorIcon() {
+  return (
+    <svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+      <path d="M3 2 L3 12 L6 9 L7.8 13 L9.4 12.4 L7.6 8.5 L12 8.5 Z" />
+    </svg>
   )
 }
