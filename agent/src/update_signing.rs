@@ -11,10 +11,15 @@
 //   accepted if ANY key in the array verifies it. Rotation procedure
 //   documented in `docs/release-signing.md`.
 //
-// Enforcement is unconditional from v0.1.26 onward (Red Team F1) — there
-// is no opt-out env var. Old binaries (≤v0.1.25) self-update via the
-// SHA-only path one last time to reach v0.1.26; from there every hop is
-// signed.
+// Soft-launch contract:
+//   Signing is enabled in CI by setting the `MINISIGN_SECRET_KEY` +
+//   `MINISIGN_PASSPHRASE` repo secrets AND replacing the placeholder in
+//   `TRUSTED_PUBKEYS` below. v0.1.25 was the unsigned transition release
+//   (the workflow detects the missing secret and skips signing). From
+//   v0.1.26 onward the workflow publishes signed manifests and `verify`
+//   on the agent side runtime-rejects anything else (Red Team F1). The
+//   v0.1.24 → v0.1.25 hop uses the old SHA-only `update.rs`; the v0.1.25
+//   → v0.1.26 hop uses the new strict path against v0.1.26's signatures.
 
 use std::collections::HashMap;
 
@@ -32,17 +37,22 @@ use minisign_verify::{PublicKey, Signature};
 ///    embedding `[K1, K2]` so the rotation window stays open).
 /// 4. Drop K1 only when N+1 is no longer expected to receive updates.
 ///
-/// **Pre-merge action:** generate the v0.1.26 keypair offline (`minisign
-/// -G`), commit the public key here as `K1`, and stash the secret key in
-/// the GitHub org secrets (`MINISIGN_SECRET_KEY` + `MINISIGN_PASSPHRASE`).
-/// See `docs/release-signing.md` for custodian + Shamir-2-of-3 backup
-/// requirements.
+/// **Pre-v0.1.26 action:** generate the production keypair offline
+/// (`minisign -G`), replace the placeholder below with the base64 line
+/// from `minisign.pub` (third line, no `RWQ`/`RWR`-only header), and
+/// stash the secret key in the GitHub repo secrets
+/// (`MINISIGN_SECRET_KEY` + `MINISIGN_PASSPHRASE`). The release workflow
+/// auto-detects the secret and only then runs the signing pipeline +
+/// pubkey-placeholder gate. See `docs/release-signing.md` for custodian
+/// + Shamir-2-of-3 backup requirements.
 pub const TRUSTED_PUBKEYS: &[&str] = &[
     // K1 — placeholder until the operator generates the production key.
-    // The release workflow refuses to publish if this is empty; this comment
-    // is the source of truth for the maintenance contract.
-    // Replace with the base64 line from `minisign.pub` (third line of the
-    // generated file, no `RWQ`/`RWR`-only header lines).
+    // The release workflow gates the placeholder check on the
+    // `MINISIGN_SECRET_KEY` secret being present, so this placeholder is
+    // tolerated for the v0.1.25 transition release. Once the operator
+    // provisions the secret, the gate refuses to publish until this line
+    // is replaced with the real base64 pubkey from `minisign.pub`
+    // (third line, no `RWQ`/`RWR`-only header).
     "REPLACE_WITH_PRODUCTION_PUBKEY_BEFORE_RELEASE",
 ];
 

@@ -162,6 +162,28 @@ jobs:
         with:
           path: artifacts
 
+      # Soft-launch gate. Signing is enabled when the operator has provisioned
+      # `MINISIGN_SECRET_KEY` (and `MINISIGN_PASSPHRASE`) as repo secrets AND
+      # replaced the `TRUSTED_PUBKEYS` placeholder in `agent/src/update_signing.rs`.
+      # v0.1.25 ships unsigned per the transition contract documented in
+      # `update_signing.rs`; v0.1.26 onward must publish signed.
+      - name: Detect signing capability
+        id: signing
+        shell: bash
+        env:
+          MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -n "${MINISIGN_SECRET_KEY:-}" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+            echo "Signing: enabled (MINISIGN_SECRET_KEY is set)"
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "Signing: disabled — soft-launch / v0.1.25 transition release."
+            echo "          Set MINISIGN_SECRET_KEY + MINISIGN_PASSPHRASE secrets"
+            echo "          and replace the TRUSTED_PUBKEYS placeholder before v0.1.26."
+          fi
+
       - name: Combine SHA256 manifest
         id: manifest
         shell: bash
@@ -191,6 +213,7 @@ jobs:
       # runtime, but the publisher would only learn after every client's
       # `oxiremote update` started failing.
       - name: Verify TRUSTED_PUBKEYS has been provisioned
+        if: steps.signing.outputs.enabled == 'true'
         shell: bash
         run: |
           set -euo pipefail
@@ -202,6 +225,7 @@ jobs:
           fi
 
       - name: Install minisign + expect
+        if: steps.signing.outputs.enabled == 'true'
         shell: bash
         run: |
           set -euo pipefail
@@ -209,6 +233,7 @@ jobs:
           sudo apt-get install -y minisign expect
 
       - name: Sign artifacts with minisign
+        if: steps.signing.outputs.enabled == 'true'
         timeout-minutes: 10
         env:
           # Bound to the env table so expect can read them via $env(NAME)
