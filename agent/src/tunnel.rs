@@ -10,7 +10,7 @@ use reqwest::Client;
 use tar::Archive;
 use tokio::io::AsyncBufReadExt;
 use tokio::sync::Notify;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::events::{AgentEvent, EventBus, TunnelStep};
 
@@ -319,40 +319,26 @@ pub async fn ensure_quick_tunnel(
     let (registered_tx, registered_rx) = tokio::sync::oneshot::channel::<()>();
 
     // stderr carries cloudflared's INF/ERR log lines, the URL banner, and
-    // the registration log. One scraper task handles all three.
+    // the registration log. One scraper task handles all three. We track the
+    // last announced URL across the whole process lifetime, not just the
+    // first banner — Cloudflare's edge can invalidate a Quick Tunnel session
+    // (network blip, edge migration) and cloudflared will reconnect with a
+    // *new* URL while still alive. Without continuous capture the agent's
+    // stored URL goes stale and every cross-origin pairing 404s with NXDOMAIN
+    // until the operator manually restarts.
     let url_for_stderr = url.clone();
     let bus_for_url = bus.clone();
     tokio::spawn(async move {
         let reader = tokio::io::BufReader::new(stderr);
-        let mut lines = reader.lines();
-        let mut url_announced = false;
-        let mut tx = Some(registered_tx);
-        while let Ok(Some(line)) = lines.next_line().await {
-            info!(target: "cloudflared", "{}", line);
-            if !url_announced
-                && let Some(m) = url_re.find(&line)
-            {
-                url_announced = true;
-                let captured = m.as_str().to_string();
-                {
-                    let mut u = url_for_stderr.lock().await;
-                    *u = Some(captured.clone());
-                }
-                // Surface the URL on the bus so the operator sees progress
-                // while we still wait for the registration confirmation.
-                bus_for_url.send(AgentEvent::TunnelStepChanged {
-                    step: TunnelStep::Connecting,
-                    attempt: 1,
-                    info: Some(format!("URL issued: {captured} (waiting for edge)")),
-                    reason: None,
-                });
-            }
-            if registered_re.is_match(&line)
-                && let Some(t) = tx.take()
-            {
-                let _ = t.send(());
-            }
-        }
+        process_cloudflared_stderr(
+            reader,
+            url_for_stderr,
+            bus_for_url,
+            url_re,
+            registered_re,
+            registered_tx,
+        )
+        .await;
     });
 
     // stdout is rarely used by cloudflared but inheriting it would corrupt the
@@ -628,6 +614,105 @@ pub async fn ensure_named_tunnel(
     Ok(cfg.hostname)
 }
 
+/// Outcome of inspecting a cloudflared stderr line for a Quick Tunnel URL
+/// banner. Pure value type so the de-dupe state machine can be unit-tested
+/// without spinning up a real cloudflared process.
+#[derive(Debug, PartialEq, Eq)]
+enum UrlChange {
+    /// First URL ever seen on this stream — caller surfaces a progressive
+    /// UI signal but does NOT emit `TunnelUrlChanged`. The lifecycle
+    /// emission for the first URL is owned by `main.rs`, which fires it
+    /// after `ensure_quick_tunnel` returns (i.e. after registration
+    /// completes). Splitting first vs rotated keeps the bus event ordering
+    /// clean: Connecting → Tunneling → first TunnelUrlChanged.
+    First(String),
+    /// URL differs from the last one seen — cloudflared rotated the public
+    /// URL mid-process. Caller MUST emit `TunnelUrlChanged` so
+    /// `discovery::spawn_register` re-registers session / temp-key / code
+    /// with the worker, plus a `TunnelStepChanged` for the dashboard.
+    Rotated(String),
+    /// No URL on this line, or a duplicate of the last URL we saw.
+    /// (cloudflared can reprint the URL banner on idle reconnect attempts
+    /// that resolve to the same URL — those are benign.)
+    None,
+}
+
+/// Pure URL-change detector. Mutates `last_url` only when a NEW, DIFFERENT
+/// URL is observed; ignores duplicates and lines without a URL match.
+fn detect_url_change(line: &str, last_url: &mut Option<String>, url_re: &Regex) -> UrlChange {
+    let Some(m) = url_re.find(line) else {
+        return UrlChange::None;
+    };
+    let captured = m.as_str().to_string();
+    if last_url.as_deref() == Some(captured.as_str()) {
+        return UrlChange::None;
+    }
+    let was_first = last_url.is_none();
+    *last_url = Some(captured.clone());
+    if was_first {
+        UrlChange::First(captured)
+    } else {
+        UrlChange::Rotated(captured)
+    }
+}
+
+/// Drive the cloudflared stderr stream end-to-end: forward every line into
+/// tracing for the agent log, classify it via `detect_url_change`, emit the
+/// right bus events, and fire the registration oneshot once. Extracted from
+/// the `tokio::spawn` body so the whole loop is testable with an in-memory
+/// `AsyncBufRead` (e.g. `tokio::io::DuplexStream`).
+async fn process_cloudflared_stderr<R: tokio::io::AsyncBufRead + Unpin>(
+    reader: R,
+    url_slot: Arc<tokio::sync::Mutex<Option<String>>>,
+    bus: Arc<EventBus>,
+    url_re: Regex,
+    registered_re: Regex,
+    registered_tx: tokio::sync::oneshot::Sender<()>,
+) {
+    let mut lines = reader.lines();
+    let mut last_url: Option<String> = None;
+    let mut tx = Some(registered_tx);
+    while let Ok(Some(line)) = lines.next_line().await {
+        info!(target: "cloudflared", "{}", line);
+        match detect_url_change(&line, &mut last_url, &url_re) {
+            UrlChange::First(captured) => {
+                {
+                    let mut u = url_slot.lock().await;
+                    *u = Some(captured.clone());
+                }
+                bus.send(AgentEvent::TunnelStepChanged {
+                    step: TunnelStep::Connecting,
+                    attempt: 1,
+                    info: Some(format!("URL issued: {captured} (waiting for edge)")),
+                    reason: None,
+                });
+            }
+            UrlChange::Rotated(captured) => {
+                {
+                    let mut u = url_slot.lock().await;
+                    *u = Some(captured.clone());
+                }
+                warn!(new_url = %captured, "cloudflared rotated tunnel URL — re-registering");
+                bus.send(AgentEvent::TunnelUrlChanged {
+                    url: captured.clone(),
+                });
+                bus.send(AgentEvent::TunnelStepChanged {
+                    step: TunnelStep::Tunneling,
+                    attempt: 1,
+                    info: Some(captured.clone()),
+                    reason: Some("URL rotated — re-registered with discovery worker".into()),
+                });
+            }
+            UrlChange::None => {}
+        }
+        if registered_re.is_match(&line)
+            && let Some(t) = tx.take()
+        {
+            let _ = t.send(());
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -742,4 +827,424 @@ mod tests {
         assert!(art.is_ok(), "current host should be supported: {:?}", art.err());
     }
 
+    // ---------------------------------------------------------------------
+    // URL rotation detection — covers the bug where cloudflared rotates the
+    // public Quick Tunnel URL mid-process and the agent silently goes stale.
+    // The state machine is the entire fix; these tests pin its semantics so
+    // a future refactor can't regress it.
+    // ---------------------------------------------------------------------
+
+    fn url_re() -> Regex {
+        Regex::new(r"https://[a-z0-9\-]+\.trycloudflare\.com").unwrap()
+    }
+
+    fn registered_re() -> Regex {
+        Regex::new(r"(?i)(Registered tunnel connection|Connection registered)").unwrap()
+    }
+
+    #[test]
+    fn detect_url_change_first_url_returns_first_and_sets_state() {
+        let re = url_re();
+        let mut last: Option<String> = None;
+        let line = "2026-05-08T11:00:00Z INF | https://alpha.trycloudflare.com";
+        let out = detect_url_change(line, &mut last, &re);
+        assert_eq!(out, UrlChange::First("https://alpha.trycloudflare.com".into()));
+        assert_eq!(last.as_deref(), Some("https://alpha.trycloudflare.com"));
+    }
+
+    #[test]
+    fn detect_url_change_returns_none_for_lines_without_url() {
+        let re = url_re();
+        let mut last: Option<String> = None;
+        for line in &[
+            "INF | Starting cloudflared",
+            "ERR | something went wrong",
+            "",
+            "Some random log line",
+            "https://not-trycloudflare.com is not a match",
+            "http://lowercase-http.trycloudflare.com is wrong scheme",
+        ] {
+            assert_eq!(detect_url_change(line, &mut last, &re), UrlChange::None);
+        }
+        assert_eq!(last, None, "non-matching lines must NOT mutate state");
+    }
+
+    #[test]
+    fn detect_url_change_same_url_repeated_returns_none() {
+        let re = url_re();
+        let mut last: Option<String> = None;
+        let url = "https://alpha.trycloudflare.com";
+        // First sighting → First.
+        assert_eq!(
+            detect_url_change(url, &mut last, &re),
+            UrlChange::First(url.into())
+        );
+        // Repeats → None (de-duped). cloudflared can reprint the banner on
+        // benign reconnects to the same URL — must not spam the bus.
+        for _ in 0..5 {
+            assert_eq!(detect_url_change(url, &mut last, &re), UrlChange::None);
+            assert_eq!(last.as_deref(), Some(url), "state must remain stable");
+        }
+    }
+
+    #[test]
+    fn detect_url_change_different_url_returns_rotated() {
+        let re = url_re();
+        let mut last: Option<String> = None;
+        assert_eq!(
+            detect_url_change("https://alpha.trycloudflare.com", &mut last, &re),
+            UrlChange::First("https://alpha.trycloudflare.com".into())
+        );
+        assert_eq!(
+            detect_url_change("https://bravo.trycloudflare.com", &mut last, &re),
+            UrlChange::Rotated("https://bravo.trycloudflare.com".into())
+        );
+        assert_eq!(last.as_deref(), Some("https://bravo.trycloudflare.com"));
+    }
+
+    #[test]
+    fn detect_url_change_three_sequential_rotations() {
+        let re = url_re();
+        let mut last: Option<String> = None;
+        let urls = [
+            "https://aaa.trycloudflare.com",
+            "https://bbb.trycloudflare.com",
+            "https://ccc.trycloudflare.com",
+            "https://ddd.trycloudflare.com",
+        ];
+        let outs: Vec<UrlChange> = urls
+            .iter()
+            .map(|u| detect_url_change(u, &mut last, &re))
+            .collect();
+        assert_eq!(outs[0], UrlChange::First(urls[0].into()));
+        for (i, expected) in urls.iter().enumerate().skip(1) {
+            assert_eq!(outs[i], UrlChange::Rotated((*expected).into()));
+        }
+        assert_eq!(last.as_deref(), Some(urls[3]));
+    }
+
+    #[test]
+    fn detect_url_change_rotation_back_to_previous_still_emits_rotated() {
+        // A → B → A is a real rotation (the agent's stored URL was B, B is
+        // now invalid, the new URL is A). We must NOT short-circuit here:
+        // the worker still needs the new value posted.
+        let re = url_re();
+        let mut last: Option<String> = None;
+        let a = "https://alpha.trycloudflare.com";
+        let b = "https://bravo.trycloudflare.com";
+        assert_eq!(
+            detect_url_change(a, &mut last, &re),
+            UrlChange::First(a.into())
+        );
+        assert_eq!(
+            detect_url_change(b, &mut last, &re),
+            UrlChange::Rotated(b.into())
+        );
+        assert_eq!(
+            detect_url_change(a, &mut last, &re),
+            UrlChange::Rotated(a.into()),
+            "A → B → A: third call must still rotate (not de-dupe against the original first URL)"
+        );
+        assert_eq!(last.as_deref(), Some(a));
+    }
+
+    #[test]
+    fn detect_url_change_extracts_url_from_log_prefix() {
+        let re = url_re();
+        let mut last: Option<String> = None;
+        // Real cloudflared output wraps the URL in INF lines + box drawing.
+        let line = "2026-05-08T11:00:00Z INF |  https://reliability-wyoming-oil-tex.trycloudflare.com                          |";
+        let out = detect_url_change(line, &mut last, &re);
+        assert_eq!(
+            out,
+            UrlChange::First("https://reliability-wyoming-oil-tex.trycloudflare.com".into())
+        );
+    }
+
+    #[test]
+    fn detect_url_change_only_extracts_first_url_when_multiple_on_line() {
+        let re = url_re();
+        let mut last: Option<String> = None;
+        let line = "switching from https://old.trycloudflare.com to https://new.trycloudflare.com";
+        let out = detect_url_change(line, &mut last, &re);
+        assert_eq!(
+            out,
+            UrlChange::First("https://old.trycloudflare.com".into()),
+            "regex.find() returns the leftmost match — caller depends on this"
+        );
+    }
+
+    #[test]
+    fn detect_url_change_uppercase_host_does_not_match() {
+        // cloudflared always emits lowercase. A future format change would
+        // surface as a `None` here; better to require an explicit code update
+        // than silently accept an unexpected shape.
+        let re = url_re();
+        let mut last: Option<String> = None;
+        let out = detect_url_change("https://ALPHA.trycloudflare.com", &mut last, &re);
+        assert_eq!(out, UrlChange::None);
+        assert_eq!(last, None);
+    }
+
+    #[test]
+    fn detect_url_change_strips_trailing_path_query_punctuation() {
+        // The URL regex is bounded by host suffix — anything trailing (path,
+        // query, comma, paren) is excluded. Ensures the captured value is a
+        // clean URL ready for `tunnelUrl` registration with the worker.
+        let re = url_re();
+        let cases = [
+            ("(https://alpha.trycloudflare.com)", "https://alpha.trycloudflare.com"),
+            ("https://alpha.trycloudflare.com/health", "https://alpha.trycloudflare.com"),
+            ("https://alpha.trycloudflare.com?foo=bar", "https://alpha.trycloudflare.com"),
+            ("https://alpha.trycloudflare.com,more text", "https://alpha.trycloudflare.com"),
+        ];
+        for (input, expected) in cases {
+            let mut last: Option<String> = None;
+            let out = detect_url_change(input, &mut last, &re);
+            assert_eq!(out, UrlChange::First(expected.into()), "input: {input}");
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // End-to-end stderr task — drives `process_cloudflared_stderr` with an
+    // in-memory pipe so we can verify event-bus sequencing exactly as the
+    // production task would behave with a real cloudflared.
+    // ---------------------------------------------------------------------
+
+    use crate::events::EventBus;
+    use tokio::io::AsyncWriteExt;
+
+    /// Spawn the production stderr loop against a pipe. Writes `lines` then
+    /// closes the writer to terminate the loop. Drains the bus into a vec.
+    /// Returns (events, registered_received_within_timeout).
+    async fn run_stderr_loop(lines: &[&str]) -> (Vec<AgentEvent>, bool) {
+        let bus = EventBus::new();
+        let mut rx = bus.subscribe();
+        let url_slot = Arc::new(tokio::sync::Mutex::new(None::<String>));
+        let (reg_tx, reg_rx) = tokio::sync::oneshot::channel::<()>();
+
+        let (mut writer, reader) = tokio::io::duplex(64 * 1024);
+        let buf_reader = tokio::io::BufReader::new(reader);
+
+        // EventBus::new() already returns Arc<EventBus>; clone the Arc for
+        // the spawned task so both this scope and the task observe the same
+        // broadcast channel.
+        let bus_for_task = bus.clone();
+        let slot_for_task = url_slot.clone();
+        let task = tokio::spawn(async move {
+            process_cloudflared_stderr(
+                buf_reader,
+                slot_for_task,
+                bus_for_task,
+                url_re(),
+                registered_re(),
+                reg_tx,
+            )
+            .await;
+        });
+
+        for l in lines {
+            writer.write_all(l.as_bytes()).await.unwrap();
+            writer.write_all(b"\n").await.unwrap();
+        }
+        // Closing the write half EOFs the reader and ends the loop.
+        drop(writer);
+
+        // Wait for the loop to finish (bounded — guards against a regression
+        // that would block forever).
+        tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .expect("stderr loop did not terminate within 2s")
+            .unwrap();
+
+        let registered =
+            tokio::time::timeout(Duration::from_millis(50), reg_rx).await.is_ok_and(|r| r.is_ok());
+
+        let mut events = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            events.push(ev);
+        }
+        (events, registered)
+    }
+
+    fn count_url_changed(events: &[AgentEvent]) -> usize {
+        events
+            .iter()
+            .filter(|e| matches!(e, AgentEvent::TunnelUrlChanged { .. }))
+            .count()
+    }
+
+    fn count_step_changed(events: &[AgentEvent], wanted_step: TunnelStep) -> usize {
+        events
+            .iter()
+            .filter(|e| matches!(e, AgentEvent::TunnelStepChanged { step, .. } if *step == wanted_step))
+            .count()
+    }
+
+    #[tokio::test]
+    async fn stderr_loop_first_url_does_not_emit_tunnel_url_changed() {
+        // First URL belongs to main.rs (it owns the lifecycle emission after
+        // ensure_quick_tunnel returns). The stderr task only emits a
+        // progressive Connecting step.
+        let (events, _) = run_stderr_loop(&[
+            "INF | Starting tunnel",
+            "INF | https://alpha.trycloudflare.com",
+        ])
+        .await;
+        assert_eq!(
+            count_url_changed(&events),
+            0,
+            "first URL must not emit TunnelUrlChanged from the stderr loop"
+        );
+        assert_eq!(
+            count_step_changed(&events, TunnelStep::Connecting),
+            1,
+            "first URL must emit one Connecting step"
+        );
+    }
+
+    #[tokio::test]
+    async fn stderr_loop_url_rotation_emits_tunnel_url_changed_and_tunneling_step() {
+        let (events, _) = run_stderr_loop(&[
+            "INF | https://alpha.trycloudflare.com",
+            "ERR | edge dropped",
+            "INF | https://bravo.trycloudflare.com",
+        ])
+        .await;
+        assert_eq!(
+            count_url_changed(&events),
+            1,
+            "exactly one TunnelUrlChanged for the single rotation"
+        );
+        assert_eq!(
+            count_step_changed(&events, TunnelStep::Tunneling),
+            1,
+            "rotation emits Tunneling step (with rotation reason)"
+        );
+        // Sanity: the carried URL is the new one.
+        let url_evt = events
+            .iter()
+            .find_map(|e| match e {
+                AgentEvent::TunnelUrlChanged { url } => Some(url.clone()),
+                _ => None,
+            })
+            .expect("TunnelUrlChanged event present");
+        assert_eq!(url_evt, "https://bravo.trycloudflare.com");
+    }
+
+    #[tokio::test]
+    async fn stderr_loop_repeated_same_url_dedupes() {
+        let same = "INF | https://alpha.trycloudflare.com";
+        let (events, _) = run_stderr_loop(&[same, same, same, same]).await;
+        assert_eq!(
+            count_url_changed(&events),
+            0,
+            "no rotation: must not emit TunnelUrlChanged"
+        );
+        assert_eq!(
+            count_step_changed(&events, TunnelStep::Connecting),
+            1,
+            "first URL emits Connecting once; duplicates de-duped"
+        );
+    }
+
+    #[tokio::test]
+    async fn stderr_loop_two_rotations_emit_two_url_changed() {
+        let (events, _) = run_stderr_loop(&[
+            "INF | https://alpha.trycloudflare.com",
+            "INF | https://bravo.trycloudflare.com",
+            "INF | https://charlie.trycloudflare.com",
+        ])
+        .await;
+        assert_eq!(
+            count_url_changed(&events),
+            2,
+            "alpha→bravo and bravo→charlie are both rotations"
+        );
+    }
+
+    #[tokio::test]
+    async fn stderr_loop_registered_oneshot_fires_once() {
+        let (_, registered) = run_stderr_loop(&[
+            "INF | https://alpha.trycloudflare.com",
+            "INF | Registered tunnel connection 1",
+            "INF | Registered tunnel connection 2", // second match must not re-fire
+            "INF | Registered tunnel connection 3",
+        ])
+        .await;
+        assert!(registered, "registered_tx must fire on first match");
+    }
+
+    #[tokio::test]
+    async fn stderr_loop_ignores_non_url_lines_for_dedupe() {
+        // Mix random log lines around URL banners — must not interfere with
+        // dedupe state.
+        let (events, _) = run_stderr_loop(&[
+            "INF | Starting cloudflared",
+            "INF | https://alpha.trycloudflare.com",
+            "WRN | network blip",
+            "INF | https://alpha.trycloudflare.com",
+            "INF | something else",
+            "INF | https://bravo.trycloudflare.com",
+            "INF | unrelated noise",
+        ])
+        .await;
+        assert_eq!(count_url_changed(&events), 1, "alpha→bravo = 1 rotation");
+    }
+
+    #[tokio::test]
+    async fn stderr_loop_url_slot_holds_latest_url() {
+        let bus = EventBus::new();
+        let url_slot = Arc::new(tokio::sync::Mutex::new(None::<String>));
+        let (reg_tx, _reg_rx) = tokio::sync::oneshot::channel::<()>();
+
+        let (mut writer, reader) = tokio::io::duplex(64 * 1024);
+        let buf_reader = tokio::io::BufReader::new(reader);
+        let bus_for_task = bus.clone();
+        let slot_for_task = url_slot.clone();
+
+        let task = tokio::spawn(async move {
+            process_cloudflared_stderr(
+                buf_reader,
+                slot_for_task,
+                bus_for_task,
+                url_re(),
+                registered_re(),
+                reg_tx,
+            )
+            .await;
+        });
+
+        for l in [
+            "INF | https://alpha.trycloudflare.com",
+            "INF | https://bravo.trycloudflare.com",
+            "INF | https://charlie.trycloudflare.com",
+        ] {
+            writer.write_all(l.as_bytes()).await.unwrap();
+            writer.write_all(b"\n").await.unwrap();
+        }
+        drop(writer);
+        tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .unwrap()
+            .unwrap();
+
+        let final_url = url_slot.lock().await.clone();
+        assert_eq!(
+            final_url.as_deref(),
+            Some("https://charlie.trycloudflare.com"),
+            "url_slot must always hold the most recent URL — the heartbeat reads this"
+        );
+    }
+
+    #[tokio::test]
+    async fn stderr_loop_terminates_cleanly_on_eof() {
+        // Empty input — no URL, no registration. Loop must terminate via EOF
+        // and not hang. (Regression guard: a future refactor that turns the
+        // loop into `loop {}` instead of `while Ok(Some(line))` would deadlock
+        // here.)
+        let (events, registered) = run_stderr_loop(&[]).await;
+        assert!(events.is_empty());
+        assert!(!registered);
+    }
 }
