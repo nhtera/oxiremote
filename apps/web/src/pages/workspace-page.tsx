@@ -76,11 +76,11 @@ export default function WorkspacePage() {
   const {
     connectedById,
     reconnectAttemptById,
-    reconnectExhaustedById,
+    phaseById,
     reconnectingById,
     handleConnectedChange,
     handleReconnectAttempt,
-    handleReconnectExhausted,
+    handleReconnectPhase,
     clearSession,
     resetReconnect,
   } = useSessionConnectionState()
@@ -488,7 +488,29 @@ export default function WorkspacePage() {
   }, [attachFiles])
 
   const focusedAttempt = focusedSessionId ? (reconnectAttemptById[focusedSessionId] ?? 0) : 0
-  const focusedExhausted = focusedSessionId ? !!reconnectExhaustedById[focusedSessionId] : false
+  const focusedPhase = focusedSessionId ? (phaseById[focusedSessionId] ?? 'fast') : 'fast'
+
+  // Wake up the WS reconnect loop when the OS / browser tells us the network
+  // came back, the tab regained focus, or the device unlocked. Without this
+  // a slow-phase reconnect could sit waiting up to 30s after the host woke.
+  // The hook is idempotent — bumping reconnectNonce on a healthy connection
+  // is a no-op (connect() short-circuits if the WS is already open).
+  const isFocusedConnectedRef = useRef(isFocusedConnected)
+  useEffect(() => { isFocusedConnectedRef.current = isFocusedConnected }, [isFocusedConnected])
+  useEffect(() => {
+    const wake = () => {
+      if (!isFocusedConnectedRef.current) setReconnectNonce((n) => n + 1)
+    }
+    const onVis = () => { if (document.visibilityState === 'visible') wake() }
+    window.addEventListener('online', wake)
+    window.addEventListener('focus', wake)
+    document.addEventListener('visibilitychange', onVis)
+    return () => {
+      window.removeEventListener('online', wake)
+      window.removeEventListener('focus', wake)
+      document.removeEventListener('visibilitychange', onVis)
+    }
+  }, [])
 
   const hasSessions = sessions.length > 0
   const anyAssigned = paneAssignments.some((s) => s !== null)
@@ -553,7 +575,7 @@ export default function WorkspacePage() {
           onFocusPane={(idx: PaneIndex) => setFocusedPane(idx)}
           onConnectedChange={handleConnectedChange}
           onReconnectAttempt={handleReconnectAttempt}
-          onReconnectExhausted={handleReconnectExhausted}
+          onReconnectPhase={handleReconnectPhase}
           onError={setErr}
           registerSend={registerSend}
           registerGetSelection={registerGetSelection}
@@ -625,10 +647,10 @@ export default function WorkspacePage() {
       {hasSessions && anyAssigned && <TerminalSendComposer onSend={sendInput} />}
 
       <ReconnectModal
-        open={!!focusedSessionId && active?.state !== 'exited' && !isFocusedConnected && (focusedAttempt > 0 || focusedExhausted)}
+        open={!!focusedSessionId && active?.state !== 'exited' && !isFocusedConnected && focusedAttempt > 0}
         attempt={focusedAttempt}
         maxAttempts={MAX_RECONNECT_ATTEMPTS}
-        exhausted={focusedExhausted}
+        phase={focusedPhase}
         countdownMs={backoffMsForAttempt(focusedAttempt)}
         onCancel={() => {
           if (focusedSessionId) {
@@ -638,14 +660,10 @@ export default function WorkspacePage() {
             void refreshSessions()
           }
         }}
-        onRetry={
-          focusedExhausted
-            ? undefined
-            : () => {
-                if (focusedSessionId) resetReconnect(focusedSessionId)
-                setReconnectNonce((n) => n + 1)
-              }
-        }
+        onRetry={() => {
+          if (focusedSessionId) resetReconnect(focusedSessionId)
+          setReconnectNonce((n) => n + 1)
+        }}
       />
 
       <KeyboardShortcutOverlay
