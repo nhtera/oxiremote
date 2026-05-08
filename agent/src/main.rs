@@ -877,11 +877,13 @@ async fn server_main(
     {
         match discovery::load_discovery_id(&state.db_path) {
             Ok(discovery_id) => {
-                // Heartbeat: refreshes the worker's session record TTL. Quick
-                // Tunnel emits TunnelUrlChanged once per process, so without
-                // this loop the session row falls out of KV (24h TTL) and
-                // every cross-origin OTK / code / sk- lookup would 404 even
-                // with a healthy tunnel. Re-uses the live tunnel_url snapshot.
+                // Heartbeat: refreshes the worker's session record TTL. The
+                // tunnel.rs stderr parser also re-emits TunnelUrlChanged on
+                // mid-process URL rotations, but rotations aren't guaranteed
+                // — without this loop a long-lived stable tunnel's session
+                // row would fall out of KV (24h TTL) and every cross-origin
+                // OTK / code / sk- lookup would 404 even with a healthy
+                // tunnel. Re-uses the live tunnel_url snapshot.
                 {
                     let hb_client = state.http_client.clone();
                     let hb_url = url.clone();
@@ -958,6 +960,27 @@ async fn server_main(
         }
     } else if discovery_url.is_some() && state.discovery_secret.is_none() {
         warn!("OXI_DISCOVERY_URL is set but discovery_secret could not be loaded — worker calls disabled");
+    }
+
+    // Keep state.tunnel_url in sync with TunnelUrlChanged events. cloudflared
+    // can rotate the public URL mid-process when Cloudflare invalidates a
+    // Quick Tunnel session (edge migration, network blip). The tunnel.rs
+    // stderr parser detects this and re-emits TunnelUrlChanged; this listener
+    // propagates it into the shared slot so the heartbeat (reads
+    // tunnel_url.read()) and any future readers see the fresh value without
+    // requiring an agent restart.
+    {
+        let slot = state.tunnel_url.clone();
+        let mut rx = state.event_bus.subscribe();
+        tokio::spawn(async move {
+            while let Ok(ev) = rx.recv().await {
+                if let AgentEvent::TunnelUrlChanged { url } = ev
+                    && let Ok(mut guard) = slot.write()
+                {
+                    *guard = Some(url);
+                }
+            }
+        });
     }
 
     // Desktop notifications + agent-end Web Push. Tray runtime is not yet

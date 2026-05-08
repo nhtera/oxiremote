@@ -23,7 +23,7 @@ pub enum StepStatus {
 /// Unit-only on purpose — flattens to a plain string on the wire (`"ready"`,
 /// `"failed"`, …) so the SPA can pattern-match it directly. When `Failed`,
 /// the human-readable cause rides on the parent event's `reason` field.
-#[derive(Debug, Clone, Copy, Serialize)]
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum TunnelStep {
     /// Locating / downloading cloudflared binary.
@@ -118,9 +118,10 @@ pub enum AgentEvent {
         ok: bool,
     },
     /// cloudflared process exited unexpectedly. Distinct from `TunnelUrlChanged`
-    /// (which has one-shot URL semantics). Consumers must handle this to surface
-    /// a dead-tunnel indicator; no auto-restart is performed — quick-tunnel URLs
-    /// rotate on each spawn, which would silently invalidate active QR codes.
+    /// (which fires on each new URL, including mid-process rotations).
+    /// Consumers must handle this to surface a dead-tunnel indicator; no
+    /// auto-restart is performed — a fresh spawn would mint a different URL,
+    /// which would silently invalidate active QR codes.
     ///
     /// `recovery_hint` is a short, user-actionable string ("Run …", "Check …")
     /// that the TUI / WebUI can render directly so a dead tunnel is not a

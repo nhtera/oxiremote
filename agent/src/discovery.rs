@@ -39,11 +39,13 @@ pub const TEMP_KEY_EXPIRY_MINUTES: u32 = 30;
 /// keeps cross-origin sk-… pairing working in the no-rotation case.
 pub const PERMANENT_LOOKUP_EXPIRY_MINUTES: u32 = 24 * 60;
 
-/// Cadence for the session refresh heartbeat. Quick Tunnel emits
-/// `TunnelUrlChanged` exactly once per process, so without this loop the
-/// session record's KV TTL would expire and every cross-origin lookup would
-/// dangle (tempkey index points at a session that no longer exists). 15 min
-/// gives the worker session record (24h TTL) a generous safety margin.
+/// Cadence for the session refresh heartbeat. Without this loop the session
+/// record's KV TTL would expire on long-lived stable tunnels and every
+/// cross-origin lookup would dangle (tempkey index points at a session that
+/// no longer exists). 15 min gives the worker session record (24h TTL) a
+/// generous safety margin. Note: `TunnelUrlChanged` also fires on mid-process
+/// URL rotations (tunnel.rs stderr parser detects this), but rotations are
+/// not guaranteed to happen — the heartbeat is the floor.
 pub const HEARTBEAT_INTERVAL_SECS: u64 = 15 * 60;
 
 const RETRY_ATTEMPTS: u32 = 3;
