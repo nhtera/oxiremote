@@ -48,19 +48,6 @@ const FN_KEYS: KeyDef[] = Array.from({ length: 12 }, (_, i) => ({
   code: `F${i + 1}`,
 }))
 
-// Map a printable character → DOM `code` value plus a shift flag so the host
-// receives the correct keycap. Falls back to `Key<UPPER>` for letters and
-// `Digit<N>` for digits. Anything else uses the literal character (the host
-// will route it through its layout).
-function charToKey(ch: string): { code: string; shift: boolean } {
-  if (ch >= 'a' && ch <= 'z') return { code: `Key${ch.toUpperCase()}`, shift: false }
-  if (ch >= 'A' && ch <= 'Z') return { code: `Key${ch}`, shift: true }
-  if (ch >= '0' && ch <= '9') return { code: `Digit${ch}`, shift: false }
-  if (ch === ' ') return { code: 'Space', shift: false }
-  if (ch === '\n') return { code: 'Enter', shift: false }
-  return { code: ch, shift: false }
-}
-
 export default function DesktopOnscreenKeyboard({
   open,
   onClose,
@@ -101,20 +88,10 @@ export default function DesktopOnscreenKeyboard({
 
   function sendText() {
     if (!text) return
-    for (const ch of text) {
-      const { code, shift } = charToKey(ch)
-      const ev: DesktopInputEvent = {
-        t: 'key',
-        code,
-        action: 'down',
-        ctrl: false,
-        alt: false,
-        shift,
-        meta: false,
-      }
-      onKeyEvent(ev)
-      onKeyEvent({ ...ev, action: 'up' })
-    }
+    // One `{t:'text'}` ctrl frame — agent routes via `enigo.text()` for
+    // Unicode-safe injection. Avoids the per-char dom_code_to_key path that
+    // previously dropped punctuation like `!@#$`.
+    onKeyEvent({ t: 'text', s: text })
     setText('')
   }
 

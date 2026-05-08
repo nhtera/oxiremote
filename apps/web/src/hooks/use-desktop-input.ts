@@ -3,75 +3,78 @@
 //             two-finger swipe → scroll, drag → drag.
 // Trackpad mode: mouse move → cursor move, click → click, two-finger scroll → scroll.
 //
-// Also exports `sendTextBatch`: dispatches a string as a throttled sequence of
-// key events (~30 ms/char) so input ordering is preserved on slow tunnels.
+// Also exports `sendTextLiteral`: dispatches a string as a single (or chunked)
+// `{t:'text'}` ctrl frame. The agent routes that to `enigo.text()` which is
+// Unicode-safe and platform-native — punctuation, accents, and emoji land
+// verbatim instead of going through the dom_code_to_key drop path.
 
 import { type RefObject, useCallback, useEffect, useRef } from 'react'
 import type { DesktopInputEvent } from './use-desktop-session'
 
 export type InputMode = 'touch' | 'trackpad'
 
-// Character → key code mapping for printable ASCII.
-// Keys outside this map are sent as-is using the character itself.
-function charToCode(ch: string): string {
-  if (ch === ' ') return 'Space'
-  if (ch === '\n' || ch === '\r') return 'Enter'
-  if (ch === '\t') return 'Tab'
-  const upper = ch.toUpperCase()
-  // A–Z
-  if (/^[A-Z]$/.test(upper)) return `Key${upper}`
-  // 0–9
-  if (/^[0-9]$/.test(ch)) return `Digit${ch}`
-  // Punctuation: use the raw character; the agent maps code → char.
-  return ch
+// Server caps the per-frame `s` payload at 4096 UTF-8 bytes; leave headroom
+// for the surrounding `{t:"text","s":...}` envelope and any escape blow-up.
+const MAX_TEXT_CHUNK_BYTES = 4000
+
+function utf8ByteLength(s: string): number {
+  return new TextEncoder().encode(s).length
 }
 
-// Shift-required characters on a US QWERTY layout.
-const SHIFT_CHARS = new Set('~!@#$%^&*()_+{}|:"<>?ABCDEFGHIJKLMNOPQRSTUVWXYZ')
+/**
+ * Split `text` into chunks each <= `max` UTF-8 bytes. Grapheme-aware when
+ * `Intl.Segmenter` is available so emoji families and combining marks stay
+ * intact across chunk boundaries; falls back to codepoint slicing otherwise.
+ */
+function chunkByUtf8Bytes(text: string, max: number): string[] {
+  if (utf8ByteLength(text) <= max) return [text]
+  const segmenter =
+    typeof Intl !== 'undefined' && 'Segmenter' in Intl
+      ? new Intl.Segmenter(undefined, { granularity: 'grapheme' })
+      : null
+  const units: string[] = segmenter
+    ? Array.from(segmenter.segment(text), (s) => s.segment)
+    : Array.from(text) // codepoint-aware fallback
+  const out: string[] = []
+  let buf = ''
+  for (const u of units) {
+    if (utf8ByteLength(buf + u) > max) {
+      if (buf) out.push(buf)
+      buf = u
+    } else {
+      buf += u
+    }
+  }
+  if (buf) out.push(buf)
+  return out
+}
 
 /**
- * Sends `text` to the remote machine as a sequence of key-down/key-up events.
- * Throttled at `delayMs` per character (default 30 ms) so the agent's ordered
- * ctrl DataChannel never reorders events under network jitter.
- * Returns a cancel function that stops dispatching mid-sequence.
+ * Send `text` as one (or chunked) `{t:'text', s}` ctrl frame(s). Replaces the
+ * old per-character keycode synthesis: faster, Unicode-safe, no jitter
+ * throttling needed because the ctrl DataChannel is ordered.
  */
-export function sendTextBatch(
+export function sendTextLiteral(
   text: string,
   sendInput: (ev: DesktopInputEvent) => void,
-  delayMs = 30,
-): () => void {
-  let cancelled = false
-  let idx = 0
-
-  function sendNext() {
-    if (cancelled || idx >= text.length) return
-    const ch = text[idx++]
-    const code = charToCode(ch)
-    const shift = SHIFT_CHARS.has(ch)
-    const ev: DesktopInputEvent = { t: 'key', code, action: 'down', ctrl: false, alt: false, shift, meta: false }
-    sendInput(ev)
-    sendInput({ ...ev, action: 'up' })
-    window.setTimeout(sendNext, delayMs)
+): void {
+  if (!text) return
+  for (const s of chunkByUtf8Bytes(text, MAX_TEXT_CHUNK_BYTES)) {
+    sendInput({ t: 'text', s })
   }
-
-  // Kick off the first character immediately (no leading delay).
-  sendNext()
-
-  return () => { cancelled = true }
 }
 
 /**
- * Hook that returns a stable `sendTextBatch` bound to the caller's `sendInput`.
- * The returned function signature matches the phase spec: `(text: string) => void`.
- * Internally it starts the async dispatch and discards the cancel handle —
- * callers that need to abort (e.g. on unmount) should call the raw export.
+ * Hook that returns a stable `sendTextLiteral` bound to the caller's
+ * `sendInput`. Callers receive a `(text: string) => void` they can pass into
+ * any composer onSend prop.
  */
-export function useSendTextBatch(sendInput: (ev: DesktopInputEvent) => void) {
+export function useSendTextLiteral(sendInput: (ev: DesktopInputEvent) => void) {
   const sendInputRef = useRef(sendInput)
   useEffect(() => { sendInputRef.current = sendInput }, [sendInput])
 
   return useCallback((text: string) => {
-    sendTextBatch(text, (ev) => sendInputRef.current(ev))
+    sendTextLiteral(text, (ev) => sendInputRef.current(ev))
   }, [])
 }
 

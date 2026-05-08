@@ -25,10 +25,11 @@ import DesktopTopStrip from '../components/desktop-top-strip'
 import DesktopGestureHelp from '../components/desktop-gesture-help'
 import DesktopOnscreenKeyboard from '../components/desktop-onscreen-keyboard'
 import DesktopTextBatchSheet from '../components/desktop-text-batch-sheet'
+import DesktopTextStrip from '../components/desktop-text-strip'
 import DesktopExitConfirm from '../components/desktop-exit-confirm'
 import ReconnectModal from '../components/reconnect-modal'
 import { useConfirm } from '../components/ui'
-import { useSendTextBatch } from '../hooks/use-desktop-input'
+import { useSendTextLiteral } from '../hooks/use-desktop-input'
 
 interface Capabilities {
   available: boolean
@@ -245,8 +246,10 @@ export default function DesktopPage() {
     navigate(`/h/${hostId}`)
   }, [hostId, navigate])
 
-  // Text-batch send — dispatches typed characters through the existing input channel.
-  const handleSendTextBatch = useSendTextBatch(sendInput)
+  // Text composer send — one `{t:'text'}` ctrl frame per call (chunked at
+  // 4 KB UTF-8 to stay below the server-side cap). Replaces the old per-char
+  // keycode synthesis so punctuation and Unicode land verbatim on the host.
+  const handleSendTextLiteral = useSendTextLiteral(sendInput)
 
   const handleReload = useCallback(() => {
     sessionApiRef.current.disconnect()
@@ -411,6 +414,13 @@ export default function DesktopPage() {
       </div>
 
       <div className="fixed bottom-0 left-0 right-0 z-20 pb-safe px-safe lg:static lg:w-60 lg:h-full lg:shrink-0 lg:pb-0 lg:px-0">
+        {/* Always-visible text composer pinned above the toolbar on mobile.
+            Hidden on lg+ via the component's own `lg:hidden` so the desktop
+            sidebar (which has its own composer flow) is unchanged. */}
+        <DesktopTextStrip
+          onSend={handleSendTextLiteral}
+          onOpenSheet={() => setShowTextBatch(true)}
+        />
         <DesktopToolbar
           quality={quality}
           onQualityChange={handleQualityChange}
@@ -445,7 +455,7 @@ export default function DesktopPage() {
       <DesktopTextBatchSheet
         open={showTextBatch}
         onClose={() => setShowTextBatch(false)}
-        onSend={handleSendTextBatch}
+        onSend={handleSendTextLiteral}
       />
 
       <DesktopExitConfirm

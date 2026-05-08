@@ -144,6 +144,12 @@ mod inner {
             #[serde(default)]
             meta: bool,
         },
+        /// Literal-text injection. Routed to `enigo.text()` server-side, which
+        /// uses platform-native Unicode keystroke synthesis (no keycode lookup,
+        /// no modifier flags). Server caps `s` at 4096 UTF-8 bytes.
+        Text {
+            s: String,
+        },
         Quality {
             tier: String, // "high" | "med" | "low"
         },
@@ -183,6 +189,7 @@ mod inner {
                     let a = parse_press_action(&action)?;
                     Some(InputEvent::Key { code, action: a, ctrl, shift, alt, meta })
                 }
+                WireInput::Text { s } => Some(InputEvent::Text { s }),
                 WireInput::Quality { tier } => {
                     let t = parse_quality_tier(&tier)?;
                     Some(InputEvent::QualityChange { tier: t })
@@ -1283,6 +1290,28 @@ mod inner {
     }
 
     // ─── Tests ───────────────────────────────────────────────────────────────
+    #[cfg(test)]
+    mod wire_input_tests {
+        use super::*;
+
+        /// Wire-format guard: `{t:'text', s:...}` parses into `WireInput::Text`
+        /// and round-trips through `into_input_event` to `InputEvent::Text`.
+        /// Catches accidental tag-rename or struct-shape regressions.
+        #[test]
+        fn text_event_parses_from_wire() {
+            let json = r#"{"t":"text","s":"Hello!@#"}"#;
+            let parsed: WireInput = serde_json::from_str(json).expect("parse");
+            match &parsed {
+                WireInput::Text { s } => assert_eq!(s, "Hello!@#"),
+                other => panic!("expected Text variant, got {other:?}"),
+            }
+            match parsed.into_input_event() {
+                Some(InputEvent::Text { s }) => assert_eq!(s, "Hello!@#"),
+                other => panic!("expected InputEvent::Text, got {other:?}"),
+            }
+        }
+    }
+
     #[cfg(all(test, feature = "h264"))]
     mod tier_bitrate_tests {
         use super::*;

@@ -41,6 +41,11 @@ pub enum InputEvent {
         alt: bool,
         meta: bool,
     },
+    /// Literal text. Routed to `enigo.text()` — Unicode-safe; modifier flags
+    /// do not apply (caller's job to chunk + ensure intent is "type the
+    /// literal characters"). Server caps `s` at 4096 UTF-8 bytes; longer
+    /// payloads warn-and-drop. Client chunks below this in practice.
+    Text { s: String },
     /// Client requests a quality change for the capture loop.
     QualityChange { tier: QualityTier },
 }
@@ -141,6 +146,19 @@ impl InputInjector {
                 }
                 if ctrl {
                     let _ = self.enigo.key(Key::Control, Direction::Release);
+                }
+            }
+
+            InputEvent::Text { s } => {
+                const MAX_TEXT_BYTES: usize = 4096;
+                if s.len() > MAX_TEXT_BYTES {
+                    warn!(
+                        len = s.len(),
+                        max = MAX_TEXT_BYTES,
+                        "text event payload too large — dropped"
+                    );
+                } else {
+                    self.enigo.text(&s).context("text injection")?;
                 }
             }
 
@@ -247,6 +265,40 @@ fn dom_code_to_key(code: &str) -> Option<Key> {
         "Numpad7" => Some(Key::Unicode('7')),
         "Numpad8" => Some(Key::Unicode('8')),
         "Numpad9" => Some(Key::Unicode('9')),
+        // Single-character `code` (punctuation, etc.) — fall back to Unicode
+        // injection so combos like Ctrl+; or Shift+/ don't silently drop.
+        // Multi-char codes (e.g. "MediaPlayPause") still return None and emit
+        // the existing "unmapped DOM key code" warning at the call site.
+        other if other.chars().count() == 1 => other.chars().next().map(Key::Unicode),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dom_code_to_key_unicode_fallback() {
+        // Punctuation: must fall back to Unicode (was None previously)
+        assert!(matches!(dom_code_to_key(";"), Some(Key::Unicode(';'))));
+        assert!(matches!(dom_code_to_key("/"), Some(Key::Unicode('/'))));
+        assert!(matches!(dom_code_to_key("@"), Some(Key::Unicode('@'))));
+        assert!(matches!(dom_code_to_key("!"), Some(Key::Unicode('!'))));
+
+        // Named keys still preferred over fallback
+        assert!(matches!(dom_code_to_key("Enter"), Some(Key::Return)));
+        assert!(matches!(dom_code_to_key("Space"), Some(Key::Space)));
+        assert!(matches!(dom_code_to_key("Tab"), Some(Key::Tab)));
+
+        // Letter / digit prefixes still resolve through their dedicated path
+        assert!(matches!(dom_code_to_key("KeyA"), Some(Key::Unicode('a'))));
+        assert!(matches!(dom_code_to_key("Digit3"), Some(Key::Unicode('3'))));
+
+        // Multi-char unknown codes still return None
+        assert!(dom_code_to_key("MediaPlayPause").is_none());
+
+        // Empty string returns None (no codepoints)
+        assert!(dom_code_to_key("").is_none());
     }
 }

@@ -26,7 +26,10 @@ export type DesktopStatus =
 export type QualityTier = 'low' | 'med' | 'high'
 
 export interface DesktopInputEvent {
-  t: 'mouse' | 'wheel' | 'key' | 'quality' | 'monitor' | 'settings'
+  // 'text' is Unicode-safe literal-string injection; routed server-side to
+  // `enigo.text()` and skips the dom_code_to_key path entirely. Modifier
+  // flags do not apply — caller intent must be "type these characters".
+  t: 'mouse' | 'wheel' | 'key' | 'text' | 'quality' | 'monitor' | 'settings'
   [key: string]: unknown
 }
 

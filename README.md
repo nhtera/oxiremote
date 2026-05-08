@@ -60,6 +60,12 @@ On first launch the agent downloads `cloudflared`, opens a Quick Tunnel, and pri
 - `OXIREMOTE_INSTALL_DIR=...` — install script target directory
 - `OXIREMOTE_BINARY_URL=...` — npm wrapper download base URL (corp proxies / mirrors)
 
+## Mobile usage
+
+Tap the **Type to send to remote** bar pinned above the on-screen keys to bring up the iOS/Android keyboard. Hit **Send** (or Enter) to dispatch the entire string at once — useful for passwords, command snippets, and pasted text. Punctuation, accented characters, and emoji are all supported. The Sheet button next to the input opens a multiline composer for long pastes.
+
+> **Note (macOS):** the lock screen accepts text from this composer for screensaver / session-lock states. **FileVault pre-login** unlock is not yet supported — Apple's `EnableSecureEventInput` blocks synthetic keystrokes at the loginwindow. Workaround: use Touch ID, Apple Watch unlock, or the host's physical keyboard for the initial post-boot login.
+
 ## Notifications (Web Push)
 
 The agent runs a Web Push server. Install the web UI as a PWA on your phone (Add to Home Screen on iOS), enable notifications from the in-app banner, then trigger a push from the shell:
