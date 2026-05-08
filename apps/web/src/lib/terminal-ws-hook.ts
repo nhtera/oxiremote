@@ -4,7 +4,7 @@ import { FitAddon } from 'xterm-addon-fit'
 import { useTerminalStore, type Session } from '../state/terminal-store'
 import { isDiscoveryMode } from './discovery-client'
 import { getActiveHost, loadApiKey, loadTunnelBase } from './api-client'
-import { probeHost } from './host-reachability'
+import { probeHost, refreshTunnelBaseFromDiscovery } from './host-reachability'
 
 export type ReconnectPhase = 'fast' | 'slow'
 
@@ -274,8 +274,20 @@ async function scheduleReconnect(
     handle.lastProbeAt = now
     const id = getActiveHost()
     if (id) {
+      // probeHost internally tries the cached tunnel base first, then
+      // re-resolves via the discovery worker if that fails (covers Quick
+      // Tunnel URL rotation after host sleep/wake). On a successful refresh
+      // the new base is persisted, so the WS-URL builder picks it up on
+      // the next connect() call.
       const result = await probeHost(id)
       probeAlive = result === 'alive'
+      if (!probeAlive) {
+        // Even when the probe stays unreachable, try refreshing the base
+        // once: the agent may have just re-registered with the worker but
+        // /api/health hasn't propagated yet, or the cached base is wrong
+        // and the probe was hitting nothing. Worst case: no-op.
+        await refreshTunnelBaseFromDiscovery(id)
+      }
     }
   }
 

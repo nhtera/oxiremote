@@ -20,6 +20,11 @@ import { isDiscoveryMode } from './discovery-client'
 
 const API_KEY_PREFIX = 'oxi_api_key_'
 const TUNNEL_BASE_PREFIX = 'oxi_tunnel_base_'
+// Stable per-host worker lookup id, captured at pair time from the agent's
+// pairing-exchange response. Lets a discovery-mode SPA re-resolve the
+// current tunnel URL via the worker after a Quick Tunnel rotation without
+// making the user re-pair.
+const DISCOVERY_LOOKUP_PREFIX = 'oxi_discovery_lookup_id_'
 const ACTIVE_HOST_KEY = 'oxi_active_host'
 const CSRF_COOKIE = 'oxi_csrf'
 
@@ -74,10 +79,16 @@ export function clearApiKey(hostId?: string) {
     if (hostId) {
       localStorage.removeItem(API_KEY_PREFIX + hostId)
       localStorage.removeItem(TUNNEL_BASE_PREFIX + hostId)
+      localStorage.removeItem(DISCOVERY_LOOKUP_PREFIX + hostId)
     } else {
       for (let i = localStorage.length - 1; i >= 0; i--) {
         const k = localStorage.key(i)
-        if (k && (k.startsWith(API_KEY_PREFIX) || k.startsWith(TUNNEL_BASE_PREFIX))) {
+        if (
+          k &&
+          (k.startsWith(API_KEY_PREFIX) ||
+            k.startsWith(TUNNEL_BASE_PREFIX) ||
+            k.startsWith(DISCOVERY_LOOKUP_PREFIX))
+        ) {
           localStorage.removeItem(k)
         }
       }
@@ -106,6 +117,31 @@ export function loadTunnelBase(hostId?: string): string | null {
   if (!id) return null
   try {
     const v = localStorage.getItem(TUNNEL_BASE_PREFIX + id)
+    return v && v.length > 0 ? v : null
+  } catch {
+    return null
+  }
+}
+
+/**
+ * Discovery worker lookup id storage. Captured from the pairing-exchange
+ * response. Persisted only in discovery mode — the worker route is the only
+ * thing that uses it. Old SPAs / agents pre-0.1.28 won't have this key set;
+ * callers must treat null as "no refresh path available, use cached base".
+ */
+export function storeDiscoveryLookupId(hostId: string, lookupId: string) {
+  try {
+    localStorage.setItem(DISCOVERY_LOOKUP_PREFIX + hostId, lookupId)
+  } catch {
+    /* quota / private mode */
+  }
+}
+
+export function loadDiscoveryLookupId(hostId?: string): string | null {
+  const id = hostId ?? getActiveHost()
+  if (!id) return null
+  try {
+    const v = localStorage.getItem(DISCOVERY_LOOKUP_PREFIX + id)
     return v && v.length > 0 ? v : null
   } catch {
     return null
