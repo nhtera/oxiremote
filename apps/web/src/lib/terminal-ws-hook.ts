@@ -3,7 +3,10 @@ import { Terminal } from 'xterm'
 import { FitAddon } from 'xterm-addon-fit'
 import { useTerminalStore, type Session } from '../state/terminal-store'
 import { isDiscoveryMode } from './discovery-client'
-import { loadApiKey, loadTunnelBase } from './api-client'
+import { getActiveHost, loadApiKey, loadTunnelBase } from './api-client'
+import { probeHost, refreshTunnelBaseFromDiscovery } from './host-reachability'
+
+export type ReconnectPhase = 'fast' | 'slow'
 
 export type SessionHandle = {
   term: Terminal
@@ -14,6 +17,15 @@ export type SessionHandle = {
   reconnectTimer: number | null
   reconnectAttempt: number
   closedByUser: boolean
+  // Two-phase backoff. 'fast' uses BACKOFF_MS for transient drops; 'slow'
+  // uses SLOW_BACKOFF_MS once /api/health probing confirms the host is down.
+  phase: ReconnectPhase
+  slowAttempt: number
+  // Rate-limit /api/health probes (one per ~3s).
+  lastProbeAt: number
+  // Bumped on manual retry / mount so an in-flight async probe knows to bail
+  // if the user has triggered a fresh reconnect path in the meantime.
+  scheduleEpoch: number
 }
 
 /// Subprotocol marker used to carry a Bearer api_key on WS upgrade in
@@ -42,38 +54,54 @@ function wsProtocols(): string[] | undefined {
   return [WS_BEARER_PROTOCOL, key]
 }
 
-// Exponential-ish backoff capped at 5s, matches "reconnect within 3s" success criterion.
+// Fast ladder for transient drops (handshake race, brief tunnel hiccup).
+// Cumulative ~12s — covers reconnect storms without making the user wait too
+// long before we surface a clearer "host appears offline" message.
 export const BACKOFF_MS = [500, 1000, 2000, 3000, 5000]
 
-/** Backoff (in ms) the hook will wait before attempt N (1-indexed). UI uses
- *  this to keep the reconnect modal's countdown / progress bar in sync. */
+// Slow ladder once /api/health says the host is unreachable (sleep/wake,
+// Wi-Fi handoff, agent restart). Cycles at 30s; we never give up
+// automatically — the modal lets the user explicitly bail out via "Exit",
+// and connectivity events (online / visibilitychange / focus) wake the loop
+// up immediately when the device comes back.
+export const SLOW_BACKOFF_MS = [5000, 10000, 15000, 30000]
+
+/** Backoff (in ms) the hook will wait before fast-phase attempt N
+ *  (1-indexed). UI uses this to keep the reconnect modal's countdown / progress
+ *  bar in sync. Slow phase doesn't surface a per-attempt countdown. */
 export function backoffMsForAttempt(attempt: number): number {
   const idx = Math.max(0, Math.min(attempt - 1, BACKOFF_MS.length - 1))
   return BACKOFF_MS[idx]
 }
-// Stop trying after 8 attempts (~21s of cumulative back-off + the WS handshake
-// time-out). Past this the disconnect is almost always permanent — agent
-// crash, device revoke, network split — and silently retrying forever both
-// burns battery and hides the failure from the user. Surface it via the
-// reconnect modal so they can choose to retry or give up.
-export const MAX_RECONNECT_ATTEMPTS = 8
+
+// Exposed for the reconnect modal's progress bar denominator while in fast
+// phase. Once the hook transitions to slow phase the modal hides the bar
+// and switches its copy from "Reconnecting…" to "Host appears offline".
+export const MAX_RECONNECT_ATTEMPTS = BACKOFF_MS.length
+
+const PROBE_RATE_LIMIT_MS = 3000
+// Tiny delay between a "host is alive" probe and the next WS attempt —
+// avoids a fast spin if probeHost returns alive but the WS handshake
+// immediately fails again (e.g. agent is up but route layer is still warming).
+const FAST_RECOVERY_DELAY_MS = 250
 
 type Options = {
   activeId: string | null
   reconnectNonce: number
   onConnected: (connected: boolean) => void
   onError: (msg: string) => void
-  /** Fired once when the reconnect cap is hit; UI uses this to surface the modal. */
-  onReconnectExhausted?: () => void
   /** Fired on each new reconnect attempt so the UI can show "attempt N of M". */
   onReconnectAttempt?: (attempt: number) => void
+  /** Fired when the hook switches between fast (transient drop) and slow
+   *  (host appears offline) reconnect phases. Drives the modal's copy. */
+  onReconnectPhase?: (phase: ReconnectPhase) => void
 }
 
 export function useTerminalWs(
   handlesRef: React.MutableRefObject<Map<string, SessionHandle>>,
   options: Options
 ) {
-  const { activeId, reconnectNonce, onConnected, onError, onReconnectExhausted, onReconnectAttempt } = options
+  const { activeId, reconnectNonce, onConnected, onError, onReconnectAttempt, onReconnectPhase } = options
   const activeIdRef = useRef<string | null>(null)
   const { setSessions } = useTerminalStore.getState()
 
@@ -115,7 +143,13 @@ export function useTerminalWs(
     }
     handle.closedByUser = false
     handle.reconnectAttempt = 0
-    connect(handle, sessionId, onConnected, activeIdRef, onReconnectExhausted, onReconnectAttempt)
+    handle.slowAttempt = 0
+    handle.phase = 'fast'
+    // Invalidate any in-flight async scheduleReconnect so a stale probe
+    // resolution doesn't queue a duplicate WS attempt after this fresh path.
+    handle.scheduleEpoch += 1
+    onReconnectPhase?.('fast')
+    connect(handle, sessionId, onConnected, activeIdRef, onReconnectAttempt, onReconnectPhase)
 
     const onData = handle.term.onData((data) => {
       if (handle.ws?.readyState === WebSocket.OPEN) {
@@ -135,8 +169,8 @@ function connect(
   sessionId: string,
   onConnected: (c: boolean) => void,
   activeIdRef: React.MutableRefObject<string | null>,
-  onReconnectExhausted?: () => void,
   onReconnectAttempt?: (attempt: number) => void,
+  onReconnectPhase?: (phase: ReconnectPhase) => void,
 ) {
   if (handle.reconnectTimer != null) {
     window.clearTimeout(handle.reconnectTimer)
@@ -157,6 +191,11 @@ function connect(
   ws.onopen = () => {
     handle.connected = true
     handle.reconnectAttempt = 0
+    handle.slowAttempt = 0
+    if (handle.phase !== 'fast') {
+      handle.phase = 'fast'
+      onReconnectPhase?.('fast')
+    }
     if (activeIdRef.current === sessionId) onConnected(true)
     // Send attach first — server will reply with snapshot, then live chunks.
     const lastSeq = useTerminalStore.getState().lastSeqById[sessionId]
@@ -168,22 +207,7 @@ function connect(
     handle.ws = null
     if (activeIdRef.current === sessionId) onConnected(false)
     if (handle.closedByUser) return
-    // Cap reconnect attempts so a permanent failure (agent crash, device
-    // revoke) surfaces in the UI instead of looping in the background
-    // forever and burning battery on a connection that will never come back.
-    if (handle.reconnectAttempt >= MAX_RECONNECT_ATTEMPTS) {
-      handle.closedByUser = true
-      onReconnectExhausted?.()
-      return
-    }
-    // Auto-reconnect with backoff.
-    const delay = BACKOFF_MS[Math.min(handle.reconnectAttempt, BACKOFF_MS.length - 1)]
-    handle.reconnectAttempt += 1
-    onReconnectAttempt?.(handle.reconnectAttempt)
-    handle.reconnectTimer = window.setTimeout(() => {
-      handle.reconnectTimer = null
-      connect(handle, sessionId, onConnected, activeIdRef, onReconnectExhausted, onReconnectAttempt)
-    }, delay)
+    void scheduleReconnect(handle, sessionId, onConnected, activeIdRef, onReconnectAttempt, onReconnectPhase)
   }
 
   ws.onmessage = (ev) => {
@@ -214,6 +238,91 @@ function connect(
       // Unknown variants silently ignored per spec
     } catch {}
   }
+}
+
+async function scheduleReconnect(
+  handle: SessionHandle,
+  sessionId: string,
+  onConnected: (c: boolean) => void,
+  activeIdRef: React.MutableRefObject<string | null>,
+  onReconnectAttempt?: (attempt: number) => void,
+  onReconnectPhase?: (phase: ReconnectPhase) => void,
+) {
+  if (handle.closedByUser) return
+
+  // Fast phase: walk the existing ladder. Covers brief drops where probing
+  // would just add latency before the next WS attempt.
+  if (handle.phase === 'fast' && handle.reconnectAttempt < BACKOFF_MS.length) {
+    const delay = BACKOFF_MS[handle.reconnectAttempt]
+    handle.reconnectAttempt += 1
+    onReconnectAttempt?.(handle.reconnectAttempt)
+    handle.reconnectTimer = window.setTimeout(() => {
+      handle.reconnectTimer = null
+      connect(handle, sessionId, onConnected, activeIdRef, onReconnectAttempt, onReconnectPhase)
+    }, delay)
+    return
+  }
+
+  // Past the fast ladder (or already in slow phase). Probe /api/health
+  // (rate-limited) to decide between staying in slow and jumping back to
+  // fast — the latter handles "host went away briefly and is back now",
+  // e.g. MacBook woke from sleep.
+  const epoch = handle.scheduleEpoch
+  let probeAlive = false
+  const now = Date.now()
+  if (now - handle.lastProbeAt >= PROBE_RATE_LIMIT_MS) {
+    handle.lastProbeAt = now
+    const id = getActiveHost()
+    if (id) {
+      // probeHost internally tries the cached tunnel base first, then
+      // re-resolves via the discovery worker if that fails (covers Quick
+      // Tunnel URL rotation after host sleep/wake). On a successful refresh
+      // the new base is persisted, so the WS-URL builder picks it up on
+      // the next connect() call.
+      const result = await probeHost(id)
+      probeAlive = result === 'alive'
+      if (!probeAlive) {
+        // Even when the probe stays unreachable, try refreshing the base
+        // once: the agent may have just re-registered with the worker but
+        // /api/health hasn't propagated yet, or the cached base is wrong
+        // and the probe was hitting nothing. Worst case: no-op.
+        await refreshTunnelBaseFromDiscovery(id)
+      }
+    }
+  }
+
+  // The probe await may have raced with a manual retry / mount that bumped
+  // scheduleEpoch. If so the new code path now owns the schedule — bail to
+  // avoid a duplicate WS connection.
+  if (handle.scheduleEpoch !== epoch || handle.closedByUser) return
+
+  if (probeAlive) {
+    // Host is back. Reset to fast phase and retry on a tight delay; if the
+    // WS still fails we'll walk the fast ladder again.
+    handle.phase = 'fast'
+    handle.reconnectAttempt = 1
+    handle.slowAttempt = 0
+    onReconnectPhase?.('fast')
+    onReconnectAttempt?.(1)
+    handle.reconnectTimer = window.setTimeout(() => {
+      handle.reconnectTimer = null
+      connect(handle, sessionId, onConnected, activeIdRef, onReconnectAttempt, onReconnectPhase)
+    }, FAST_RECOVERY_DELAY_MS)
+    return
+  }
+
+  // Unreachable / unknown / probe was rate-limited → slow phase.
+  if (handle.phase !== 'slow') {
+    handle.phase = 'slow'
+    onReconnectPhase?.('slow')
+  }
+  const delay = SLOW_BACKOFF_MS[Math.min(handle.slowAttempt, SLOW_BACKOFF_MS.length - 1)]
+  handle.slowAttempt += 1
+  onReconnectAttempt?.(BACKOFF_MS.length + handle.slowAttempt)
+  handle.reconnectTimer = window.setTimeout(() => {
+    handle.reconnectTimer = null
+    connect(handle, sessionId, onConnected, activeIdRef, onReconnectAttempt, onReconnectPhase)
+  }, delay)
 }
 
 export function destroyHandle(

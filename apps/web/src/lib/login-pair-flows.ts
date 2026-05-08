@@ -1,6 +1,12 @@
 import type { NavigateFunction } from 'react-router-dom'
 import { useHostStore } from '../state/host-store'
-import { loadApiKey, makeRemoteClient, storeApiKey, storeTunnelBase } from './api-client'
+import {
+  loadApiKey,
+  makeRemoteClient,
+  storeApiKey,
+  storeDiscoveryLookupId,
+  storeTunnelBase,
+} from './api-client'
 import {
   isDiscoveryMode,
   isLikelyOtk,
@@ -143,6 +149,7 @@ export async function submitDiscoveryPair(
   }
   storeApiKey(body.host_id, body.api_key)
   storeTunnelBase(body.host_id, session.tunnelUrl)
+  if (body.discovery_id) storeDiscoveryLookupId(body.host_id, body.discovery_id)
   // Prefer the agent-supplied hostname (DESKTOP-…, TienNHs-MBP.lan) over
   // the user-typed device label and the truncated host_id. Older agents
   // omit `label`; we keep the same fallbacks to stay backward-compatible.
@@ -215,6 +222,7 @@ async function submitDiscoveryPermanent(rawKey: string, ctx: PairCtx): Promise<v
   }
   storeApiKey(body.host_id, body.api_key)
   storeTunnelBase(body.host_id, session.tunnelUrl)
+  if (body.discovery_id) storeDiscoveryLookupId(body.host_id, body.discovery_id)
   const friendlyLabel =
     body.label?.trim() || ctx.deviceLabel.trim() || body.host_id.slice(0, 8)
   recordSavedHost({
@@ -299,6 +307,7 @@ async function submitDiscoveryCode(raw: string, ctx: PairCtx): Promise<void> {
   }
   storeApiKey(body.host_id, body.api_key)
   storeTunnelBase(body.host_id, session.tunnelUrl)
+  if (body.discovery_id) storeDiscoveryLookupId(body.host_id, body.discovery_id)
   const friendlyLabel =
     body.label?.trim() || ctx.deviceLabel.trim() || body.host_id.slice(0, 8)
   recordSavedHost({
@@ -388,4 +397,9 @@ interface DiscoveryPairBody {
   // are optional for backward compatibility with pre-0.1.15 agents.
   label?: string | null
   platform?: string | null
+  // Stable per-host worker lookup id (agent 0.1.28+). Lets the SPA re-resolve
+  // the current tunnel URL via the discovery worker after a Quick Tunnel
+  // rotation. Older agents omit it; callers must treat undefined as "no
+  // refresh path — fall back to the cached tunnel base".
+  discovery_id?: string | null
 }

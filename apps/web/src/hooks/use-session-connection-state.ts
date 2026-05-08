@@ -1,26 +1,27 @@
 import { useMemo, useState } from 'react'
+import type { ReconnectPhase } from '../lib/terminal-ws-hook'
 
 // Per-session telemetry for the workspace page. Tracks connected/disconnected
-// flags, reconnect attempt counts, and an "exhausted" flag once the WS hook
-// gives up. Drives tab-bar dots, the focused pane's status pill, and the
-// reconnect modal. Records (not zustand) keep this ephemeral state out of
-// the global store.
+// flags, reconnect attempt counts, and the active retry phase ('fast' for
+// transient drops, 'slow' once the host appears genuinely offline). Drives
+// tab-bar dots, the focused pane's status pill, and the reconnect modal copy.
+// Records (not zustand) keep this ephemeral state out of the global store.
 export function useSessionConnectionState() {
   const [connectedById, setConnectedById] = useState<Record<string, boolean>>({})
   const [reconnectAttemptById, setReconnectAttemptById] = useState<Record<string, number>>({})
-  const [reconnectExhaustedById, setReconnectExhaustedById] = useState<Record<string, boolean>>({})
+  const [phaseById, setPhaseById] = useState<Record<string, ReconnectPhase>>({})
 
   const handleConnectedChange = (sessionId: string, connected: boolean) => {
     setConnectedById((m) => (m[sessionId] === connected ? m : { ...m, [sessionId]: connected }))
     if (connected) {
       setReconnectAttemptById((m) => ({ ...m, [sessionId]: 0 }))
-      setReconnectExhaustedById((m) => ({ ...m, [sessionId]: false }))
+      setPhaseById((m) => (m[sessionId] === 'fast' ? m : { ...m, [sessionId]: 'fast' }))
     }
   }
   const handleReconnectAttempt = (sessionId: string, attempt: number) =>
     setReconnectAttemptById((m) => ({ ...m, [sessionId]: attempt }))
-  const handleReconnectExhausted = (sessionId: string) =>
-    setReconnectExhaustedById((m) => ({ ...m, [sessionId]: true }))
+  const handleReconnectPhase = (sessionId: string, phase: ReconnectPhase) =>
+    setPhaseById((m) => (m[sessionId] === phase ? m : { ...m, [sessionId]: phase }))
 
   // A session is "reconnecting" if its WS-hook reported an attempt and it
   // hasn't reconnected yet. Drives the orange tab dot for non-focused panes
@@ -42,22 +43,22 @@ export function useSessionConnectionState() {
     }
     setConnectedById(drop)
     setReconnectAttemptById(drop)
-    setReconnectExhaustedById(drop)
+    setPhaseById(drop)
   }
 
   function resetReconnect(id: string) {
-    setReconnectExhaustedById((m) => ({ ...m, [id]: false }))
     setReconnectAttemptById((m) => ({ ...m, [id]: 0 }))
+    setPhaseById((m) => ({ ...m, [id]: 'fast' }))
   }
 
   return {
     connectedById,
     reconnectAttemptById,
-    reconnectExhaustedById,
+    phaseById,
     reconnectingById,
     handleConnectedChange,
     handleReconnectAttempt,
-    handleReconnectExhausted,
+    handleReconnectPhase,
     clearSession,
     resetReconnect,
   }

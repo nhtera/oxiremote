@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { TerminalPrefs } from '../../lib/terminal-prefs'
 import type { PaneAssignments, PaneCount, PaneIndex } from '../../state/terminal-store'
 import type { UploadError } from '../../hooks/use-file-upload'
+import type { ReconnectPhase } from '../../lib/terminal-ws-hook'
 import XtermPane from './xterm-pane'
 
 export type PaneUpload = {
@@ -29,7 +30,7 @@ type Props = {
   onFocusPane: (idx: PaneIndex) => void
   onConnectedChange: (sessionId: string, connected: boolean) => void
   onReconnectAttempt: (sessionId: string, attempt: number) => void
-  onReconnectExhausted: (sessionId: string) => void
+  onReconnectPhase: (sessionId: string, phase: ReconnectPhase) => void
   onError: (msg: string) => void
   registerSend: (sessionId: string, sendFn: ((data: string) => void) | null) => void
   /** Optional registry for per-session selection getters. When supplied, the
@@ -62,7 +63,7 @@ function evenSizes(n: PaneCount): number[] {
 
 export default function MultiPaneGrid({
   paneCount, paneAssignments, focusedPane, prefs, reconnectNonce,
-  onFocusPane, onConnectedChange, onReconnectAttempt, onReconnectExhausted, onError, registerSend,
+  onFocusPane, onConnectedChange, onReconnectAttempt, onReconnectPhase, onError, registerSend,
   registerGetSelection,
   onAttachFiles,
   uploads, previews,
@@ -160,7 +161,7 @@ export default function MultiPaneGrid({
             onFocus={() => onFocusPane(idx)}
             onConnectedChange={onConnectedChange}
             onReconnectAttempt={onReconnectAttempt}
-            onReconnectExhausted={onReconnectExhausted}
+            onReconnectPhase={onReconnectPhase}
             onError={onError}
             registerSend={registerSend}
             registerGetSelection={registerGetSelection}
@@ -190,7 +191,7 @@ type PaneProps = {
   onFocus: () => void
   onConnectedChange: (sessionId: string, connected: boolean) => void
   onReconnectAttempt: (sessionId: string, attempt: number) => void
-  onReconnectExhausted: (sessionId: string) => void
+  onReconnectPhase: (sessionId: string, phase: ReconnectPhase) => void
   onError: (msg: string) => void
   registerSend: (sessionId: string, sendFn: ((data: string) => void) | null) => void
   /** Optional registry for per-session selection getters. When supplied, the
@@ -208,7 +209,7 @@ type PaneProps = {
 
 function Pane({
   paneIdx, sessionId, basis, isFocused, prefs, reconnectNonce,
-  onFocus, onConnectedChange, onReconnectAttempt, onReconnectExhausted, onError, registerSend,
+  onFocus, onConnectedChange, onReconnectAttempt, onReconnectPhase, onError, registerSend,
   registerGetSelection, onAttachFiles,
   paneUploads, panePreviews,
   onCancelUpload, onDismissUpload, onRetryUpload, onDismissPreview,
@@ -240,7 +241,7 @@ function Pane({
             onFocus={onFocus}
             onConnectedChange={onConnectedChange}
             onReconnectAttempt={onReconnectAttempt}
-            onReconnectExhausted={onReconnectExhausted}
+            onReconnectPhase={onReconnectPhase}
             onError={onError}
             registerSend={registerSend}
             registerGetSelection={registerGetSelection}

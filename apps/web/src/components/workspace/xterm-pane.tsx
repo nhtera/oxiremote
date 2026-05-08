@@ -5,7 +5,7 @@ import 'xterm/css/xterm.css'
 
 import { terminalThemes } from '../../lib/terminal-themes'
 import type { TerminalPrefs } from '../../lib/terminal-prefs'
-import { useTerminalWs, destroyHandle, type SessionHandle } from '../../lib/terminal-ws-hook'
+import { useTerminalWs, destroyHandle, type ReconnectPhase, type SessionHandle } from '../../lib/terminal-ws-hook'
 import { useVisualViewport } from '../../hooks/use-visual-viewport'
 import type { PaneIndex } from '../../state/terminal-store'
 import { UploadChip } from '../upload-chip'
@@ -22,7 +22,7 @@ type Props = {
    *  the focused pane's status pill and reconnect modal. */
   onConnectedChange: (sessionId: string, connected: boolean) => void
   onReconnectAttempt: (sessionId: string, attempt: number) => void
-  onReconnectExhausted: (sessionId: string) => void
+  onReconnectPhase: (sessionId: string, phase: ReconnectPhase) => void
   onError: (msg: string) => void
   /** Workspace keeps a Map<sessionId, sendFn> so the global composer can
    *  forward input to whichever pane is focused. Pass null on unmount. */
@@ -55,7 +55,7 @@ function debounce<F extends (...args: unknown[]) => void>(fn: F, ms: number) {
 
 export default function XtermPane({
   sessionId, paneIdx, prefs, isFocused, onFocus,
-  onConnectedChange, onReconnectAttempt, onReconnectExhausted, onError,
+  onConnectedChange, onReconnectAttempt, onReconnectPhase, onError,
   registerSend, registerGetSelection, reconnectNonce,
   onAttachFiles,
   uploads, previews,
@@ -91,6 +91,7 @@ export default function XtermPane({
     handlesRef.current.set(sessionId, {
       term, fit, ws: null, connected: false,
       reconnectTimer: null, reconnectAttempt: 0, closedByUser: false,
+      phase: 'fast', slowAttempt: 0, lastProbeAt: 0, scheduleEpoch: 0,
     })
     setMounted(true)
     return () => {
@@ -172,7 +173,7 @@ export default function XtermPane({
     onConnected: (c) => onConnectedChange(sessionId, c),
     onError,
     onReconnectAttempt: (n) => onReconnectAttempt(sessionId, n),
-    onReconnectExhausted: () => onReconnectExhausted(sessionId),
+    onReconnectPhase: (phase) => onReconnectPhase(sessionId, phase),
   })
 
   // Expose sendInput to the workspace so the bottom composer can dispatch

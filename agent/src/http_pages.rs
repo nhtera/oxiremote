@@ -249,6 +249,13 @@ fn build_pairing_response(
                 StatusCode::ACCEPTED
             };
 
+            // Stable per-host worker lookup id. Lets a discovery-mode SPA
+            // re-resolve the agent's current tunnel URL after a Quick Tunnel
+            // rotation (sleep/wake) without making the user re-pair. None on
+            // best-effort failure — old SPAs ignore the field, new ones fall
+            // back to the cached tunnel base.
+            let discovery_id = crate::discovery::load_discovery_id(&state.db_path).ok();
+
             (
                 http_status,
                 jar.add(cookie),
@@ -266,6 +273,7 @@ fn build_pairing_response(
                     "host_id": state.host_info.host_id,
                     "label": state.host_info.label,
                     "platform": state.host_info.platform,
+                    "discovery_id": discovery_id,
                 })),
             )
                 .into_response()

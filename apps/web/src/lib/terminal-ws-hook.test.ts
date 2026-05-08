@@ -1,11 +1,17 @@
 import { describe, it, expect } from 'vitest'
-import { BACKOFF_MS, MAX_RECONNECT_ATTEMPTS, backoffMsForAttempt } from './terminal-ws-hook'
+import {
+  BACKOFF_MS,
+  MAX_RECONNECT_ATTEMPTS,
+  SLOW_BACKOFF_MS,
+  backoffMsForAttempt,
+} from './terminal-ws-hook'
 
 // The hook itself opens real WebSockets — too entangled with React lifecycle
-// for unit tests. The contract worth pinning here is the backoff schedule and
-// the reconnect cap, since both feed UI countdowns and the reconnect modal.
+// for unit tests. The contract worth pinning here is the two-phase backoff:
+// fast ladder for transient drops (covered by the modal countdown), and a
+// slow ladder for "host appears offline" that cycles indefinitely.
 
-describe('backoff schedule', () => {
+describe('fast-phase backoff schedule', () => {
   it('returns the configured value for each attempt within range', () => {
     expect(backoffMsForAttempt(1)).toBe(BACKOFF_MS[0])
     expect(backoffMsForAttempt(2)).toBe(BACKOFF_MS[1])
@@ -22,16 +28,38 @@ describe('backoff schedule', () => {
     expect(backoffMsForAttempt(999)).toBe(BACKOFF_MS[BACKOFF_MS.length - 1])
   })
 
-  it('cumulative backoff finishes within ~30s so reconnect cap surfaces before user gives up', () => {
+  it('cumulative fast-phase backoff finishes within ~15s so the modal can switch to "host appears offline" promptly', () => {
     let total = 0
-    for (let i = 1; i <= MAX_RECONNECT_ATTEMPTS; i++) total += backoffMsForAttempt(i)
-    expect(total).toBeLessThan(30_000)
+    for (let i = 1; i <= BACKOFF_MS.length; i++) total += backoffMsForAttempt(i)
+    expect(total).toBeLessThan(15_000)
   })
 })
 
-describe('reconnect cap', () => {
-  it('is set above 5 (allows transient blips) but not absurdly high', () => {
-    expect(MAX_RECONNECT_ATTEMPTS).toBeGreaterThan(5)
-    expect(MAX_RECONNECT_ATTEMPTS).toBeLessThanOrEqual(12)
+describe('reconnect budget', () => {
+  it('MAX_RECONNECT_ATTEMPTS matches the fast ladder length (drives modal progress bar)', () => {
+    expect(MAX_RECONNECT_ATTEMPTS).toBe(BACKOFF_MS.length)
+  })
+
+  it('fast ladder is short enough to feel responsive on transient drops', () => {
+    expect(BACKOFF_MS.length).toBeGreaterThanOrEqual(3)
+    expect(BACKOFF_MS.length).toBeLessThanOrEqual(8)
+  })
+})
+
+describe('slow-phase backoff schedule', () => {
+  it('starts at >= the fast cap so we don\'t hammer the network when the host is offline', () => {
+    expect(SLOW_BACKOFF_MS[0]).toBeGreaterThanOrEqual(BACKOFF_MS[BACKOFF_MS.length - 1])
+  })
+
+  it('caps at 30s — long enough to spare battery, short enough to feel alive', () => {
+    const cap = SLOW_BACKOFF_MS[SLOW_BACKOFF_MS.length - 1]
+    expect(cap).toBeGreaterThanOrEqual(15_000)
+    expect(cap).toBeLessThanOrEqual(60_000)
+  })
+
+  it('is monotonically non-decreasing (no surprise speed-ups mid-cycle)', () => {
+    for (let i = 1; i < SLOW_BACKOFF_MS.length; i++) {
+      expect(SLOW_BACKOFF_MS[i]).toBeGreaterThanOrEqual(SLOW_BACKOFF_MS[i - 1])
+    }
   })
 })
