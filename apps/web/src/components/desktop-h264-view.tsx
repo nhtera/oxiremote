@@ -151,6 +151,7 @@ export default function DesktopH264View({
       onZoomChange={onZoomChange}
       onGestureApi={onGestureApi}
       bottomAnchor={bottomAnchor}
+      screenDims={screenDims}
     />
   )
 }
@@ -163,6 +164,7 @@ function CanvasWithInput({
   onZoomChange,
   onGestureApi,
   bottomAnchor,
+  screenDims,
 }: {
   canvasRef: React.RefObject<HTMLCanvasElement | null>
   mode: InputMode
@@ -171,6 +173,7 @@ function CanvasWithInput({
   onZoomChange?: (scale: number) => void
   onGestureApi?: (api: DesktopGestureApi) => void
   bottomAnchor: boolean
+  screenDims?: { width: number; height: number }
 }) {
   const overlayRef = useRef<DesktopRectOverlayHandle>(null)
   const layerRef = useRef<HTMLDivElement>(null)
@@ -190,7 +193,7 @@ function CanvasWithInput({
     gestureMode,
     rectOverlay: overlayForwarder,
   })
-  const { cursor, resetZoom } = useCanvasGestures({
+  const { cursor, resetZoom, fitToViewport } = useCanvasGestures({
     target: canvasRef,
     layer: layerRef,
     viewport: viewportRef,
@@ -202,6 +205,11 @@ function CanvasWithInput({
   useEffect(() => {
     onGestureApi?.({ resetZoom })
   }, [onGestureApi, resetZoom])
+  // Smart auto-fit on first valid stream dims (mirrors the JPEG view).
+  useEffect(() => {
+    if (!screenDims) return
+    fitToViewport()
+  }, [screenDims, fitToViewport])
   return (
     <div
       ref={viewportRef}

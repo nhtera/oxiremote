@@ -208,6 +208,7 @@ export default function DesktopJpegView({
       onZoomChange={onZoomChange}
       onGestureApi={onGestureApi}
       bottomAnchor={bottomAnchor}
+      screenDims={screenDims}
     />
   )
 }
@@ -220,6 +221,7 @@ function CanvasWithInput({
   onZoomChange,
   onGestureApi,
   bottomAnchor,
+  screenDims,
 }: {
   canvasRef: React.RefObject<HTMLCanvasElement | null>
   mode: InputMode
@@ -228,6 +230,7 @@ function CanvasWithInput({
   onZoomChange?: (scale: number) => void
   onGestureApi?: (api: DesktopGestureApi) => void
   bottomAnchor: boolean
+  screenDims?: { width: number; height: number }
 }) {
   const overlayRef = useRef<DesktopRectOverlayHandle>(null)
   const layerRef = useRef<HTMLDivElement>(null)
@@ -253,7 +256,7 @@ function CanvasWithInput({
   // Pointer-Events gesture stack owns 1-finger pan, pinch-zoom, and the
   // trackpad-mode virtual cursor. The sprite renders only in trackpad mode;
   // touch mode taps directly without a cursor.
-  const { cursor, resetZoom } = useCanvasGestures({
+  const { cursor, resetZoom, fitToViewport } = useCanvasGestures({
     target: canvasRef,
     layer: layerRef,
     viewport: viewportRef,
@@ -267,6 +270,13 @@ function CanvasWithInput({
   useEffect(() => {
     onGestureApi?.({ resetZoom })
   }, [onGestureApi, resetZoom])
+  // Smart auto-fit: kicks in once the first valid stream-dim arrives so the
+  // host fills a sensible portion of the wrap. One-shot per `resetZoom` —
+  // tap "Fit" in the menu to undo and re-arm.
+  useEffect(() => {
+    if (!screenDims) return
+    fitToViewport()
+  }, [screenDims, fitToViewport])
   return (
     <div
       ref={viewportRef}
