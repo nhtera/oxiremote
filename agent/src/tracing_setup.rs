@@ -116,7 +116,7 @@ pub fn init(
     // Set up the rolling file appender. Best-effort: if the logs dir can't be
     // created (read-only home, etc.) we fall back to bus + stderr only.
     let log_dir = data_dir.join("logs");
-    let file_guard = match std::fs::create_dir_all(&log_dir) {
+    match std::fs::create_dir_all(&log_dir) {
         Ok(()) => {
             // Append a SESSION header BEFORE wiring tracing so even crashes
             // during subscriber init are bracketed by a known boot marker.
@@ -161,9 +161,7 @@ pub fn init(
             }
             None
         }
-    };
-
-    file_guard
+    }
 }
 
 /// Write a one-line SESSION marker to the log file. Best-effort: I/O errors

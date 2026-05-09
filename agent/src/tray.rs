@@ -200,29 +200,72 @@ pub fn run_event_loop(handle: &TrayHandle) {
 }
 
 /// Bootstrap an NSApplication, set Accessory activation policy (menu-bar
-/// icon only, no Dock entry), and pump NSRunLoop in 100ms slices so we can
-/// drain TrayCmd messages between platform event dispatches.
+/// icon only, no Dock entry), then run a hand-rolled equivalent of
+/// `[NSApp run]` so we can interleave `TrayCmd` polling between event
+/// dispatches.
 ///
-/// `NSRunLoop::runUntilDate:` runs the loop until the given date expires OR
-/// an input source fires — whichever comes first. This gives tooltip updates
-/// a maximum latency of ~100ms, which is imperceptible to the operator.
+/// Two pieces are required for a working menu-bar status item:
+///
+/// 1. **`finishLaunching`** — publishes the `NSStatusItem` to the menu bar
+///    and posts the `applicationDidFinishLaunching` notifications that
+///    AppKit needs before any UI shows. `[NSApp run]` does this implicitly;
+///    we don't call `run` (it blocks forever with no way to service
+///    TrayCmd), so we call `finishLaunching` ourselves.
+///
+/// 2. **`nextEventMatchingMask` + `sendEvent`** — pumps NSEvents through
+///    the application object. Menu-bar clicks arrive as NSEvents that target
+///    the status item's tracking rect; without `[NSApp sendEvent:]` the
+///    icon paints but stays unclickable, because tray-icon's menu callback
+///    is wired to fire from `sendEvent`'s downstream dispatch.
+///
+/// History: v0.1.37 swapped `[NSApp run]` for `NSRunLoop::runUntilDate:`,
+/// which only pumps the run loop's *input sources* (timers, ports) — not
+/// NSEvents. That broke both the icon publication path AND click dispatch.
+/// v0.1.45 added `finishLaunching` (icon shows up); this version replaces
+/// `runUntilDate` with the proper NSApp event pump so clicks fire again.
 #[cfg(target_os = "macos")]
 fn macos_run(handle: &TrayHandle) {
-    use objc2_app_kit::{NSApplication, NSApplicationActivationPolicy};
-    use objc2_foundation::{NSDate, NSRunLoop};
+    use objc2_app_kit::{NSApplication, NSApplicationActivationPolicy, NSEventMask};
+    use objc2_foundation::{NSDate, NSDefaultRunLoopMode};
 
     let mtm = objc2::MainThreadMarker::new()
         .expect("tray::run_event_loop must be called on the main thread");
     let app = NSApplication::sharedApplication(mtm);
     app.setActivationPolicy(NSApplicationActivationPolicy::Accessory);
+    app.finishLaunching();
+
+    // NSDefaultRunLoopMode is a static `&'static NSRunLoopMode` initialised
+    // by AppKit before this binary runs; reading it post-`sharedApplication`
+    // is sound and the binding is already marked safe.
+    let default_mode = unsafe { NSDefaultRunLoopMode };
 
     loop {
         process_tray_cmds(handle);
-        // Pump the run loop for up to 100ms — processes menu events, then
-        // returns so we can drain any pending TrayCmd messages.
-        let rl = NSRunLoop::mainRunLoop();
+
+        // Wait up to 100ms for the next event — caps TrayCmd latency at
+        // ~100ms while idle. If an event is dequeued, drain any others
+        // already queued (no blocking, distantPast deadline) so a burst of
+        // mouse-track / menu-update events doesn't get serialised across
+        // multiple 100ms ticks.
         let deadline = NSDate::dateWithTimeIntervalSinceNow(0.1);
-        rl.runUntilDate(&deadline);
+        let event = app.nextEventMatchingMask_untilDate_inMode_dequeue(
+            NSEventMask::Any,
+            Some(&deadline),
+            default_mode,
+            true,
+        );
+        if let Some(ev) = event {
+            app.sendEvent(&ev);
+            let immediate = NSDate::distantPast();
+            while let Some(e) = app.nextEventMatchingMask_untilDate_inMode_dequeue(
+                NSEventMask::Any,
+                Some(&immediate),
+                default_mode,
+                true,
+            ) {
+                app.sendEvent(&e);
+            }
+        }
     }
 }
 
