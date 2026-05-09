@@ -1,8 +1,8 @@
 // Single source of truth for the version label shown across the landing site
 // (nav badge, hero pill, footer line). Update here when cutting a release —
 // don't sprinkle string literals through the sections.
-export const VERSION = 'v0.1.36'
+export const VERSION = 'v0.1.37'
 
 // Short tagline shown next to the hero version pill — typically the headline
 // feature or theme of the release. Empty string hides the secondary text.
-export const VERSION_TAGLINE = 'CRD-style remote desktop — pure object-fit:contain, pinch or % button to fill more screen'
+export const VERSION_TAGLINE = 'Stable background agent — auto-respawn, tunnel persistence, sleep/wake recovery'
