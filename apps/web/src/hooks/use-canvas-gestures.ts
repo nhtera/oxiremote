@@ -636,6 +636,8 @@ export function useCanvasGestures({
   const userInteractedRef = useRef(false)
   const lastFitWRef = useRef(0)
   const lastFitHRef = useRef(0)
+  const lastFitIwRef = useRef(0)
+  const lastFitIhRef = useRef(0)
   const fitToViewport = useCallback(() => {
     if (userInteractedRef.current) return
     const c = target.current
@@ -645,12 +647,25 @@ export function useCanvasGestures({
     const ih = (c as HTMLCanvasElement).height
     const vrect = v.getBoundingClientRect()
     if (!iw || !ih || !vrect.width || !vrect.height) return
+    // Skip the canvas's pre-bitmap default of 300×150 — those dims are
+    // the HTMLCanvasElement default before the first frame arrives. If
+    // we computed a fit against them, the screenDims-driven re-fit would
+    // be locked out by the idempotent guard below once the real bitmap
+    // landed but the wrap rect had already settled.
+    if (iw === 300 && ih === 150) return
     // Idempotent on identical dims — ResizeObserver fires for sub-pixel
     // changes and we don't want to re-write the transform every frame.
+    // Includes canvas dims so a new bitmap (host changed monitor / pipeline
+    // swap from default 300×150) re-runs the fit even when the wrap is
+    // unchanged.
     if (Math.abs(vrect.width - lastFitWRef.current) < 1 &&
-        Math.abs(vrect.height - lastFitHRef.current) < 1) return
+        Math.abs(vrect.height - lastFitHRef.current) < 1 &&
+        iw === lastFitIwRef.current &&
+        ih === lastFitIhRef.current) return
     lastFitWRef.current = vrect.width
     lastFitHRef.current = vrect.height
+    lastFitIwRef.current = iw
+    lastFitIhRef.current = ih
     const intAspect = iw / ih
     const wrapAspect = vrect.width / vrect.height
     const mismatch = intAspect > wrapAspect ? intAspect / wrapAspect : wrapAspect / intAspect
@@ -685,6 +700,8 @@ export function useCanvasGestures({
     userInteractedRef.current = false
     lastFitWRef.current = 0
     lastFitHRef.current = 0
+    lastFitIwRef.current = 0
+    lastFitIhRef.current = 0
     applyTransform()
     fitToViewport()
   }, [applyTransform, fitToViewport])
