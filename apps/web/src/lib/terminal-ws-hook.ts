@@ -6,6 +6,7 @@ import { isDiscoveryMode, getCurrentTunnelUrl } from './discovery-client'
 import { getActiveHost, loadApiKey, loadTunnelBase, storeTunnelBase } from './api-client'
 import { probeHost, refreshTunnelBaseFromDiscovery } from './host-reachability'
 import { isAllowedTunnelHost, getNamedTunnelAllowlist } from './url-validation'
+import { shouldFastRetryOnHandshakeFailure } from './ws-fast-retry'
 import { TUNNEL_URL_CHANGED_EVENT } from '../hooks/use-tunnel-url-sse'
 
 export type ReconnectPhase = 'fast' | 'slow'
@@ -35,18 +36,6 @@ export type SessionHandle = {
   // Tracks whether the one-shot immediate retry has been spent in the current
   // disconnect cycle. Reset on a successful open so future drops can use it.
   fastRetryUsed: boolean
-}
-
-/// Decision predicate (pure, exported for unit tests): when a WS closes
-/// without ever having opened AND we haven't already used the fast retry
-/// for this disconnect cycle, retry once with no backoff. Quick Tunnel
-/// edge-stream-listener hiccups normally heal within ~50-200ms so this
-/// path catches transients before they reach the modal.
-export function shouldFastRetryOnHandshakeFailure(
-  everOpenedThisCycle: boolean,
-  fastRetryUsed: boolean,
-): boolean {
-  return !everOpenedThisCycle && !fastRetryUsed
 }
 
 /// Subprotocol marker used to carry a Bearer api_key on WS upgrade in

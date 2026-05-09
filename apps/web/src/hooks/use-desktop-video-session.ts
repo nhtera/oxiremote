@@ -22,6 +22,7 @@ import type { DesktopInputEvent, DesktopStatus, QualityTier } from './use-deskto
 import { isDiscoveryMode, getCurrentTunnelUrl } from '../lib/discovery-client'
 import { getActiveHost, loadApiKey, loadTunnelBase, storeTunnelBase } from '../lib/api-client'
 import { isAllowedTunnelHost, getNamedTunnelAllowlist } from '../lib/url-validation'
+import { shouldFastRetryOnHandshakeFailure } from '../lib/ws-fast-retry'
 import { TUNNEL_URL_CHANGED_EVENT } from './use-tunnel-url-sse'
 
 const WS_BEARER_PROTOCOL = 'oxi-bearer-v1'
@@ -91,6 +92,11 @@ export function useDesktopVideoSession(
   const attemptRef = useRef(0)
   const destroyedRef = useRef(false)
   const rvfcHandleRef = useRef<number | null>(null)
+  // Distinguishes Cloudflare Quick Tunnel handshake transients (close/error
+  // before onopen) from mid-session disconnects. Reset to false in connect();
+  // flipped true once `ws.onopen` fires. Pairs with fastRetryUsedRef.
+  const everOpenedThisCycleRef = useRef(false)
+  const fastRetryUsedRef = useRef(false)
 
   // Latest UI tier — pushed into ctrl DC on open so the agent encodes at the
   // right bitrate from the first frame rather than falling back to default.
@@ -193,6 +199,7 @@ export function useDesktopVideoSession(
   const connect = useCallback(() => {
     if (destroyedRef.current) return
     teardown()
+    everOpenedThisCycleRef.current = false
 
     setStatus('connecting')
     const protocols = wsProtocols()
@@ -260,6 +267,8 @@ export function useDesktopVideoSession(
     ws.onopen = () => {
       // If this WS is already stale (StrictMode cleanup closed our pc), skip.
       if (wsRef.current !== ws) return
+      everOpenedThisCycleRef.current = true
+      fastRetryUsedRef.current = false
       setStatus('signaling')
       // Announce decoder capabilities BEFORE sending the offer so the server
       // can decide H.264 vs JPEG before the first ICE candidate arrives.
@@ -339,6 +348,19 @@ export function useDesktopVideoSession(
 
   function handleDisconnect() {
     if (destroyedRef.current) return
+
+    // Cloudflare Quick Tunnel handshake transients close the WS before
+    // `onopen` ever fires. Burn one immediate retry per cycle without
+    // bumping the attempt counter or flipping into the 'reconnecting' state.
+    if (shouldFastRetryOnHandshakeFailure(everOpenedThisCycleRef.current, fastRetryUsedRef.current)) {
+      fastRetryUsedRef.current = true
+      teardown()
+      queueMicrotask(() => {
+        if (!destroyedRef.current) connect()
+      })
+      return
+    }
+
     const next = attemptRef.current + 1
     attemptRef.current = next
     setAttempt(next)

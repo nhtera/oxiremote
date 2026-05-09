@@ -8,6 +8,7 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import { isDiscoveryMode, getCurrentTunnelUrl } from '../lib/discovery-client'
 import { getActiveHost, loadApiKey, loadTunnelBase, storeTunnelBase } from '../lib/api-client'
 import { isAllowedTunnelHost, getNamedTunnelAllowlist } from '../lib/url-validation'
+import { shouldFastRetryOnHandshakeFailure } from '../lib/ws-fast-retry'
 import { TUNNEL_URL_CHANGED_EVENT } from './use-tunnel-url-sse'
 
 /// Subprotocol marker used to carry a Bearer api_key on WS upgrade in
@@ -113,6 +114,12 @@ export function useDesktopSession(
   const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const attemptRef = useRef(0)
   const destroyedRef = useRef(false)
+  // Distinguishes Cloudflare Quick Tunnel handshake transients (close/error
+  // before onopen) from mid-session disconnects. Reset to false at the start
+  // of every connect(); flipped true once `ws.onopen` fires. Pairs with
+  // fastRetryUsedRef to gate the one-shot immediate retry per cycle.
+  const everOpenedThisCycleRef = useRef(false)
+  const fastRetryUsedRef = useRef(false)
   // Latest UI-selected tier — read from `ctrlDc.onopen` to tell the agent
   // which tier to encode at before any frame leaves. Kept in a ref (not in
   // the effect's dep list) so tier changes don't tear down the session.
@@ -149,6 +156,7 @@ export function useDesktopSession(
     if (destroyedRef.current) return
     teardown()
     fallbackRef.current = false
+    everOpenedThisCycleRef.current = false
 
     setStatus('connecting')
 
@@ -231,6 +239,8 @@ export function useDesktopSession(
 
     ws.onopen = () => {
       if (wsRef.current !== ws) return
+      everOpenedThisCycleRef.current = true
+      fastRetryUsedRef.current = false
       setStatus('signaling')
       // Push the persisted HiDPI preference before the offer so the agent
       // builds the JPEG capture pipeline at the right dims from frame zero.
@@ -346,6 +356,20 @@ export function useDesktopSession(
 
   function handleDisconnect() {
     if (destroyedRef.current) return
+
+    // Cloudflare Quick Tunnel handshake transients close the WS before
+    // `onopen` ever fires. Burn one immediate retry per cycle without
+    // bumping the user-visible attempt counter or flipping into the
+    // 'reconnecting' state — the modal/UI never reacts.
+    if (shouldFastRetryOnHandshakeFailure(everOpenedThisCycleRef.current, fastRetryUsedRef.current)) {
+      fastRetryUsedRef.current = true
+      teardown()
+      queueMicrotask(() => {
+        if (!destroyedRef.current) connect()
+      })
+      return
+    }
+
     const next = attemptRef.current + 1
     attemptRef.current = next
     setAttempt(next)

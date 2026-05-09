@@ -4,8 +4,8 @@ import {
   MAX_RECONNECT_ATTEMPTS,
   SLOW_BACKOFF_MS,
   backoffMsForAttempt,
-  shouldFastRetryOnHandshakeFailure,
 } from './terminal-ws-hook'
+import { shouldFastRetryOnHandshakeFailure } from './ws-fast-retry'
 
 // The hook itself opens real WebSockets — too entangled with React lifecycle
 // for unit tests. The contract worth pinning here is the two-phase backoff:
