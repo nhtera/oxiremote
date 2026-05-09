@@ -632,51 +632,46 @@ export function useCanvasGestures({
   // lands closer to the wrap height. Capped so horizontal pan stays
   // bounded — the user can pinch in further if they want true cover.
   const autoFittedRef = useRef(false)
+  const fitRetriesRef = useRef(0)
   const fitToViewport = useCallback(() => {
     if (autoFittedRef.current) return
     const c = target.current
     const v = viewport.current
-    if (!c || !v) return
+    if (!c || !v) {
+      // Refs not populated yet — retry on next frame, bounded.
+      if (fitRetriesRef.current++ < 10) requestAnimationFrame(() => fitToViewport())
+      return
+    }
     const iw = (c as HTMLCanvasElement).width
     const ih = (c as HTMLCanvasElement).height
     const vrect = v.getBoundingClientRect()
-    if (!iw || !ih || !vrect.width || !vrect.height) return
+    if (!iw || !ih || !vrect.width || !vrect.height) {
+      // Layout hasn't settled yet (lazy-chunk + first paint racing the
+      // capabilities WS message). Retry on next frame, bounded so a stuck
+      // 0-dim wrap doesn't burn cycles forever. Without this retry the
+      // single shot from the screenDims useEffect is wasted on undefined
+      // wrap dimensions and the auto-fit never applies.
+      if (fitRetriesRef.current++ < 10) requestAnimationFrame(() => fitToViewport())
+      return
+    }
     if (scaleRef.current !== 1 || txRef.current !== 0 || tyRef.current !== 0) {
-      // User (or a prior auto-fit) already moved the transform — leave it.
       autoFittedRef.current = true
       return
     }
     const intAspect = iw / ih
     const wrapAspect = vrect.width / vrect.height
-    // mismatch >= 1, equals 1 only when the aspects match exactly.
     const mismatch = intAspect > wrapAspect ? intAspect / wrapAspect : wrapAspect / intAspect
-    // Threshold: at mismatch ≤ 1.3 the pure-contain fill is ≥ 77% which
-    // reads as "fits well" (the Mac case the user explicitly approved).
-    // Don't fight it.
     if (mismatch <= 1.3) {
       autoFittedRef.current = true
       return
     }
-    // Two-cap strategy. For landscape wraps (typical desktop browser with
-    // sidebar) horizontal pan is cheap and we go close to cover-fit so the
-    // host fills the wrap height fully. For portrait wraps (mobile) the
-    // user previously rejected aggressive zoom — keep that capped tighter
-    // so vertical+horizontal overflow doesn't both happen at once.
     const cap = wrapAspect >= 1 ? 1.8 : 1.5
-    // Pure-contain fill = 1 / mismatch. To reach the wrap edge we'd need
-    // scale = mismatch (true cover). 0.95× of that lands a hair inside
-    // the wrap height so a visible sliver of letterbox remains —
-    // RVNC-style reassurance that you're seeing the whole frame.
     const S = Math.min(cap, 0.95 * mismatch)
     if (S <= 1.001) {
       autoFittedRef.current = true
       return
     }
     scaleRef.current = S
-    // Centre the scaled layer around the wrap centre. With
-    // transform-origin 0 0, raw scale pushes content down-right from the
-    // top-left; this offset compensates back to a centred result without
-    // changing the origin (the pinch-zoom math depends on origin 0 0).
     txRef.current = ((1 - S) * vrect.width) / 2
     tyRef.current = ((1 - S) * vrect.height) / 2
     applyTransform()
@@ -692,6 +687,7 @@ export function useCanvasGestures({
     txRef.current = 0
     tyRef.current = 0
     autoFittedRef.current = false
+    fitRetriesRef.current = 0
     applyTransform()
   }, [applyTransform])
 
