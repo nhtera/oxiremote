@@ -265,6 +265,37 @@ fn main() -> anyhow::Result<()> {
     }
 }
 
+/// Bind a TCP listener with bounded retry on `AddrInUse`. The TUI parent
+/// already binds :8787 to keep the dashboard responsive; when the user picks
+/// "Open Web UI" the parent calls `process::exit(0)` and the detached child
+/// races to bind before Windows has fully released the parent's listener.
+/// On a clean handoff that release window is well under a second, but it can
+/// stretch to 1–2s on busy machines. Retry with exponential backoff inside
+/// `timeout` so transient cleanup is invisible to the operator; only fall
+/// through to the legacy "sweep stale processes" path once the window closes.
+async fn bind_with_retry(
+    addr: std::net::SocketAddr,
+    timeout: std::time::Duration,
+) -> std::io::Result<tokio::net::TcpListener> {
+    use tokio::time::{Duration, Instant};
+    let deadline = Instant::now() + timeout;
+    let mut delay_ms = 100u64;
+    loop {
+        match tokio::net::TcpListener::bind(addr).await {
+            Ok(l) => return Ok(l),
+            Err(e)
+                if e.kind() == std::io::ErrorKind::AddrInUse
+                    && Instant::now() < deadline =>
+            {
+                tracing::debug!(%addr, delay_ms, "bind AddrInUse — retrying");
+                tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                delay_ms = (delay_ms * 2).min(800);
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
 /// Poll loopback `AGENT_PORT` with `GET /api/health` until the handler
 /// responds 200, or `timeout` elapses. Returns true on first 200, false if
 /// the deadline lapses with no successful probe.
@@ -1099,14 +1130,15 @@ async fn server_main(
         }
     }
 
-    let listener = match tokio::net::TcpListener::bind(addr).await {
+    let listener = match bind_with_retry(addr, std::time::Duration::from_secs(5)).await {
         Ok(l) => l,
         Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
-            // Belt-and-braces: instance_lock::acquire already kills the prior
-            // process via pidfile, but a stale/missing pidfile (e.g. crash
-            // without Drop, pre-0.1.1 data_dir bug on Windows) leaves the old
-            // agent holding the port. Sweep the process table once and retry.
-            tracing::warn!(%addr, "port in use — sweeping stale oxiremote processes");
+            // The retry window expired with the port still in use. Either a
+            // genuine orphan oxiremote is holding it (prior crash without
+            // Drop, pre-0.1.1 data_dir bug on Windows) or some unrelated app
+            // grabbed :8787. Sweep the process table — if anything was
+            // killed, give it a moment and try once more before giving up.
+            tracing::warn!(%addr, "port in use after retry window — sweeping stale oxiremote processes");
             let killed = instance_lock::kill_other_oxiremote_processes();
             if killed == 0 {
                 eprintln!(
