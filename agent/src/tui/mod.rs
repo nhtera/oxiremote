@@ -94,6 +94,19 @@ fn spawn_detached_tray() {
             });
         }
     }
+    #[cfg(windows)]
+    {
+        // Mirror `run_ui_command` — without DETACHED_PROCESS the child
+        // inherits the TUI parent's console, and when the parent exits it
+        // tears that console down underneath the still-running child, which
+        // leaves tray-icon's hidden message window in a half-dead state and
+        // makes the dashboard load black/stuck. CREATE_NO_WINDOW prevents a
+        // flash of an empty console window in the meantime.
+        use std::os::windows::process::CommandExt;
+        const DETACHED_PROCESS: u32 = 0x00000008;
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+        cmd.creation_flags(DETACHED_PROCESS | CREATE_NO_WINDOW);
+    }
 
     match cmd.spawn() {
         Ok(child) => {
