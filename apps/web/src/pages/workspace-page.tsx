@@ -647,11 +647,15 @@ export default function WorkspacePage() {
       {hasSessions && anyAssigned && <TerminalSendComposer onSend={sendInput} />}
 
       <ReconnectModal
-        // Defer modal until attempt > 1 so the first transient drop (cold-tunnel
-        // WS upgrade race, stale-URL recovery via discovery worker, etc.) recovers
-        // silently inside the 500ms first-attempt backoff. The modal still pops
-        // on attempt 2+ if the connection is genuinely stuck.
-        open={!!focusedSessionId && active?.state !== 'exited' && !isFocusedConnected && focusedAttempt > 1}
+        // Defer modal until attempt > 3 so the first ~3.5s of reconnect storm
+        // is silent. Cloudflare Quick Tunnels hardcode ha-connections=1, so a
+        // single QUIC connection routes everything; transient stream-listener
+        // hiccups at the edge surface as failed WS upgrades that the agent
+        // never sees. Recovery normally happens within 1-2 retries
+        // (backoff: 500ms+1000ms+2000ms = 3.5s). The "Disconnected" tab pill
+        // still gives feedback during the silent window. README → "Named
+        // tunnels" for the stable production fix.
+        open={!!focusedSessionId && active?.state !== 'exited' && !isFocusedConnected && focusedAttempt > 3}
         attempt={focusedAttempt}
         maxAttempts={MAX_RECONNECT_ATTEMPTS}
         phase={focusedPhase}

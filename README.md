@@ -80,7 +80,9 @@ Tapping the notification opens the deep link on the correct host. The CLI reads 
 
 ## Named tunnels (production)
 
-For a stable hostname, configure a Cloudflare Named Tunnel:
+Quick Tunnels are great for trying things out, but they hardcode `ha-connections=1`: every HTTP and WebSocket request from your client funnels through a single QUIC connection to a single Cloudflare edge POP. When that connection has a transient stream-listener hiccup — which Cloudflare itself flags as expected for account-less tunnels ("no uptime guarantee") — in-flight WS upgrades fail at the edge and never reach the agent. The SPA reconnects automatically, but you'll occasionally see "Connection lost" flashes.
+
+A Named Tunnel runs with `ha-connections=4` across multiple edge POPs and gets you a stable hostname that doesn't rotate per process. Setup is one-time:
 
 ```bash
 # 1. Write the config scaffold
