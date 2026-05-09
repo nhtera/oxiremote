@@ -389,7 +389,6 @@ export function useCanvasGestures({
             tyRef.current = localMidY - (localMidY - tyRef.current) * k
             scaleRef.current = newScale
             transformChanged = true
-            userInteractedRef.current = true
           }
         }
 
@@ -405,7 +404,6 @@ export function useCanvasGestures({
             txRef.current += midDx
             tyRef.current += midDy
             transformChanged = true
-            userInteractedRef.current = true
           }
         } else {
           const wdx = Math.round(midDx / 8)
@@ -435,7 +433,6 @@ export function useCanvasGestures({
         if (p.moved) {
           txRef.current += dx
           tyRef.current += dy
-          userInteractedRef.current = true
           applyTransform()
         }
       } else {
@@ -499,7 +496,6 @@ export function useCanvasGestures({
         if (panX !== 0 || panY !== 0) {
           txRef.current += panX
           tyRef.current += panY
-          userInteractedRef.current = true
           applyTransform()
           // Pan absorbed |pan|; reduce cursor advancement by the same so the
           // remote-coord invariant holds (cursor_delta + |pan| = wantDelta).
@@ -625,86 +621,25 @@ export function useCanvasGestures({
   // erase finger-driven movements after the on-screen keyboard appears /
   // hides.)
 
-  // Conservative auto-fit. RVNC-pure `object-fit: contain` leaves big
-  // letterbox bars when the host aspect doesn't match the wrap. We scale
-  // up modestly (cap 1.25 → ~12.5% crop per side worst case). Re-fits on
-  // every wrap resize via ResizeObserver until the user pinches or pans —
-  // important because the first-paint wrap rect is often stale (lazy
-  // chunk + capabilities WS message racing flex layout), which left the
-  // auto-fit translate computed against a smaller wrap and the image
-  // visually anchored top-left after layout grew.
-  const userInteractedRef = useRef(false)
-  const lastFitWRef = useRef(0)
-  const lastFitHRef = useRef(0)
-  const lastFitIwRef = useRef(0)
-  const lastFitIhRef = useRef(0)
+  // CRD-style: pure object-fit: contain, no auto-scale. Aspect-mismatched
+  // hosts get letterbox bars by default — same as Chrome Remote Desktop.
+  // User pinches in (or hits the % button to set 100%/150%/200%) when they
+  // want to fill more screen at the cost of cropping edges. Earlier ships
+  // tried to be clever with auto-scale-up + ResizeObserver re-fit and the
+  // math was provably correct, but the visual result was still confusing
+  // (different fit on first vs second paint, scale-up that looked cropped
+  // even when it wasn't). KISS: don't touch the transform automatically.
   const fitToViewport = useCallback(() => {
-    if (userInteractedRef.current) return
-    const c = target.current
-    const v = viewport.current
-    if (!c || !v) return
-    const iw = (c as HTMLCanvasElement).width
-    const ih = (c as HTMLCanvasElement).height
-    const vrect = v.getBoundingClientRect()
-    if (!iw || !ih || !vrect.width || !vrect.height) return
-    // Skip the canvas's pre-bitmap default of 300×150 — those dims are
-    // the HTMLCanvasElement default before the first frame arrives. If
-    // we computed a fit against them, the screenDims-driven re-fit would
-    // be locked out by the idempotent guard below once the real bitmap
-    // landed but the wrap rect had already settled.
-    if (iw === 300 && ih === 150) return
-    // Idempotent on identical dims — ResizeObserver fires for sub-pixel
-    // changes and we don't want to re-write the transform every frame.
-    // Includes canvas dims so a new bitmap (host changed monitor / pipeline
-    // swap from default 300×150) re-runs the fit even when the wrap is
-    // unchanged.
-    if (Math.abs(vrect.width - lastFitWRef.current) < 1 &&
-        Math.abs(vrect.height - lastFitHRef.current) < 1 &&
-        iw === lastFitIwRef.current &&
-        ih === lastFitIhRef.current) return
-    lastFitWRef.current = vrect.width
-    lastFitHRef.current = vrect.height
-    lastFitIwRef.current = iw
-    lastFitIhRef.current = ih
-    const intAspect = iw / ih
-    const wrapAspect = vrect.width / vrect.height
-    const mismatch = intAspect > wrapAspect ? intAspect / wrapAspect : wrapAspect / intAspect
-    let S = mismatch <= 1.3 ? 1 : Math.min(1.25, 0.95 * mismatch)
-    if (S < 1.001) S = 1
-    scaleRef.current = S
-    txRef.current = S === 1 ? 0 : ((1 - S) * vrect.width) / 2
-    tyRef.current = S === 1 ? 0 : ((1 - S) * vrect.height) / 2
-    applyTransform()
-  }, [target, viewport, applyTransform])
+    // No-op preserved as an exported handle so existing call sites
+    // (`screenDims` useEffect, gesture API consumers) compile unchanged.
+  }, [])
 
-  // Re-fit on wrap resize until the user takes manual control. Catches the
-  // common race where the screenDims useEffect fires while the flex parent
-  // is still measuring 0 (or a stale small size); the observer trips again
-  // when the real layout lands and re-centers correctly.
-  useEffect(() => {
-    const v = viewport.current
-    if (!v) return
-    const ro = new ResizeObserver(() => fitToViewport())
-    ro.observe(v)
-    return () => ro.disconnect()
-  }, [viewport, fitToViewport])
-
-  /** Reset the matrix transform — drops any pinch-zoom or edge-pan offset.
-   *  `applyTransform` re-fires `onZoomChange(1)` so the toolbar's zoom %
-   *  indicator follows. Re-arms `fitToViewport` so a follow-up call (or
-   *  ResizeObserver tick) can apply the smart auto-fit again. */
   const resetZoom = useCallback(() => {
     scaleRef.current = 1
     txRef.current = 0
     tyRef.current = 0
-    userInteractedRef.current = false
-    lastFitWRef.current = 0
-    lastFitHRef.current = 0
-    lastFitIwRef.current = 0
-    lastFitIhRef.current = 0
     applyTransform()
-    fitToViewport()
-  }, [applyTransform, fitToViewport])
+  }, [applyTransform])
 
   return { cursor, resetZoom, fitToViewport }
 }
