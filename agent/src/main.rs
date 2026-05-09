@@ -389,9 +389,14 @@ fn run_ui_command() -> anyhow::Result<()> {
 /// Headless path: single tokio runtime on the current (main) thread.
 fn run_server_headless() -> anyhow::Result<()> {
     let bus = EventBus::new();
-    tracing_setup::init(tracing_setup::AgentMode::Headless, bus.clone());
-
     let data_dir = default_data_dir()?;
+    // Hold the file-appender guard for the lifetime of the process so
+    // background log lines are flushed at clean shutdown.
+    let _log_guard = tracing_setup::init(
+        tracing_setup::AgentMode::Headless,
+        bus.clone(),
+        &data_dir,
+    );
     let _lock = instance_lock::InstanceLock::acquire(&data_dir)
         .context("acquire instance lock")?;
 
@@ -410,9 +415,12 @@ fn run_server_headless() -> anyhow::Result<()> {
 /// The event bus is shared so tunnel/device events drive the TUI live.
 fn run_with_tui() -> anyhow::Result<()> {
     let bus = EventBus::new();
-    tracing_setup::init(tracing_setup::AgentMode::Tui, bus.clone());
-
     let data_dir = default_data_dir()?;
+    let _log_guard = tracing_setup::init(
+        tracing_setup::AgentMode::Tui,
+        bus.clone(),
+        &data_dir,
+    );
     let lock = instance_lock::InstanceLock::acquire(&data_dir)
         .context("acquire instance lock")?;
 
@@ -500,9 +508,15 @@ fn run_with_tray() -> anyhow::Result<()> {
     }
 
     let bus = EventBus::new();
-    tracing_setup::init(tracing_setup::AgentMode::Headless, bus.clone());
-
     let data_dir = default_data_dir()?;
+    // File-log guard MUST live until the tray loop exits; we hand it to a
+    // local binding so it's dropped on `process::exit(0)` from the Shutdown
+    // menu (drop = flush + close the appender thread).
+    let _log_guard = tracing_setup::init(
+        tracing_setup::AgentMode::Headless,
+        bus.clone(),
+        &data_dir,
+    );
     let _lock = instance_lock::InstanceLock::acquire(&data_dir)
         .context("acquire instance lock")?;
 

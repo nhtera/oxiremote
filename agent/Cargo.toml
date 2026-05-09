@@ -3,7 +3,7 @@ members = [".", "crates/desktop"]
 
 [package]
 name = "oxiremote"
-version = "0.1.41"
+version = "0.1.42"
 edition = "2024"
 description = "Self-hosted remote-access agent — terminal, files, preview, and remote desktop over a Cloudflare tunnel."
 repository = "https://github.com/nhtera/oxiremote"
@@ -42,6 +42,7 @@ tower = "0.5"
 tower-http = { version = "0.6", features = ["trace", "cors"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-appender = "0.2"
 uuid = { version = "1", features = ["v4", "serde"] }
 
 blake3 = "1"
