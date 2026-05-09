@@ -478,6 +478,27 @@ fn run_with_tui() -> anyhow::Result<()> {
 /// main. macOS / Windows require the tray to live on the main thread, so the
 /// dispatcher is symmetric with `run_with_tui` — only the consumer differs.
 fn run_with_tray() -> anyhow::Result<()> {
+    // Windows: the parent (`oxiremote ui` or the TUI's "Open Web UI") spawned
+    // us with DETACHED_PROCESS, so we have no console. Cloudflared is a CUI
+    // subsystem child and on some Windows configurations refuses to function
+    // without a real console handle (it bails on its first quick-tunnel API
+    // call with "invalid UUID length: 0"). Allocate our own console up front
+    // and immediately hide its window so the user never sees it. Cloudflared
+    // then inherits a valid console handle when we spawn it later.
+    #[cfg(target_os = "windows")]
+    unsafe {
+        use windows_sys::Win32::System::Console::{AllocConsole, GetConsoleWindow};
+        use windows_sys::Win32::UI::WindowsAndMessaging::{ShowWindow, SW_HIDE};
+        // Best-effort. AllocConsole returns 0 if a console is already
+        // attached (e.g. agent launched directly from PowerShell without
+        // detach) — that's fine; we just hide whatever we have.
+        let _ = AllocConsole();
+        let hwnd = GetConsoleWindow();
+        if !hwnd.is_null() {
+            let _ = ShowWindow(hwnd, SW_HIDE);
+        }
+    }
+
     let bus = EventBus::new();
     tracing_setup::init(tracing_setup::AgentMode::Headless, bus.clone());
 

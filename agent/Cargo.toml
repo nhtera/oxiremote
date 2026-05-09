@@ -3,7 +3,7 @@ members = [".", "crates/desktop"]
 
 [package]
 name = "oxiremote"
-version = "0.1.40"
+version = "0.1.41"
 edition = "2024"
 description = "Self-hosted remote-access agent — terminal, files, preview, and remote desktop over a Cloudflare tunnel."
 repository = "https://github.com/nhtera/oxiremote"
@@ -114,6 +114,12 @@ windows-sys = { version = "0.59", features = [
     # because its signature takes *mut OVERLAPPED. Without it, the symbol
     # is invisible and the compiler suggests `LockFile` instead.
     "Win32_System_IO",
+    # Win32_System_Console — AllocConsole + GetConsoleWindow used by the
+    # detached --tray child to give itself a hidden console so cloudflared
+    # (a CUI subsystem child) inherits a real console handle. Without this
+    # the spawned cloudflared bails on its first Cloudflare API call with
+    # "invalid UUID length: 0".
+    "Win32_System_Console",
     "Win32_Security",
     "Win32_Foundation",
     "Win32_Storage_FileSystem",
