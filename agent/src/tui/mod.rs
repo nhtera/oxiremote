@@ -184,12 +184,22 @@ fn new_terminal() -> Result<Term> {
 /// `discovery_url` + `discovery_temp_key` are populated when
 /// `OXI_DISCOVERY_URL` is set; the dashboard uses them to switch the QR
 /// payload to the cross-origin discovery form.
-pub fn run_tui(
+///
+/// `spawn_server` is invoked lazily on the FIRST "Terminal UI" menu pick.
+/// "Open Web UI" never invokes it — that path daemonizes a fresh `--tray`
+/// child without ever binding :8787 in this process, eliminating the
+/// parent→child port-handoff race that previously caused 5-10s of bind
+/// failures on Windows.
+pub fn run_tui<F>(
     event_bus: Arc<EventBus>,
     db_path: PathBuf,
     discovery_url: Option<String>,
     discovery_temp_key: Arc<std::sync::RwLock<Option<String>>>,
-) -> Result<()> {
+    spawn_server: F,
+) -> Result<()>
+where
+    F: FnOnce() -> anyhow::Result<()>,
+{
     let mut _guard = TerminalGuard::enter()?;
     let mut term = new_terminal()?;
 
@@ -198,6 +208,8 @@ pub fn run_tui(
     // from the dashboard doesn't re-probe on every loop iteration. `mut` so
     // a successful update or a stale-cache no-op can clear the prompt.
     let mut update_version = crate::update::check_latest();
+
+    let mut spawn_server = Some(spawn_server);
 
     loop {
         match menu::run_menu(&mut term, update_version.as_deref())? {
@@ -208,20 +220,31 @@ pub fn run_tui(
                 // tunnel + tray going forward; the launching shell returns
                 // to its prompt.
                 //
-                // The child opens the browser itself — see `spawn_detached_tray`,
-                // which sets `OXI_OPEN_BROWSER_ON_READY=1`. Doing the open from
-                // the parent races the parent's exit: the parent's TCP probe
-                // succeeds against the parent's *own* listener, the parent
-                // opens Safari, the parent exits and releases :8787, and
-                // Safari hits the dead window before the child finishes
-                // booting. The child polls its own /api/health and opens the
-                // browser only once the response succeeds.
+                // CRITICAL: spawn_server has NOT been invoked, so :8787 is
+                // unbound in this process. The detached child gets a clean
+                // port — no race with parent's listener cleanup. (Previously
+                // the server was spawned eagerly before the menu, which left
+                // the child fighting the parent's TIME_WAIT / OS port-release
+                // window for 5-10s on Windows.)
+                //
+                // The child opens the browser itself via
+                // OXI_OPEN_BROWSER_ON_READY=1, polling its own /api/health
+                // first. Doing the open from the parent races the parent's
+                // exit and lands the browser in a "Can't Connect" gap.
                 drop(term);
                 drop(_guard);
                 spawn_detached_tray();
                 std::process::exit(0);
             }
             MenuChoice::TerminalUi => {
+                // Lazy server spawn — first time only. Subsequent re-entries
+                // (user hits 'b' from the dashboard, then picks Terminal UI
+                // again) reuse the already-running server thread.
+                if let Some(spawn) = spawn_server.take()
+                    && let Err(err) = spawn()
+                {
+                    return Err(err);
+                }
                 dashboard::run_dashboard(
                     &mut term,
                     event_bus.clone(),

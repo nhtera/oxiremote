@@ -444,6 +444,15 @@ fn run_server_headless() -> anyhow::Result<()> {
 
 /// TUI path: tokio runtime on a sibling thread, TUI event loop on main.
 /// The event bus is shared so tunnel/device events drive the TUI live.
+///
+/// Lazy server spawn: previously this function spawned the server thread
+/// (and bound :8787) before the menu was shown. When the user picked
+/// "Open Web UI (background)" we then called `process::exit(0)` and let
+/// the detached `--tray` child race to bind the same port — on Windows
+/// that race regularly cost 5-10s of port-cleanup, breaking the handoff.
+/// Now the server thread is only spawned if the user actually picks
+/// "Terminal UI", so the "Open Web UI" path becomes byte-equivalent to
+/// `oxiremote ui` from a clean state — no race, no bind retry needed.
 fn run_with_tui() -> anyhow::Result<()> {
     let bus = EventBus::new();
     let data_dir = default_data_dir()?;
@@ -457,50 +466,62 @@ fn run_with_tui() -> anyhow::Result<()> {
 
     let db_path = data_dir.join("oxiremote.sqlite");
 
-    // Build the discovery handle before spawning either thread so server +
+    // Build the discovery handle before either thread starts so server +
     // TUI share the same `discovery_temp_key` slot — the listener writes,
     // the TUI reads, no synchronization beyond the RwLock.
     let discovery_url = env_defaults::discovery_url();
     let discovery_temp_key: Arc<StdRwLock<Option<String>>> = Arc::new(StdRwLock::new(None));
 
+    // Closure that spawns the server thread on demand. The TUI invokes it
+    // only when the user enters the Terminal UI dashboard; the "Open Web
+    // UI" path never invokes it, so the parent never binds :8787.
     let bus_for_server = bus.clone();
     let discovery_url_srv = discovery_url.clone();
     let discovery_temp_key_srv = discovery_temp_key.clone();
-    std::thread::Builder::new()
-        .name("oxiremote-server".into())
-        .spawn(move || {
-            let rt = match tokio::runtime::Builder::new_multi_thread()
-                .enable_all()
-                .build()
-            {
-                Ok(rt) => rt,
-                Err(err) => {
-                    // No stderr in TUI mode — push to bus so log pane sees it.
+    let spawn_server = move || -> anyhow::Result<()> {
+        std::thread::Builder::new()
+            .name("oxiremote-server".into())
+            .spawn(move || {
+                let rt = match tokio::runtime::Builder::new_multi_thread()
+                    .enable_all()
+                    .build()
+                {
+                    Ok(rt) => rt,
+                    Err(err) => {
+                        // No stderr in TUI mode — push to bus so log pane sees it.
+                        bus_for_server.send(crate::events::AgentEvent::LogEntry {
+                            level: crate::events::LogLevel::Error,
+                            module: "agent".into(),
+                            ts: 0,
+                            msg: format!("failed to build tokio runtime: {err}"),
+                        });
+                        return;
+                    }
+                };
+                if let Err(err) = rt.block_on(server_main(
+                    bus_for_server.clone(),
+                    discovery_url_srv,
+                    discovery_temp_key_srv,
+                )) {
                     bus_for_server.send(crate::events::AgentEvent::LogEntry {
                         level: crate::events::LogLevel::Error,
                         module: "agent".into(),
                         ts: 0,
-                        msg: format!("failed to build tokio runtime: {err}"),
+                        msg: format!("server exited: {err:#}"),
                     });
-                    return;
                 }
-            };
-            if let Err(err) = rt.block_on(server_main(
-                bus_for_server.clone(),
-                discovery_url_srv,
-                discovery_temp_key_srv,
-            )) {
-                bus_for_server.send(crate::events::AgentEvent::LogEntry {
-                    level: crate::events::LogLevel::Error,
-                    module: "agent".into(),
-                    ts: 0,
-                    msg: format!("server exited: {err:#}"),
-                });
-            }
-        })
-        .context("spawn server thread")?;
+            })
+            .context("spawn server thread")?;
+        Ok(())
+    };
 
-    let result = tui::run_tui(bus, db_path, discovery_url, discovery_temp_key);
+    let result = tui::run_tui(
+        bus,
+        db_path,
+        discovery_url,
+        discovery_temp_key,
+        spawn_server,
+    );
     // Explicit drop — process::exit skips destructors so we'd otherwise leak
     // the PID file and lock out the next start.
     drop(lock);
