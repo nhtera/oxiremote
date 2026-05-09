@@ -1,8 +1,8 @@
 // Single source of truth for the version label shown across the landing site
 // (nav badge, hero pill, footer line). Update here when cutting a release —
 // don't sprinkle string literals through the sections.
-export const VERSION = 'v0.1.32'
+export const VERSION = 'v0.1.33'
 
 // Short tagline shown next to the hero version pill — typically the headline
 // feature or theme of the release. Empty string hides the secondary text.
-export const VERSION_TAGLINE = 'Auto-fit retry on layout race — fix sticky letterbox when wrap measures 0 on first paint'
+export const VERSION_TAGLINE = 'Tighter auto-fit cap (1.25) — no more cropped left-edge content on aspect-mismatched viewports'

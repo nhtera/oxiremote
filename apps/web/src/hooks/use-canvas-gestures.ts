@@ -622,15 +622,15 @@ export function useCanvasGestures({
   // hides.)
 
   // Conservative auto-fit. RVNC-pure `object-fit: contain` leaves big
-  // letterbox bars when the host aspect doesn't match the wrap (typical
-  // examples: 16:9 host on iPhone portrait → 28% fill; 16:9 host inside
-  // a desktop browser whose lg-sidebar squashes the wrap to ≤1.2 aspect
-  // → 57% fill). The user accepts pure-contain when the fill is already
-  // ≥80% (e.g. 16:10 Mac host) but reads anything below that as "small".
-  // We compute the would-be pure-contain fill and, when it's noticeably
-  // below the comfortable threshold, scale the layer up so painted-h
-  // lands closer to the wrap height. Capped so horizontal pan stays
-  // bounded — the user can pinch in further if they want true cover.
+  // letterbox bars when the host aspect doesn't match the wrap. We scale
+  // up modestly to reclaim some of those bars, but the cap is tight (1.25)
+  // because once contain fits one dimension, every additional 0.1 of scale
+  // crops 5% of the other dimension on each side. At cap 1.25 the worst-
+  // case crop is ~12.5% per side — visible but recoverable via pinch /
+  // pan. Earlier ships used 1.5/1.8, which produced 25% crop and visibly
+  // cut content (left-edge "phone or tablet" → "hone or tablet"). The
+  // user can pinch in further for true cover; we only auto-trade a small
+  // amount of edge content for visibly larger central content.
   const autoFittedRef = useRef(false)
   const fitRetriesRef = useRef(0)
   const fitToViewport = useCallback(() => {
@@ -665,8 +665,7 @@ export function useCanvasGestures({
       autoFittedRef.current = true
       return
     }
-    const cap = wrapAspect >= 1 ? 1.8 : 1.5
-    const S = Math.min(cap, 0.95 * mismatch)
+    const S = Math.min(1.25, 0.95 * mismatch)
     if (S <= 1.001) {
       autoFittedRef.current = true
       return
