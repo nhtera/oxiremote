@@ -290,6 +290,11 @@ export function useDesktopVideoSession(
           // Stale PC from a previous StrictMode mount may reject after the
           // live mount replaced our refs — don't cascade its failure.
           if (pcRef.current !== pc) return
+          // handleDisconnect is a hoisted `function` declared below; the
+          // mutual reference between connect/handleDisconnect is intentional
+          // and safe (no reassignment, function-declaration hoisting handles
+          // it at runtime).
+          // eslint-disable-next-line react-hooks/immutability
           handleDisconnect()
         })
     }
@@ -327,7 +332,6 @@ export function useDesktopVideoSession(
           // have mounted the JPEG hook instead — log and close as protocol
           // mismatch rather than silently streaming via the wrong path.
           if (msg.mode !== 'h264') {
-            // eslint-disable-next-line no-console
             console.warn('video-session: server selected non-H.264 pipeline', msg.mode)
           }
           break
@@ -397,14 +401,14 @@ export function useDesktopVideoSession(
     }, RECONNECT_DELAY_MS)
   }
 
-  const sendInput = useCallback((ev: DesktopInputEvent) => sendCtrl(ev), []) // eslint-disable-line
-  const setQuality = useCallback((q: QualityTier) => sendCtrl({ t: 'quality', tier: q }), []) // eslint-disable-line
+  const sendInput = useCallback((ev: DesktopInputEvent) => sendCtrl(ev), [])
+  const setQuality = useCallback((q: QualityTier) => sendCtrl({ t: 'quality', tier: q }), [])
   // Mid-session HiDPI flip → server tears down the PC; the reconnect path
   // re-runs ws.onopen which sends the new persisted hidpi before the offer.
   const setSettings = useCallback(
     (next: { hidpi: boolean }) => sendCtrl({ t: 'settings', hidpi: next.hidpi }),
     [],
-  ) // eslint-disable-line
+  )
 
   const disconnect = useCallback(() => {
     destroyedRef.current = true

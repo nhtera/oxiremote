@@ -420,18 +420,18 @@ export function useDesktopSession(
 
   const sendInput = useCallback((ev: DesktopInputEvent) => {
     sendCtrl(ev)
-  }, []) // eslint-disable-line react-hooks/exhaustive-deps
+  }, [])
 
   const setQuality = useCallback((tier: QualityTier) => {
     sendCtrl({ t: 'quality', tier })
-  }, []) // eslint-disable-line
+  }, [])
 
   // JPEG path supports live HiDPI flips: agent's `spawn_capture_pipeline`
   // restarts the loop on the settings watch and re-emits Capabilities so
   // the canvas resizes itself. No reconnect needed.
   const setSettings = useCallback((next: { hidpi: boolean }) => {
     sendCtrl({ t: 'settings', hidpi: next.hidpi })
-  }, []) // eslint-disable-line react-hooks/exhaustive-deps
+  }, [])
 
   const disconnect = useCallback(() => {
     destroyedRef.current = true
