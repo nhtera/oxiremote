@@ -160,6 +160,13 @@ async fn api_agent_state(State(state): State<Arc<AppState>>) -> Json<serde_json:
         .flatten()
         .map(|rec| json!({ "token": rec.token, "expires_at": rec.expires_at }));
 
+    // True when the discovery worker URL is active (env set or bundled default).
+    // False only when the user explicitly cleared OXI_DISCOVERY_URL=.
+    let discovery_configured = crate::env_defaults::discovery_url().is_some();
+    // Tunnel mode for the SPA discovery banner — only show the banner when
+    // discovery is disabled AND the URL rotates on every restart (quick tunnel).
+    let tunnel_mode = if state.is_quick_tunnel { "quick" } else { "named" };
+
     Json(json!({
         "tunnel_url": tunnel_url,
         "tunnel_step": tunnel_step,
@@ -177,6 +184,10 @@ async fn api_agent_state(State(state): State<Arc<AppState>>) -> Json<serde_json:
         // on the user-facing SPA which then resolves the tunnel via the
         // discovery worker. Null when unset (tunnel-only deployments).
         "web_url": state.web_url,
+        // discovery_configured: false only when OXI_DISCOVERY_URL= was
+        // explicitly cleared. True for all default/configured installs.
+        "discovery_configured": discovery_configured,
+        "tunnel_mode": tunnel_mode,
     }))
 }
 
@@ -1282,6 +1293,8 @@ mod tests {
             desktop_service: None,
             discovery_url: None,
             web_url: None,
+            is_quick_tunnel: true,
+            named_tunnel_hostname: None,
             discovery_temp_key: std::sync::Arc::new(std::sync::RwLock::new(None)),
             tunnel_shutdown: std::sync::Arc::new(tokio::sync::Notify::new()),
             telemetry: std::sync::Arc::new(crate::telemetry::TelemetryState::new()),

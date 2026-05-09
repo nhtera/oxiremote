@@ -1,12 +1,14 @@
 import { create } from 'zustand'
 import { isDiscoveryMode } from '../lib/discovery-client'
-import { loadApiKey, loadTunnelBase } from '../lib/api-client'
+import { loadApiKey, loadTunnelBase, storeNamedTunnelHostname } from '../lib/api-client'
 import { listSavedHosts, recordSavedHost } from '../lib/saved-hosts'
 
 type HostState = {
   currentHostId: string | null
   label: string | null
   platform: string | null
+  /** Named-tunnel hostname from /api/host. Null for Quick Tunnel users. */
+  namedTunnelHostname: string | null
   loading: boolean
   error: string | null
   fetchHost: (expectedHostId?: string) => Promise<void>
@@ -21,6 +23,7 @@ export const useHostStore = create<HostState>(() => ({
   currentHostId: null,
   label: null,
   platform: null,
+  namedTunnelHostname: null,
   loading: false,
   error: null,
 
@@ -54,7 +57,12 @@ async function doFetchHost(expectedHostId?: string): Promise<void> {
       useHostStore.setState({ loading: false, error: `Failed to fetch host (${res.status})` })
       return
     }
-    const data = (await res.json()) as { host_id: string; label: string; platform: string }
+    const data = (await res.json()) as {
+      host_id: string
+      label: string
+      platform: string
+      tunnel_named_hostname?: string | null
+    }
     if (expectedHostId && data.host_id !== expectedHostId) {
       // Agent at this tunnel base returned a different host identity than
       // the active-host pointer expected. Should not happen if tunnel bases
@@ -65,11 +73,16 @@ async function doFetchHost(expectedHostId?: string): Promise<void> {
       useHostStore.setState({ loading: false, error: 'Host response mismatch' })
       return
     }
+    const namedTunnelHostname = data.tunnel_named_hostname ?? null
+    // Persist to localStorage so getNamedTunnelAllowlist() can read it
+    // without a live /api/host call (needed during transport retry path).
+    storeNamedTunnelHostname(data.host_id, namedTunnelHostname)
     useHostStore.setState({
       loading: false,
       currentHostId: data.host_id,
       label: data.label,
       platform: data.platform,
+      namedTunnelHostname,
     })
     // Self-heal saved-hosts: when a saved entry's `label` is the legacy
     // truncated `host_id.slice(0,8)` placeholder (pre-0.1.15 discovery

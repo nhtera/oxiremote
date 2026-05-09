@@ -29,6 +29,7 @@ use tower::{Layer, Service};
 const ALLOWED_METHODS: &str = "GET, POST, PUT, DELETE, PATCH, OPTIONS";
 const ALLOWED_HEADERS: &str = "authorization, content-type, x-oxi-csrf";
 const MAX_AGE: &str = "86400";
+#[allow(dead_code)] // kept for backward-compat reference; production uses resolved_origins()
 const CORS_ENV: &str = "OXI_CORS_ORIGINS";
 
 /// Shared runtime-mutable allowlist of CORS origins.
@@ -53,6 +54,9 @@ pub fn seed_origins(env_origins: &[String], db_origins: &[String]) -> CorsOrigin
 
 /// Read the seed origins from `OXI_CORS_ORIGINS` (comma-separated). Empty when
 /// unset. Kept here so `main.rs` doesn't have to re-implement the parsing.
+///
+/// Deprecated: prefer `resolved_origins()` which applies the bundled default.
+#[allow(dead_code)]
 pub fn env_origins() -> Vec<String> {
     std::env::var(CORS_ENV)
         .unwrap_or_default()
@@ -60,6 +64,20 @@ pub fn env_origins() -> Vec<String> {
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .collect()
+}
+
+/// Origins resolved via `env_defaults`: applies the bundled default
+/// (`remote.erai.dev`) when `OXI_CORS_ORIGINS` is unset, or returns empty
+/// when the var is explicitly cleared (`OXI_CORS_ORIGINS=`).
+pub fn resolved_origins() -> Vec<String> {
+    match crate::env_defaults::cors_origins() {
+        Some(s) => s
+            .split(',')
+            .map(|o| o.trim().to_string())
+            .filter(|o| !o.is_empty())
+            .collect(),
+        None => Vec::new(), // explicit opt-out
+    }
 }
 
 /// Tower layer that wraps any service with the runtime CORS check.

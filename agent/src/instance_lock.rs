@@ -1,62 +1,227 @@
-// PID-file based instance lock. On acquire, an existing live process listed in
-// `<data_dir>/agent.pid` is terminated so the new instance can bind 8787
-// without `Address already in use`.
+// Advisory file lock for single-instance enforcement.
 //
-// Cross-platform without extra crates: shell out to `kill`/`taskkill`. The
-// latency cost (~1ms) is fine at startup.
+// Uses flock(2) on Unix and LockFileEx on Windows — the lock is held for the
+// entire process lifetime via OwnedFd / OwnedHandle. This prevents the
+// PID-file kill-and-overwrite race that caused guaranteed respawn loops when
+// combined with launchd KeepAlive=Crashed: launchd could fire a second instance
+// before the first finished startup, the second killed the first, and the loser
+// exited non-zero, triggering another respawn.
+//
+// Lock failure (another live instance holds it) → exit(0) so the OS supervisor
+// does NOT count it as a crash and respawn again.
 
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 
 use anyhow::{Context, Result};
 
 pub struct InstanceLock {
-    pid_path: PathBuf,
+    _lock_file: LockFile,
 }
 
 impl InstanceLock {
-    /// Read the PID file. If a live process exists, kill it (gracefully, then
-    /// hard) so the port is freed. Then write our own PID.
+    /// Acquire the advisory lock. If another instance already holds it, exits
+    /// the process with code 0 (graceful — does not trigger crash respawn).
     pub fn acquire(data_dir: &Path) -> Result<Self> {
-        std::fs::create_dir_all(data_dir).context("create data dir for pid file")?;
-        let pid_path = data_dir.join("agent.pid");
+        std::fs::create_dir_all(data_dir).context("create data dir for lock file")?;
+        let lock_path = data_dir.join("agent.lock");
 
-        if let Ok(contents) = std::fs::read_to_string(&pid_path)
-            && let Ok(pid) = contents.trim().parse::<i32>() {
-                let me = std::process::id() as i32;
-                // Ownership check: PIDs are recycled on busy systems, so the
-                // PID we wrote on the last shutdown may now belong to an
-                // unrelated process (sshd, a build job, the user's editor).
-                // Killing it would be a serious foot-gun — verify that the
-                // process is actually our own binary before sending signals.
-                if pid != me && process_alive(pid) && pid_is_oxiremote(pid) {
-                    let _ = kill_process(pid, false);
-                    std::thread::sleep(Duration::from_millis(800));
-                    if process_alive(pid) {
-                        let _ = kill_process(pid, true);
-                        std::thread::sleep(Duration::from_millis(200));
-                    }
-                }
+        match LockFile::acquire(&lock_path) {
+            Ok(lock_file) => Ok(Self { _lock_file: lock_file }),
+            Err(LockError::AlreadyLocked) => {
+                // Another live instance is running — exit cleanly so launchd /
+                // systemd / Task Scheduler does not treat this as a crash.
+                tracing::info!("another oxiremote instance is running; exiting");
+                std::process::exit(0);
             }
-
-        std::fs::write(&pid_path, std::process::id().to_string())
-            .context("write pid file")?;
-        Ok(Self { pid_path })
+            Err(LockError::Io(e)) => {
+                Err(anyhow::anyhow!("instance lock I/O error: {e}"))
+            }
+        }
     }
 }
 
-impl Drop for InstanceLock {
+// ------------------------------------------------------------------
+// Platform lock implementations
+// ------------------------------------------------------------------
+
+enum LockError {
+    AlreadyLocked,
+    Io(std::io::Error),
+}
+
+impl From<std::io::Error> for LockError {
+    fn from(e: std::io::Error) -> Self {
+        LockError::Io(e)
+    }
+}
+
+// ------------------------------------------------------------------
+// Unix: flock(2) advisory lock held via OwnedFd
+// ------------------------------------------------------------------
+
+#[cfg(unix)]
+struct LockFile {
+    _fd: std::os::unix::io::OwnedFd,
+    path: PathBuf,
+}
+
+#[cfg(unix)]
+impl LockFile {
+    fn acquire(path: &Path) -> std::result::Result<Self, LockError> {
+        use std::os::unix::io::IntoRawFd;
+        use std::os::unix::io::FromRawFd;
+
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(path)
+            .map_err(LockError::Io)?;
+
+        let fd = file.into_raw_fd();
+
+        // LOCK_EX | LOCK_NB: exclusive, non-blocking.
+        let ret = unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) };
+        if ret != 0 {
+            let err = std::io::Error::last_os_error();
+            // EWOULDBLOCK / EAGAIN means another process holds the lock.
+            if err.kind() == std::io::ErrorKind::WouldBlock {
+                unsafe { libc::close(fd) };
+                return Err(LockError::AlreadyLocked);
+            }
+            unsafe { libc::close(fd) };
+            return Err(LockError::Io(err));
+        }
+
+        // Write our PID into the lock file for observability (not used for logic).
+        let pid = std::process::id().to_string();
+        unsafe {
+            // Truncate then write — best-effort, ignore errors.
+            libc::ftruncate(fd, 0);
+            let _ = libc::write(fd, pid.as_ptr() as *const libc::c_void, pid.len());
+        }
+
+        let owned = unsafe { std::os::unix::io::OwnedFd::from_raw_fd(fd) };
+        Ok(Self { _fd: owned, path: path.to_path_buf() })
+    }
+}
+
+#[cfg(unix)]
+impl Drop for LockFile {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.pid_path);
+        // flock is released automatically when the fd closes (OwnedFd drop).
+        // Remove the lock file so the next start doesn't see stale bytes.
+        let _ = std::fs::remove_file(&self.path);
     }
 }
+
+// ------------------------------------------------------------------
+// Windows: LockFileEx advisory lock held via OwnedHandle
+// ------------------------------------------------------------------
+
+#[cfg(windows)]
+struct LockFile {
+    _handle: std::os::windows::io::OwnedHandle,
+    path: PathBuf,
+}
+
+#[cfg(windows)]
+impl LockFile {
+    fn acquire(path: &Path) -> std::result::Result<Self, LockError> {
+        use std::os::windows::io::{FromRawHandle, IntoRawHandle};
+        use windows_sys::Win32::Foundation::{HANDLE, FALSE};
+        use windows_sys::Win32::Storage::FileSystem::{
+            LockFileEx, LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY,
+        };
+
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(path)
+            .map_err(LockError::Io)?;
+
+        let handle: HANDLE = file.into_raw_handle() as HANDLE;
+
+        // OVERLAPPED zeroed — required by LockFileEx even when offset is 0.
+        let mut overlapped: windows_sys::Win32::System::IO::OVERLAPPED =
+            unsafe { std::mem::zeroed() };
+
+        let ret = unsafe {
+            LockFileEx(
+                handle,
+                LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY,
+                0,
+                1,
+                0,
+                &mut overlapped,
+            )
+        };
+
+        if ret == FALSE {
+            let err = std::io::Error::last_os_error();
+            unsafe { windows_sys::Win32::Foundation::CloseHandle(handle) };
+            // ERROR_LOCK_VIOLATION (33) means already locked.
+            if err.raw_os_error() == Some(33) {
+                return Err(LockError::AlreadyLocked);
+            }
+            return Err(LockError::Io(err));
+        }
+
+        // Write PID for observability.
+        let pid = std::process::id().to_string();
+        let _ = std::fs::write(path, &pid);
+
+        let owned = unsafe { std::os::windows::io::OwnedHandle::from_raw_handle(handle as _) };
+        Ok(Self { _handle: owned, path: path.to_path_buf() })
+    }
+}
+
+#[cfg(windows)]
+impl Drop for LockFile {
+    fn drop(&mut self) {
+        // Lock released when OwnedHandle drops (closes the HANDLE).
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+// ------------------------------------------------------------------
+// Fallback: platforms that are neither unix nor windows
+// ------------------------------------------------------------------
+
+#[cfg(not(any(unix, windows)))]
+struct LockFile {
+    path: PathBuf,
+}
+
+#[cfg(not(any(unix, windows)))]
+impl LockFile {
+    fn acquire(path: &Path) -> std::result::Result<Self, LockError> {
+        // No advisory lock available — best-effort PID file only.
+        std::fs::write(path, std::process::id().to_string()).map_err(LockError::Io)?;
+        Ok(Self { path: path.to_path_buf() })
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+impl Drop for LockFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+// ------------------------------------------------------------------
+// Belt-and-braces sweep (preserved from prior implementation)
+// ------------------------------------------------------------------
 
 /// Best-effort fallback when bind() fails with AddrInUse but `acquire()` did
-/// not catch a stale process — usually because the prior instance crashed
-/// without writing a pidfile, or wrote one in a different data_dir (e.g. an
-/// older release with the pre-USERPROFILE env-fallback bug). Scans the
-/// process table for live `oxiremote` processes other than ourselves and
-/// terminates them. Returns the number of processes killed.
+/// not catch a stale process. Scans the process table for live `oxiremote`
+/// processes other than ourselves and terminates them. Returns the number of
+/// processes killed.
+///
+/// With flock-based locking this path should rarely trigger, but it is
+/// preserved as a safety net for edge cases (e.g. lock file on a networked
+/// volume that doesn't honour flock semantics).
 pub fn kill_other_oxiremote_processes() -> u32 {
     let me = std::process::id() as i32;
     let mut killed = 0;
@@ -65,10 +230,10 @@ pub fn kill_other_oxiremote_processes() -> u32 {
             continue;
         }
         let _ = kill_process(pid, false);
-        std::thread::sleep(Duration::from_millis(500));
+        std::thread::sleep(std::time::Duration::from_millis(500));
         if process_alive(pid) {
             let _ = kill_process(pid, true);
-            std::thread::sleep(Duration::from_millis(200));
+            std::thread::sleep(std::time::Duration::from_millis(200));
         }
         killed += 1;
     }
@@ -134,16 +299,8 @@ fn list_oxiremote_pids() -> Vec<i32> {
         .collect()
 }
 
-/// Verify the named PID is actually an oxiremote process. Belt-and-braces
-/// against PID reuse: the agent's `agent.pid` file may point at a recycled
-/// PID owned by an unrelated process after a crash + reboot. Conservative on
-/// failure — if we can't determine the binary name, return `false` and skip
-/// the kill rather than risk hitting an innocent process.
-///
-/// Linux: read `/proc/{pid}/comm`.
-/// macOS: invoke `ps -p {pid} -o comm=` (libproc would need a C dep).
-/// Windows: handled in the windows-cfg block; tasklist already filters by PID
-/// so the kill path is naturally narrower.
+/// Conservative PID ownership check — if we can't verify the binary name,
+/// skip the kill rather than risk hitting an innocent process.
 #[cfg(target_os = "linux")]
 fn pid_is_oxiremote(pid: i32) -> bool {
     std::fs::read_to_string(format!("/proc/{pid}/comm"))
@@ -159,9 +316,6 @@ fn pid_is_oxiremote(pid: i32) -> bool {
         .ok()
         .and_then(|o| String::from_utf8(o.stdout).ok())
         .map(|s| {
-            // ps prints the full path on macOS; match on the basename only so
-            // running from `~/.cargo/bin/oxiremote` and `target/release/oxiremote`
-            // both verify cleanly.
             s.trim()
                 .rsplit('/')
                 .next()
@@ -173,8 +327,6 @@ fn pid_is_oxiremote(pid: i32) -> bool {
 
 #[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
 fn pid_is_oxiremote(_pid: i32) -> bool {
-    // Other Unix targets — we can't introspect cheaply without a C dep, so
-    // skip the kill rather than risk hitting the wrong process.
     false
 }
 
@@ -249,25 +401,15 @@ fn kill_process(pid: i32, force: bool) -> bool {
 mod tests {
     use super::*;
 
-    /// Belt-and-braces against PID reuse: after a crash + reboot the agent's
-    /// pid file may point at a recycled PID owned by sshd / a build job /
-    /// the user's editor. `pid_is_oxiremote` MUST return false for those so
-    /// the kill path skips them.
+    /// The PID-based ownership guard (used by the sweep fallback) must reject
+    /// pid 1 (init/launchd) and the test harness binary itself.
     #[test]
     fn skips_kill_when_pid_belongs_to_other_process() {
-        // PID 1 is init/launchd — never our binary. The guard MUST reject
-        // it regardless of liveness check (on macOS unprivileged `kill -0 1`
-        // returns failure, but a privileged or recycled probe could pass).
         assert!(
             !pid_is_oxiremote(1),
-            "init/launchd must not be misidentified as oxiremote — \
-             would cause kill -TERM 1 attempts in the wild"
+            "init/launchd must not be misidentified as oxiremote"
         );
 
-        // The test harness binary is called `oxiremote-<hash>` (not bare
-        // `oxiremote`), so the guard correctly rejects our own PID too.
-        // Pinning this protects cargo tests from killing themselves on a
-        // hypothetical stale pid file pointing at the harness PID.
         let me = std::process::id() as i32;
         assert!(process_alive(me), "the test harness should see itself as alive");
         assert!(
@@ -276,12 +418,8 @@ mod tests {
         );
     }
 
-    /// A plainly-bogus PID must report as not-alive. Defensive — `kill -0` on
-    /// a free PID returns failure, so the guard short-circuits before
-    /// pid_is_oxiremote ever runs.
     #[test]
     fn process_alive_false_for_unused_pid() {
-        // 2^31 - 1 is the kernel max PID; no process should hold it.
         assert!(!process_alive(i32::MAX));
     }
 }

@@ -1,5 +1,6 @@
 mod agent_api;
 mod agent_detector;
+mod env_defaults;
 mod approval;
 mod auth;
 mod autostart;
@@ -52,6 +53,8 @@ mod tray;
 mod tui;
 mod tunnel;
 mod tunnel_named;
+mod heartbeat;
+mod tunnel_supervisor;
 #[cfg(target_os = "windows")]
 mod win_jobs;
 mod workspaces;
@@ -133,10 +136,19 @@ pub struct AppState {
     /// Stub field so non-desktop builds compile without the feature flag.
     #[cfg(not(feature = "desktop"))]
     pub desktop_service: Option<()>,
-    /// Cloudflare discovery worker base URL (`OXI_DISCOVERY_URL`). When unset,
-    /// the agent runs in single-binary embedded mode and emits `<tunnel>/login`
-    /// QR payloads exactly as before.
+    /// Cloudflare discovery worker base URL (`OXI_DISCOVERY_URL`). Resolved via
+    /// `env_defaults::discovery_url()`: defaults to the bundled worker URL when
+    /// the env var is unset; `None` only when the user explicitly clears it.
     pub discovery_url: Option<String>,
+    /// Whether the agent is running in Quick Tunnel mode (vs Named Tunnel).
+    /// Set once at boot; used by `/api/host` so the SPA can show a banner when
+    /// discovery is disabled AND the tunnel URL rotates per restart.
+    pub is_quick_tunnel: bool,
+    /// Named-tunnel hostname from `tunnel.toml` (the `hostname` field).
+    /// Populated only when a named-tunnel config exists AND the hostname field
+    /// is set. `None` for Quick Tunnel users. Exposed via `/api/host` so the
+    /// SPA's URL allowlist can accept this domain without operator config.
+    pub named_tunnel_hostname: Option<String>,
     /// Public web app base URL (`OXI_WEB_URL`). When set, QR payloads and the
     /// dashboard share-link point here (e.g.
     /// `https://remote.example.com/login?k=<otk>`) instead of the per-host
@@ -383,7 +395,7 @@ fn run_server_headless() -> anyhow::Result<()> {
     let _lock = instance_lock::InstanceLock::acquire(&data_dir)
         .context("acquire instance lock")?;
 
-    let discovery_url = read_discovery_url();
+    let discovery_url = env_defaults::discovery_url();
     let discovery_temp_key: Arc<StdRwLock<Option<String>>> = Arc::new(StdRwLock::new(None));
 
     let rt = tokio::runtime::Builder::new_multi_thread()
@@ -393,31 +405,6 @@ fn run_server_headless() -> anyhow::Result<()> {
     rt.block_on(async move { server_main(bus, discovery_url, discovery_temp_key).await })
 }
 
-/// Read `OXI_DISCOVERY_URL`, treating empty / whitespace-only values as unset.
-/// Trailing slashes are stripped so callers can `format!("{base}/api/...")`
-/// without double-slash guards. Returns None when the agent runs in embedded
-/// mode (single-binary, no Cloudflare discovery worker).
-fn read_discovery_url() -> Option<String> {
-    read_trimmed_env("OXI_DISCOVERY_URL")
-}
-
-/// Read `OXI_WEB_URL` — the public SPA where users land when they scan the
-/// QR or click the share-link. Independent of `OXI_DISCOVERY_URL` (the
-/// worker). Returns None when unset / blank, in which case the QR falls
-/// back to `<tunnel>/login`.
-fn read_web_url() -> Option<String> {
-    read_trimmed_env("OXI_WEB_URL")
-}
-
-fn read_trimmed_env(name: &str) -> Option<String> {
-    let raw = std::env::var(name).ok()?;
-    let trimmed = raw.trim().trim_end_matches('/');
-    if trimmed.is_empty() {
-        None
-    } else {
-        Some(trimmed.to_string())
-    }
-}
 
 /// TUI path: tokio runtime on a sibling thread, TUI event loop on main.
 /// The event bus is shared so tunnel/device events drive the TUI live.
@@ -434,7 +421,7 @@ fn run_with_tui() -> anyhow::Result<()> {
     // Build the discovery handle before spawning either thread so server +
     // TUI share the same `discovery_temp_key` slot — the listener writes,
     // the TUI reads, no synchronization beyond the RwLock.
-    let discovery_url = read_discovery_url();
+    let discovery_url = env_defaults::discovery_url();
     let discovery_temp_key: Arc<StdRwLock<Option<String>>> = Arc::new(StdRwLock::new(None));
 
     let bus_for_server = bus.clone();
@@ -498,8 +485,15 @@ fn run_with_tray() -> anyhow::Result<()> {
     let _lock = instance_lock::InstanceLock::acquire(&data_dir)
         .context("acquire instance lock")?;
 
-    let discovery_url = read_discovery_url();
+    let discovery_url = env_defaults::discovery_url();
     let discovery_temp_key: Arc<StdRwLock<Option<String>>> = Arc::new(StdRwLock::new(None));
+
+    // Allocate the tray-cmd channel up-front so we can move the Sender into
+    // the server thread (which owns the only tokio runtime in this process)
+    // and keep the Receiver on the main thread for the tray event loop.
+    // Spawning the bridge directly via `tokio::spawn` from the main thread
+    // would panic with "no reactor running" — there is no runtime here.
+    let (tray_cmd_tx, tray_cmd_rx) = tray::tray_cmd_channel();
 
     let bus_for_server = bus.clone();
     let discovery_url_srv = discovery_url.clone();
@@ -522,6 +516,13 @@ fn run_with_tray() -> anyhow::Result<()> {
                     return;
                 }
             };
+            // Bridge tunnel events to the main-thread tray loop. Spawned on
+            // this runtime BEFORE block_on so the watcher lives the full
+            // server lifetime and shares the same broadcast bus.
+            rt.spawn(tray::run_degraded_watcher(
+                bus_for_server.clone(),
+                tray_cmd_tx,
+            ));
             if let Err(err) = rt.block_on(server_main(
                 bus_for_server.clone(),
                 discovery_url_srv,
@@ -537,6 +538,8 @@ fn run_with_tray() -> anyhow::Result<()> {
         })
         .context("spawn server thread")?;
 
+    drop(bus); // bus stays live via the server thread's clone; we don't need ours
+
     // If launched with `OXI_OPEN_BROWSER_ON_READY=1` (TUI menu hand-off or
     // `oxiremote ui`), poll our own /api/health and open the browser when it
     // responds. Doing this from the child — not the launcher — closes the
@@ -549,8 +552,7 @@ fn run_with_tray() -> anyhow::Result<()> {
     // Build the tray on the main thread, then drive its event loop. The loop
     // never returns under normal use — `Shutdown` from the menu calls
     // `process::exit(0)` directly so the lock drop is unreachable here.
-    let handle = tray::build_tray().context("build tray")?;
-    drop(bus); // bus stays live via the server thread's clone; we don't need ours
+    let handle = tray::build_tray(tray_cmd_rx).context("build tray")?;
     tray::run_event_loop(&handle);
     unreachable!()
 }
@@ -590,9 +592,10 @@ async fn server_main(
         info
     };
 
-    let secure_cookies = std::env::var("OXI_SECURE_COOKIES")
-        .ok()
-        .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
+    // Resolved via env_defaults: defaults to true (OXI_SECURE_COOKIES=1) when
+    // the var is unset. Empty value (OXI_SECURE_COOKIES=) → false (opt-out for
+    // self-hosted HTTP-only deployments).
+    let secure_cookies = env_defaults::secure_cookies();
 
     let workspace_root = std::env::var("OXI_WORKSPACE")
         .map(PathBuf::from)
@@ -638,13 +641,15 @@ async fn server_main(
     let proxy_allowed_ports = Arc::new(StdRwLock::new(proxy_allowed_ports));
 
     // CORS allowlist: env var (backward compat) ∪ persisted DB origins.
+    // env_defaults::cors_origins() supplies the bundled default (remote.erai.dev)
+    // when OXI_CORS_ORIGINS is unset; empty value = explicit opt-out.
     // Mutable at runtime via pairing handlers (auto-add) and /api/agent/cors.
     let cors_db_origins = db::load_cors_allowed_origins(&db_path).unwrap_or_else(|err| {
         warn!(error=%err, "failed to load cors_allowed_origins; defaulting to empty");
         Vec::new()
     });
-    let cors_origins =
-        security::cors::seed_origins(&security::cors::env_origins(), &cors_db_origins);
+    let cors_env_origins = security::cors::resolved_origins();
+    let cors_origins = security::cors::seed_origins(&cors_env_origins, &cors_db_origins);
 
     // Probe desktop availability once at boot. On macOS this triggers the TCC
     // Screen Recording prompt on first run — expected behaviour. The probe runs
@@ -675,6 +680,15 @@ async fn server_main(
     let telemetry = Arc::new(TelemetryState::new());
     let files_activity = Arc::new(files_activity::new_map());
 
+    // Read tunnel config early so `is_quick_tunnel` is available for AppState.
+    // Stored in a separate variable; the actual supervisor spawn uses the same
+    // value below.
+    let named_cfg_for_state = tunnel_named::load().unwrap_or(None);
+    let is_quick_tunnel = named_cfg_for_state.is_none();
+    let named_tunnel_hostname = named_cfg_for_state
+        .as_ref()
+        .and_then(|c| c.hostname.clone());
+
     let state = Arc::new(AppState {
         db_path,
         signing_key,
@@ -699,7 +713,9 @@ async fn server_main(
         desktop_available: desktop_avail,
         desktop_service: desktop_svc,
         discovery_url: discovery_url.clone(),
-        web_url: read_web_url(),
+        web_url: env_defaults::web_url(),
+        is_quick_tunnel,
+        named_tunnel_hostname,
         discovery_temp_key: discovery_temp_key.clone(),
         tunnel_shutdown: Arc::new(tokio::sync::Notify::new()),
         telemetry,
@@ -1078,129 +1094,130 @@ async fn server_main(
     let pairing = http_pages::create_pairing_code(&state).context("create pairing code")?;
     info!(pairing_code = %pairing.code, "pair to continue");
 
-    // Start tunnel in background — don't block the HTTP server.
-    // If `~/.config/oxiremote/tunnel.toml` exists, run a named tunnel; else
-    // fall back to a Quick Tunnel for the dev/first-run experience.
-    let named_cfg = tunnel_named::load().unwrap_or(None);
+    // Shared signal: heartbeat notifies this when a post-wake probe fails.
+    // Supervisor's inner select reacts by killing and respawning cloudflared.
+    let force_respawn = Arc::new(tokio::sync::Notify::new());
+
+    // Start tunnel supervisor in background — respawns cloudflared automatically
+    // on TunnelDown or heartbeat-triggered force_respawn without restarting the
+    // agent process. If `~/.config/oxiremote/tunnel.toml` exists, run a named
+    // tunnel; else fall back to a Quick Tunnel for the dev/first-run experience.
+    // (`named_cfg_for_state` was read earlier to populate `AppState::is_quick_tunnel`.)
     let tunnel_state = state.clone();
     let tunnel_shutdown = state.tunnel_shutdown.clone();
+    let force_respawn_sup = force_respawn.clone();
     tokio::spawn(async move {
-        let url = match named_cfg {
-            Some(cfg) => match tunnel::ensure_named_tunnel(cloudflared, cfg, tunnel_state.event_bus.clone(), tunnel_shutdown.clone()).await {
-                Ok(Some(target)) => {
-                    info!(%target, "named tunnel ready");
-                    Some(target)
-                }
-                Ok(None) => {
-                    // Named tunnel up, but operator did not configure a
-                    // public hostname — there is nothing meaningful to show
-                    // to clients. Surface a Verifying step so the WebUI/TUI
-                    // tunnel card stops sitting on Tunneling forever.
-                    info!("named tunnel ready without public hostname");
-                    tunnel_state.event_bus.send(events::AgentEvent::TunnelStepChanged {
-                        step: events::TunnelStep::Ready,
-                        attempt: 1,
-                        info: Some("named tunnel active (no public hostname configured)".into()),
-                        reason: None,
-                    });
-                    None
-                }
-                Err(err) => {
-                    warn!(error=%err, "named tunnel failed");
-                    None
-                }
-            },
-            None => match tunnel::ensure_quick_tunnel(addr, cloudflared, tunnel_state.event_bus.clone(), tunnel_shutdown.clone()).await {
-                Ok(url) => {
-                    info!(%url, "quick tunnel ready");
-                    Some(url)
-                }
-                Err(err) => {
-                    warn!(error=%err, "quick tunnel failed");
-                    None
-                }
-            },
+        let mode = match named_cfg_for_state {
+            Some(cfg) => tunnel_supervisor::TunnelMode::Named(cfg),
+            None => tunnel_supervisor::TunnelMode::Quick(addr),
         };
-        if let Some(u) = url {
-            if let Ok(mut guard) = tunnel_state.tunnel_url.write() {
-                *guard = Some(u.clone());
-            }
-            tunnel_state
-                .event_bus
-                .send(events::AgentEvent::TunnelUrlChanged { url: u.clone() });
 
-            // Step 4 — tunnel transport up; begin health probes.
-            tunnel_state.event_bus.send(events::AgentEvent::TunnelStepChanged {
-                step: events::TunnelStep::Verifying,
-                attempt: 1,
-                info: Some("running HTTP health probes…".into()),
-                reason: None,
-            });
-
-            // Race the active probe loop against the first real client event.
-            // The probe uses the system DNS resolver, which can lag for a
-            // freshly-issued `*.trycloudflare.com` subdomain. Real clients
-            // resolve via Cloudflare's edge and may succeed long before the
-            // local resolver catches up — when that happens, treating "client
-            // got through" as Ready avoids a spurious 3-minute timeout.
-            let probe_bus = tunnel_state.event_bus.clone();
-            let probe_url = u.clone();
-            let probe_client = tunnel_state.http_client.clone();
-            let probe_fut = async move {
-                health_check::run_health_check(probe_url, probe_bus, probe_client).await
-            };
-
-            let mut client_rx = tunnel_state.event_bus.subscribe();
-            let first_client_fut = async move {
-                loop {
-                    match client_rx.recv().await {
-                        Ok(events::AgentEvent::OtkUsed { .. })
-                        | Ok(events::AgentEvent::DevicePending { .. })
-                        | Ok(events::AgentEvent::DeviceApproved { .. })
-                        | Ok(events::AgentEvent::DeviceConnected { .. }) => return true,
-                        Ok(_) => continue,
-                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                        Err(_) => return false,
-                    }
-                }
-            };
-
-            let healthy = tokio::select! {
-                h = probe_fut => h,
-                c = first_client_fut => c,
-            };
-
-            if healthy {
-                // Step 5 — probe passed OR a real client connected.
-                tunnel_state.event_bus.send(events::AgentEvent::TunnelStepChanged {
-                    step: events::TunnelStep::Ready,
-                    attempt: 1,
-                    info: Some(u),
-                    reason: None,
-                });
-            } else {
-                // Probe timed out and no client connected. Cloudflared HAS
-                // registered with Cloudflare's edge (we awaited that signal in
-                // ensure_quick_tunnel) — registration is the real liveness
-                // proof. The HEAD probe is a nice-to-have that fails on
-                // networks where local DNS lags Cloudflare DNS, even though
-                // real clients (phones over cellular) connect just fine.
-                // Don't gate the dashboard behind probe success: surface
-                // Ready with a soft diagnostic so the operator can see the
-                // QR and the user can pair. If the tunnel is actually broken
-                // (rare), the scan attempt will surface the real failure.
-                warn!("local health probe inconclusive within timeout — proceeding to Ready since tunnel is registered");
-                tunnel_state.event_bus.send(events::AgentEvent::TunnelStepChanged {
-                    step: events::TunnelStep::Ready,
-                    attempt: 1,
-                    info: Some(format!(
-                        "{u} (local probe inconclusive — scan QR to test)"
-                    )),
-                    reason: None,
-                });
-            }
+        // The supervisor emits TunnelUrlChanged on each successful spawn;
+        // the health-probe and Ready step logic runs inside a subscriber task
+        // below that reacts to that event.
+        if let Err(err) = tunnel_supervisor::run(
+            mode,
+            cloudflared,
+            tunnel_state.event_bus.clone(),
+            tunnel_shutdown,
+            force_respawn_sup,
+        )
+        .await
+        {
+            warn!(error=%err, "tunnel supervisor exited with error");
         }
     });
+
+    // Heartbeat: detects sleep/wake via wall vs monotonic clock skew, then
+    // probes the local agent. On probe failure, signals force_respawn so the
+    // supervisor kills and respawns cloudflared. Spawned at agent startup so
+    // it covers the window between agent boot and first tunnel ready.
+    heartbeat::spawn(addr, force_respawn, state.tunnel_shutdown.clone());
+
+    // Health-probe task: fires on every TunnelUrlChanged (first spawn + every
+    // respawn). Runs Verifying probes then emits Ready.
+    {
+        let probe_state = state.clone();
+        let mut probe_rx = state.event_bus.subscribe();
+        tokio::spawn(async move {
+            while let Ok(ev) = probe_rx.recv().await {
+                let u = match ev {
+                    events::AgentEvent::TunnelUrlChanged { url } => url,
+                    _ => continue,
+                };
+
+                // Step 4 — tunnel transport up; begin health probes.
+                probe_state.event_bus.send(events::AgentEvent::TunnelStepChanged {
+                    step: events::TunnelStep::Verifying,
+                    attempt: 1,
+                    info: Some("running HTTP health probes…".into()),
+                    reason: None,
+                });
+
+                // Race the active probe loop against the first real client event.
+                // The probe uses the system DNS resolver, which can lag for a
+                // freshly-issued `*.trycloudflare.com` subdomain. Real clients
+                // resolve via Cloudflare's edge and may succeed long before the
+                // local resolver catches up — when that happens, treating "client
+                // got through" as Ready avoids a spurious 3-minute timeout.
+                let probe_bus = probe_state.event_bus.clone();
+                let probe_url = u.clone();
+                let probe_client = probe_state.http_client.clone();
+                let probe_fut = async move {
+                    health_check::run_health_check(probe_url, probe_bus, probe_client).await
+                };
+
+                let mut client_rx = probe_state.event_bus.subscribe();
+                let first_client_fut = async move {
+                    loop {
+                        match client_rx.recv().await {
+                            Ok(events::AgentEvent::OtkUsed { .. })
+                            | Ok(events::AgentEvent::DevicePending { .. })
+                            | Ok(events::AgentEvent::DeviceApproved { .. })
+                            | Ok(events::AgentEvent::DeviceConnected { .. }) => return true,
+                            Ok(_) => continue,
+                            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                            Err(_) => return false,
+                        }
+                    }
+                };
+
+                let healthy = tokio::select! {
+                    h = probe_fut => h,
+                    c = first_client_fut => c,
+                };
+
+                if healthy {
+                    // Step 5 — probe passed OR a real client connected.
+                    probe_state.event_bus.send(events::AgentEvent::TunnelStepChanged {
+                        step: events::TunnelStep::Ready,
+                        attempt: 1,
+                        info: Some(u),
+                        reason: None,
+                    });
+                } else {
+                    // Probe timed out and no client connected. Cloudflared HAS
+                    // registered with Cloudflare's edge (we awaited that signal in
+                    // ensure_quick_tunnel) — registration is the real liveness
+                    // proof. The HEAD probe is a nice-to-have that fails on
+                    // networks where local DNS lags Cloudflare DNS, even though
+                    // real clients (phones over cellular) connect just fine.
+                    // Don't gate the dashboard behind probe success: surface
+                    // Ready with a soft diagnostic so the operator can see the
+                    // QR and the user can pair.
+                    warn!("local health probe inconclusive within timeout — proceeding to Ready since tunnel is registered");
+                    probe_state.event_bus.send(events::AgentEvent::TunnelStepChanged {
+                        step: events::TunnelStep::Ready,
+                        attempt: 1,
+                        info: Some(format!(
+                            "{u} (local probe inconclusive — scan QR to test)"
+                        )),
+                        reason: None,
+                    });
+                }
+            }
+        });
+    }
 
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())

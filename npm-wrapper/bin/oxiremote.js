@@ -12,6 +12,9 @@
 const path = require('node:path')
 const { spawn } = require('node:child_process')
 
+// Cross-reference: these values are also baked into the Rust binary at
+// agent/src/env_defaults.rs (DEFAULT_DISCOVERY_URL etc.) so non-npm install
+// paths get the same defaults. If any URL changes here, update that file too.
 const DEFAULTS = {
   OXI_DISCOVERY_URL: 'https://oxiremote-discovery.tienn.workers.dev',
   OXI_WEB_URL: 'https://remote.erai.dev',

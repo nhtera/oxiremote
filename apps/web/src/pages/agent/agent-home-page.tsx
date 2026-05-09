@@ -41,6 +41,11 @@ type AgentState = {
   auto_approve?: boolean
   desktop_enabled?: boolean
   otk?: OtkState | null
+  /** False only when OXI_DISCOVERY_URL= was explicitly cleared. True for all
+   *  default/configured installs (bundled default or explicit URL set). */
+  discovery_configured?: boolean
+  /** "quick" or "named" — quick tunnel URL rotates on every restart. */
+  tunnel_mode?: string
 }
 
 interface PendingDevice {
@@ -246,6 +251,13 @@ export default function AgentHomePage() {
   // URL for embedded-mode deployments.
   const pairingBaseUrl = state?.web_url ?? tunnelUrl
   const onboarding = !tunnelStepReady || !tunnelHealthy
+  // Show a banner when discovery is explicitly disabled (OXI_DISCOVERY_URL=)
+  // AND the tunnel is Quick (URL rotates on restart). Named tunnels have
+  // stable hostnames so the banner is not needed there.
+  const showDiscoveryDisabledBanner =
+    state !== null &&
+    state.discovery_configured === false &&
+    state.tunnel_mode === 'quick'
 
   if (fetchStatus === 'error') {
     return (
@@ -293,6 +305,14 @@ export default function AgentHomePage() {
             {tunnelDown && (
               <div className="px-4 py-3 rounded-md bg-danger/10 border border-danger/40 text-danger text-sm font-medium">
                 Tunnel went down — connections will fail. Restart the agent to reconnect.
+              </div>
+            )}
+
+            {showDiscoveryDisabledBanner && (
+              <div className="px-4 py-3 rounded-md bg-warning/10 border border-warning/30 text-warning text-sm">
+                Discovery worker disabled. Quick tunnel URL rotates per restart
+                {' '}— set <code className="font-mono text-xs">OXI_DISCOVERY_URL</code> or remove the
+                empty override.
               </div>
             )}
 

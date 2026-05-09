@@ -163,9 +163,138 @@ export async function ensureTransport(): Promise<TransportInfo> {
   return readTransportInfo()
 }
 
-/** Convenience: relative path + credentialed fetch against current base. */
+// ─── Stale-URL fallback ──────────────────────────────────────────────────────
+
+/** Thrown when the host is unreachable and the discovery fallback is not
+ *  configured or has no mapping. Callers can `instanceof` check this to show
+ *  a "host offline" UI instead of a generic network error. */
+export class HostUnreachableError extends Error {
+  cachedUrl: string
+  resolvedUrl: string | null
+  constructor(message: string, cachedUrl: string, resolvedUrl: string | null = null) {
+    super(message)
+    this.name = 'HostUnreachableError'
+    this.cachedUrl = cachedUrl
+    this.resolvedUrl = resolvedUrl
+  }
+}
+
+/** Thrown when the discovery worker returns a URL that does not match the
+ *  `*.trycloudflare.com` allowlist or the operator's named-tunnel domain.
+ *  The original cached URL is NOT replaced. */
+export class SuspiciousTunnelUrlError extends Error {
+  suspiciousUrl: string
+  constructor(suspiciousUrl: string) {
+    super(
+      `Discovery worker returned a URL outside the allowed domain list: ${suspiciousUrl}. ` +
+        'The cached URL has NOT been updated.',
+    )
+    this.name = 'SuspiciousTunnelUrlError'
+    this.suspiciousUrl = suspiciousUrl
+  }
+}
+
+/** Symbol used to mark a request as already-retried so the fallback path
+ *  does not loop. Attached as a property on the `init` object. */
+const RETRY_MARKER = Symbol.for('oxi.host-fetch.retried')
+
+/** Emitted on the window when the fallback path successfully re-resolves
+ *  the tunnel URL and retries the original request. A React component
+ *  (host-moved-toast) listens to this and surfaces a brief toast. */
+export const HOST_MOVED_EVENT = 'oxi:host-moved'
+
+/** Classify whether a fetch error or response looks like the host is
+ *  unreachable (vs. a normal API error like 401 / 422). */
+function isHostUnreachable(err: unknown, res: Response | null): boolean {
+  // TypeError: network error, CORS failure, DNS resolution, TLS failure.
+  if (err instanceof TypeError) return true
+  // A 5xx response from Cloudflare when the origin is down (530 = DNS error,
+  // 502 / 503 / 504 = origin timeout). Do NOT treat 4xx as unreachable — the
+  // agent is alive, the request just failed (auth, validation, etc.).
+  if (res && res.status >= 500) return true
+  return false
+}
+
+/** Convenience: relative path + credentialed fetch against current base.
+ *
+ * On first host-unreachable failure the fallback path fires once:
+ *   1. Query the discovery worker for the current tunnel URL.
+ *   2. Validate it against `*.trycloudflare.com` + named-tunnel allowlist.
+ *   3. If valid and different: pin the new base, retry the request once.
+ *   4. On success: emit `oxi:host-moved` so the toast component can surface
+ *      "Host moved — reconnected".
+ * The marker `RETRY_MARKER` prevents infinite loops.
+ */
 export async function apiFetch(path: string, init: RequestInit = {}): Promise<Response> {
   const base = await getApiBase()
   const url = path.startsWith('http') ? path : base + path
-  return fetch(url, { credentials: 'include', ...init })
+
+  // Cast to access the retry marker property.
+  const opts = init as RequestInit & { [key: symbol]: boolean }
+  const alreadyRetried = opts[RETRY_MARKER] === true
+
+  let res: Response | null = null
+  let fetchErr: unknown = null
+  try {
+    res = await fetch(url, { credentials: 'include', ...init })
+    if (!isHostUnreachable(null, res)) return res
+    // 5xx from CF/origin — treat as unreachable, fall through to retry.
+  } catch (err) {
+    if (!isHostUnreachable(err, null)) throw err
+    fetchErr = err
+  }
+
+  // Already retried on this request, or discovery isn't configured → rethrow.
+  if (alreadyRetried) {
+    if (fetchErr) throw fetchErr
+    return res!
+  }
+
+  // Dynamic imports avoid circular dependency:
+  // api-client.ts → transport.ts (static), transport.ts → api-client.ts (dynamic).
+  const [{ getCurrentTunnelUrl }, { getActiveHost, loadTunnelBase, storeTunnelBase }, { isAllowedTunnelHost, getNamedTunnelAllowlist }] =
+    await Promise.all([
+      import('./discovery-client'),
+      import('./api-client'),
+      import('./url-validation'),
+    ])
+
+  const cachedUrl = loadTunnelBase() ?? base
+  let newUrl: string | null = null
+  try {
+    newUrl = await getCurrentTunnelUrl()
+  } catch {
+    // Worker unreachable — fall through to re-throw original.
+  }
+
+  if (!newUrl || newUrl === cachedUrl) {
+    if (fetchErr) throw new HostUnreachableError(`Host unreachable: ${cachedUrl}`, cachedUrl, null)
+    return res!
+  }
+
+  const allowlist = getNamedTunnelAllowlist()
+  if (!isAllowedTunnelHost(newUrl, allowlist)) {
+    throw new SuspiciousTunnelUrlError(newUrl)
+  }
+
+  // Persist new base and update the session-storage transport cache so
+  // subsequent same-tab fetches also use the new URL without a race.
+  const activeHostId = getActiveHost()
+  if (activeHostId) storeTunnelBase(activeHostId, newUrl)
+  // Also update session-storage base cache used by `getApiBase`.
+  try { sessionStorage.setItem(CACHE_KEY, newUrl) } catch { /* ignore */ }
+
+  // Retry with the rebased URL, marked to prevent a second retry.
+  const newFetchUrl = path.startsWith('http')
+    ? path.replace(/^https?:\/\/[^/]+/, newUrl)
+    : newUrl + path
+  const retryInit: typeof opts = { ...init, [RETRY_MARKER]: true }
+  const retryRes = await fetch(newFetchUrl, { credentials: 'include', ...retryInit })
+
+  // Emit success event so the toast component can surface recovery feedback.
+  if (typeof window !== 'undefined') {
+    window.dispatchEvent(new CustomEvent(HOST_MOVED_EVENT))
+  }
+
+  return retryRes
 }

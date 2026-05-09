@@ -2,9 +2,11 @@ import { useEffect, useRef } from 'react'
 import { Terminal } from 'xterm'
 import { FitAddon } from 'xterm-addon-fit'
 import { useTerminalStore, type Session } from '../state/terminal-store'
-import { isDiscoveryMode } from './discovery-client'
-import { getActiveHost, loadApiKey, loadTunnelBase } from './api-client'
+import { isDiscoveryMode, getCurrentTunnelUrl } from './discovery-client'
+import { getActiveHost, loadApiKey, loadTunnelBase, storeTunnelBase } from './api-client'
 import { probeHost, refreshTunnelBaseFromDiscovery } from './host-reachability'
+import { isAllowedTunnelHost, getNamedTunnelAllowlist } from './url-validation'
+import { TUNNEL_URL_CHANGED_EVENT } from '../hooks/use-tunnel-url-sse'
 
 export type ReconnectPhase = 'fast' | 'slow'
 
@@ -108,6 +110,23 @@ export function useTerminalWs(
   useEffect(() => {
     activeIdRef.current = activeId
   }, [activeId])
+
+  // When the supervisor rotates the tunnel URL, close all active WS connections
+  // so their onclose handlers schedule a reconnect via the updated tunnel base.
+  useEffect(() => {
+    function onTunnelUrlChanged() {
+      for (const handle of handlesRef.current.values()) {
+        if (handle.ws && handle.ws.readyState < WebSocket.CLOSING) {
+          // Tear down cleanly; onclose fires and schedules reconnect.
+          handle.ws.close()
+        }
+      }
+    }
+    window.addEventListener(TUNNEL_URL_CHANGED_EVENT, onTunnelUrlChanged)
+    return () => window.removeEventListener(TUNNEL_URL_CHANGED_EVENT, onTunnelUrlChanged)
+  // handlesRef is stable (same ref object across renders) — no dep needed.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
 
   async function refreshSessions() {
     const res = await fetch('/api/terminal/sessions', { credentials: 'include' })
@@ -249,6 +268,27 @@ async function scheduleReconnect(
   onReconnectPhase?: (phase: ReconnectPhase) => void,
 ) {
   if (handle.closedByUser) return
+
+  // On the very first reconnect attempt, try resolving the current tunnel URL
+  // via the discovery worker. This handles the cold-load stale-URL case (agent
+  // restarted with a new Quick Tunnel before the SPA tab was refreshed). The
+  // SSE path handles mid-session URL rotation; this covers the gap before SSE
+  // connects. Concurrent calls from desktop hooks share the coalesced promise.
+  if (handle.reconnectAttempt === 0) {
+    try {
+      const fresh = await getCurrentTunnelUrl()
+      const cached = loadTunnelBase()
+      if (fresh && fresh !== cached) {
+        const allowlist = getNamedTunnelAllowlist()
+        if (isAllowedTunnelHost(fresh, allowlist)) {
+          const hostId = getActiveHost()
+          if (hostId) storeTunnelBase(hostId, fresh)
+        }
+      }
+    } catch {
+      // Discovery not configured or worker unreachable — proceed with cached URL.
+    }
+  }
 
   // Fast phase: walk the existing ladder. Covers brief drops where probing
   // would just add latency before the next WS attempt.

@@ -5,8 +5,10 @@
 // as WS binary messages. Client detects via {"type":"fallback"} JSON message.
 
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { isDiscoveryMode } from '../lib/discovery-client'
-import { loadApiKey, loadTunnelBase } from '../lib/api-client'
+import { isDiscoveryMode, getCurrentTunnelUrl } from '../lib/discovery-client'
+import { getActiveHost, loadApiKey, loadTunnelBase, storeTunnelBase } from '../lib/api-client'
+import { isAllowedTunnelHost, getNamedTunnelAllowlist } from '../lib/url-validation'
+import { TUNNEL_URL_CHANGED_EVENT } from './use-tunnel-url-sse'
 
 /// Subprotocol marker used to carry a Bearer api_key on WS upgrade in
 /// discovery (cross-origin) mode. Browsers can't set `Authorization` on
@@ -356,8 +358,29 @@ export function useDesktopSession(
 
     setStatus('reconnecting')
     teardown()
+
+    // On the first disconnect, attempt to refresh the tunnel base via the
+    // discovery worker (handles cold-load stale URL before SSE arrives).
+    // Concurrent calls from sibling hooks share the coalesced promise.
+    const doReconnect = next === 1
+      ? async () => {
+          try {
+            const fresh = await getCurrentTunnelUrl()
+            const cached = loadTunnelBase()
+            if (fresh && fresh !== cached) {
+              const allowlist = getNamedTunnelAllowlist()
+              if (isAllowedTunnelHost(fresh, allowlist)) {
+                const hostId = getActiveHost()
+                if (hostId) storeTunnelBase(hostId, fresh)
+              }
+            }
+          } catch { /* discovery not configured or worker unreachable */ }
+          if (!destroyedRef.current) connect()
+        }
+      : async () => { if (!destroyedRef.current) connect() }
+
     reconnectTimerRef.current = setTimeout(() => {
-      if (!destroyedRef.current) connect()
+      void doReconnect()
     }, RECONNECT_DELAY_MS)
   }
 
@@ -402,6 +425,21 @@ export function useDesktopSession(
       teardown()
     }
   }, [hostId, deviceId]) // eslint-disable-line react-hooks/exhaustive-deps
+
+  // When the supervisor rotates the tunnel URL, teardown the current session
+  // and reconnect so the WS upgrade uses the new tunnel base within ~3s.
+  useEffect(() => {
+    if (!deviceId) return
+    function onTunnelUrlChanged() {
+      if (destroyedRef.current) return
+      teardown()
+      connect()
+    }
+    window.addEventListener(TUNNEL_URL_CHANGED_EVENT, onTunnelUrlChanged)
+    return () => window.removeEventListener(TUNNEL_URL_CHANGED_EVENT, onTunnelUrlChanged)
+  // connect / teardown are stable useCallback refs; deviceId guards mount.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [deviceId])
 
   return { status, sendInput, setQuality, setSettings, disconnect, attempt, screenDims, tileSize, lastEndReason }
 }

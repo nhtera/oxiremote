@@ -25,6 +25,10 @@ const TUNNEL_BASE_PREFIX = 'oxi_tunnel_base_'
 // current tunnel URL via the worker after a Quick Tunnel rotation without
 // making the user re-pair.
 const DISCOVERY_LOOKUP_PREFIX = 'oxi_discovery_lookup_id_'
+// Named-tunnel hostname from /api/host (tunnel.toml hostname field).
+// Persisted so the URL allowlist check can run synchronously during fetch
+// retry without a live /api/host round-trip. Null = Quick Tunnel.
+const NAMED_TUNNEL_HOSTNAME_PREFIX = 'oxi_named_tunnel_hostname_'
 const ACTIVE_HOST_KEY = 'oxi_active_host'
 const CSRF_COOKIE = 'oxi_csrf'
 
@@ -80,6 +84,7 @@ export function clearApiKey(hostId?: string) {
       localStorage.removeItem(API_KEY_PREFIX + hostId)
       localStorage.removeItem(TUNNEL_BASE_PREFIX + hostId)
       localStorage.removeItem(DISCOVERY_LOOKUP_PREFIX + hostId)
+      localStorage.removeItem(NAMED_TUNNEL_HOSTNAME_PREFIX + hostId)
     } else {
       for (let i = localStorage.length - 1; i >= 0; i--) {
         const k = localStorage.key(i)
@@ -87,7 +92,8 @@ export function clearApiKey(hostId?: string) {
           k &&
           (k.startsWith(API_KEY_PREFIX) ||
             k.startsWith(TUNNEL_BASE_PREFIX) ||
-            k.startsWith(DISCOVERY_LOOKUP_PREFIX))
+            k.startsWith(DISCOVERY_LOOKUP_PREFIX) ||
+            k.startsWith(NAMED_TUNNEL_HOSTNAME_PREFIX))
         ) {
           localStorage.removeItem(k)
         }
@@ -143,6 +149,33 @@ export function loadDiscoveryLookupId(hostId?: string): string | null {
   try {
     const v = localStorage.getItem(DISCOVERY_LOOKUP_PREFIX + id)
     return v && v.length > 0 ? v : null
+  } catch {
+    return null
+  }
+}
+
+/**
+ * Named-tunnel hostname storage. Populated from /api/host response
+ * (`tunnel_named_hostname` field) and used by the URL allowlist to permit
+ * auto-resolve to the operator's configured named-tunnel domain.
+ * Stores empty string to represent explicit null (Quick Tunnel).
+ */
+export function storeNamedTunnelHostname(hostId: string, hostname: string | null) {
+  try {
+    localStorage.setItem(NAMED_TUNNEL_HOSTNAME_PREFIX + hostId, hostname ?? '')
+  } catch {
+    /* quota / private mode */
+  }
+}
+
+export function loadNamedTunnelHostname(hostId?: string): string | null {
+  const id = hostId ?? getActiveHost()
+  if (!id) return null
+  try {
+    const v = localStorage.getItem(NAMED_TUNNEL_HOSTNAME_PREFIX + id)
+    // Empty string = Quick Tunnel (explicitly null). Missing key = not yet fetched.
+    if (v === null) return null
+    return v.length > 0 ? v : null
   } catch {
     return null
   }

@@ -20,6 +20,8 @@ import { registerServiceWorker } from './lib/push-client'
 import { getActiveHost, loadApiKey, loadTunnelBase } from './lib/api-client'
 import { switchActiveHost } from './lib/host-switch-helpers'
 import { listSavedHosts } from './lib/saved-hosts'
+import { useTunnelUrlSse } from './hooks/use-tunnel-url-sse'
+import { HostMovedToast } from './components/host-moved-toast'
 
 // Agent dashboard is localhost-only. Lazy-loaded so it never enters the
 // tunnel-facing bundle for devices that can't reach these routes anyway.
@@ -142,6 +144,11 @@ function App() {
   const fetchHost = useHostStore((s) => s.fetchHost)
   const navigate = useNavigate()
 
+  // Proactive tunnel-URL reconnect: listen for supervisor-emitted
+  // tunnel_url_changed SSE events and broadcast oxi:tunnel-url-changed so
+  // active WS hooks (terminal, desktop) can reconnect within ~3s.
+  useTunnelUrlSse()
+
   // Fetch host info once on mount; 401 is handled inside fetchHost
   useEffect(() => {
     fetchHost()
@@ -183,6 +190,7 @@ function App() {
   return (
     <ToastProvider>
       <ConfirmProvider>
+        <HostMovedToast />
         <AppRoutes />
       </ConfirmProvider>
     </ToastProvider>

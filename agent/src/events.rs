@@ -138,6 +138,14 @@ pub enum AgentEvent {
     /// transport are torn down. SPA listeners use this to transition the
     /// dashboard back to the onboarding card without a full reload.
     TunnelDisconnected,
+    /// Tunnel supervisor has failed to keep cloudflared alive `cumulative_failures_today`
+    /// times in the last 24h. Tray goes red; cleared on next TunnelUrlChanged.
+    /// `reason` must not include filesystem paths or env values the operator
+    /// hasn't opted into exposing.
+    Degraded {
+        reason: String,
+        retry_in_secs: u64,
+    },
     /// An AI coding agent CLI (claude/codex/cursor/opencode) was detected as
     /// the foreground process in a terminal session. Emitted at most once per
     /// state change — repeated polls that see the same agent are no-ops.

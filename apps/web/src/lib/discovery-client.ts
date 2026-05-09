@@ -131,6 +131,48 @@ export async function lookupPairingCode(code: string): Promise<LookupResult | nu
   return rawLookup(code)
 }
 
+// ─── Cold-load resolver ─────────────────────────────────────────────────────
+//
+// Used by the fetch retry path and WS reconnect hooks when the SPA cold-loads
+// with a stale cached tunnel base (agent restarted → new Quick Tunnel URL).
+// The SSE path (use-tunnel-url-sse.ts) handles mid-session URL rotation;
+// this path handles the "page was already open when the URL changed" case.
+//
+// Module-level singleton promise: all concurrent callers (transport retry +
+// up to 3 WS hooks reconnecting in parallel) share one worker round-trip.
+
+let resolveInFlight: Promise<string | null> | null = null
+
+/**
+ * Resolve the active host's current tunnel URL via the discovery worker.
+ *
+ * Concurrent callers receive the same in-flight promise (coalesced) so at most
+ * one worker hit occurs per reconnect storm. Returns null when:
+ *   - discovery mode is not active (embedded SPA), or
+ *   - no `discovery_id` is stored (paired pre-0.1.28), or
+ *   - the worker has no mapping for this host (worker down / unregistered).
+ *
+ * Does NOT persist the result — callers are responsible for validating
+ * against the URL allowlist before writing to localStorage.
+ */
+export async function getCurrentTunnelUrl(): Promise<string | null> {
+  if (resolveInFlight) return resolveInFlight
+  resolveInFlight = (async () => {
+    try {
+      // loadDiscoveryLookupId is imported lazily to avoid a circular dep at
+      // module parse time (api-client ← transport ← discovery-client).
+      const { loadDiscoveryLookupId } = await import('./api-client')
+      const lookupId = loadDiscoveryLookupId()
+      if (!lookupId) return null
+      const session = await lookupAny(lookupId)
+      return session?.tunnelUrl ?? null
+    } finally {
+      resolveInFlight = null
+    }
+  })()
+  return resolveInFlight
+}
+
 async function rawLookup(key: string): Promise<LookupResult | null> {
   const base = discoveryBaseUrl()
   if (!base) return null

@@ -12,6 +12,7 @@ use serde_json::json;
 use tracing::{info, warn};
 
 use crate::events::AgentEvent;
+use crate::env_defaults;
 use crate::AppState;
 
 pub fn router() -> Router<Arc<AppState>> {
@@ -68,7 +69,30 @@ async fn api_host_info(
     if crate::auth::require_tunnel_auth(&state.db_path, &state.signing_key, &jar, bearer.as_deref()).await.is_none() {
         return StatusCode::UNAUTHORIZED.into_response();
     }
-    (StatusCode::OK, Json(state.host_info.clone())).into_response()
+    // `discovery_configured` is true when the discovery worker URL is active
+    // (env set non-empty or bundled default in use). False only when the user
+    // explicitly cleared OXI_DISCOVERY_URL= to opt out.
+    let discovery_configured = env_defaults::discovery_url().is_some();
+    // `tunnel_mode`: "named" when ~/.config/oxiremote/tunnel.toml was present
+    // at startup; "quick" otherwise. Named tunnels have stable hostnames and
+    // do not need the discovery banner.
+    let tunnel_mode = if state.is_quick_tunnel { "quick" } else { "named" };
+    // `tunnel_named_hostname`: the hostname from tunnel.toml when running in
+    // named-tunnel mode. The SPA's URL allowlist auto-accepts this domain so
+    // named-tunnel users don't need to configure anything. Null for Quick Tunnel.
+    let tunnel_named_hostname: serde_json::Value = state
+        .named_tunnel_hostname
+        .as_deref()
+        .map(serde_json::Value::from)
+        .unwrap_or(serde_json::Value::Null);
+    (StatusCode::OK, Json(json!({
+        "host_id": state.host_info.host_id,
+        "label": state.host_info.label,
+        "platform": state.host_info.platform,
+        "discovery_configured": discovery_configured,
+        "tunnel_mode": tunnel_mode,
+        "tunnel_named_hostname": tunnel_named_hostname,
+    }))).into_response()
 }
 
 /// GET /api/hosts/{id}/desktop/capabilities

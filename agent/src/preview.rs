@@ -532,6 +532,8 @@ mod tests {
             desktop_service: None,
             discovery_url: None,
             web_url: None,
+            is_quick_tunnel: true,
+            named_tunnel_hostname: None,
             discovery_temp_key: Arc::new(std::sync::RwLock::new(None)),
             tunnel_shutdown: Arc::new(tokio::sync::Notify::new()),
             telemetry: Arc::new(crate::telemetry::TelemetryState::new()),
