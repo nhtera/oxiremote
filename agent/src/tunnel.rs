@@ -269,18 +269,30 @@ pub async fn ensure_quick_tunnel(
     // kill_on_drop ensures cloudflared dies with the agent (panic, SIGINT,
     // OS shutdown). Without it, every crash leaves an orphaned cloudflared
     // reparented to init, accumulating Cloudflare quick-tunnel slot usage.
-    let mut child = tokio::process::Command::new(&cloudflared)
-        .args([
-            "tunnel",
-            "--no-autoupdate",
-            "--url",
-            &format!("http://{addr}"),
-        ])
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()
-        .context("spawn cloudflared")?;
+    let mut cmd = tokio::process::Command::new(&cloudflared);
+    cmd.args([
+        "tunnel",
+        "--no-autoupdate",
+        "--url",
+        &format!("http://{addr}"),
+    ])
+    .stdout(std::process::Stdio::piped())
+    .stderr(std::process::Stdio::piped())
+    .kill_on_drop(true);
+    // Windows: when the agent itself runs without a console (tray-detached
+    // child via CREATE_NO_WINDOW), every child it spawns must also pass
+    // CREATE_NO_WINDOW. Otherwise cloudflared's startup `AttachConsole`
+    // fails and it exits before registering — visible in the TUI as
+    // "cloudflared exited before registering". Harmless when the parent
+    // does have a console (TUI dashboard mode); it just suppresses a brief
+    // console-flash from cloudflared.
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    let mut child = cmd.spawn().context("spawn cloudflared")?;
 
     // Windows: tie the child to a kill-on-job-close job object so cloudflared
     // dies with the agent even when Drop never runs (taskkill /f, panic, OS
@@ -474,14 +486,20 @@ pub async fn ensure_named_tunnel(
         reason: None,
     });
 
-    let mut child = match tokio::process::Command::new(&cloudflared)
-        .args(&args)
+    let mut cmd = tokio::process::Command::new(&cloudflared);
+    cmd.args(&args)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()
-        .context("spawn cloudflared named tunnel")
+        .kill_on_drop(true);
+    // See ensure_quick_tunnel for CREATE_NO_WINDOW rationale — same fix
+    // for the named-tunnel path.
+    #[cfg(target_os = "windows")]
     {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    let mut child = match cmd.spawn().context("spawn cloudflared named tunnel") {
         Ok(c) => c,
         Err(err) => {
             bus.send(AgentEvent::TunnelStepChanged {
