@@ -4,6 +4,7 @@ import {
   MAX_RECONNECT_ATTEMPTS,
   SLOW_BACKOFF_MS,
   backoffMsForAttempt,
+  shouldFastRetryOnHandshakeFailure,
 } from './terminal-ws-hook'
 
 // The hook itself opens real WebSockets — too entangled with React lifecycle
@@ -43,6 +44,25 @@ describe('reconnect budget', () => {
   it('fast ladder is short enough to feel responsive on transient drops', () => {
     expect(BACKOFF_MS.length).toBeGreaterThanOrEqual(3)
     expect(BACKOFF_MS.length).toBeLessThanOrEqual(8)
+  })
+})
+
+describe('handshake-failure fast retry', () => {
+  // Quick Tunnels hardcode ha-connections=1; transient edge-stream-listener
+  // failures surface as a WS that closes without ever opening. We retry once
+  // immediately to mask these from the user — but only once per disconnect
+  // cycle, so a genuinely-broken endpoint falls through to the backoff ladder.
+  it('fires when the WS closed before opening and the immediate retry is unspent', () => {
+    expect(shouldFastRetryOnHandshakeFailure(false, false)).toBe(true)
+  })
+
+  it('does not fire after the immediate retry has already been spent this cycle', () => {
+    expect(shouldFastRetryOnHandshakeFailure(false, true)).toBe(false)
+  })
+
+  it('does not fire on a mid-session disconnect (we did open at some point)', () => {
+    expect(shouldFastRetryOnHandshakeFailure(true, false)).toBe(false)
+    expect(shouldFastRetryOnHandshakeFailure(true, true)).toBe(false)
   })
 })
 

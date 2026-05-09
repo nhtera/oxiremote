@@ -28,6 +28,25 @@ export type SessionHandle = {
   // Bumped on manual retry / mount so an in-flight async probe knows to bail
   // if the user has triggered a fresh reconnect path in the meantime.
   scheduleEpoch: number
+  // Distinguishes handshake failures (never opened — likely a Cloudflare Quick
+  // Tunnel edge transient) from mid-session disconnects. Reset to false at the
+  // start of every connect(); flipped true once `ws.onopen` fires.
+  everOpenedThisCycle: boolean
+  // Tracks whether the one-shot immediate retry has been spent in the current
+  // disconnect cycle. Reset on a successful open so future drops can use it.
+  fastRetryUsed: boolean
+}
+
+/// Decision predicate (pure, exported for unit tests): when a WS closes
+/// without ever having opened AND we haven't already used the fast retry
+/// for this disconnect cycle, retry once with no backoff. Quick Tunnel
+/// edge-stream-listener hiccups normally heal within ~50-200ms so this
+/// path catches transients before they reach the modal.
+export function shouldFastRetryOnHandshakeFailure(
+  everOpenedThisCycle: boolean,
+  fastRetryUsed: boolean,
+): boolean {
+  return !everOpenedThisCycle && !fastRetryUsed
 }
 
 /// Subprotocol marker used to carry a Bearer api_key on WS upgrade in
@@ -206,9 +225,12 @@ function connect(
     ? new WebSocket(wsUrl(`/api/terminal/sessions/${sessionId}/ws`), protocols)
     : new WebSocket(wsUrl(`/api/terminal/sessions/${sessionId}/ws`))
   handle.ws = ws
+  handle.everOpenedThisCycle = false
 
   ws.onopen = () => {
     handle.connected = true
+    handle.everOpenedThisCycle = true
+    handle.fastRetryUsed = false
     handle.reconnectAttempt = 0
     handle.slowAttempt = 0
     if (handle.phase !== 'fast') {
@@ -226,6 +248,16 @@ function connect(
     handle.ws = null
     if (activeIdRef.current === sessionId) onConnected(false)
     if (handle.closedByUser) return
+    if (shouldFastRetryOnHandshakeFailure(handle.everOpenedThisCycle, handle.fastRetryUsed)) {
+      handle.fastRetryUsed = true
+      // queueMicrotask: jump back into the connect path before the next
+      // setTimeout tick. Doesn't bump reconnectAttempt — the user-visible
+      // counter only reflects retries that involved a backoff wait.
+      queueMicrotask(() =>
+        connect(handle, sessionId, onConnected, activeIdRef, onReconnectAttempt, onReconnectPhase),
+      )
+      return
+    }
     void scheduleReconnect(handle, sessionId, onConnected, activeIdRef, onReconnectAttempt, onReconnectPhase)
   }
 

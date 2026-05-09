@@ -92,6 +92,7 @@ export default function XtermPane({
       term, fit, ws: null, connected: false,
       reconnectTimer: null, reconnectAttempt: 0, closedByUser: false,
       phase: 'fast', slowAttempt: 0, lastProbeAt: 0, scheduleEpoch: 0,
+      everOpenedThisCycle: false, fastRetryUsed: false,
     })
     setMounted(true)
     return () => {
