@@ -109,6 +109,11 @@ windows-sys = { version = "0.59", features = [
     "Win32_UI_WindowsAndMessaging",
     "Win32_System_JobObjects",
     "Win32_System_Threading",
+    # Win32_System_IO — provides OVERLAPPED. LockFileEx (used by
+    # instance_lock.rs on Windows) is itself cfg-gated on this feature
+    # because its signature takes *mut OVERLAPPED. Without it, the symbol
+    # is invisible and the compiler suggests `LockFile` instead.
+    "Win32_System_IO",
     "Win32_Security",
     "Win32_Foundation",
     "Win32_Storage_FileSystem",
