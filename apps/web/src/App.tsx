@@ -17,10 +17,12 @@ import HostLogsPage from './pages/host-logs-page'
 import { ToastProvider, ConfirmProvider } from './components/ui'
 import { useHostStore } from './state/host-store'
 import { registerServiceWorker } from './lib/push-client'
-import { getActiveHost, loadApiKey, loadTunnelBase } from './lib/api-client'
+import { getActiveHost, loadApiKey, loadTunnelBase, storeTunnelBase } from './lib/api-client'
 import { switchActiveHost } from './lib/host-switch-helpers'
 import { listSavedHosts } from './lib/saved-hosts'
 import { useTunnelUrlSse } from './hooks/use-tunnel-url-sse'
+import { isDiscoveryMode, getCurrentTunnelUrl } from './lib/discovery-client'
+import { isAllowedTunnelHost, getNamedTunnelAllowlist } from './lib/url-validation'
 import { HostMovedToast } from './components/host-moved-toast'
 
 // Agent dashboard is localhost-only. Lazy-loaded so it never enters the
@@ -148,6 +150,33 @@ function App() {
   // tunnel_url_changed SSE events and broadcast oxi:tunnel-url-changed so
   // active WS hooks (terminal, desktop) can reconnect within ~3s.
   useTunnelUrlSse()
+
+  // Discovery-mode pre-warm: SSE is same-origin only, so cross-origin SPAs
+  // (Cloudflare Pages discovery deploy) miss tunnel rotations until their
+  // next API call. On mount, ask the discovery worker for the current
+  // tunnel URL and update the cached base before any WS upgrade fires.
+  // Eliminates the cold-load stale-URL case where the agent rotated its
+  // Quick Tunnel since this tab last cached it — without it, the first
+  // terminal/desktop WS would fail and the reconnect modal would flash
+  // during recovery.
+  useEffect(() => {
+    if (!isDiscoveryMode()) return
+    void (async () => {
+      try {
+        const fresh = await getCurrentTunnelUrl()
+        if (!fresh) return
+        const cached = loadTunnelBase()
+        if (fresh === cached) return
+        if (!isAllowedTunnelHost(fresh, getNamedTunnelAllowlist())) return
+        const hostId = getActiveHost()
+        if (hostId) storeTunnelBase(hostId, fresh)
+      } catch {
+        // Discovery worker unreachable — cached base will be tried first
+        // and the existing on-failure refresh in scheduleReconnect handles
+        // recovery. No-op here.
+      }
+    })()
+  }, [])
 
   // Fetch host info once on mount; 401 is handled inside fetchHost
   useEffect(() => {

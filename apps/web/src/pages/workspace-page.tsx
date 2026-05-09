@@ -647,7 +647,11 @@ export default function WorkspacePage() {
       {hasSessions && anyAssigned && <TerminalSendComposer onSend={sendInput} />}
 
       <ReconnectModal
-        open={!!focusedSessionId && active?.state !== 'exited' && !isFocusedConnected && focusedAttempt > 0}
+        // Defer modal until attempt > 1 so the first transient drop (cold-tunnel
+        // WS upgrade race, stale-URL recovery via discovery worker, etc.) recovers
+        // silently inside the 500ms first-attempt backoff. The modal still pops
+        // on attempt 2+ if the connection is genuinely stuck.
+        open={!!focusedSessionId && active?.state !== 'exited' && !isFocusedConnected && focusedAttempt > 1}
         attempt={focusedAttempt}
         maxAttempts={MAX_RECONNECT_ATTEMPTS}
         phase={focusedPhase}
