@@ -116,6 +116,8 @@ pub async fn api_desktop_capabilities(
 
     #[cfg(feature = "desktop")]
     {
+        use crate::pipeline_selection::{operator_preference, ClientCapabilities, OperatorPref};
+
         let available = state.desktop_available;
         let monitors: Vec<serde_json::Value> = if available {
             desktop::list_monitors()
@@ -126,16 +128,49 @@ pub async fn api_desktop_capabilities(
             vec![]
         };
 
-        // Surface the operator's pipeline preference so the SPA can mount the
-        // correct hook (JPEG vs H.264) before opening the WS — spares a
-        // doomed H.264 handshake when the server will choose JPEG anyway.
-        let preferred_pipeline = crate::pipeline_selection::operator_preference().wire_name();
+        // Best-effort hint for the SPA so it can pick the right session hook
+        // before the WS upgrade. We don't know the real client capabilities
+        // here (that handshake happens after upgrade), so we feed `choose()`
+        // an optimistic capability set: WebCodecs+H.264 baseline. That gives
+        // the SPA the "what would Auto resolve to right now" answer, which is
+        // what the pill tooltip references as `chosen_default`.
+        let op = operator_preference();
+        let optimistic_caps = ClientCapabilities {
+            codecs: vec!["h264-baseline-3.1".to_string()],
+            webcodecs: true,
+        };
+        let (chosen_default, default_reason) =
+            match crate::pipeline_selection::choose(op, &optimistic_caps) {
+                Ok(d) => (d.pipeline.wire_name(), d.reason),
+                // `forced-h264-no-client` is unreachable with the optimistic
+                // caps above; if a future refactor makes it reachable we'd
+                // rather surface `h264` + an explanatory reason than 500.
+                Err(e) => ("h264", e.reason),
+            };
+
+        // `available_pipelines` is the *transport list* the binary can speak
+        // at all (build-time feature gate). `preferred_pipeline` is what the
+        // operator's env var picks; `chosen_default` is what `Auto` would
+        // resolve to for the SPA right now.
+        let mut available_pipelines = vec!["jpeg".to_string()];
+        if crate::pipeline_selection::H264_COMPILED {
+            available_pipelines.push("h264".to_string());
+        }
+        let preferred_pipeline = match op {
+            OperatorPref::Jpeg => "jpeg",
+            OperatorPref::Auto => "auto",
+            #[cfg(feature = "h264")]
+            OperatorPref::H264 => "h264",
+        };
 
         let body = json!({
             "available": available,
             "quality_tiers": ["low", "med", "high"],
             "monitors": monitors,
+            "available_pipelines": available_pipelines,
             "preferred_pipeline": preferred_pipeline,
+            "chosen_default": chosen_default,
+            "default_reason": default_reason,
         });
         (StatusCode::OK, Json(body)).into_response()
     }
@@ -146,7 +181,10 @@ pub async fn api_desktop_capabilities(
             "available": false,
             "quality_tiers": ["low", "med", "high"],
             "monitors": [],
+            "available_pipelines": ["jpeg"],
             "preferred_pipeline": "jpeg",
+            "chosen_default": "jpeg",
+            "default_reason": "no-desktop-feature",
         });
         (StatusCode::OK, Json(body)).into_response()
     }

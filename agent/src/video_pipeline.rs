@@ -161,7 +161,7 @@ pub fn spawn_video_pipeline(mut cfg: VideoPipelineConfig) {
             // Pick up bitrate changes without blocking — watch::Receiver
             // surfaces the latest value via `borrow`.
             if cfg.bitrate_rx.has_changed().unwrap_or(false) {
-                let new_bps = (*cfg.bitrate_rx.borrow_and_update()).0;
+                let new_bps = cfg.bitrate_rx.borrow_and_update().0;
                 if new_bps != last_bitrate {
                     if let Err(e) = encoder.set_bitrate(BitrateBps(new_bps)) {
                         warn!(error = %e, "encoder set_bitrate failed");

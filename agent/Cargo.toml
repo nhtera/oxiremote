@@ -153,9 +153,13 @@ quick-xml = { version = "0.37", features = ["serialize"] }
 tokio = { version = "1", features = ["test-util"] }
 
 [features]
-default = ["desktop"]
+# H.264 is now the default video pipeline. The auto-select path in
+# `pipeline_selection::choose()` still resolves to JPEG when the client
+# can't decode H.264, so the JPEG transport stays a first-class fallback.
+# Headless / CI builds that don't need video: `--no-default-features`.
+default = ["desktop", "h264"]
 desktop = ["dep:desktop", "dep:webrtc"]
-# Phase 03 H.264 pipeline (VT on macOS, OpenH264 fallback). Adds WebRTC
-# video track + capabilities exchange. Gated so the default JPEG build stays
-# compile-clean while H.264 is under active development.
+# H.264 pipeline (VT on macOS, OpenH264 fallback). The default JPEG build
+# (`--no-default-features --features desktop`) still compiles cleanly so the
+# transport split survives a feature-flag rollback.
 h264 = ["desktop", "desktop/h264", "dep:rtcp"]

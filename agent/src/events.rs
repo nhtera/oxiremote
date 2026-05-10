@@ -194,6 +194,17 @@ pub enum AgentEvent {
         #[serde(skip_serializing_if = "Option::is_none")]
         reason: Option<String>,
     },
+    /// Remote-desktop session resolved its transport pipeline. Fired once per
+    /// session right after `pipeline_selection::choose()`. The host dashboard
+    /// log surface uses this to count JPEG fallbacks vs auto-H.264 sessions
+    /// — the phase-01 telemetry soak success metric is computed from these.
+    /// `reason` is the stable identifier from `pipeline_selection::Decision`
+    /// (e.g. `"auto-h264"`, `"auto-jpeg-no-client"`, `"forced-jpeg"`).
+    PipelineChosen {
+        device_id: String,
+        pipeline: String,
+        reason: String,
+    },
 }
 
 /// Lightweight tunnel-state snapshot kept in lockstep with broadcast events.

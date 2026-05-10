@@ -24,9 +24,10 @@ Single Rust test: `cargo test --manifest-path agent/Cargo.toml <name>` (e.g. `tu
 
 ## Cargo Features
 
-- `default = ["desktop"]` — JPEG remote-desktop pipeline (xcap + mozjpeg + WebRTC DataChannel). Linux requires X11/xcb dev headers; see `.github/workflows/release.yml` step "Install Linux build deps".
-- `h264` — adds VideoToolbox (macOS) or OpenH264 (Linux) and the WebRTC video-track pipeline. **Default JPEG build must stay compile-clean** when `h264` is absent — `pipeline_selection::choose()` falls back to JPEG and `Pipeline::H264` is `#[cfg(feature = "h264")]`.
+- `default = ["desktop", "h264"]` — **as of phase-01 of `260511-0201-remote-desktop-pipeline-enhance`, H.264 is the default video pipeline.** `pipeline_selection::OperatorPref::Auto` resolves to H.264 when the client supports it (iPad Safari ≥17, Chrome, modern Android) and to JPEG otherwise. Linux requires X11/xcb dev headers + `libopenh264-dev`; see `.github/workflows/release.yml` "Install Linux build deps".
+- `desktop` (no `h264`) — JPEG-only build (xcap + mozjpeg + WebRTC DataChannel). The compile-clean `--no-default-features --features desktop` invariant is enforced — `Pipeline::H264` stays `#[cfg(feature = "h264")]`, and `choose()` returns `Pipeline::Jpeg` with reason `auto-jpeg-no-feature`.
 - Build without remote desktop: `cargo build --no-default-features` (e.g. headless CI).
+- Per-session override: the SPA can append `?force_pipeline=jpeg|h264|auto` to the WS upgrade. The agent parses + validates and uses it for **that session only** without touching the env-var preference. Used by the SPA to honor `FallbackPending` (3 s no-IDR watchdog) when an H.264 negotiation completes but no keyframe arrives.
 
 ## Subcommand Dispatch (`agent/src/main.rs`)
 
@@ -104,7 +105,7 @@ The dashboard `TunnelStatusPill` and `TunnelStatusCard` render a tri-state: gree
 | `OXI_SECURE_COOKIES=1` | Mark auth cookies `Secure` (required over HTTPS / tunnel). |
 | `OXI_WORKSPACE=/path` | Workspace root exposed by the file browser (defaults to CWD). |
 | `OXI_HEADLESS=1` | Force headless server even with a TTY. |
-| `OXI_VIDEO_PIPELINE=h264\|jpeg` | Operator preference for remote desktop pipeline. |
+| `OXI_VIDEO_PIPELINE=auto\|h264\|jpeg` | Operator preference for remote-desktop pipeline. **Default `auto`** post phase-01: H.264 when feature compiled + client supports decode, JPEG otherwise. `h264` fails-closed on incapable clients (no silent JPEG fallback); `jpeg` forces JPEG. Unknown values fall back to `auto`. |
 | `OXI_DISCOVERY_URL` | Cloudflare discovery-worker base URL (e.g. `https://oxiremote-discovery.<account>.workers.dev`). When set, the agent registers `discovery_id → tunnelUrl` after every `TunnelUrlChanged` and the QR encodes a cross-origin form. Unset = embedded-SPA mode (no behaviour change). |
 | `OXI_GIT_BASH_PATH` | Windows only. Absolute path to `bash.exe` from Git for Windows when the standard install paths are non-default (e.g. portable Git, scoop). When unset, terminal sessions probe `C:\Program Files\Git\bin\bash.exe` then fall back to `powershell.exe`. |
 | `OXIREMOTE_INSTALL_DIR` | Override install target dir for `scripts/install.sh`. |

@@ -122,6 +122,11 @@ fn extract_sps_pps(annexb: &[u8]) -> Option<ParameterSets> {
         (Some(s), Some(p)) => Some(ParameterSets {
             sps: Bytes::copy_from_slice(s),
             pps: Bytes::copy_from_slice(p),
+            // OpenH264 is software-only; the trait method is the source of
+            // truth but extract_sps_pps is a free function called outside an
+            // impl block — locking the value here avoids threading the
+            // encoder ref through. Keep in sync with H264Encoder::is_hardware.
+            is_hardware: false,
         }),
         _ => None,
     }
@@ -220,6 +225,11 @@ impl H264Encoder for OpenH264Encoder {
 
     fn parameter_sets(&self) -> Option<ParameterSets> {
         self.params.clone()
+    }
+
+    fn is_hardware(&self) -> bool {
+        // OpenH264 is pure CPU.
+        false
     }
 }
 

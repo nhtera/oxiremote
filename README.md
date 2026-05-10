@@ -57,8 +57,15 @@ On first launch the agent downloads `cloudflared`, opens a Quick Tunnel, and pri
 - `OXI_SECURE_COOKIES=1` — mark auth cookies as `Secure` (recommended over HTTPS / tunnel)
 - `OXI_WORKSPACE=/path/to/project` — set the workspace root (defaults to CWD)
 - `OXI_HEADLESS=1` — force headless server mode even when a TTY is attached
+- `OXI_VIDEO_PIPELINE=auto|h264|jpeg` — pick the remote-desktop transport. **Default `auto`** (H.264 when the client supports it, JPEG otherwise). Force `h264` to fail-closed on incapable clients; force `jpeg` to disable H.264 entirely.
 - `OXIREMOTE_INSTALL_DIR=...` — install script target directory
 - `OXIREMOTE_BINARY_URL=...` — npm wrapper download base URL (corp proxies / mirrors)
+
+## Remote desktop
+
+H.264 over a WebRTC video track is the default for clients that support it (iPad Safari ≥17, Chrome desktop, recent Android Chrome). Older browsers fall back to JPEG tile streaming over a DataChannel. The chosen pipeline is shown in the desktop toolbar as `H.264 (HW)` / `H.264 (SW)` / `JPEG` — hover the pill for the reason.
+
+Operators who need to opt out: `OXI_VIDEO_PIPELINE=jpeg`. Headless builds without H.264: `cargo build --no-default-features --features desktop`.
 
 ## Mobile usage
 

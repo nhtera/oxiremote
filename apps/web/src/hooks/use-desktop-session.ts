@@ -28,6 +28,19 @@ export type DesktopStatus =
 
 export type QualityTier = 'low' | 'med' | 'high'
 
+/**
+ * Pipeline status surfaced from the agent's `pipelineChosen` / `pipeline`
+ * signals. Both desktop hooks expose it so the toolbar pill can render
+ * `H.264 (HW)` / `H.264 (SW)` / `JPEG` with a tooltip explaining the
+ * reason. `hardwareAccel` is `undefined` until the H.264 encoder lands
+ * its first IDR (~33ms after stream-up).
+ */
+export interface DesktopPipelineInfo {
+  mode: 'h264' | 'jpeg'
+  reason: string
+  hardwareAccel?: boolean
+}
+
 export interface DesktopInputEvent {
   // 'text' is Unicode-safe literal-string injection; routed server-side to
   // `enigo.text()` and skips the dom_code_to_key path entirely. Modifier
@@ -53,6 +66,10 @@ interface SessionApi {
   /// stopped"). Set when the capture pipeline exits mid-session so the UI can
   /// show a meaningful reconnect message instead of a frozen frame.
   lastEndReason?: string
+  /// Latest pipeline info from the agent's `pipelineChosen` / `pipeline`
+  /// signals. Drives the toolbar `PipelineStatusPill`. `undefined` between
+  /// session start and the first signaling exchange.
+  pipelineInfo?: DesktopPipelineInfo
 }
 
 // Callback invoked for every raw tile binary message (DC or WS fallback).
@@ -71,18 +88,52 @@ const MAX_ATTEMPTS = 3
 // (cross-origin) mode the SPA lives on Pages but the agent's WS lives on
 // the per-host tunnel — rewrite to the saved tunnel base so the upgrade
 // hits the right origin.
-function wsUrl(deviceId: string): string {
+//
+// `forcePipeline` (when set) is appended as a query parameter so the agent
+// honors `?force_pipeline=jpeg|h264|auto` for this session only. The flag
+// is set after a `fallbackPending` server signal — see `consumeForcePipeline`.
+function wsUrl(deviceId: string, forcePipeline?: 'jpeg' | 'h264' | 'auto'): string {
   const path = `/ws/desktop/${encodeURIComponent(deviceId)}`
+  const query = forcePipeline ? `?force_pipeline=${forcePipeline}` : ''
   if (isDiscoveryMode()) {
     const base = loadTunnelBase()
     if (base) {
       const wsBase = base.replace(/^http:/, 'ws:').replace(/^https:/, 'wss:')
-      return `${wsBase}${path}`
+      return `${wsBase}${path}${query}`
     }
   }
   const proto = location.protocol === 'https:' ? 'wss:' : 'ws:'
-  return `${proto}//${location.host}${path}`
+  return `${proto}//${location.host}${path}${query}`
 }
+
+// Sessionstorage key the H.264 hook writes after a `fallbackPending`. We
+// read it on the next connect, drop it, and pass `force_pipeline=jpeg` to
+// the agent so it doesn't try H.264 again. Per-host so two hosts in the
+// same browser tab don't share a stale fallback flag.
+const FORCE_JPEG_PREFIX = 'oxi.desktop.force_jpeg:'
+
+export function setForceJpeg(hostId: string) {
+  try {
+    sessionStorage.setItem(`${FORCE_JPEG_PREFIX}${hostId}`, '1')
+  } catch {
+    /* private mode / quota — best-effort, fallback works without it on next reload */
+  }
+}
+
+function consumeForceJpeg(hostId: string): boolean {
+  try {
+    const k = `${FORCE_JPEG_PREFIX}${hostId}`
+    const v = sessionStorage.getItem(k)
+    if (v) sessionStorage.removeItem(k)
+    return !!v
+  } catch {
+    return false
+  }
+}
+
+// Window event the H.264 hook fires when it receives `fallbackPending`. The
+// page listens and re-mounts the desktop view in JPEG mode for this session.
+export const DESKTOP_FALLBACK_PENDING_EVENT = 'oxi:desktop-fallback-pending'
 
 function wsProtocols(): string[] | undefined {
   if (!isDiscoveryMode()) return undefined
@@ -103,6 +154,7 @@ export function useDesktopSession(
   const [screenDims, setScreenDims] = useState<{ width: number; height: number } | undefined>()
   const [tileSize, setTileSize] = useState<number | undefined>()
   const [lastEndReason, setLastEndReason] = useState<string | undefined>()
+  const [pipelineInfo, setPipelineInfo] = useState<DesktopPipelineInfo | undefined>()
 
   // Refs hold live handles so reconnect logic can tear down and rebuild.
   const wsRef = useRef<WebSocket | null>(null)
@@ -120,6 +172,14 @@ export function useDesktopSession(
   // fastRetryUsedRef to gate the one-shot immediate retry per cycle.
   const everOpenedThisCycleRef = useRef(false)
   const fastRetryUsedRef = useRef(false)
+  // Mount-scoped force-JPEG flag. Read from sessionStorage ONCE per mount
+  // lifecycle (see useEffect below) rather than inside `connect()`. React 18
+  // StrictMode double-invokes effects in dev — destructively consuming the
+  // sessionStorage key inside connect() would burn it on the first mount and
+  // leave the second mount (the one that actually survives) without the
+  // override. Pinning into a ref preserves the value across the mount/
+  // remount churn and is consumed atomically when the survivor connects.
+  const forceJpegRef = useRef(false)
   // Latest UI-selected tier — read from `ctrlDc.onopen` to tell the agent
   // which tier to encode at before any frame leaves. Kept in a ref (not in
   // the effect's dep list) so tier changes don't tear down the session.
@@ -160,10 +220,16 @@ export function useDesktopSession(
 
     setStatus('connecting')
 
+    // Read from the mount-scoped ref (populated by useEffect below from the
+    // sessionStorage flag). The flag is cleared on the first `connect()` of
+    // this mount so reconnects within the same mount don't re-force JPEG
+    // forever — the user's Reload button clears the page-level state to
+    // retry H.264.
+    const forcePipeline = forceJpegRef.current ? 'jpeg' : undefined
+    if (forceJpegRef.current) forceJpegRef.current = false
     const protocols = wsProtocols()
-    const ws = protocols
-      ? new WebSocket(wsUrl(deviceId), protocols)
-      : new WebSocket(wsUrl(deviceId))
+    const url = wsUrl(deviceId, forcePipeline)
+    const ws = protocols ? new WebSocket(url, protocols) : new WebSocket(url)
     ws.binaryType = 'arraybuffer'
     wsRef.current = ws
 
@@ -333,6 +399,21 @@ export function useDesktopSession(
           if (!destroyedRef.current) handleDisconnect()
           break
         }
+
+        case 'pipelineChosen':
+        case 'pipeline': {
+          // Phase-01: pipelineChosen lands at session start, pipeline (with
+          // avcc) lands at first IDR on H.264. Both carry the chosen mode +
+          // stable reason; pipeline overrides with the authoritative
+          // hardware_accel once the encoder backend is locked.
+          const mode = msg.mode === 'h264' ? 'h264' : 'jpeg'
+          const reason = typeof msg.reason === 'string' ? msg.reason : 'unknown'
+          const hwRaw = msg.hardwareAccel ?? msg.hardware_accel
+          const hardwareAccel =
+            typeof hwRaw === 'boolean' ? hwRaw : undefined
+          setPipelineInfo({ mode, reason, hardwareAccel })
+          break
+        }
       }
     }
 
@@ -443,6 +524,10 @@ export function useDesktopSession(
     // Skip until /api/me has resolved the authenticated device_id.
     if (!deviceId) return
     destroyedRef.current = false
+    // Consume the sessionStorage flag exactly ONCE per mount lifecycle.
+    // StrictMode dev double-mount would otherwise eat the flag on mount A,
+    // leaving mount B (the survivor) without the force-JPEG hint.
+    forceJpegRef.current = consumeForceJpeg(hostId)
     connect()
     return () => {
       destroyedRef.current = true
@@ -465,5 +550,16 @@ export function useDesktopSession(
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [deviceId])
 
-  return { status, sendInput, setQuality, setSettings, disconnect, attempt, screenDims, tileSize, lastEndReason }
+  return {
+    status,
+    sendInput,
+    setQuality,
+    setSettings,
+    disconnect,
+    attempt,
+    screenDims,
+    tileSize,
+    lastEndReason,
+    pipelineInfo,
+  }
 }

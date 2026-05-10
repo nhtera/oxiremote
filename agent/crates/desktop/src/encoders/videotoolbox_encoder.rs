@@ -222,6 +222,10 @@ fn extract_frame(
             (Ok(sps), Ok(pps)) => Some(ParameterSets {
                 sps: Bytes::copy_from_slice(&sps),
                 pps: Bytes::copy_from_slice(&pps),
+                // VT runs on the media engine; H264Encoder::is_hardware
+                // returns true for this backend. Mirror that here so the
+                // callback path doesn't have to re-probe.
+                is_hardware: true,
             }),
             _ => None,
         }
@@ -423,7 +427,7 @@ impl Drop for VideoToolboxEncoder {
         // Tear down the session first so no more callbacks will fire with our
         // refcon. Then drop the Arc clone that was leaked into VT as refcon.
         unsafe { self.session.invalidate() };
-        let refcon = Arc::as_ptr(&self.state) as *const Mutex<SharedState>;
+        let refcon = Arc::as_ptr(&self.state);
         // SAFETY: `refcon` is the same pointer Arc::into_raw produced in new().
         // We are the sole remaining clone route, and after invalidate() no VT
         // thread can still be inside the callback with this refcon.
@@ -467,7 +471,7 @@ impl H264Encoder for VideoToolboxEncoder {
         let mut info_flags = VTEncodeInfoFlags::empty();
         let status = unsafe {
             self.session.encode_frame(
-                &*pixel_buf,
+                &pixel_buf,
                 pts,
                 duration,
                 frame_props.as_deref(),
@@ -512,6 +516,11 @@ impl H264Encoder for VideoToolboxEncoder {
         // lifetime issue. Only the session layer calls this on first IDR.
         let guard = self.state.lock().unwrap_or_else(|p| p.into_inner());
         guard.params.clone()
+    }
+
+    fn is_hardware(&self) -> bool {
+        // VideoToolbox runs on the Apple silicon / x86 Intel media engine.
+        true
     }
 }
 

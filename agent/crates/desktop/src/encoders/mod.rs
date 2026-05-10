@@ -31,10 +31,16 @@ pub struct EncodedFrame {
 
 /// Parameter sets extracted on the first IDR so the client can build its
 /// WebCodecs `VideoDecoder.configure({ description })` blob via `build_avcc`.
+///
+/// `is_hardware` rides on the same first-IDR oneshot so the session layer
+/// can emit `SignalOut::Pipeline { hardware_accel }` to the SPA pill without
+/// adding a second channel — the encoder backend is locked from this point
+/// on so a single snapshot is correct for the session lifetime.
 #[derive(Debug, Clone)]
 pub struct ParameterSets {
     pub sps: Bytes,
     pub pps: Bytes,
+    pub is_hardware: bool,
 }
 
 /// Bitrate targets by quality tier, in bits per second.
@@ -88,4 +94,10 @@ pub trait H264Encoder: Send {
     /// thread) and can't hand out borrows. Callers invoke this only on the
     /// first keyframe so the clone cost (two `Bytes` Arc-clones) is trivial.
     fn parameter_sets(&self) -> Option<ParameterSets>;
+
+    /// True when the backend offloads encode work to dedicated silicon
+    /// (VideoToolbox on Apple, future Media Foundation / NVENC on Windows).
+    /// Software backends (OpenH264) return false. Used by the SPA status
+    /// pill to render `H.264 (HW)` vs `H.264 (SW)`.
+    fn is_hardware(&self) -> bool;
 }

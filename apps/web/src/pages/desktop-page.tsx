@@ -13,11 +13,14 @@ import { useNavigate, useParams } from 'react-router-dom'
 import { useHostStore } from '../state/host-store'
 import type {
   DesktopInputEvent,
+  DesktopPipelineInfo,
   DesktopStatus,
   QualityTier,
 } from '../hooks/use-desktop-session'
+import { DESKTOP_FALLBACK_PENDING_EVENT } from '../hooks/use-desktop-session'
 import type { InputMode, GestureMode } from '../hooks/use-desktop-input'
 import { supportsH264Video } from '../hooks/use-desktop-video-session'
+import PipelineStatusPill from '../components/pipeline-status-pill'
 import DesktopJpegView from '../components/desktop-jpeg-view'
 import DesktopH264View from '../components/desktop-h264-view'
 import type { DesktopGestureApi } from '../components/desktop-jpeg-view'
@@ -37,8 +40,14 @@ interface Capabilities {
   available: boolean
   quality_tiers: QualityTier[]
   monitors: { id: number; label: string; width: number; height: number }[]
-  /** Server operator preference — 'h264' requires a client that also supports it. */
-  preferred_pipeline?: 'jpeg' | 'h264'
+  /** Operator preference: 'auto' (default) | 'h264' | 'jpeg'. Phase-01: the
+   *  old binary surface was 'h264'|'jpeg'; new agents emit 'auto'. SPA treats
+   *  'auto' as "try H.264 if the client supports it" — same effect as the old
+   *  'h264' preference but without the fail-closed semantics. */
+  preferred_pipeline?: 'auto' | 'jpeg' | 'h264'
+  /** What `Auto` would resolve to right now given an optimistic client cap
+   *  set. Used as the SPA's pre-mount hint when `preferred_pipeline === 'auto'`. */
+  chosen_default?: 'jpeg' | 'h264'
 }
 
 interface SessionApi {
@@ -157,6 +166,13 @@ export default function DesktopPage() {
   const [screenDims, setScreenDims] = useState<{ width: number; height: number } | undefined>(
     undefined,
   )
+  const [pipelineInfo, setPipelineInfo] = useState<DesktopPipelineInfo | undefined>()
+  // Per-session force-JPEG flag — flipped true when the H.264 hook reports
+  // `fallbackPending`. Causes the next render to mount the JPEG view; the
+  // JPEG hook then appends `?force_pipeline=jpeg` to its WS upgrade so the
+  // agent stays on JPEG for this session. Reset on `Reload` so the user can
+  // retry H.264 deliberately.
+  const [forceJpegSession, setForceJpegSession] = useState(false)
   const sessionApiRef = useRef<SessionApi>(noopApi)
 
   // Container that wraps the canvas. Tracked via ResizeObserver so we can
@@ -227,13 +243,30 @@ export default function DesktopPage() {
       status: DesktopStatus
       attempt: number
       screenDims?: { width: number; height: number }
+      pipelineInfo?: DesktopPipelineInfo
     }) => {
       setStatus(s.status)
       setAttempt(s.attempt)
       if (s.screenDims) setScreenDims(s.screenDims)
+      if (s.pipelineInfo) setPipelineInfo(s.pipelineInfo)
     },
     [],
   )
+
+  // Listen for the H.264 hook's `fallbackPending` signal: re-mount as JPEG
+  // and bump the reload nonce so the new view fully reinitialises (vs
+  // re-using a torn-down PC). The H.264 hook has already set the
+  // sessionStorage marker the JPEG hook consumes on its next connect.
+  useEffect(() => {
+    function onFallback() {
+      setForceJpegSession(true)
+      setReloadNonce((n) => n + 1)
+      setPipelineInfo(undefined) // pill clears until the JPEG hook emits its own
+    }
+    window.addEventListener(DESKTOP_FALLBACK_PENDING_EVENT, onFallback)
+    return () =>
+      window.removeEventListener(DESKTOP_FALLBACK_PENDING_EVENT, onFallback)
+  }, [])
   const onSessionApi = useCallback((api: SessionApi) => {
     sessionApiRef.current = api
   }, [])
@@ -311,6 +344,10 @@ export default function DesktopPage() {
 
   const handleReload = useCallback(() => {
     sessionApiRef.current.disconnect()
+    // User-driven reload: give H.264 another chance. The sessionStorage
+    // marker was consumed when the JPEG hook ran, so this just clears the
+    // page-level flag that pinned the view to JPEG.
+    setForceJpegSession(false)
     setReloadNonce((n) => n + 1)
   }, [])
 
@@ -416,7 +453,14 @@ export default function DesktopPage() {
     )
   }
 
-  const useH264 = caps.preferred_pipeline === 'h264' && supportsH264Video()
+  // Pick H.264 when: client can decode AND (operator forced H.264 OR Auto
+  // resolves to H.264) AND no per-session fallback flag is set. The
+  // `chosen_default` hint covers the new `Auto` preference; the legacy
+  // `'h264'` branch is kept for compatibility with older agents.
+  const wantsH264 =
+    caps.preferred_pipeline === 'h264' ||
+    (caps.preferred_pipeline === 'auto' && caps.chosen_default === 'h264')
+  const useH264 = wantsH264 && supportsH264Video() && !forceJpegSession
   const monitorDefault = caps.monitors[0]
     ? { width: caps.monitors[0].width, height: caps.monitors[0].height }
     : undefined
@@ -455,6 +499,20 @@ export default function DesktopPage() {
       {/* Disable touch/pointer events on the canvas while text-batch sheet is open
           so taps on the visible canvas don't register as remote clicks. */}
       <div ref={canvasWrapRef} className={`flex-1 relative min-h-0${showTextBatch ? ' pointer-events-none' : ''}`}>
+        {/* Phase-01 pipeline-status pill: shows `H.264 (HW/SW)` or `JPEG`
+            with a tooltip explaining the chosen-reason. `pointer-events-none`
+            so it never steals canvas taps. Mounted in the canvas wrap so it
+            scales correctly on both mobile + lg layouts without toolbar
+            prop drilling. */}
+        {pipelineInfo && (
+          <div className="absolute top-2 right-2 z-10 pointer-events-none">
+            <PipelineStatusPill
+              mode={pipelineInfo.mode}
+              reason={pipelineInfo.reason}
+              hardwareAccel={pipelineInfo.hardwareAccel}
+            />
+          </div>
+        )}
         {useH264 ? (
           <DesktopH264View
             key={`h264-${reloadNonce}`}

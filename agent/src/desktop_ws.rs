@@ -14,7 +14,7 @@ mod inner {
     use std::time::Duration;
 
     use axum::extract::ws::{Message, WebSocket};
-    use axum::extract::{Path, State, WebSocketUpgrade};
+    use axum::extract::{Path, Query, State, WebSocketUpgrade};
     use axum::http::{HeaderMap, StatusCode};
     use axum::response::IntoResponse;
     use axum_extra::extract::cookie::CookieJar;
@@ -24,6 +24,7 @@ mod inner {
     use serde::{Deserialize, Serialize};
     use tokio::sync::{mpsc, watch, Mutex};
     use tracing::{info, warn};
+    use crate::events::AgentEvent;
     use webrtc::api::APIBuilder;
     use webrtc::api::media_engine::MediaEngine;
     use webrtc::data_channel::data_channel_init::RTCDataChannelInit;
@@ -44,9 +45,25 @@ mod inner {
     use crate::desktop_service::DesktopService;
     use crate::desktop_ws_capture::{spawn_capture_pipeline, Sink};
     use crate::pipeline_selection::{
-        choose as choose_pipeline, operator_preference, ClientCapabilities, Pipeline,
+        choose as choose_pipeline, operator_preference, parse_force_pipeline, ClientCapabilities,
+        ForcedH264Unavailable, OperatorPref, Pipeline,
     };
     use crate::AppState;
+
+    /// Optional per-session pipeline override, parsed from the WS upgrade
+    /// query string. The SPA appends `?force_pipeline=jpeg` when honoring a
+    /// `FallbackPending` so the reconnect session forces JPEG without
+    /// changing the agent's env-var preference. Validated against the same
+    /// allow-list as the env var; unknown values yield 400.
+    ///
+    /// `pub(crate)` because the route handler is `pub(crate)` and Rust
+    /// requires query types to be at least as visible as the handler that
+    /// names them (`private_interfaces` lint, hard error in 2024 edition).
+    #[derive(Debug, Deserialize, Default)]
+    pub(crate) struct DesktopWsQuery {
+        #[serde(default)]
+        force_pipeline: Option<String>,
+    }
 
     // ── Wire-format types ─────────────────────────────────────────────────────
 
@@ -94,10 +111,27 @@ mod inner {
             scale_factor: f32,
             tile_size: u32,
         },
+        /// Phase-01: emitted once per session, immediately after the agent
+        /// resolves the transport pipeline (BOTH paths). Drives the SPA's
+        /// `PipelineStatusPill` so users can see why a session went JPEG vs
+        /// H.264 without waiting for the avcC blob below. `hardware_accel`
+        /// is `Some(false)` on JPEG and known-software builds; on H.264 it
+        /// starts `None` and the subsequent `Pipeline` message (after first
+        /// IDR) refines it to `Some(true)` / `Some(false)`.
+        PipelineChosen {
+            mode: &'a str, // "h264" | "jpeg"
+            reason: &'a str,
+            hardware_accel: Option<bool>,
+        },
         /// Server tells client which pipeline was selected and the per-tier
         /// bitrate presets. On H.264 mode `avcc_description` carries the
         /// base64-encoded `avcC` box built from the first IDR's SPS+PPS,
         /// ready for `VideoDecoder.configure({ description })`.
+        ///
+        /// Phase-01 additions: `reason` mirrors `PipelineChosen.reason` so a
+        /// client that missed the first message can still self-describe;
+        /// `hardware_accel` is authoritative once this message lands (the
+        /// encoder backend is locked at that point).
         Pipeline {
             mode: &'a str, // "h264" | "jpeg"
             codec: Option<&'a str>,
@@ -105,6 +139,16 @@ mod inner {
             tier_bitrates_kbps_med: u32,
             tier_bitrates_kbps_high: u32,
             avcc_description_b64: Option<String>,
+            reason: &'a str,
+            hardware_accel: bool,
+        },
+        /// Phase-01: session-start IDR watchdog tripped. The agent has
+        /// already initiated PC teardown; the client is expected to reconnect
+        /// with `?force_pipeline=jpeg` so the rescue session bypasses H.264.
+        /// `reason` is a stable identifier (e.g. `"no-idr-3s"`) — keep it
+        /// short, it goes into the pill tooltip on the next session.
+        FallbackPending {
+            reason: &'a str,
         },
         /// Capture pipeline exited mid-session (permission revoked, monitor
         /// unplugged, encoder error). Client uses this to fire its reconnect
@@ -239,10 +283,23 @@ mod inner {
     pub async fn api_desktop_ws(
         ws: WebSocketUpgrade,
         Path(device_id): Path<String>,
+        Query(query): Query<DesktopWsQuery>,
         State(state): State<Arc<AppState>>,
         jar: CookieJar,
         headers: HeaderMap,
     ) -> impl IntoResponse {
+        // Validate the optional `?force_pipeline=` override BEFORE doing any
+        // auth work — a bad value here is a client bug, surfacing it as a
+        // 400 saves a doomed WS upgrade and helps the SPA developer trace it.
+        // `None` keeps the env-var preference path; `Some(_)` overrides for
+        // this session only.
+        let force_override: Option<OperatorPref> = match query.force_pipeline.as_deref() {
+            None | Some("") => None,
+            Some(v) => match parse_force_pipeline(v) {
+                Some(pref) => Some(pref),
+                None => return StatusCode::BAD_REQUEST.into_response(),
+            },
+        };
         // Browsers can't set `Authorization` on a WS upgrade, so the
         // cross-origin discovery SPA carries the api_key via subprotocols
         // (`["oxi-bearer-v1", <key>]`). Same-origin embedded mode keeps
@@ -298,7 +355,9 @@ mod inner {
         } else {
             ws
         };
-        upgrade.on_upgrade(move |socket| desktop_session(socket, device_id, state, svc, close_rx))
+        upgrade.on_upgrade(move |socket| {
+            desktop_session(socket, device_id, state, svc, close_rx, force_override)
+        })
     }
 
     // ── Session entry ─────────────────────────────────────────────────────────
@@ -309,9 +368,14 @@ mod inner {
         state: Arc<AppState>,
         svc: Arc<DesktopService>,
         close_rx: tokio::sync::oneshot::Receiver<()>,
+        force_override: Option<OperatorPref>,
     ) {
-        info!(device = %device_id, "desktop session opened");
-        if let Err(e) = run_session(socket, &device_id, state, close_rx).await {
+        info!(
+            device = %device_id,
+            force_pipeline = ?force_override,
+            "desktop session opened"
+        );
+        if let Err(e) = run_session(socket, &device_id, state, close_rx, force_override).await {
             warn!(device = %device_id, error = %e, "desktop session error");
         }
         svc.remove(&device_id);
@@ -321,8 +385,9 @@ mod inner {
     async fn run_session(
         mut socket: WebSocket,
         device_id: &str,
-        _state: Arc<AppState>,
+        state: Arc<AppState>,
         mut close_rx: tokio::sync::oneshot::Receiver<()>,
+        force_override: Option<OperatorPref>,
     ) -> anyhow::Result<()> {
         // ── Peer connection ───────────────────────────────────────────────────
         // Register the default codec set so the H.264 track the server adds
@@ -470,9 +535,66 @@ mod inner {
         // a sendonly video track so the server's answer matches the client's
         // recvonly video m-line. The returned RTCRtpSender feeds
         // `spawn_rtcp_reader` for PLI + REMB feedback.
+        //
+        // Per-session pipeline override from `?force_pipeline=` is honored
+        // ONLY when the operator's env preference is `Auto`. Forced env
+        // (`jpeg` or `h264`) pins intent and is immutable from the client —
+        // closes a privilege-escalation path where an authenticated tunnel
+        // client could bypass `OXI_VIDEO_PIPELINE=jpeg` by passing
+        // `?force_pipeline=h264`. Matches the plan's downgrade-only contract;
+        // the watchdog-driven JPEG fallback flow still works because that
+        // flow only fires when the operator was Auto in the first place
+        // (the agent never picks H.264 under forced JPEG).
+        let env_pref = operator_preference();
+        let operator_pref = match (force_override, env_pref) {
+            (Some(ov), OperatorPref::Auto) => ov,
+            (Some(_), forced) => forced,
+            (None, env) => env,
+        };
         #[cfg_attr(not(feature = "h264"), allow(unused_variables))]
-        let (pipeline, offer_sdp, initial_hidpi) =
-            await_offer_with_caps(&mut socket, &pc, &mut close_rx).await?;
+        let (decision_pipeline, decision_reason, offer_sdp, initial_hidpi) =
+            match await_offer_with_caps(&mut socket, &pc, &mut close_rx, operator_pref).await {
+                Ok(v) => v,
+                Err(e) => {
+                    // Emit a telemetry event for the failure path so dashboards
+                    // can count forced-h264-no-client and other negotiation
+                    // failures. Without this the success metric "auto-h264
+                    // rate" is computed against only successful sessions and
+                    // hides the fail-closed denominator.
+                    let reason = e
+                        .downcast_ref::<ForcedH264Unavailable>()
+                        .map(|f| f.reason.to_string())
+                        .unwrap_or_else(|| "negotiation-failed".to_string());
+                    state.event_bus.send(AgentEvent::PipelineChosen {
+                        device_id: device_id.to_string(),
+                        pipeline: "none".to_string(),
+                        reason,
+                    });
+                    return Err(e);
+                }
+            };
+        #[cfg_attr(not(feature = "h264"), allow(unused_variables))]
+        let pipeline = decision_pipeline;
+
+        // Emit the immediate pill signal + telemetry event. `hardware_accel`
+        // is unknown for H.264 until the encoder builds; JPEG is always SW.
+        let hw_hint: Option<bool> = match pipeline {
+            Pipeline::Jpeg => Some(false),
+            #[cfg(feature = "h264")]
+            Pipeline::H264 => None,
+        };
+        if let Ok(msg) = serde_json::to_string(&SignalOut::PipelineChosen {
+            mode: pipeline.wire_name(),
+            reason: decision_reason,
+            hardware_accel: hw_hint,
+        }) {
+            let _ = ws_out_tx.send(msg).await;
+        }
+        state.event_bus.send(AgentEvent::PipelineChosen {
+            device_id: device_id.to_string(),
+            pipeline: pipeline.wire_name().to_string(),
+            reason: decision_reason.to_string(),
+        });
         // Seed the settings watch with the pre-offer client preference so
         // the encoder starts at the user's persisted HiDPI mode without a
         // reconnect round-trip.
@@ -521,6 +643,9 @@ mod inner {
                 &settings_tx,
                 &mut settings_rx,
                 &mut close_rx,
+                decision_reason,
+                device_id,
+                &state,
             )
             .await;
             let _ = pc.close().await;
@@ -741,6 +866,9 @@ mod inner {
         settings_tx: &watch::Sender<bool>,
         settings_rx: &mut watch::Receiver<bool>,
         close_rx: &mut tokio::sync::oneshot::Receiver<()>,
+        decision_reason: &'static str,
+        device_id: &str,
+        state: &Arc<AppState>,
     ) -> anyhow::Result<()> {
         use base64::{engine::general_purpose::STANDARD as B64_STD, Engine as _};
         use desktop::capture::CaptureLoop;
@@ -826,7 +954,44 @@ mod inner {
         let current_hidpi = hidpi;
 
         // ── Main WS loop, pumping signaling + watching for first IDR ──────────
+        //
+        // Phase-01 session-start watchdog: 3 s budget from
+        // `RTCPeerConnectionState::Connected` to first IDR. Starting the
+        // timer at session entry (before ICE) would false-positive on slow
+        // cellular paths where ICE itself can take 3-5 s. We register a
+        // PC-state-change callback that signals a Notify when Connected;
+        // the watchdog future awaits the notify then sleeps 3 s. If the
+        // first IDR arrives before the timer fires we set `params_rx =
+        // None` and the watchdog arm becomes unselectable.
         let mut params_rx = Some(params_rx);
+        let connected_notify = Arc::new(tokio::sync::Notify::new());
+        {
+            // Only the first transition to Connected counts; PCs can briefly
+            // bounce through Disconnected→Connected after ICE-restart in the
+            // future, but we don't want to re-arm the watchdog mid-session
+            // (params_rx is already None at that point anyway).
+            let notify = Arc::clone(&connected_notify);
+            let fired = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            pc.on_peer_connection_state_change(Box::new(move |state| {
+                let notify = Arc::clone(&notify);
+                let fired = Arc::clone(&fired);
+                Box::pin(async move {
+                    use std::sync::atomic::Ordering;
+                    use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
+                    if matches!(state, RTCPeerConnectionState::Connected)
+                        && !fired.swap(true, Ordering::SeqCst)
+                    {
+                        notify.notify_waiters();
+                    }
+                })
+            }));
+        }
+        let watchdog_notify = Arc::clone(&connected_notify);
+        let watchdog = async move {
+            watchdog_notify.notified().await;
+            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        };
+        tokio::pin!(watchdog);
         loop {
             tokio::select! {
                 biased;
@@ -837,6 +1002,7 @@ mod inner {
                 res = wait_params(params_rx.as_mut()), if params_rx.is_some() => {
                     params_rx = None;
                     if let Some(params) = res {
+                        let hw_accel = params.is_hardware;
                         let avcc = desktop::build_avcc(&params.sps, &params.pps);
                         let b64 = B64_STD.encode(&avcc);
                         let msg = SignalOut::Pipeline {
@@ -846,12 +1012,41 @@ mod inner {
                             tier_bitrates_kbps_med: BitrateBps::MED.0 / 1_000,
                             tier_bitrates_kbps_high: BitrateBps::HIGH.0 / 1_000,
                             avcc_description_b64: Some(b64),
+                            reason: decision_reason,
+                            hardware_accel: hw_accel,
                         };
                         if let Ok(txt) = serde_json::to_string(&msg) {
                             let _ = ws_out_tx.send(txt).await;
                         }
-                        info!("h264: avcC description sent, decoder can configure");
+                        info!(
+                            hardware_accel = hw_accel,
+                            "h264: avcC description sent, decoder can configure"
+                        );
                     }
+                }
+
+                // Phase-01 watchdog: 3 s elapsed (post-Connected) without
+                // an IDR. Send `FallbackPending` straight to the socket
+                // (the mpsc would also work, but we want it on the wire
+                // before we break out of the loop and tear the WS down)
+                // and emit a `PipelineChosen` event tagging the JPEG
+                // fallback so dashboards count it as a fallback session.
+                _ = &mut watchdog, if params_rx.is_some() => {
+                    warn!(
+                        device = %device_id,
+                        "h264: session-start IDR watchdog tripped — signaling FallbackPending"
+                    );
+                    if let Ok(txt) = serde_json::to_string(&SignalOut::FallbackPending {
+                        reason: "no-idr-3s",
+                    }) {
+                        let _ = socket.send(Message::Text(txt.into())).await;
+                    }
+                    state.event_bus.send(AgentEvent::PipelineChosen {
+                        device_id: device_id.to_string(),
+                        pipeline: "jpeg".to_string(),
+                        reason: "fallback-idr-watchdog".to_string(),
+                    });
+                    break;
                 }
 
                 // Push pending signaling (ICE + avcC) out to the WS client.
@@ -966,15 +1161,22 @@ mod inner {
     /// with the user's persisted HiDPI preference on first frame — saves a
     /// reconnect round-trip when the client has toggled HiDPI on previously.
     ///
-    /// Returns the chosen `Pipeline` (AND of operator env preference +
-    /// client-advertised decoder capability), the offer SDP to feed into
-    /// `complete_answer`, and the initial HiDPI flag (default `false`).
+    /// Returns the chosen `Pipeline`, the stable reason code for the SPA
+    /// pill / telemetry, the offer SDP for `complete_answer`, and the
+    /// initial HiDPI flag.
+    ///
+    /// `operator` is the per-session preference (env var unless overridden
+    /// by `?force_pipeline=` on the WS upgrade). When the operator has
+    /// forced H.264 and the client lacks decode support, this function ships
+    /// a clear `CaptureEnded` message to the client and returns an error —
+    /// the caller closes the PC. Silent JPEG fallback is intentionally NOT
+    /// applied in that case (fail-closed matches operator intent).
     async fn await_offer_with_caps(
         socket: &mut WebSocket,
         pc: &RTCPeerConnection,
         close_rx: &mut tokio::sync::oneshot::Receiver<()>,
-    ) -> anyhow::Result<(Pipeline, String, bool)> {
-        let operator = operator_preference();
+        operator: OperatorPref,
+    ) -> anyhow::Result<(Pipeline, &'static str, String, bool)> {
         let mut client_caps = ClientCapabilities::default();
         let mut initial_hidpi = false;
 
@@ -992,16 +1194,49 @@ mod inner {
                     };
                     match serde_json::from_str::<SignalIn>(&text) {
                         Ok(SignalIn::Offer { sdp }) => {
-                            let chosen = choose_pipeline(operator, &client_caps);
-                            info!(
-                                operator = ?operator,
-                                client_webcodecs = client_caps.webcodecs,
-                                client_codec_count = client_caps.codecs.len(),
-                                pipeline = chosen.wire_name(),
-                                initial_hidpi,
-                                "negotiation: offer received"
-                            );
-                            return Ok((chosen, sdp, initial_hidpi));
+                            match choose_pipeline(operator, &client_caps) {
+                                Ok(decision) => {
+                                    info!(
+                                        operator = ?operator,
+                                        client_webcodecs = client_caps.webcodecs,
+                                        client_codec_count = client_caps.codecs.len(),
+                                        pipeline = decision.pipeline.wire_name(),
+                                        reason = decision.reason,
+                                        initial_hidpi,
+                                        "negotiation: offer received"
+                                    );
+                                    return Ok((
+                                        decision.pipeline,
+                                        decision.reason,
+                                        sdp,
+                                        initial_hidpi,
+                                    ));
+                                }
+                                Err(err) => {
+                                    // Operator forced H.264 but client can't
+                                    // decode. Tell the client clearly before
+                                    // tearing down — the SPA's `captureEnded`
+                                    // handler surfaces the reason in the
+                                    // reconnect modal.
+                                    warn!(
+                                        operator = ?operator,
+                                        reason = err.reason,
+                                        "pipeline forced but unsatisfiable"
+                                    );
+                                    if let Ok(msg) =
+                                        serde_json::to_string(&SignalOut::CaptureEnded {
+                                            reason: format!(
+                                                "Server forced H.264 but this client lacks decode support ({})",
+                                                err.reason
+                                            ),
+                                        })
+                                    {
+                                        let _ =
+                                            socket.send(Message::Text(msg.into())).await;
+                                    }
+                                    return Err(anyhow::Error::new(err));
+                                }
+                            }
                         }
                         Ok(SignalIn::Ice { candidate }) => {
                             if let Err(e) = pc.add_ice_candidate(candidate).await {

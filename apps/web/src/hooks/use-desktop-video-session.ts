@@ -18,7 +18,16 @@
 
 import { useCallback, useEffect, useRef, useState } from 'react'
 
-import type { DesktopInputEvent, DesktopStatus, QualityTier } from './use-desktop-session'
+import type {
+  DesktopInputEvent,
+  DesktopPipelineInfo,
+  DesktopStatus,
+  QualityTier,
+} from './use-desktop-session'
+import {
+  DESKTOP_FALLBACK_PENDING_EVENT,
+  setForceJpeg,
+} from './use-desktop-session'
 import { isDiscoveryMode, getCurrentTunnelUrl } from '../lib/discovery-client'
 import { getActiveHost, loadApiKey, loadTunnelBase, storeTunnelBase } from '../lib/api-client'
 import { isAllowedTunnelHost, getNamedTunnelAllowlist } from '../lib/url-validation'
@@ -36,6 +45,8 @@ interface VideoSessionApi {
   attempt: number
   /** Set once the agent announces the stream dimensions via `capabilities`. */
   screenDims?: { width: number; height: number }
+  /** Latest pipeline info — see `use-desktop-session.ts`. */
+  pipelineInfo?: DesktopPipelineInfo
 }
 
 /** Callback invoked once per decoded video frame. Caller draws to canvas. */
@@ -83,6 +94,7 @@ export function useDesktopVideoSession(
   const [status, setStatus] = useState<DesktopStatus>('idle')
   const [attempt, setAttempt] = useState(0)
   const [screenDims, setScreenDims] = useState<{ width: number; height: number } | undefined>()
+  const [pipelineInfo, setPipelineInfo] = useState<DesktopPipelineInfo | undefined>()
 
   const wsRef = useRef<WebSocket | null>(null)
   const pcRef = useRef<RTCPeerConnection | null>(null)
@@ -327,14 +339,42 @@ export function useDesktopVideoSession(
             setScreenDims({ width: msg.width as number, height: msg.height as number })
           }
           break
-        case 'pipeline':
-          // Server confirmed pipeline choice. If it's "jpeg", the host should
-          // have mounted the JPEG hook instead — log and close as protocol
-          // mismatch rather than silently streaming via the wrong path.
-          if (msg.mode !== 'h264') {
-            console.warn('video-session: server selected non-H.264 pipeline', msg.mode)
+        case 'pipelineChosen':
+        case 'pipeline': {
+          // Server's chosen pipeline + reason. `pipelineChosen` fires at
+          // session start; `pipeline` fires at first IDR carrying avcC +
+          // authoritative `hardware_accel`. We accept both so the pill can
+          // render immediately on session start and refine on IDR.
+          const mode = msg.mode === 'h264' ? 'h264' : 'jpeg'
+          const reason = typeof msg.reason === 'string' ? msg.reason : 'unknown'
+          const hwRaw = (msg as Record<string, unknown>).hardwareAccel
+            ?? (msg as Record<string, unknown>).hardware_accel
+          const hardwareAccel =
+            typeof hwRaw === 'boolean' ? hwRaw : undefined
+          setPipelineInfo({ mode, reason, hardwareAccel })
+          if (mode === 'jpeg') {
+            // Server picked JPEG even though the SPA mounted the H.264 hook
+            // — we'd be reading audio out of a video transceiver. Tear down
+            // and let the page re-mount as JPEG.
+            console.warn('video-session: server selected JPEG; remounting')
+            setForceJpeg(hostId)
+            window.dispatchEvent(new CustomEvent(DESKTOP_FALLBACK_PENDING_EVENT))
+            if (!destroyedRef.current) handleDisconnect()
           }
           break
+        }
+        case 'fallbackPending': {
+          // Server's session-start IDR watchdog fired. Set the sessionStorage
+          // marker so the next mount tells the agent to skip H.264, then
+          // notify the page to re-mount as JPEG. Tear down our PC — the
+          // server has already closed its side.
+          const reason = typeof msg.reason === 'string' ? msg.reason : 'no-idr'
+          console.warn('video-session: fallbackPending', reason)
+          setForceJpeg(hostId)
+          window.dispatchEvent(new CustomEvent(DESKTOP_FALLBACK_PENDING_EVENT))
+          if (!destroyedRef.current) handleDisconnect()
+          break
+        }
       }
     }
 
@@ -441,5 +481,14 @@ export function useDesktopVideoSession(
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [deviceId])
 
-  return { status, sendInput, setQuality, setSettings, disconnect, attempt, screenDims }
+  return {
+    status,
+    sendInput,
+    setQuality,
+    setSettings,
+    disconnect,
+    attempt,
+    screenDims,
+    pipelineInfo,
+  }
 }
