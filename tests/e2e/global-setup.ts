@@ -48,7 +48,19 @@ async function globalSetup(config: FullConfig) {
     throw new Error(`pair body shape regression: ${JSON.stringify(body)}`)
   }
 
-  await ctx.storageState({ path: STORAGE_STATE })
+  // Catch a footgun: the agent defaults to `Secure` cookies, which the
+  // browser silently drops over plain HTTP loopback. The pair flow appears
+  // to succeed but every auth-required spec then 401s. Detect and fail-fast
+  // with a clear remediation message.
+  const state = await ctx.storageState({ path: STORAGE_STATE })
+  const secureOnHttp = baseURL.startsWith('http://')
+    && state.cookies.some((c) => c.secure && c.name.startsWith('oxi'))
+  if (secureOnHttp) {
+    throw new Error(
+      `agent set Secure cookies but baseURL is plain HTTP (${baseURL}). ` +
+      `Restart the agent with OXI_SECURE_COOKIES= (empty) so cookies are not Secure.`,
+    )
+  }
   await ctx.dispose()
 }
 
