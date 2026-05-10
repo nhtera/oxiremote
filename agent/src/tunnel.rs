@@ -252,6 +252,7 @@ pub async fn ensure_quick_tunnel(
     cloudflared: PathBuf,
     bus: Arc<EventBus>,
     shutdown: Arc<Notify>,
+    rate_limited: Arc<std::sync::atomic::AtomicBool>,
 ) -> anyhow::Result<String> {
     // Step 1 — process is about to spawn.
     bus.send(AgentEvent::TunnelStepChanged {
@@ -335,6 +336,7 @@ pub async fn ensure_quick_tunnel(
     // until the operator manually restarts.
     let url_for_stderr = url.clone();
     let bus_for_url = bus.clone();
+    let rate_limited_for_stderr = rate_limited.clone();
     tokio::spawn(async move {
         let reader = tokio::io::BufReader::new(stderr);
         process_cloudflared_stderr(
@@ -344,6 +346,7 @@ pub async fn ensure_quick_tunnel(
             url_re,
             registered_re,
             registered_tx,
+            rate_limited_for_stderr,
         )
         .await;
     });
@@ -453,6 +456,7 @@ pub async fn ensure_named_tunnel(
     cfg: crate::tunnel_named::NamedTunnelConfig,
     bus: Arc<EventBus>,
     shutdown: Arc<Notify>,
+    rate_limited: Arc<std::sync::atomic::AtomicBool>,
 ) -> anyhow::Result<Option<String>> {
     bus.send(AgentEvent::TunnelStepChanged {
         step: TunnelStep::Preparing,
@@ -531,6 +535,7 @@ pub async fn ensure_named_tunnel(
     // step list to rewind.
     let (registered_tx, registered_rx) = tokio::sync::oneshot::channel::<()>();
     let bus_for_stderr = bus.clone();
+    let rate_limited_for_stderr = rate_limited.clone();
     tokio::spawn(async move {
         let reader = tokio::io::BufReader::new(stderr);
         let mut lines = reader.lines();
@@ -538,6 +543,10 @@ pub async fn ensure_named_tunnel(
         let mut tx = Some(registered_tx);
         while let Ok(Some(line)) = lines.next_line().await {
             info!(target: "cloudflared", "{}", line);
+            if is_rate_limit_line(&line) {
+                warn!(target: "cloudflared", "rate-limit signature detected — supervisor will back off long");
+                rate_limited_for_stderr.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
             if !announced && registered_re.is_match(&line) {
                 announced = true;
                 bus_for_stderr.send(AgentEvent::TunnelStepChanged {
@@ -667,11 +676,28 @@ fn detect_url_change(line: &str, last_url: &mut Option<String>, url_re: &Regex) 
     }
 }
 
+/// Cloudflare-side per-IP rate-limit signature in cloudflared's stderr ERR
+/// line. Two markers fire together when api.trycloudflare.com throttles a
+/// QuickTunnel-create request: HTTP 429 plus Cloudflare error code 1015.
+/// Either one is sufficient evidence — we OR them so a stderr format change
+/// doesn't silently break the detector.
+pub(crate) fn is_rate_limit_line(line: &str) -> bool {
+    line.contains("429 Too Many Requests")
+        || line.contains("status_code=\"429")
+        || line.contains("error code: 1015")
+}
+
 /// Drive the cloudflared stderr stream end-to-end: forward every line into
 /// tracing for the agent log, classify it via `detect_url_change`, emit the
 /// right bus events, and fire the registration oneshot once. Extracted from
 /// the `tokio::spawn` body so the whole loop is testable with an in-memory
 /// `AsyncBufRead` (e.g. `tokio::io::DuplexStream`).
+///
+/// `rate_limited` is set to `true` if any line matches `is_rate_limit_line`.
+/// The supervisor reads + clears it after each failed spawn to choose between
+/// the standard exponential backoff and a long (10 min) cool-down — cloudflared's
+/// per-IP quick-tunnel-create throttle resets within ~5-15 min, so retrying
+/// every 60 s just deepens the rate-limit hole.
 async fn process_cloudflared_stderr<R: tokio::io::AsyncBufRead + Unpin>(
     reader: R,
     url_slot: Arc<tokio::sync::Mutex<Option<String>>>,
@@ -679,12 +705,17 @@ async fn process_cloudflared_stderr<R: tokio::io::AsyncBufRead + Unpin>(
     url_re: Regex,
     registered_re: Regex,
     registered_tx: tokio::sync::oneshot::Sender<()>,
+    rate_limited: Arc<std::sync::atomic::AtomicBool>,
 ) {
     let mut lines = reader.lines();
     let mut last_url: Option<String> = None;
     let mut tx = Some(registered_tx);
     while let Ok(Some(line)) = lines.next_line().await {
         info!(target: "cloudflared", "{}", line);
+        if is_rate_limit_line(&line) {
+            warn!(target: "cloudflared", "rate-limit signature detected — supervisor will back off long");
+            rate_limited.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
         match detect_url_change(&line, &mut last_url, &url_re) {
             UrlChange::First(captured) => {
                 {
@@ -727,6 +758,37 @@ async fn process_cloudflared_stderr<R: tokio::io::AsyncBufRead + Unpin>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- Rate-limit signature detection (drives supervisor long-backoff) ---
+
+    /// Verbatim ERR line shape from cloudflared 2026.3.0 when api.trycloudflare.com
+    /// throttles a quick-tunnel-create request. Both markers (HTTP 429 + error
+    /// code 1015) appear on one line; either one is sufficient evidence.
+    #[test]
+    fn is_rate_limit_line_matches_429_and_1015() {
+        let real = "2026-05-10T17:21:12Z ERR Error unmarshaling QuickTunnel response: \
+                    error code: 1015 error=\"invalid character 'e' looking for beginning of value\" \
+                    status_code=\"429 Too Many Requests\"";
+        assert!(is_rate_limit_line(real));
+
+        // Either marker alone is enough — defensive against stderr format drift.
+        assert!(is_rate_limit_line("status_code=\"429 Too Many Requests\""));
+        assert!(is_rate_limit_line("error code: 1015"));
+        assert!(is_rate_limit_line("status_code=\"429\""));
+    }
+
+    #[test]
+    fn is_rate_limit_line_skips_unrelated_lines() {
+        // The 1101 (Worker exception) family must NOT trigger long backoff —
+        // it's a Cloudflare-side flake, not an IP throttle. Generic error
+        // bodies and registration logs must also stay quiet.
+        assert!(!is_rate_limit_line("error code: 1101"));
+        assert!(!is_rate_limit_line("status_code=\"500 Internal Server Error\""));
+        assert!(!is_rate_limit_line(
+            "Registered tunnel connection connIndex=0 ip=198.41.192.67"
+        ));
+        assert!(!is_rate_limit_line(""));
+    }
 
     /// Verify that `TunnelDown` is emitted when the child exits immediately.
     /// Uses `/usr/bin/false` (exits 1 immediately) as a stand-in for a crashed
@@ -1050,6 +1112,7 @@ mod tests {
                 url_re(),
                 registered_re(),
                 reg_tx,
+                Arc::new(std::sync::atomic::AtomicBool::new(false)),
             )
             .await;
         });
@@ -1222,6 +1285,7 @@ mod tests {
                 url_re(),
                 registered_re(),
                 reg_tx,
+                Arc::new(std::sync::atomic::AtomicBool::new(false)),
             )
             .await;
         });

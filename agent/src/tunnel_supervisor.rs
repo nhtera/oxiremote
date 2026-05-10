@@ -65,6 +65,12 @@ impl Backoff {
     }
 }
 
+/// Long backoff applied when cloudflared's stderr exposes Cloudflare's per-IP
+/// rate-limit signature (HTTP 429 / error code 1015) on quick-tunnel-create.
+/// The throttle window is typically 5-15 min; retrying every 60 s just deepens
+/// the rate-limit hole. 10 min is a safe middle ground.
+const RATE_LIMIT_BACKOFF: Duration = Duration::from_secs(600);
+
 /// Thin wrapper: spawns cloudflared in the appropriate mode and returns the
 /// tunnel URL (None for Named mode without a public hostname). Errors are
 /// recoverable unless the binary is missing (ENOENT), which is returned as-is
@@ -74,6 +80,7 @@ async fn spawn_tunnel(
     cf_path: &Path,
     bus: &Arc<EventBus>,
     shutdown: &Arc<Notify>,
+    rate_limited: &Arc<AtomicBool>,
 ) -> anyhow::Result<Option<String>> {
     match mode {
         TunnelMode::Quick(addr) => {
@@ -82,6 +89,7 @@ async fn spawn_tunnel(
                 cf_path.to_path_buf(),
                 bus.clone(),
                 shutdown.clone(),
+                rate_limited.clone(),
             )
             .await?;
             Ok(Some(url))
@@ -92,9 +100,22 @@ async fn spawn_tunnel(
                 cfg.clone(),
                 bus.clone(),
                 shutdown.clone(),
+                rate_limited.clone(),
             )
             .await
         }
+    }
+}
+
+/// Pick the right delay before respawning. If the stderr scanner saw the
+/// rate-limit signature during the last spawn attempt, override the
+/// short-window exponential backoff with a 10-min cool-down. Pure function
+/// so the decision is unit-testable without driving the full loop.
+fn pick_backoff(short_window: Duration, was_rate_limited: bool) -> Duration {
+    if was_rate_limited {
+        RATE_LIMIT_BACKOFF
+    } else {
+        short_window
     }
 }
 
@@ -165,13 +186,19 @@ pub async fn run(
     let mut cumulative_failures_today: u32 = 0;
     let mut cumulative_window_start = Instant::now();
 
+    // Set by `tunnel::process_cloudflared_stderr` on detection of HTTP 429 /
+    // Cloudflare error code 1015 in cloudflared's stderr. Read + cleared after
+    // each spawn failure to switch from short-window backoff to a 10-min
+    // cool-down when our IP is throttled.
+    let rate_limited = Arc::new(AtomicBool::new(false));
+
     loop {
         if shutdown_flag.load(Ordering::SeqCst) {
             break;
         }
 
         let spawn_start = Instant::now();
-        match spawn_tunnel(&mode, &cf_path, &bus, &shutdown).await {
+        match spawn_tunnel(&mode, &cf_path, &bus, &shutdown, &rate_limited).await {
             Ok(url_or_none) => {
                 if let Some(url) = url_or_none {
                     bus.send(AgentEvent::TunnelUrlChanged { url });
@@ -208,7 +235,17 @@ pub async fn run(
             cumulative_window_start = Instant::now();
         }
 
-        let delay = backoff.next_delay();
+        // Read + clear the rate-limit flag. If the last spawn hit HTTP 429 /
+        // error 1015, switch to a 10-min cool-down so we stop hammering
+        // Cloudflare's throttled API.
+        let was_rate_limited = rate_limited.swap(false, Ordering::SeqCst);
+        if was_rate_limited {
+            warn!(
+                "cloudflared 429 / Cloudflare error 1015 detected — backing off {}s before respawn",
+                RATE_LIMIT_BACKOFF.as_secs()
+            );
+        }
+        let delay = pick_backoff(backoff.next_delay(), was_rate_limited);
 
         if cumulative_failures_today >= 10 {
             bus.send(AgentEvent::Degraded {
@@ -274,6 +311,28 @@ mod tests {
         b.record_success();
         // Should NOT reset — haven't been stable for 5 minutes.
         assert_eq!(b.attempt, 4);
+    }
+
+    // --- Rate-limit-aware backoff (regression for cloudflared 429 / 1015) ---
+
+    #[test]
+    fn pick_backoff_uses_rate_limit_constant_when_throttled() {
+        // When stderr scanner saw HTTP 429 / error 1015, we must back off for
+        // RATE_LIMIT_BACKOFF (10 min), not the much shorter exponential value.
+        // Hammering api.trycloudflare.com under throttle deepens the rate-limit
+        // window and starves the user of any tunnel until it expires.
+        let short = Duration::from_secs(60);
+        assert_eq!(pick_backoff(short, true), RATE_LIMIT_BACKOFF);
+        assert_eq!(RATE_LIMIT_BACKOFF, Duration::from_secs(600));
+    }
+
+    #[test]
+    fn pick_backoff_passes_through_short_window_when_not_throttled() {
+        // Non-rate-limit failures keep the existing exponential backoff path.
+        for secs in [1, 2, 4, 8, 16, 32, 60] {
+            let short = Duration::from_secs(secs);
+            assert_eq!(pick_backoff(short, false), short);
+        }
     }
 
     #[test]
