@@ -29,7 +29,16 @@ const TUNNEL_HEADER = { 'cf-connecting-ip': '203.0.113.42' } as const
 test.describe('ux parity flows', () => {
   // --- Phase 6: /login "Recently paired" (no auth, no pairing) ------------
 
+  // The SPA's LoginPage (with SavedHostsPanel) only loads in RELEASE builds.
+  // Debug builds intercept `/login` with `http_pages::login_page` — a static
+  // HTML page gated by `#[cfg(debug_assertions)]` that pre-dates the SPA.
+  // Skip when not running against a release binary; gate via env so CI can
+  // opt in by setting OXI_E2E_RELEASE=1.
   test('login renders Recently paired list when localStorage seeded', async ({ page }) => {
+    test.skip(
+      !process.env.OXI_E2E_RELEASE,
+      'SPA LoginPage only loads in release builds — set OXI_E2E_RELEASE=1 with a release agent.',
+    )
     await page.addInitScript(() => {
       const saved = [
         {
@@ -60,7 +69,9 @@ test.describe('ux parity flows', () => {
   test('agent dashboard renders 2-col layout, tunnel pill, and SVG nav icons', async ({ page }) => {
     await page.goto('/agent')
     await expect(page.getByText(/host dashboard/i)).toBeVisible()
-    await expect(page.getByText(/localhost only/i)).toBeVisible()
+    // Header copy was updated from "localhost only" to "localhost dashboard"
+    // when the dashboard chip layout settled — see agent-header.tsx.
+    await expect(page.getByText(/localhost dashboard/i)).toBeVisible()
     // Sidebar nav uses inline SVG icons (Phase 5) — at least one <svg> child.
     const navSvgs = page.locator('nav svg')
     await expect(navSvgs.first()).toBeVisible()
@@ -80,11 +91,13 @@ test.describe('ux parity — phase 2 file APIs', () => {
   test.skip(!PAIRING_CODE, 'OXI_PAIRING_CODE env var not provided')
   test.use({ storageState: STORAGE_STATE })
 
-  test('files list accepts with_git=1', async ({ request }) => {
+  test('files list accepts with_git=true', async ({ request }) => {
     // git_status field is per-entry and may be absent on clean files;
     // we just guard that the response shape didn't regress when
-    // `with_git=1` is supplied.
-    const res = await request.get('/api/files/list?path=.&with_git=1')
+    // `with_git=true` is supplied. (The serde extractor on the agent only
+    // accepts `true|false`, not `0|1` — the test was written before that
+    // tightening landed.)
+    const res = await request.get('/api/files/list?path=.&with_git=true')
     expect(res.ok(), await res.text()).toBeTruthy()
     const body = (await res.json()) as { entries?: unknown[] } | unknown[]
     const entries = Array.isArray(body) ? body : body.entries
