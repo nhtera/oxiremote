@@ -293,7 +293,12 @@ async fn register_with_retry(
 /// tunnel emits the bare hostname `oxiremote.example.com`. The SPA does
 /// `${tunnelUrl}/api/...` and only works with full URLs, so normalize before
 /// the worker sees the value.
-fn normalize_tunnel_url(raw: &str) -> String {
+///
+/// `pub(crate)` so callers building public URLs (e.g. the QR `qr_url` in
+/// `agent_api`) can reuse the same single-source-of-truth normalization
+/// instead of hand-rolling `format!("https://{host}/...")`, which double-
+/// schemes a quick-tunnel URL.
+pub(crate) fn normalize_tunnel_url(raw: &str) -> String {
     let trimmed = raw.trim();
     if trimmed.starts_with("https://") || trimmed.starts_with("http://") {
         trimmed.to_string()

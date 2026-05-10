@@ -16,7 +16,11 @@
  *     attach on outgoing calls — matches how multi-host routing works in UI.
  */
 import { apiFetch } from './transport'
-import { isDiscoveryMode } from './discovery-client'
+import { discoveryBaseUrl, isDiscoveryMode } from './discovery-client'
+
+// Quick Tunnel hostname pattern — used at boot to recognize legacy
+// `tunnelBase` entries that should be migrated to the proxy URL.
+const TRYCLOUDFLARE_HOST_RE = /^https?:\/\/[a-z0-9-]+\.trycloudflare\.com\b/i
 
 const API_KEY_PREFIX = 'oxi_api_key_'
 const TUNNEL_BASE_PREFIX = 'oxi_tunnel_base_'
@@ -151,6 +155,60 @@ export function loadDiscoveryLookupId(hostId?: string): string | null {
     return v && v.length > 0 ? v : null
   } catch {
     return null
+  }
+}
+
+/**
+ * Build the Worker-proxy base URL for a given host's `discovery_id`. Returns
+ * null when discovery is not active (no `VITE_DISCOVERY_URL`) — caller
+ * should fall back to the direct tunnel URL.
+ *
+ * Wire shape: `<worker>/proxy/<discovery_id>` (no trailing slash). Caller
+ * appends `/api/...` or `/ws/...` directly.
+ */
+export function proxiedTunnelUrl(discoveryId: string, base?: string): string | null {
+  const root = (base ?? discoveryBaseUrl()).replace(/\/+$/, '')
+  if (!root) return null
+  // Discovery_id is hex64 in production; we don't enforce here so tests can
+  // exercise the helper with shorter fixtures. The agent + worker both gate
+  // on shape independently.
+  return `${root}/proxy/${discoveryId}`
+}
+
+/**
+ * Migrate a legacy cached `tunnelBase` (pointing at a Quick Tunnel
+ * `*.trycloudflare.com` host) to the Phase-2 proxy URL. Idempotent: only
+ * rewrites when the input matches the legacy shape AND a proxy URL can be
+ * built (discovery active + lookup id persisted). Returns the new value
+ * for caller convenience, or null when no rewrite was needed.
+ */
+export function migrateTunnelBaseToProxy(hostId: string): string | null {
+  const cached = loadTunnelBase(hostId)
+  if (!cached || !TRYCLOUDFLARE_HOST_RE.test(cached)) return null
+  const lookupId = loadDiscoveryLookupId(hostId)
+  if (!lookupId) return null
+  const proxied = proxiedTunnelUrl(lookupId)
+  if (!proxied) return null
+  storeTunnelBase(hostId, proxied)
+  return proxied
+}
+
+/**
+ * Migrate every paired host's stale Quick Tunnel base to the proxy URL.
+ * Called once at SPA boot. Skipping a host (no lookup id) is silent — old
+ * agents that never registered a discovery_id keep their direct base.
+ */
+export function migrateAllTunnelBasesToProxy(): void {
+  if (typeof localStorage === 'undefined') return
+  try {
+    for (let i = 0; i < localStorage.length; i++) {
+      const k = localStorage.key(i)
+      if (!k || !k.startsWith(TUNNEL_BASE_PREFIX)) continue
+      const hostId = k.slice(TUNNEL_BASE_PREFIX.length)
+      migrateTunnelBaseToProxy(hostId)
+    }
+  } catch {
+    /* private mode / quota — best-effort */
   }
 }
 

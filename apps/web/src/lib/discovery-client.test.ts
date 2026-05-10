@@ -20,6 +20,13 @@ vi.mock('./api-client', () => ({
   makeRemoteClient: vi.fn(),
   installFetchInterceptor: vi.fn(),
   oxiFetch: vi.fn(),
+  // Phase 2: getCurrentTunnelUrl prefers the proxy URL when discovery is
+  // active. The test env sets no VITE_DISCOVERY_URL, so this returns null
+  // and the resolver falls back to the raw tunnelUrl — same observable
+  // result the test asserts (null in test env).
+  proxiedTunnelUrl: vi.fn(() => null),
+  migrateAllTunnelBasesToProxy: vi.fn(),
+  migrateTunnelBaseToProxy: vi.fn(),
 }))
 
 describe('getCurrentTunnelUrl', () => {

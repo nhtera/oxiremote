@@ -324,6 +324,22 @@ async fn api_agent_qr(
     }
 }
 
+/// Build the QR-encoded login URL the user scans on their phone.
+///
+/// Tunnel-mode shapes differ: quick tunnel emits `https://...trycloudflare.com`
+/// (already a full URL), named tunnel emits a bare hostname. Reuse
+/// `discovery::normalize_tunnel_url` so a quick-tunnel URL is never re-prefixed
+/// (`https://https://...`, the bug this helper fixes).
+fn build_qr_url(tunnel_url: Option<&str>, token: &str) -> String {
+    match tunnel_url {
+        Some(host) => format!(
+            "{}/login?k={token}",
+            crate::discovery::normalize_tunnel_url(host)
+        ),
+        None => format!("http://localhost:8787/login?k={token}"),
+    }
+}
+
 /// POST /api/agent/keys/one-time — generate a new OTK (invalidates prior live token).
 async fn api_agent_keys_one_time(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     match one_time_keys::generate_otk(&state.db_path, None) {
@@ -351,10 +367,7 @@ async fn api_agent_keys_one_time(State(state): State<Arc<AppState>>) -> impl Int
             }
 
             let tunnel_url = state.tunnel_url.read().ok().and_then(|g| g.clone());
-            let qr_url = match tunnel_url {
-                Some(ref host) => format!("https://{host}/login?k={}", rec.token),
-                None => format!("http://localhost:8787/login?k={}", rec.token),
-            };
+            let qr_url = build_qr_url(tunnel_url.as_deref(), &rec.token);
 
             (
                 StatusCode::OK,
@@ -1134,7 +1147,13 @@ fn query_recent_key_usage(db_path: &std::path::PathBuf) -> Vec<serde_json::Value
         return vec![];
     };
 
-    // OTK usages: one_time_keys where used_at IS NOT NULL.
+    // OTK usages: one_time_keys where a device actually consumed the token.
+    // `used_at` alone is NOT a real-pair signal — `generate_otk` invalidates
+    // any prior live token by stamping `used_at = now()` without ever
+    // consuming it (so a fresh OTK can't be confused with the old one). Those
+    // ghost rows show up here as "OTK used – unknown" and confuse operators.
+    // The authoritative real-pair signal is `consumed_by_device IS NOT NULL`.
+    //
     // Join via `consumed_by_device` (the phone that scanned the QR) — the
     // legacy `issued_by_session` link points at the dashboard session that
     // generated the code, which never has the consuming-device info.
@@ -1147,6 +1166,7 @@ fn query_recent_key_usage(db_path: &std::path::PathBuf) -> Vec<serde_json::Value
              FROM one_time_keys ok
              LEFT JOIN trusted_devices td ON ok.consumed_by_device = td.device_id
              WHERE ok.used_at IS NOT NULL
+               AND ok.consumed_by_device IS NOT NULL
              ORDER BY ok.used_at DESC
              LIMIT 10",
         )
@@ -1577,5 +1597,74 @@ mod tests {
         assert!(files_activity::is_active(&map, "dev-1"));
         // Unknown device is not active.
         assert!(!files_activity::is_active(&map, "dev-unknown"));
+    }
+
+    /// Quick-tunnel URL already starts with `https://`. The QR builder must
+    /// not re-prefix it (regression for the "qr_url returns https://https://"
+    /// bug fixed in Phase 0).
+    #[test]
+    fn qr_url_quick_tunnel_no_double_scheme() {
+        let qr = super::build_qr_url(Some("https://abc.trycloudflare.com"), "deadbeef");
+        assert_eq!(
+            qr.matches("://").count(),
+            1,
+            "qr_url must contain exactly one scheme separator: {qr}"
+        );
+        assert!(qr.starts_with("https://abc.trycloudflare.com/login?k=deadbeef"));
+    }
+
+    /// Named-tunnel URL is a bare hostname; the helper prepends `https://`.
+    #[test]
+    fn qr_url_named_tunnel_adds_scheme() {
+        let qr = super::build_qr_url(Some("oxi.example.com"), "tok123");
+        assert_eq!(qr, "https://oxi.example.com/login?k=tok123");
+    }
+
+    /// Loopback fallback when the tunnel hasn't published a URL yet.
+    #[test]
+    fn qr_url_falls_back_to_loopback() {
+        let qr = super::build_qr_url(None, "tok456");
+        assert_eq!(qr, "http://localhost:8787/login?k=tok456");
+    }
+
+    /// Recent Key Usage must NOT surface OTKs that were never consumed by a
+    /// device — those rows are regen-invalidations from `generate_otk` and
+    /// rendered as "OTK used – unknown" before this fix. Real pair attempts
+    /// have `consumed_by_device IS NOT NULL`.
+    #[test]
+    fn recent_key_usage_excludes_unconsumed_otks() {
+        use rusqlite::{params, Connection};
+
+        let db = test_db("recent-no-ghost");
+        let conn = Connection::open(&db).unwrap();
+
+        // Ghost row: regen-invalidated OTK (used_at set, consumed_by_device NULL).
+        conn.execute(
+            "INSERT INTO one_time_keys(token, created_at, expires_at, used_at, consumed_by_device)
+             VALUES ('ghost', 100, 200, 150, NULL)",
+            params![],
+        )
+        .unwrap();
+
+        // Real row: consumed by a device.
+        conn.execute(
+            "INSERT INTO one_time_keys(token, created_at, expires_at, used_at, consumed_by_device)
+             VALUES ('real', 110, 210, 160, 'dev-iphone')",
+            params![],
+        )
+        .unwrap();
+
+        let rows = super::query_recent_key_usage(&db);
+        let otk_rows: Vec<_> = rows
+            .iter()
+            .filter(|r| r["kind"].as_str() == Some("otk_used"))
+            .collect();
+        assert_eq!(
+            otk_rows.len(),
+            1,
+            "ghost row must be filtered out; got rows: {rows:?}"
+        );
+        // The surviving row is the real one — `at` matches the consumed entry.
+        assert_eq!(otk_rows[0]["at"].as_i64(), Some(160));
     }
 }

@@ -1,5 +1,13 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest'
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
 import { isAllowedTunnelHost, getNamedTunnelAllowlist } from './url-validation'
+
+// Phase-2 worker-proxy allowlist: the worker host must be approved for
+// `/proxy/<id>/...` paths. Mock `discoveryBaseUrl` so the relevant cases
+// have a stable target — the production export reads `import.meta.env`,
+// which is empty under vitest.
+vi.mock('./discovery-client', () => ({
+  discoveryBaseUrl: () => 'https://oxiremote-discovery.test.workers.dev',
+}))
 
 // ── isAllowedTunnelHost ──────────────────────────────────────────────────────
 
@@ -43,6 +51,32 @@ describe('isAllowedTunnelHost', () => {
   it('rejects a domain that merely contains the allowlist entry as a suffix trick', () => {
     // "evil-my-tunnel.example.com" should NOT match "my-tunnel.example.com"
     expect(isAllowedTunnelHost('https://evil-my-tunnel.example.com', ['my-tunnel.example.com'])).toBe(false)
+  })
+
+  it('accepts the discovery-worker host when the URL is a /proxy/<id> path', () => {
+    expect(
+      isAllowedTunnelHost(
+        `https://oxiremote-discovery.test.workers.dev/proxy/${'a'.repeat(64)}`,
+        [],
+      ),
+    ).toBe(true)
+  })
+
+  it('rejects the discovery-worker host without the /proxy/ path prefix', () => {
+    // A bare worker hostname is NOT a valid tunnel target — the worker only
+    // brokers requests when they hit /proxy/<id>/...
+    expect(
+      isAllowedTunnelHost('https://oxiremote-discovery.test.workers.dev/api/anything', []),
+    ).toBe(false)
+  })
+
+  it('rejects a different *.workers.dev that is not the configured worker', () => {
+    expect(
+      isAllowedTunnelHost(
+        `https://attacker.workers.dev/proxy/${'a'.repeat(64)}`,
+        [],
+      ),
+    ).toBe(false)
   })
 })
 

@@ -3,6 +3,7 @@ import { useHostStore } from '../state/host-store'
 import {
   loadApiKey,
   makeRemoteClient,
+  proxiedTunnelUrl,
   storeApiKey,
   storeDiscoveryLookupId,
   storeTunnelBase,
@@ -26,6 +27,55 @@ import { isPermanentKey, sanitizeAccessKey } from '../components/login/access-ke
 interface PairCtx {
   deviceLabel: string
   navigate: NavigateFunction
+}
+
+interface SessionLike {
+  tunnelUrl: string
+  discoveryId: string | null
+}
+
+/**
+ * Pick the SPA's preferred upstream base for a discovery-mode pair attempt.
+ * Phase 2 prefers the worker-proxy URL because the SPA's local DNS can lag
+ * behind Cloudflare's authoritative resolver after sleep/wake; routing
+ * through the worker makes that lag invisible. Falls back to the raw
+ * tunnelUrl when the worker hasn't echoed a discoveryId (older worker,
+ * embedded mode quirks, etc.).
+ */
+function pickPairBase(session: SessionLike): { base: string; proxied: boolean } {
+  if (session.discoveryId) {
+    const proxy = proxiedTunnelUrl(session.discoveryId)
+    if (proxy) return { base: proxy, proxied: true }
+  }
+  return { base: session.tunnelUrl, proxied: false }
+}
+
+/**
+ * Two-attempt POST: try the worker-proxy URL first, fall back to the direct
+ * tunnel URL on 502/504 (proxy reachable but upstream agent gone) or
+ * TypeError (worker unreachable). Pre-Phase-2 callers that don't have a
+ * proxy URL skip the fallback path entirely (single fetch).
+ *
+ * The fallback only fires for an actual transport-level failure of the
+ * proxy — not for upstream auth (401/403) or validation (4xx) errors,
+ * which the agent legitimately returned and the caller must surface.
+ */
+async function fetchWithProxyFallback(
+  proxyBase: string | null,
+  directBase: string,
+  path: string,
+  init: RequestInit,
+): Promise<Response> {
+  if (proxyBase) {
+    try {
+      const res = await fetch(`${proxyBase}${path}`, init)
+      if (res.status !== 502 && res.status !== 504) return res
+    } catch (err) {
+      // TypeError = network failure / CORS / DNS. Retry direct.
+      if (!(err instanceof TypeError)) throw err
+    }
+  }
+  return fetch(`${directBase}${path}`, init)
 }
 
 // Same-origin OTK success: cookie auth, no api_key in body.
@@ -130,12 +180,18 @@ export async function submitDiscoveryPair(
   if (!session) {
     throw new Error('Discovery key expired or unknown — generate a fresh QR.')
   }
-  const res = await fetch(`${session.tunnelUrl}/api/login/one-time`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    credentials: 'omit',
-    body: JSON.stringify({ token: otkToken.toLowerCase() }),
-  })
+  const { base: pairBase } = pickPairBase(session)
+  const res = await fetchWithProxyFallback(
+    session.discoveryId ? proxiedTunnelUrl(session.discoveryId) : null,
+    session.tunnelUrl,
+    '/api/login/one-time',
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      credentials: 'omit',
+      body: JSON.stringify({ token: otkToken.toLowerCase() }),
+    },
+  )
   if (res.status !== 200 && res.status !== 202) {
     throw new Error('That key is invalid or expired.')
   }
@@ -148,8 +204,14 @@ export async function submitDiscoveryPair(
     window.localStorage.setItem('oxi:device-label', ctx.deviceLabel.trim())
   }
   storeApiKey(body.host_id, body.api_key)
-  storeTunnelBase(body.host_id, session.tunnelUrl)
+  // Persist whichever base served the pair request — proxy URL when
+  // available, raw tunnel URL otherwise. Subsequent /api/* + WS calls go
+  // through the same path the pair did.
   if (body.discovery_id) storeDiscoveryLookupId(body.host_id, body.discovery_id)
+  const persistBase = body.discovery_id
+    ? (proxiedTunnelUrl(body.discovery_id) ?? pairBase)
+    : pairBase
+  storeTunnelBase(body.host_id, persistBase)
   // Prefer the agent-supplied hostname (DESKTOP-…, TienNHs-MBP.lan) over
   // the user-typed device label and the truncated host_id. Older agents
   // omit `label`; we keep the same fallbacks to stay backward-compatible.
@@ -171,7 +233,7 @@ export async function submitDiscoveryPair(
     error: null,
   })
 
-  const remote = makeRemoteClient(session.tunnelUrl, body.api_key)
+  const remote = makeRemoteClient(persistBase, body.api_key)
   const tunnelBase = remote.baseUrl
 
   if (body.status === 'pending' || res.status === 202) {
@@ -201,15 +263,21 @@ async function submitDiscoveryPermanent(rawKey: string, ctx: PairCtx): Promise<v
       'That permanent key is unknown or the host is offline. Generate a new one from the host dashboard, or check that the agent is running.',
     )
   }
-  const res = await fetch(`${session.tunnelUrl}/api/pairing/exchange`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    credentials: 'omit',
-    body: JSON.stringify({
-      permanent_key: trimmedKey,
-      device_label: ctx.deviceLabel.trim() || undefined,
-    }),
-  })
+  const { base: pairBase } = pickPairBase(session)
+  const res = await fetchWithProxyFallback(
+    session.discoveryId ? proxiedTunnelUrl(session.discoveryId) : null,
+    session.tunnelUrl,
+    '/api/pairing/exchange',
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      credentials: 'omit',
+      body: JSON.stringify({
+        permanent_key: trimmedKey,
+        device_label: ctx.deviceLabel.trim() || undefined,
+      }),
+    },
+  )
   if (!res.ok) {
     throw new Error('Permanent key is invalid or has not been generated yet.')
   }
@@ -221,8 +289,11 @@ async function submitDiscoveryPermanent(rawKey: string, ctx: PairCtx): Promise<v
     window.localStorage.setItem('oxi:device-label', ctx.deviceLabel.trim())
   }
   storeApiKey(body.host_id, body.api_key)
-  storeTunnelBase(body.host_id, session.tunnelUrl)
   if (body.discovery_id) storeDiscoveryLookupId(body.host_id, body.discovery_id)
+  const persistBase = body.discovery_id
+    ? (proxiedTunnelUrl(body.discovery_id) ?? pairBase)
+    : pairBase
+  storeTunnelBase(body.host_id, persistBase)
   const friendlyLabel =
     body.label?.trim() || ctx.deviceLabel.trim() || body.host_id.slice(0, 8)
   recordSavedHost({
@@ -242,12 +313,12 @@ async function submitDiscoveryPermanent(rawKey: string, ctx: PairCtx): Promise<v
       state: {
         device_id: body.device_id,
         device_label: ctx.deviceLabel.trim() || undefined,
-        tunnel_base: session.tunnelUrl,
+        tunnel_base: persistBase,
       },
     })
     return
   }
-  ctx.navigate('/', { state: { tunnel_base: session.tunnelUrl } })
+  ctx.navigate('/', { state: { tunnel_base: persistBase } })
 }
 
 // Cross-origin manual pair via the discovery worker. Mirrors the QR flow
@@ -285,12 +356,18 @@ async function submitDiscoveryCode(raw: string, ctx: PairCtx): Promise<void> {
   const reqBody = kind === 'otk'
     ? { token: lookupKey }
     : { code: lookupKey, device_label: ctx.deviceLabel.trim() || undefined }
-  const res = await fetch(`${session.tunnelUrl}${endpoint}`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    credentials: 'omit',
-    body: JSON.stringify(reqBody),
-  })
+  const { base: pairBase } = pickPairBase(session)
+  const res = await fetchWithProxyFallback(
+    session.discoveryId ? proxiedTunnelUrl(session.discoveryId) : null,
+    session.tunnelUrl,
+    endpoint,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      credentials: 'omit',
+      body: JSON.stringify(reqBody),
+    },
+  )
   if (kind === 'otk') {
     if (res.status !== 200 && res.status !== 202) {
       throw new Error('That key is invalid or expired.')
@@ -306,8 +383,11 @@ async function submitDiscoveryCode(raw: string, ctx: PairCtx): Promise<void> {
     window.localStorage.setItem('oxi:device-label', ctx.deviceLabel.trim())
   }
   storeApiKey(body.host_id, body.api_key)
-  storeTunnelBase(body.host_id, session.tunnelUrl)
   if (body.discovery_id) storeDiscoveryLookupId(body.host_id, body.discovery_id)
+  const persistBase = body.discovery_id
+    ? (proxiedTunnelUrl(body.discovery_id) ?? pairBase)
+    : pairBase
+  storeTunnelBase(body.host_id, persistBase)
   const friendlyLabel =
     body.label?.trim() || ctx.deviceLabel.trim() || body.host_id.slice(0, 8)
   recordSavedHost({
@@ -328,12 +408,12 @@ async function submitDiscoveryCode(raw: string, ctx: PairCtx): Promise<void> {
         session_id: body.session_id,
         device_id: body.device_id,
         device_label: ctx.deviceLabel.trim() || undefined,
-        tunnel_base: session.tunnelUrl,
+        tunnel_base: persistBase,
       },
     })
     return
   }
-  ctx.navigate('/', { state: { tunnel_base: session.tunnelUrl } })
+  ctx.navigate('/', { state: { tunnel_base: persistBase } })
 }
 
 // Single submit path. Auto-detects by `sk-` prefix:

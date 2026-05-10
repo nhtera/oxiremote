@@ -8,10 +8,17 @@ import {
 } from './kv-store'
 import { allow as rateAllow } from './rate-limiter'
 import { corsHeaders, handlePreflight, isAllowedOrigin } from './cors-handler'
+import { handleProxy, proxyCorsHeaders } from './proxy-handler'
 
 interface Env {
   DISCOVERY: KVLike
 }
+
+// /proxy/<discovery_id>/<upstream_path...>
+// `discovery_id` is HEX64; the trailing path captures everything after
+// (including the leading `/` and any query string, which we re-build from
+// `URL.search` because the regex doesn't see the query).
+const PROXY_PATH = /^\/proxy\/([a-f0-9]{64})(\/.*)?$/
 
 const STATE_CHANGING_PATHS = new Set<string>([
   '/api/session/create',
@@ -153,12 +160,20 @@ async function handleSessionLookup(req: Request, env: Env, origin: string | null
   const url = new URL(req.url)
   const k = url.searchParams.get('k')
   if (!k) return jsonResponse({ error: 'missing k' }, 400, origin)
-  const session = await resolveTempKey(env.DISCOVERY, k)
-  if (!session || !session.tunnelUrl) {
+  const resolved = await resolveTempKey(env.DISCOVERY, k)
+  if (!resolved || !resolved.session.tunnelUrl) {
     return jsonResponse({ error: 'not found' }, 404, origin)
   }
+  // `discoveryId` lets the SPA address the worker proxy
+  // (`/proxy/<discoveryId>/...`) on the same round-trip. Without this the
+  // SPA would have to issue a second lookup or guess the id, which defeats
+  // the point of routing pair traffic through the worker.
   return jsonResponse(
-    { tunnelUrl: session.tunnelUrl, localIp: session.localIp ?? null },
+    {
+      tunnelUrl: resolved.session.tunnelUrl,
+      localIp: resolved.session.localIp ?? null,
+      discoveryId: resolved.discoveryId,
+    },
     200,
     origin,
   )
@@ -168,6 +183,36 @@ export default {
   async fetch(req: Request, env: Env): Promise<Response> {
     const url = new URL(req.url)
     const origin = req.headers.get('origin')
+
+    // /proxy/* is checked first: it's a method-agnostic pass-through and
+    // owns its own CORS (different headers than the JSON-API surface).
+    const proxyMatch = PROXY_PATH.exec(url.pathname)
+    if (proxyMatch) {
+      // Strict origin gate for the proxy. Cross-origin SPA always sends
+      // Origin; missing or non-allowed → 403 with no ACAO so the browser
+      // surfaces a CORS error rather than silently leaking a relay.
+      if (!origin || !isAllowedOrigin(origin)) {
+        return new Response('forbidden', { status: 403 })
+      }
+      if (req.method === 'OPTIONS') {
+        // Preflight: emit the strict proxy CORS headers (covers
+        // Authorization + X-OXI-CSRF that the JSON preflight does not).
+        return new Response(null, { status: 204, headers: proxyCorsHeaders(origin) })
+      }
+      // Proxy traffic gets a higher rate budget than the JSON control
+      // plane: a typical pair flow is ~10 reqs but a terminal-WS
+      // signalling burst can exceed 20/min easily. Bucket is namespaced
+      // (`proxy:` scope) so it doesn't share state with `/api/session/*`.
+      if (!rateAllow(clientIp(req), 'proxy', 600)) {
+        return new Response(JSON.stringify({ error: 'rate limited' }), {
+          status: 429,
+          headers: { 'Content-Type': 'application/json', ...proxyCorsHeaders(origin) },
+        })
+      }
+      const hostKey = proxyMatch[1]
+      const upstreamPath = (proxyMatch[2] ?? '/') + url.search
+      return handleProxy(req, env, hostKey, upstreamPath, origin)
+    }
 
     if (req.method === 'OPTIONS') return handlePreflight(origin)
 

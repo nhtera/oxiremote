@@ -41,6 +41,9 @@ vi.mock('./api-client', () => ({
   makeRemoteClient: vi.fn(),
   installFetchInterceptor: vi.fn(),
   oxiFetch: vi.fn(),
+  proxiedTunnelUrl: vi.fn(() => null),
+  migrateAllTunnelBasesToProxy: vi.fn(),
+  migrateTunnelBaseToProxy: vi.fn(),
 }))
 
 vi.mock('./url-validation', () => ({

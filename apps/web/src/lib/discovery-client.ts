@@ -28,6 +28,14 @@ const PERMANENT_KEY_PATTERN = /^sk-[A-Za-z0-9_-]{4,}$/
 export type LookupResult = {
   tunnelUrl: string
   localIp: string | null
+  /**
+   * Stable per-host id the discovery worker uses as its KV session key. The
+   * Phase-1 worker echoes this in `/api/session/lookup` so the SPA can
+   * address the worker proxy (`/proxy/<discoveryId>/...`) on the same
+   * round-trip. Older workers omit it; null = SPA must fall back to the
+   * direct tunnelUrl.
+   */
+  discoveryId: string | null
 }
 
 /** True only when the bundle is running under `vite dev` (HMR server). Vite
@@ -152,6 +160,11 @@ let resolveInFlight: Promise<string | null> | null = null
  *   - no `discovery_id` is stored (paired pre-0.1.28), or
  *   - the worker has no mapping for this host (worker down / unregistered).
  *
+ * Phase 2: when the SPA was configured with `VITE_DISCOVERY_URL` (i.e. the
+ * worker has a `/proxy/<id>/...` route) we return the **proxy URL**, not the
+ * raw tunnel URL. Routing through the proxy makes the SPA's local DNS
+ * irrelevant for this host. Caller still owns the URL allowlist check.
+ *
  * Does NOT persist the result — callers are responsible for validating
  * against the URL allowlist before writing to localStorage.
  */
@@ -161,11 +174,18 @@ export async function getCurrentTunnelUrl(): Promise<string | null> {
     try {
       // loadDiscoveryLookupId is imported lazily to avoid a circular dep at
       // module parse time (api-client ← transport ← discovery-client).
-      const { loadDiscoveryLookupId } = await import('./api-client')
+      const { loadDiscoveryLookupId, proxiedTunnelUrl } = await import('./api-client')
       const lookupId = loadDiscoveryLookupId()
       if (!lookupId) return null
       const session = await lookupAny(lookupId)
-      return session?.tunnelUrl ?? null
+      if (!session) return null
+      // Prefer the worker-echoed discoveryId; fall back to the locally-stored
+      // lookupId (which is the same value, persisted at pair time). Either
+      // way, prefer the proxy URL whenever discovery is active — that's the
+      // entire point of Phase 2.
+      const id = session.discoveryId ?? lookupId
+      const proxied = proxiedTunnelUrl(id)
+      return proxied ?? session.tunnelUrl
     } finally {
       resolveInFlight = null
     }
@@ -182,11 +202,14 @@ async function rawLookup(key: string): Promise<LookupResult | null> {
       credentials: 'omit',
     })
     if (!res.ok) return null
-    const body = (await res.json()) as Partial<LookupResult>
+    const body = (await res.json()) as { tunnelUrl?: unknown; localIp?: unknown; discoveryId?: unknown }
     if (typeof body.tunnelUrl !== 'string' || body.tunnelUrl.length === 0) return null
     return {
       tunnelUrl: body.tunnelUrl.replace(/\/$/, ''),
       localIp: typeof body.localIp === 'string' ? body.localIp : null,
+      discoveryId: typeof body.discoveryId === 'string' && body.discoveryId.length === 64
+        ? body.discoveryId
+        : null,
     }
   } catch {
     return null
