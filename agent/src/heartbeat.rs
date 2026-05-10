@@ -28,7 +28,7 @@ use tokio::sync::Notify;
 use tracing::{info, warn};
 
 use crate::events::EventBus;
-use crate::health_check::{ProbeOutcome, build_probe_client, probe_once};
+use crate::health_check::{ProbeOutcome, probe_url};
 
 const TICK_INTERVAL: Duration = Duration::from_secs(1);
 const SKEW_THRESHOLD: Duration = Duration::from_secs(5);
@@ -62,12 +62,7 @@ pub fn spawn(
             let public_ok_fut = async move {
                 match snap_url {
                     Some(public) => {
-                        let (probe_client, _diag) =
-                            build_probe_client(&public, &client).await;
-                        matches!(
-                            probe_once(&public, &probe_client).await,
-                            ProbeOutcome::Ok
-                        )
+                        matches!(probe_url(&public, &client).await, ProbeOutcome::Ok)
                     }
                     None => true,
                 }

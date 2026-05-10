@@ -5,6 +5,7 @@ import { Button, StateView } from '../../components/ui'
 import ConnTab from '../../components/agent/conn-tab'
 import ConnLogsTabs from '../../components/agent/conn-logs-tabs'
 import InlineLogsPanel from '../../components/agent/inline-logs-panel'
+import NamedTunnelBanner from '../../components/agent/named-tunnel-banner'
 import OnboardingView from '../../components/agent/onboarding-view'
 import OtkConfirmModal from '../../components/agent/otk-confirm-modal'
 import HostShell from '../../components/agent/host-shell'
@@ -12,6 +13,7 @@ import ServicesStrip from '../../components/agent/services-strip'
 import ActiveSessionsList from '../../components/active-sessions-list'
 import TunnelTelemetryBlock from '../../components/tunnel-telemetry-block'
 import RecentKeyUsage from '../../components/recent-key-usage'
+import { healthFromStepEvent, type TunnelHealth, type TunnelStepEvent } from '../../components/tunnel/health'
 
 // Host-dashboard home. Live-updates via the `/api/agent/events` SSE stream;
 // initial snapshot from `/api/agent/state`. Both endpoints are localhost-only.
@@ -85,6 +87,7 @@ export default function AgentHomePage() {
   const [pendingDevice, setPendingDevice] = useState<PendingDevice | null>(null)
   const [otkError, setOtkError] = useState<string | null>(null)
   const [tunnelHealthy, setTunnelHealthy] = useState(false)
+  const [tunnelHealth, setTunnelHealth] = useState<TunnelHealth>({ kind: 'unknown' })
   const [tunnelDown, setTunnelDown] = useState(false)
   const [tunnelStepReady, setTunnelStepReady] = useState(false)
   const [fetchStatus, setFetchStatus] = useState<FetchStatus>('loading')
@@ -112,12 +115,14 @@ export default function AgentHomePage() {
         if (cancelled) return
         setState(agentData)
         setOtk(agentData.otk ?? null)
-        if (
-          agentData.tunnel_step?.type === 'tunnel_step_changed'
-          && agentData.tunnel_step.step === 'ready'
-        ) {
-          setTunnelStepReady(true)
-          setTunnelHealthy(true)
+        if (agentData.tunnel_step?.type === 'tunnel_step_changed') {
+          const ts = agentData.tunnel_step as TunnelStepEvent
+          if (ts.step === 'ready') {
+            setTunnelStepReady(true)
+            setTunnelHealthy(true)
+          }
+          const h = healthFromStepEvent(ts)
+          if (h) setTunnelHealth(h)
         }
         setPermanentKey(keyMeta)
         setFetchStatus('ready')
@@ -140,18 +145,24 @@ export default function AgentHomePage() {
     es.onmessage = (msg) => {
       try {
         const ev: AgentEvent = JSON.parse(msg.data)
-        if (ev.type === 'tunnel_step_changed' && ev.step === 'ready') {
-          setTunnelStepReady(true)
-          setTunnelHealthy(true)
-          setTunnelDown(false)
+        if (ev.type === 'tunnel_step_changed') {
+          if (ev.step === 'ready') {
+            setTunnelStepReady(true)
+            setTunnelHealthy(true)
+            setTunnelDown(false)
+          }
+          const h = healthFromStepEvent(ev as TunnelStepEvent)
+          if (h) setTunnelHealth(h)
         } else if (ev.type === 'tunnel_url_changed') {
           setState((s) => (s ? { ...s, tunnel_url: ev.url } : s))
           setTunnelHealthy(false)
+          setTunnelHealth({ kind: 'unknown' })
           setTunnelDown(false)
           setTunnelStepReady(false)
         } else if (ev.type === 'tunnel_down') {
           setTunnelDown(true)
           setTunnelHealthy(false)
+          setTunnelHealth({ kind: 'unknown' })
         } else if (ev.type === 'health_probe') {
           if (ev.ok) setTunnelHealthy(true)
         } else if (ev.type === 'device_connected') {
@@ -316,6 +327,10 @@ export default function AgentHomePage() {
               </div>
             )}
 
+            {state?.tunnel_mode === 'quick' && state.discovery_configured && (
+              <NamedTunnelBanner hostId={state.host_id} />
+            )}
+
             <ServicesStrip
               desktopEnabled={state?.desktop_enabled ?? true}
               onDesktopEnabledChange={(next) =>
@@ -340,7 +355,7 @@ export default function AgentHomePage() {
                   connectedDevices={state.connected_devices}
                   autoApprove={state.auto_approve ?? false}
                   tunnelUrl={tunnelUrl}
-                  tunnelHealthy={tunnelHealthy}
+                  tunnelHealth={tunnelHealth}
                   onAutoApproveChange={(next) =>
                     setState((s) => (s ? { ...s, auto_approve: next } : s))
                   }

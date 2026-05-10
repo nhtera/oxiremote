@@ -36,6 +36,12 @@ pub enum TunnelStep {
     Verifying,
     /// Tunnel healthy and serving requests.
     Ready,
+    /// Tunnel transport is up but the agent's edge probe failed in a way that
+    /// indicates the public URL is not actually serving traffic (DoH NXDOMAIN,
+    /// 5xx, transport error). Distinct from `Failed` — cloudflared is still
+    /// running, just not reachable from Cloudflare's POV. The human-readable
+    /// cause rides on the parent event's `reason` field.
+    Degraded,
     /// Tunnel failed — see `reason` on the parent event.
     Failed,
 }

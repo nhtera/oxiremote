@@ -27,54 +27,121 @@ const PROBE_INTERVAL: Duration = Duration::from_secs(2);
 const PER_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(3);
 const DOH_TIMEOUT: Duration = Duration::from_secs(3);
 
-/// Result of a single HEAD probe against `<tunnel_url>/api/health`.
-/// `Err` carries a short human-readable reason ("timeout", "connecting…",
-/// HTTP status string, DNS error, …) for log/event surfaces.
-#[derive(Debug, Clone)]
+/// Result of a single probe attempt. The variants split out the failure modes
+/// that drive different operator-facing dashboard states (Phase 4):
+///
+/// - `Ok` → tunnel is serving traffic.
+/// - `Timeout` → HEAD timed out. Could be slow local DNS / slow PoP. Real
+///   clients (cellular phones via Cloudflare's edge resolver) often still pair
+///   fine, so this maps to amber-Ready.
+/// - `DohNxdomain` → Cloudflare's own DNS doesn't know the hostname.
+///   Definitive: the tunnel is not registered. Maps to red-Degraded.
+/// - `HttpError(status)` → server answered with non-2xx. 5xx → Degraded;
+///   non-401/403 4xx is treated as Ready (the agent answered, we just hit
+///   a route mismatch).
+/// - `Network(msg)` → connect/TLS/other transport error. Maps to Degraded.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProbeOutcome {
     Ok,
-    Err(String),
+    Timeout,
+    DohNxdomain,
+    HttpError(u16),
+    Network(String),
+}
+
+impl ProbeOutcome {
+    /// Short status string for the `HealthProbe` event / log output.
+    pub fn status_str(&self) -> String {
+        match self {
+            ProbeOutcome::Ok => "200 OK".into(),
+            ProbeOutcome::Timeout => "timeout".into(),
+            ProbeOutcome::DohNxdomain => "doh nxdomain".into(),
+            ProbeOutcome::HttpError(code) => format!("HTTP {code}"),
+            ProbeOutcome::Network(msg) => msg.clone(),
+        }
+    }
+}
+
+/// Outcome of resolving the tunnel host via Cloudflare DoH.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DohResult {
+    Resolved(IpAddr),
+    /// 1.1.1.1 returned `Status:3` (NXDOMAIN). Authoritative — the host
+    /// genuinely does not exist in Cloudflare's DNS, no point retrying.
+    Nxdomain,
+    /// Network / parse failure. DoH unreachable on this network. Caller falls
+    /// back to system DNS so probes still run on restricted networks.
+    Unavailable,
+}
+
+/// Outcome of building a probe client. Carries a short diagnostic string for
+/// the `HealthProbe(attempt=0)` pre-probe event.
+pub(crate) enum ClientOutcome {
+    /// Client is pinned to a Cloudflare-resolved IP.
+    Pinned(reqwest::Client, String),
+    /// Pinned-client construction failed — the supplied fallback is reused.
+    Fallback(reqwest::Client, String),
+    /// DoH said NXDOMAIN; caller should short-circuit before probing.
+    DefinitivelyBad(String),
+}
+
+impl ClientOutcome {
+    pub(crate) fn diagnostic(&self) -> &str {
+        match self {
+            ClientOutcome::Pinned(_, s)
+            | ClientOutcome::Fallback(_, s)
+            | ClientOutcome::DefinitivelyBad(s) => s,
+        }
+    }
 }
 
 /// Build a probe-only `reqwest::Client` that resolves `tunnel_url`'s host via
-/// Cloudflare DoH and pins the result to IP:443. On any failure (malformed
-/// URL, DoH blocked, empty answer) returns the supplied fallback so probes
-/// still run via the system resolver. The second tuple element is a
-/// human-readable diagnostic string suitable for surfacing to operators.
+/// Cloudflare DoH and pins the result to IP:443. Returns `DefinitivelyBad`
+/// when DoH says NXDOMAIN so the caller can skip the HEAD probe entirely
+/// (no point retrying — Cloudflare's authoritative DNS has spoken).
 pub(crate) async fn build_probe_client(
     tunnel_url: &str,
     fallback: &reqwest::Client,
-) -> (reqwest::Client, String) {
+) -> ClientOutcome {
     let Some(host) = extract_host(tunnel_url) else {
-        return (fallback.clone(), "non-https url; system dns".into());
+        return ClientOutcome::Fallback(fallback.clone(), "non-https url; system dns".into());
     };
     let doh_started = Instant::now();
-    match doh_resolve(&host).await {
-        Some(ip) => {
+    let doh = doh_resolve(&host).await;
+    let elapsed = doh_started.elapsed().as_millis() as u64;
+    match doh {
+        DohResult::Resolved(ip) => {
             info!(target: "health_check", host = %host, ip = %ip, "doh resolved");
-            let elapsed = doh_started.elapsed().as_millis() as u64;
-            let client = build_pinned_client(&host, ip).unwrap_or_else(|| {
-                warn!(target: "health_check", "pinned-client build failed; falling back");
-                fallback.clone()
-            });
-            (client, format!("doh resolved → {ip} ({elapsed}ms)"))
+            match build_pinned_client(&host, ip) {
+                Some(client) => ClientOutcome::Pinned(
+                    client,
+                    format!("doh resolved → {ip} ({elapsed}ms)"),
+                ),
+                None => {
+                    warn!(target: "health_check", "pinned-client build failed; falling back");
+                    ClientOutcome::Fallback(
+                        fallback.clone(),
+                        format!("doh resolved → {ip}; pinned client build failed"),
+                    )
+                }
+            }
         }
-        None => {
-            warn!(target: "health_check", host = %host, "doh failed; using system dns");
-            let elapsed = doh_started.elapsed().as_millis() as u64;
-            (
+        DohResult::Nxdomain => {
+            warn!(target: "health_check", host = %host, "doh nxdomain — tunnel host not registered");
+            ClientOutcome::DefinitivelyBad(format!("doh nxdomain ({elapsed}ms)"))
+        }
+        DohResult::Unavailable => {
+            warn!(target: "health_check", host = %host, "doh unavailable; using system dns");
+            ClientOutcome::Fallback(
                 fallback.clone(),
-                format!("doh blocked or failed ({elapsed}ms) → system dns"),
+                format!("doh unavailable ({elapsed}ms) → system dns"),
             )
         }
     }
 }
 
 /// Run a single HEAD probe against `<tunnel_url>/api/health` using `client`.
-/// Caller decides what to do with consecutive failures (one-shot verifying
-/// loop in `run_health_check` vs. long-running 3-strike monitor in
-/// `edge_health_monitor`). The per-request timeout matches the rest of the
-/// probe surface so a slow Cloudflare PoP can't stall the caller's interval.
+/// Returns a tagged outcome the caller maps to dashboard state.
 pub(crate) async fn probe_once(tunnel_url: &str, client: &reqwest::Client) -> ProbeOutcome {
     let health_url = format!("{}/api/health", tunnel_url.trim_end_matches('/'));
     match client
@@ -84,42 +151,79 @@ pub(crate) async fn probe_once(tunnel_url: &str, client: &reqwest::Client) -> Pr
         .await
     {
         Ok(resp) if resp.status().is_success() => ProbeOutcome::Ok,
-        Ok(resp) => ProbeOutcome::Err(resp.status().to_string()),
+        Ok(resp) => ProbeOutcome::HttpError(resp.status().as_u16()),
         Err(err) => {
-            let reason = if err.is_timeout() {
-                "timeout".to_string()
-            } else if err.is_connect() {
-                "connecting…".to_string()
-            } else if let Some(src) = err.source_chain_first() {
-                src
+            if err.is_timeout() {
+                ProbeOutcome::Timeout
             } else {
-                err.to_string()
-            };
-            ProbeOutcome::Err(reason)
+                let msg = if err.is_connect() {
+                    "connecting…".to_string()
+                } else if let Some(src) = err.source_chain_first() {
+                    src
+                } else {
+                    err.to_string()
+                };
+                ProbeOutcome::Network(msg)
+            }
         }
     }
 }
 
+/// One-shot DoH-resolve + HEAD probe. Convenience for callers (long-running
+/// monitor) that don't need to re-use the client across probes.
+pub async fn probe_url(tunnel_url: &str, fallback: &reqwest::Client) -> ProbeOutcome {
+    match build_probe_client(tunnel_url, fallback).await {
+        ClientOutcome::DefinitivelyBad(_) => ProbeOutcome::DohNxdomain,
+        ClientOutcome::Pinned(client, _) | ClientOutcome::Fallback(client, _) => {
+            probe_once(tunnel_url, &client).await
+        }
+    }
+}
+
+/// Multi-attempt verifying loop. Returns the final `ProbeOutcome` the agent
+/// should report:
+///
+/// - First `Ok` short-circuits with `Ok`.
+/// - First `DohNxdomain` short-circuits with `DohNxdomain` (definitive).
+/// - First `HttpError(5xx)` short-circuits with that error (the server
+///   answered, just unhealthy — no point retrying within an 8 s window).
+/// - `Timeout` / non-5xx `HttpError` / `Network` keep retrying until
+///   `HEALTH_TIMEOUT`; the last seen outcome is returned at end-of-window.
 pub async fn run_health_check(
     tunnel_url: String,
     bus: Arc<EventBus>,
     fallback_client: reqwest::Client,
-) -> bool {
+) -> ProbeOutcome {
     // Build a probe client that resolves the tunnel host via Cloudflare DoH
     // instead of system DNS. On any failure fall back to the system-DNS
     // client so behavior on restricted networks matches today. Surface the
     // outcome via a HealthProbe(attempt=0) diagnostic event.
-    let (probe_client, doh_status) = build_probe_client(&tunnel_url, &fallback_client).await;
-
+    let client_outcome = build_probe_client(&tunnel_url, &fallback_client).await;
     bus.send(AgentEvent::HealthProbe {
         attempt: 0,
-        status: doh_status,
+        status: client_outcome.diagnostic().to_string(),
         elapsed_ms: 0,
         ok: false,
     });
 
+    let probe_client = match client_outcome {
+        ClientOutcome::DefinitivelyBad(_) => {
+            // DoH NXDOMAIN — Cloudflare itself doesn't know the hostname.
+            // No point running HEAD probes; surface immediately.
+            bus.send(AgentEvent::HealthProbe {
+                attempt: 1,
+                status: "doh nxdomain".into(),
+                elapsed_ms: 0,
+                ok: false,
+            });
+            return ProbeOutcome::DohNxdomain;
+        }
+        ClientOutcome::Pinned(c, _) | ClientOutcome::Fallback(c, _) => c,
+    };
+
     let start = Instant::now();
     let mut attempt: u32 = 0;
+    let mut last = ProbeOutcome::Timeout;
 
     while start.elapsed() < HEALTH_TIMEOUT {
         attempt += 1;
@@ -127,29 +231,24 @@ pub async fn run_health_check(
         let outcome = probe_once(&tunnel_url, &probe_client).await;
         let elapsed_ms = probe_start.elapsed().as_millis() as u64;
 
-        match outcome {
-            ProbeOutcome::Ok => {
-                bus.send(AgentEvent::HealthProbe {
-                    attempt,
-                    status: "200 OK".into(),
-                    elapsed_ms,
-                    ok: true,
-                });
-                return true;
-            }
-            ProbeOutcome::Err(reason) => {
-                bus.send(AgentEvent::HealthProbe {
-                    attempt,
-                    status: reason,
-                    elapsed_ms,
-                    ok: false,
-                });
-            }
+        bus.send(AgentEvent::HealthProbe {
+            attempt,
+            status: outcome.status_str(),
+            elapsed_ms,
+            ok: matches!(outcome, ProbeOutcome::Ok),
+        });
+
+        match &outcome {
+            ProbeOutcome::Ok => return ProbeOutcome::Ok,
+            // 5xx: the server answered but unhealthy. Don't grind retries.
+            ProbeOutcome::HttpError(code) if *code >= 500 => return outcome,
+            _ => {}
         }
+        last = outcome;
 
         tokio::time::sleep(PROBE_INTERVAL).await;
     }
-    false
+    last
 }
 
 /// Extract the host portion of `https://host[:port][/path]`. Lighter than
@@ -166,39 +265,51 @@ fn extract_host(url: &str) -> Option<String> {
     }
 }
 
-/// Resolve `host` via Cloudflare's DoH-JSON endpoint. Returns the first A
-/// record's IP, or `None` if DoH is unreachable, returns a non-2xx status,
-/// returns no Answer section, or returns a malformed IP.
-async fn doh_resolve(host: &str) -> Option<IpAddr> {
+/// Resolve `host` via Cloudflare's DoH-JSON endpoint. Returns:
+///
+/// - `Resolved(ip)` on a successful answer with at least one A record.
+/// - `Nxdomain` when 1.1.1.1 returns `Status: 3` (definitive — host doesn't
+///   exist in Cloudflare's DNS).
+/// - `Unavailable` for any other failure (network, parse, no Answer section).
+async fn doh_resolve(host: &str) -> DohResult {
     let url = format!(
         "https://1.1.1.1/dns-query?name={}&type=A",
         urlencode(host)
     );
-    let client = reqwest::Client::builder()
-        .timeout(DOH_TIMEOUT)
-        .build()
-        .ok()?;
-    let resp = client
+    let Ok(client) = reqwest::Client::builder().timeout(DOH_TIMEOUT).build() else {
+        return DohResult::Unavailable;
+    };
+    let Ok(resp) = client
         .get(&url)
         .header("Accept", "application/dns-json")
         .send()
         .await
-        .ok()?;
+    else {
+        return DohResult::Unavailable;
+    };
     if !resp.status().is_success() {
-        return None;
+        return DohResult::Unavailable;
     }
-    // Parse manually via text() — reqwest's `json` feature isn't enabled in
-    // this project. serde_json is already a transitive dep.
-    let text = resp.text().await.ok()?;
-    let body: serde_json::Value = serde_json::from_str(&text).ok()?;
-    let answers = body.get("Answer")?.as_array()?;
+    let Ok(text) = resp.text().await else {
+        return DohResult::Unavailable;
+    };
+    let Ok(body) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return DohResult::Unavailable;
+    };
+    // Status: 3 = NXDOMAIN per RFC 8484 / DoH-JSON spec.
+    if body.get("Status").and_then(|v| v.as_u64()) == Some(3) {
+        return DohResult::Nxdomain;
+    }
+    let Some(answers) = body.get("Answer").and_then(|v| v.as_array()) else {
+        return DohResult::Unavailable;
+    };
     for ans in answers {
         let Some(data) = ans.get("data").and_then(|v| v.as_str()) else { continue };
         if let Ok(ip) = data.parse::<IpAddr>() {
-            return Some(ip);
+            return DohResult::Resolved(ip);
         }
     }
-    None
+    DohResult::Unavailable
 }
 
 /// Build a `reqwest::Client` that pins `host` → `ip:443`, bypassing whatever

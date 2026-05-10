@@ -911,9 +911,25 @@ async fn server_main(
                 let db_path = state.db_path.clone();
                 let mut rx = state.event_bus.subscribe();
                 tokio::spawn(async move {
+                    // Track the most recent tunnel URL so we can register it
+                    // when the probe finally promotes to Ready. Phase 4: don't
+                    // tell the worker about a URL we know is bad — wait for
+                    // the dashboard's own probe to clear it. The same Ready
+                    // event drives every URL rotation, so a transient
+                    // Degraded → Ready cycle re-registers the new URL.
+                    let mut latest_url: Option<String> = None;
                     loop {
                         match rx.recv().await {
                             Ok(AgentEvent::TunnelUrlChanged { url: tunnel_url }) => {
+                                latest_url = Some(tunnel_url);
+                            }
+                            Ok(AgentEvent::TunnelStepChanged {
+                                step: events::TunnelStep::Ready,
+                                ..
+                            }) => {
+                                let Some(tunnel_url) = latest_url.clone() else {
+                                    continue;
+                                };
                                 // Read the active pairing code per-event — the agent rotates
                                 // it every 5 min, and we want the latest valid one each time
                                 // we re-publish (e.g. on tunnel reconnect).
@@ -935,6 +951,17 @@ async fn server_main(
                                     bus.clone(),
                                     code,
                                     lookup_id,
+                                );
+                            }
+                            Ok(AgentEvent::TunnelStepChanged {
+                                step: events::TunnelStep::Degraded,
+                                reason,
+                                ..
+                            }) => {
+                                warn!(
+                                    target: "discovery",
+                                    reason = ?reason,
+                                    "tunnel degraded — skipping discovery registration"
                                 );
                             }
                             Ok(_) => continue,
@@ -1287,39 +1314,22 @@ async fn server_main(
                     }
                 };
 
-                let healthy = tokio::select! {
+                // A real client connecting through the tunnel is the strongest
+                // possible liveness signal — promotes to Ready with no soft
+                // suffix even if the local probe is still grinding.
+                let outcome = tokio::select! {
                     h = probe_fut => h,
-                    c = first_client_fut => c,
+                    client_won = first_client_fut => {
+                        if client_won {
+                            health_check::ProbeOutcome::Ok
+                        } else {
+                            health_check::ProbeOutcome::Network("subscriber closed".into())
+                        }
+                    }
                 };
 
-                if healthy {
-                    // Step 5 — probe passed OR a real client connected.
-                    probe_state.event_bus.send(events::AgentEvent::TunnelStepChanged {
-                        step: events::TunnelStep::Ready,
-                        attempt: 1,
-                        info: Some(u),
-                        reason: None,
-                    });
-                } else {
-                    // Probe timed out and no client connected. Cloudflared HAS
-                    // registered with Cloudflare's edge (we awaited that signal in
-                    // ensure_quick_tunnel) — registration is the real liveness
-                    // proof. The HEAD probe is a nice-to-have that fails on
-                    // networks where local DNS lags Cloudflare DNS, even though
-                    // real clients (phones over cellular) connect just fine.
-                    // Don't gate the dashboard behind probe success: surface
-                    // Ready with a soft diagnostic so the operator can see the
-                    // QR and the user can pair.
-                    warn!("local health probe inconclusive within timeout — proceeding to Ready since tunnel is registered");
-                    probe_state.event_bus.send(events::AgentEvent::TunnelStepChanged {
-                        step: events::TunnelStep::Ready,
-                        attempt: 1,
-                        info: Some(format!(
-                            "{u} (local probe inconclusive — scan QR to test)"
-                        )),
-                        reason: None,
-                    });
-                }
+                let next_step = probe_outcome_to_step(&outcome, &u);
+                probe_state.event_bus.send(next_step);
             }
         });
     }
@@ -1342,4 +1352,126 @@ async fn shutdown_signal() {
 
 async fn api_health() -> &'static str {
     "ok"
+}
+
+/// Map a verifying-loop probe outcome to the right `TunnelStepChanged` event.
+/// Phase 4: the dashboard gets honest state instead of soft-Ready-everything.
+///
+/// - `Ok` → green Ready (no suffix).
+/// - `Timeout` → amber-Ready with the existing soft-fallback suffix. Local
+///   DNS / PoP latency is the most common cause and cellular phones via
+///   Cloudflare's edge resolver still pair fine; don't paint the dashboard
+///   red over a slow probe.
+/// - `DohNxdomain` / `HttpError(5xx)` / `Network` → red `Degraded` with the
+///   reason populated so the operator can see what broke.
+/// - `HttpError(4xx)` other than 401/403 → green Ready: the agent answered,
+///   we just hit a route the proxy doesn't recognise.
+fn probe_outcome_to_step(
+    outcome: &health_check::ProbeOutcome,
+    tunnel_url: &str,
+) -> events::AgentEvent {
+    use health_check::ProbeOutcome;
+    match outcome {
+        ProbeOutcome::Ok => events::AgentEvent::TunnelStepChanged {
+            step: events::TunnelStep::Ready,
+            attempt: 1,
+            info: Some(tunnel_url.to_string()),
+            reason: None,
+        },
+        ProbeOutcome::Timeout => events::AgentEvent::TunnelStepChanged {
+            step: events::TunnelStep::Ready,
+            attempt: 1,
+            info: Some(format!(
+                "{tunnel_url} (local probe inconclusive — scan QR to test)"
+            )),
+            reason: None,
+        },
+        ProbeOutcome::HttpError(code) if (400..500).contains(code) && *code != 401 && *code != 403 => {
+            events::AgentEvent::TunnelStepChanged {
+                step: events::TunnelStep::Ready,
+                attempt: 1,
+                info: Some(tunnel_url.to_string()),
+                reason: None,
+            }
+        }
+        ProbeOutcome::DohNxdomain => events::AgentEvent::TunnelStepChanged {
+            step: events::TunnelStep::Degraded,
+            attempt: 1,
+            info: Some(tunnel_url.to_string()),
+            reason: Some("tunnel hostname not registered with Cloudflare".into()),
+        },
+        ProbeOutcome::HttpError(code) => events::AgentEvent::TunnelStepChanged {
+            step: events::TunnelStep::Degraded,
+            attempt: 1,
+            info: Some(tunnel_url.to_string()),
+            reason: Some(format!("tunnel returned HTTP {code}")),
+        },
+        ProbeOutcome::Network(msg) => events::AgentEvent::TunnelStepChanged {
+            step: events::TunnelStep::Degraded,
+            attempt: 1,
+            info: Some(tunnel_url.to_string()),
+            reason: Some(format!("tunnel network error: {msg}")),
+        },
+    }
+}
+
+#[cfg(test)]
+mod probe_outcome_to_step_tests {
+    use super::*;
+    use health_check::ProbeOutcome;
+
+    fn assert_step(outcome: ProbeOutcome, expected: events::TunnelStep, expect_reason: bool) {
+        let ev = probe_outcome_to_step(&outcome, "https://x.trycloudflare.com");
+        let events::AgentEvent::TunnelStepChanged { step, reason, .. } = ev else {
+            panic!("expected TunnelStepChanged");
+        };
+        assert_eq!(step, expected);
+        assert_eq!(reason.is_some(), expect_reason);
+    }
+
+    #[test]
+    fn ok_maps_to_ready_no_reason() {
+        assert_step(ProbeOutcome::Ok, events::TunnelStep::Ready, false);
+    }
+
+    #[test]
+    fn timeout_maps_to_ready_with_soft_suffix() {
+        let ev = probe_outcome_to_step(&ProbeOutcome::Timeout, "https://x.trycloudflare.com");
+        let events::AgentEvent::TunnelStepChanged { step, info, .. } = ev else {
+            panic!("expected TunnelStepChanged");
+        };
+        assert_eq!(step, events::TunnelStep::Ready);
+        assert!(info.unwrap().contains("local probe inconclusive"));
+    }
+
+    #[test]
+    fn nxdomain_maps_to_degraded_with_reason() {
+        assert_step(ProbeOutcome::DohNxdomain, events::TunnelStep::Degraded, true);
+    }
+
+    #[test]
+    fn http_5xx_maps_to_degraded() {
+        assert_step(ProbeOutcome::HttpError(503), events::TunnelStep::Degraded, true);
+    }
+
+    #[test]
+    fn http_404_maps_to_ready() {
+        assert_step(ProbeOutcome::HttpError(404), events::TunnelStep::Ready, false);
+    }
+
+    #[test]
+    fn http_401_maps_to_degraded() {
+        // 401/403 stay in the Degraded bucket — they suggest auth misconfig
+        // rather than route mismatch and should be visible to the operator.
+        assert_step(ProbeOutcome::HttpError(401), events::TunnelStep::Degraded, true);
+    }
+
+    #[test]
+    fn network_error_maps_to_degraded() {
+        assert_step(
+            ProbeOutcome::Network("connection refused".into()),
+            events::TunnelStep::Degraded,
+            true,
+        );
+    }
 }

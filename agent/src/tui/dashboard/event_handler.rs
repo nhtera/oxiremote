@@ -52,6 +52,20 @@ impl State {
                         }
                         return;
                     }
+                    TunnelStep::Degraded => {
+                        // Tunnel transport is up but the public URL is not
+                        // serving traffic. Surface the reason on whichever
+                        // step is currently active (typically Verifying).
+                        let why = reason
+                            .clone()
+                            .unwrap_or_else(|| "tunnel unhealthy".into());
+                        for s in &mut self.steps {
+                            if matches!(s.status, StepStatus::Active) {
+                                s.sub = Some(format!("degraded: {why}"));
+                            }
+                        }
+                        return;
+                    }
                 };
 
                 // Record when Verifying becomes active so elapsed display works.

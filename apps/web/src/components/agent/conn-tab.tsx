@@ -2,6 +2,7 @@ import AutoApproveToggle from '../auto-approve-toggle'
 import DevicesPanel from '../devices-panel'
 import PermissionsWidget from '../permissions-widget'
 import ProxyPortsCard from '../proxy-ports-card'
+import { type TunnelHealth } from '../tunnel/health'
 import TunnelStatusCard from '../tunnel-status-card'
 
 interface Props {
@@ -11,7 +12,7 @@ interface Props {
   connectedDevices: number
   autoApprove: boolean
   tunnelUrl: string | null
-  tunnelHealthy: boolean
+  tunnelHealth: TunnelHealth
   onAutoApproveChange: (next: boolean) => void
 }
 
@@ -27,12 +28,12 @@ export default function ConnTab({
   connectedDevices,
   autoApprove,
   tunnelUrl,
-  tunnelHealthy,
+  tunnelHealth,
   onAutoApproveChange,
 }: Props) {
   return (
     <div className="space-y-4">
-      <TunnelStatusCard tunnelUrl={tunnelUrl} healthy={tunnelHealthy} />
+      <TunnelStatusCard tunnelUrl={tunnelUrl} health={tunnelHealth} />
 
       <Card title="Host">
         <Row k="Host ID" v={hostId} />

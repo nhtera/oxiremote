@@ -82,6 +82,8 @@ Tapping the notification opens the deep link on the correct host. The CLI reads 
 
 Quick Tunnels are great for trying things out, but they hardcode `ha-connections=1`: every HTTP and WebSocket request from your client funnels through a single QUIC connection to a single Cloudflare edge POP. When that connection has a transient stream-listener hiccup — which Cloudflare itself flags as expected for account-less tunnels ("no uptime guarantee") — in-flight WS upgrades fail at the edge and never reach the agent. The SPA reconnects automatically, but you'll occasionally see "Connection lost" flashes.
 
+The agent ships several mitigations that make Quick Tunnels pretty usable in practice — the worker reverse-proxy hides DNS-propagation lag after sleep/wake, an edge-health monitor auto-respawns a stuck cloudflared, and the dashboard surfaces a `Tunnel unhealthy` chip with the reason instead of lying. If you want a permanent hostname that never rotates, run a Named Tunnel:
+
 A Named Tunnel runs with `ha-connections=4` across multiple edge POPs and gets you a stable hostname that doesn't rotate per process. Setup is one-time:
 
 ```bash

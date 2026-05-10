@@ -1,21 +1,15 @@
 import { useEffect, useState } from 'react'
 import StatusChip from '../ui/status-chip'
+import { healthFromStepEvent, type TunnelHealth, type TunnelStepEvent } from './health'
 
 interface AgentEventTunnelUrlChanged { type: 'tunnel_url_changed'; url: string }
 interface AgentEventHealthProbe { type: 'health_probe'; ok: boolean }
 interface AgentEventTunnelDown { type: 'tunnel_down'; reason: string; recovery_hint?: string }
-interface AgentEventTunnelStep {
-  type: 'tunnel_step_changed'
-  step: 'preparing' | 'connecting' | 'tunneling' | 'verifying' | 'ready' | 'failed'
-  attempt: number
-  info?: string
-  reason?: string
-}
 type PillEvent =
   | AgentEventTunnelUrlChanged
   | AgentEventHealthProbe
   | AgentEventTunnelDown
-  | AgentEventTunnelStep
+  | TunnelStepEvent
   | { type: string }
 
 // Compact pill for the agent-layout header — visible from every /agent/* page.
@@ -24,7 +18,7 @@ type PillEvent =
 // internal subscribers.
 export default function TunnelStatusPill() {
   const [tunnelUrl, setTunnelUrl] = useState<string | null>(null)
-  const [healthy, setHealthy] = useState(false)
+  const [health, setHealth] = useState<TunnelHealth>({ kind: 'unknown' })
   const [down, setDown] = useState<{ reason: string; hint?: string } | null>(null)
 
   useEffect(() => {
@@ -34,9 +28,10 @@ export default function TunnelStatusPill() {
       .then((data) => {
         if (cancelled || !data) return
         setTunnelUrl(data.tunnel_url ?? null)
-        const ts = data.tunnel_step as AgentEventTunnelStep | null | undefined
-        if (ts?.type === 'tunnel_step_changed' && ts.step === 'ready') {
-          setHealthy(true)
+        const ts = data.tunnel_step as TunnelStepEvent | null | undefined
+        if (ts?.type === 'tunnel_step_changed') {
+          const h = healthFromStepEvent(ts)
+          if (h) setHealth(h)
         }
       })
       .catch(() => { /* SSE will resync */ })
@@ -47,19 +42,17 @@ export default function TunnelStatusPill() {
         const ev = JSON.parse(msg.data) as PillEvent
         if (ev.type === 'tunnel_url_changed') {
           setTunnelUrl((ev as AgentEventTunnelUrlChanged).url)
-          setHealthy(false)
+          setHealth({ kind: 'unknown' })
           setDown(null)
         } else if (ev.type === 'health_probe' && (ev as AgentEventHealthProbe).ok) {
-          setHealthy(true)
-        } else if (
-          ev.type === 'tunnel_step_changed'
-          && (ev as AgentEventTunnelStep).step === 'ready'
-        ) {
-          setHealthy(true)
+          setHealth({ kind: 'ready' })
+        } else if (ev.type === 'tunnel_step_changed') {
+          const h = healthFromStepEvent(ev as TunnelStepEvent)
+          if (h) setHealth(h)
         } else if (ev.type === 'tunnel_down') {
           const td = ev as AgentEventTunnelDown
           setDown({ reason: td.reason, hint: td.recovery_hint })
-          setHealthy(false)
+          setHealth({ kind: 'unknown' })
         }
       } catch { /* drop malformed frames */ }
     }
@@ -69,14 +62,30 @@ export default function TunnelStatusPill() {
     }
   }, [])
 
-  const variant = down ? 'rejected' : !tunnelUrl ? 'offline' : healthy ? 'online' : 'pending'
-  const label = down
-    ? 'Tunnel down'
-    : !tunnelUrl
-      ? 'Starting'
-      : healthy
-        ? 'Reachable'
-        : 'Probing'
-  const title = down ? (down.hint ?? down.reason) : undefined
+  let variant: 'offline' | 'pending' | 'online' | 'rejected'
+  let label: string
+  let title: string | undefined
+  if (down) {
+    variant = 'rejected'
+    label = 'Tunnel down'
+    title = down.hint ?? down.reason
+  } else if (!tunnelUrl) {
+    variant = 'offline'
+    label = 'Starting'
+  } else if (health.kind === 'ready') {
+    variant = 'online'
+    label = 'Reachable'
+  } else if (health.kind === 'verifying') {
+    variant = 'pending'
+    label = 'Verifying'
+    title = health.reason
+  } else if (health.kind === 'degraded') {
+    variant = 'rejected'
+    label = 'Tunnel unhealthy'
+    title = health.reason
+  } else {
+    variant = 'pending'
+    label = 'Probing'
+  }
   return <span title={title}><StatusChip variant={variant}>{label}</StatusChip></span>
 }

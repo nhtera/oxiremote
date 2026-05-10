@@ -1,12 +1,15 @@
 import { useState } from 'react'
 import StatusChip from './ui/status-chip'
+import { type TunnelHealth } from './tunnel/health'
 import TunnelStatusPillImpl from './tunnel/status-pill'
 import TunnelStepList from './tunnel/step-list'
 
 interface Props {
   tunnelUrl: string | null
-  /** True once the agent's health probe has succeeded against the URL. */
-  healthy: boolean
+  /** Phase-4 tri-state probe verdict. `verifying` is amber (probe inconclusive
+   *  but cellular phones via Cloudflare's resolver can pair); `degraded` is
+   *  red (DoH NXDOMAIN, 5xx, transport error). */
+  health: TunnelHealth
 }
 
 // Re-exports for existing call sites — composers landed in `./tunnel/`.
@@ -17,7 +20,7 @@ export const TunnelProgressCard = TunnelStepList
 // pairing card). Shows the URL big, lets the operator copy / open it, and
 // surfaces the health verdict via StatusChip. When the URL hasn't appeared yet
 // (cloudflared still booting) we render a "starting" state instead of hiding.
-export default function TunnelStatusCard({ tunnelUrl, healthy }: Props) {
+export default function TunnelStatusCard({ tunnelUrl, health }: Props) {
   const [copied, setCopied] = useState(false)
 
   async function copyUrl() {
@@ -31,8 +34,30 @@ export default function TunnelStatusCard({ tunnelUrl, healthy }: Props) {
     }
   }
 
-  const variant = !tunnelUrl ? 'offline' : healthy ? 'online' : 'pending'
-  const label = !tunnelUrl ? 'Starting tunnel' : healthy ? 'Reachable' : 'Probing'
+  let variant: 'offline' | 'pending' | 'online' | 'rejected'
+  let label: string
+  let chipTitle: string | undefined
+  let banner: { tone: 'amber' | 'red'; text: string } | null = null
+  if (!tunnelUrl) {
+    variant = 'offline'
+    label = 'Starting tunnel'
+  } else if (health.kind === 'ready') {
+    variant = 'online'
+    label = 'Reachable'
+  } else if (health.kind === 'verifying') {
+    variant = 'pending'
+    label = 'Verifying'
+    chipTitle = health.reason
+    banner = { tone: 'amber', text: health.reason }
+  } else if (health.kind === 'degraded') {
+    variant = 'rejected'
+    label = 'Tunnel unhealthy'
+    chipTitle = health.reason
+    banner = { tone: 'red', text: health.reason }
+  } else {
+    variant = 'pending'
+    label = 'Probing'
+  }
 
   return (
     <section className="rounded-xl border border-border bg-surface p-4">
@@ -40,8 +65,21 @@ export default function TunnelStatusCard({ tunnelUrl, healthy }: Props) {
         <div className="text-[length:var(--text-h3)] uppercase tracking-wide text-text-muted">
           Tunnel
         </div>
-        <StatusChip variant={variant}>{label}</StatusChip>
+        <span title={chipTitle}>
+          <StatusChip variant={variant}>{label}</StatusChip>
+        </span>
       </div>
+      {banner && (
+        <div
+          className={
+            banner.tone === 'red'
+              ? 'mb-2 rounded-md border border-danger/40 bg-danger/10 px-2.5 py-1.5 text-xs text-danger'
+              : 'mb-2 rounded-md border border-amber-400/40 bg-amber-400/10 px-2.5 py-1.5 text-xs text-amber-300'
+          }
+        >
+          {banner.text}
+        </div>
+      )}
 
       {tunnelUrl ? (
         <div className="flex items-center gap-2 min-w-0">

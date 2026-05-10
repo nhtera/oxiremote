@@ -21,7 +21,7 @@ use tokio::task::JoinHandle;
 use tracing::{info, warn};
 
 use crate::events::{AgentEvent, EventBus, TunnelStep};
-use crate::health_check::{ProbeOutcome, build_probe_client, probe_once};
+use crate::health_check::{ProbeOutcome, probe_url};
 
 const INITIAL_INTERVAL: Duration = Duration::from_secs(30);
 const MAX_INTERVAL: Duration = Duration::from_secs(120);
@@ -39,10 +39,7 @@ pub fn spawn(
     let fallback = reqwest::Client::new();
     let probe = move |url: String| {
         let fallback = fallback.clone();
-        async move {
-            let (client, _diag) = build_probe_client(&url, &fallback).await;
-            probe_once(&url, &client).await
-        }
+        async move { probe_url(&url, &fallback).await }
     };
     spawn_with_probe(bus, Arc::new(probe), force_respawn, shutdown)
 }
@@ -126,54 +123,52 @@ async fn run_probe<F, Fut>(
     Fut: Future<Output = ProbeOutcome> + Send + 'static,
 {
     let outcome = (probe)(url.to_string()).await;
-    match outcome {
-        ProbeOutcome::Ok => {
-            if *consecutive_failures > 0 {
-                info!(
-                    target: "edge_health_monitor",
-                    url = url,
-                    "edge probe recovered after {} failures",
-                    *consecutive_failures
-                );
-            }
-            *consecutive_failures = 0;
-            *interval = INITIAL_INTERVAL;
-        }
-        ProbeOutcome::Err(reason) => {
-            *consecutive_failures = consecutive_failures.saturating_add(1);
-            *interval = next_backoff(*interval);
-            warn!(
+    if matches!(outcome, ProbeOutcome::Ok) {
+        if *consecutive_failures > 0 {
+            info!(
                 target: "edge_health_monitor",
                 url = url,
-                attempts = *consecutive_failures,
-                reason = %reason,
-                "edge probe failed"
+                "edge probe recovered after {} failures",
+                *consecutive_failures
             );
-            if *consecutive_failures >= FAIL_THRESHOLD {
-                let throttled = last_respawn_at
-                    .map(|t| t.elapsed() < RESPAWN_THROTTLE)
-                    .unwrap_or(false);
-                if !throttled {
-                    bus.send(AgentEvent::EdgeUnhealthy {
-                        url: url.to_string(),
-                        consecutive_failures: *consecutive_failures,
-                    });
-                    force_respawn.notify_one();
-                    *last_respawn_at = Some(Instant::now());
-                } else {
-                    info!(
-                        target: "edge_health_monitor",
-                        "respawn throttled; last respawn within {}s",
-                        RESPAWN_THROTTLE.as_secs()
-                    );
-                }
-                // Reset the counter regardless — we either fired or throttled.
-                // The next 3 consecutive failures will be evaluated fresh
-                // against the throttle window.
-                *consecutive_failures = 0;
-                *interval = INITIAL_INTERVAL;
-            }
         }
+        *consecutive_failures = 0;
+        *interval = INITIAL_INTERVAL;
+        return;
+    }
+    *consecutive_failures = consecutive_failures.saturating_add(1);
+    *interval = next_backoff(*interval);
+    let reason = outcome.status_str();
+    warn!(
+        target: "edge_health_monitor",
+        url = url,
+        attempts = *consecutive_failures,
+        reason = %reason,
+        "edge probe failed"
+    );
+    if *consecutive_failures >= FAIL_THRESHOLD {
+        let throttled = last_respawn_at
+            .map(|t| t.elapsed() < RESPAWN_THROTTLE)
+            .unwrap_or(false);
+        if !throttled {
+            bus.send(AgentEvent::EdgeUnhealthy {
+                url: url.to_string(),
+                consecutive_failures: *consecutive_failures,
+            });
+            force_respawn.notify_one();
+            *last_respawn_at = Some(Instant::now());
+        } else {
+            info!(
+                target: "edge_health_monitor",
+                "respawn throttled; last respawn within {}s",
+                RESPAWN_THROTTLE.as_secs()
+            );
+        }
+        // Reset the counter regardless — we either fired or throttled.
+        // The next 3 consecutive failures will be evaluated fresh against
+        // the throttle window.
+        *consecutive_failures = 0;
+        *interval = INITIAL_INTERVAL;
     }
 }
 
@@ -256,7 +251,7 @@ mod tests {
         let mut rx = bus.subscribe();
         let force_respawn = Arc::new(Notify::new());
         let shutdown = Arc::new(Notify::new());
-        let probe = Arc::new(|_url: String| async { ProbeOutcome::Err("fail".into()) });
+        let probe = Arc::new(|_url: String| async { ProbeOutcome::Network("fail".into()) });
 
         let handle = spawn_with_probe(bus.clone(), probe, force_respawn.clone(), shutdown.clone());
         bus.send(AgentEvent::TunnelUrlChanged { url: "https://abc.trycloudflare.com".into() });
@@ -289,7 +284,7 @@ mod tests {
         let bus = EventBus::new();
         let force_respawn = Arc::new(Notify::new());
         let shutdown = Arc::new(Notify::new());
-        let probe = Arc::new(|_url: String| async { ProbeOutcome::Err("fail".into()) });
+        let probe = Arc::new(|_url: String| async { ProbeOutcome::Network("fail".into()) });
 
         let handle = spawn_with_probe(bus.clone(), probe, force_respawn.clone(), shutdown.clone());
         bus.send(AgentEvent::TunnelUrlChanged { url: "https://abc.trycloudflare.com".into() });
@@ -335,7 +330,7 @@ mod tests {
         let probe = Arc::new(move |_url: String| {
             let n = calls_c.fetch_add(1, Ordering::SeqCst);
             async move {
-                if n < 2 { ProbeOutcome::Err("fail".into()) } else { ProbeOutcome::Ok }
+                if n < 2 { ProbeOutcome::Network("fail".into()) } else { ProbeOutcome::Ok }
             }
         });
 
@@ -390,7 +385,7 @@ mod tests {
         let calls_c = calls.clone();
         let probe = Arc::new(move |_url: String| {
             calls_c.fetch_add(1, Ordering::SeqCst);
-            async { ProbeOutcome::Err("fail".into()) }
+            async { ProbeOutcome::Network("fail".into()) }
         });
 
         let handle = spawn_with_probe(bus.clone(), probe, force_respawn.clone(), shutdown.clone());
