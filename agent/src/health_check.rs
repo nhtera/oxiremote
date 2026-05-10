@@ -27,44 +27,90 @@ const PROBE_INTERVAL: Duration = Duration::from_secs(2);
 const PER_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(3);
 const DOH_TIMEOUT: Duration = Duration::from_secs(3);
 
+/// Result of a single HEAD probe against `<tunnel_url>/api/health`.
+/// `Err` carries a short human-readable reason ("timeout", "connecting…",
+/// HTTP status string, DNS error, …) for log/event surfaces.
+#[derive(Debug, Clone)]
+pub enum ProbeOutcome {
+    Ok,
+    Err(String),
+}
+
+/// Build a probe-only `reqwest::Client` that resolves `tunnel_url`'s host via
+/// Cloudflare DoH and pins the result to IP:443. On any failure (malformed
+/// URL, DoH blocked, empty answer) returns the supplied fallback so probes
+/// still run via the system resolver. The second tuple element is a
+/// human-readable diagnostic string suitable for surfacing to operators.
+pub(crate) async fn build_probe_client(
+    tunnel_url: &str,
+    fallback: &reqwest::Client,
+) -> (reqwest::Client, String) {
+    let Some(host) = extract_host(tunnel_url) else {
+        return (fallback.clone(), "non-https url; system dns".into());
+    };
+    let doh_started = Instant::now();
+    match doh_resolve(&host).await {
+        Some(ip) => {
+            info!(target: "health_check", host = %host, ip = %ip, "doh resolved");
+            let elapsed = doh_started.elapsed().as_millis() as u64;
+            let client = build_pinned_client(&host, ip).unwrap_or_else(|| {
+                warn!(target: "health_check", "pinned-client build failed; falling back");
+                fallback.clone()
+            });
+            (client, format!("doh resolved → {ip} ({elapsed}ms)"))
+        }
+        None => {
+            warn!(target: "health_check", host = %host, "doh failed; using system dns");
+            let elapsed = doh_started.elapsed().as_millis() as u64;
+            (
+                fallback.clone(),
+                format!("doh blocked or failed ({elapsed}ms) → system dns"),
+            )
+        }
+    }
+}
+
+/// Run a single HEAD probe against `<tunnel_url>/api/health` using `client`.
+/// Caller decides what to do with consecutive failures (one-shot verifying
+/// loop in `run_health_check` vs. long-running 3-strike monitor in
+/// `edge_health_monitor`). The per-request timeout matches the rest of the
+/// probe surface so a slow Cloudflare PoP can't stall the caller's interval.
+pub(crate) async fn probe_once(tunnel_url: &str, client: &reqwest::Client) -> ProbeOutcome {
+    let health_url = format!("{}/api/health", tunnel_url.trim_end_matches('/'));
+    match client
+        .head(&health_url)
+        .timeout(PER_ATTEMPT_TIMEOUT)
+        .send()
+        .await
+    {
+        Ok(resp) if resp.status().is_success() => ProbeOutcome::Ok,
+        Ok(resp) => ProbeOutcome::Err(resp.status().to_string()),
+        Err(err) => {
+            let reason = if err.is_timeout() {
+                "timeout".to_string()
+            } else if err.is_connect() {
+                "connecting…".to_string()
+            } else if let Some(src) = err.source_chain_first() {
+                src
+            } else {
+                err.to_string()
+            };
+            ProbeOutcome::Err(reason)
+        }
+    }
+}
+
 pub async fn run_health_check(
     tunnel_url: String,
     bus: Arc<EventBus>,
     fallback_client: reqwest::Client,
 ) -> bool {
     // Build a probe client that resolves the tunnel host via Cloudflare DoH
-    // instead of system DNS. On any failure (malformed URL, DoH blocked,
-    // empty answer) fall back to the system-DNS client so behavior on
-    // restricted networks matches today. Surface the outcome via a
-    // HealthProbe(attempt=0) event so the operator can see in the probe log
-    // whether DoH actually took effect.
-    let (probe_client, doh_status) = match extract_host(&tunnel_url) {
-        Some(host) => {
-            let doh_started = Instant::now();
-            match doh_resolve(&host).await {
-                Some(ip) => {
-                    info!(target: "health_check", host = %host, ip = %ip, "doh resolved");
-                    let elapsed = doh_started.elapsed().as_millis() as u64;
-                    let client = build_pinned_client(&host, ip).unwrap_or_else(|| {
-                        warn!(target: "health_check", "pinned-client build failed; falling back");
-                        fallback_client.clone()
-                    });
-                    (client, format!("doh resolved → {ip} ({elapsed}ms)"))
-                }
-                None => {
-                    warn!(target: "health_check", host = %host, "doh failed; using system dns");
-                    let elapsed = doh_started.elapsed().as_millis() as u64;
-                    (
-                        fallback_client.clone(),
-                        format!("doh blocked or failed ({elapsed}ms) → system dns"),
-                    )
-                }
-            }
-        }
-        None => (fallback_client.clone(), "non-https url; system dns".into()),
-    };
+    // instead of system DNS. On any failure fall back to the system-DNS
+    // client so behavior on restricted networks matches today. Surface the
+    // outcome via a HealthProbe(attempt=0) diagnostic event.
+    let (probe_client, doh_status) = build_probe_client(&tunnel_url, &fallback_client).await;
 
-    // attempt=0 marks this as a pre-probe diagnostic, distinct from real probes.
     bus.send(AgentEvent::HealthProbe {
         attempt: 0,
         status: doh_status,
@@ -72,55 +118,34 @@ pub async fn run_health_check(
         ok: false,
     });
 
-    let health_url = format!("{}/api/health", tunnel_url.trim_end_matches('/'));
     let start = Instant::now();
     let mut attempt: u32 = 0;
 
     while start.elapsed() < HEALTH_TIMEOUT {
         attempt += 1;
         let probe_start = Instant::now();
-        let result = probe_client
-            .head(&health_url)
-            .timeout(PER_ATTEMPT_TIMEOUT)
-            .send()
-            .await;
+        let outcome = probe_once(&tunnel_url, &probe_client).await;
         let elapsed_ms = probe_start.elapsed().as_millis() as u64;
 
-        let event = match result {
-            Ok(resp) if resp.status().is_success() => {
+        match outcome {
+            ProbeOutcome::Ok => {
                 bus.send(AgentEvent::HealthProbe {
                     attempt,
-                    status: resp.status().to_string(),
+                    status: "200 OK".into(),
                     elapsed_ms,
                     ok: true,
                 });
                 return true;
             }
-            Ok(resp) => AgentEvent::HealthProbe {
-                attempt,
-                status: resp.status().to_string(),
-                elapsed_ms,
-                ok: false,
-            },
-            Err(err) => {
-                let status = if err.is_timeout() {
-                    "timeout".to_string()
-                } else if err.is_connect() {
-                    "connecting…".to_string()
-                } else if let Some(src) = err.source_chain_first() {
-                    src
-                } else {
-                    err.to_string()
-                };
-                AgentEvent::HealthProbe {
+            ProbeOutcome::Err(reason) => {
+                bus.send(AgentEvent::HealthProbe {
                     attempt,
-                    status,
+                    status: reason,
                     elapsed_ms,
                     ok: false,
-                }
+                });
             }
-        };
-        bus.send(event);
+        }
 
         tokio::time::sleep(PROBE_INTERVAL).await;
     }

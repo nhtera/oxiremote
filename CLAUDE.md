@@ -80,6 +80,8 @@ SQLite at the agent data dir (default `~/.oxiremote/`). **No migration tool** �
 
 Quick Tunnel (default) spawns `cloudflared --url localhost:<port>`; URL is captured **once** from stderr and never rotates mid-process — `AgentEvent::TunnelUrlChanged` is one-shot. Named tunnel kicks in when `~/.config/oxiremote/tunnel.toml` exists (see `tunnel_named.rs`). cloudflared is auto-downloaded with SHA256 verification if not on PATH.
 
+The agent self-heals zombie cloudflared processes via two complementary probes: `heartbeat.rs` detects sleep/wake skew and probes both loopback (`/api/health`) and the public tunnel URL; `edge_health_monitor.rs` issues a HEAD to the public URL every 30 s and triggers `force_respawn` after 3 consecutive failures (30 → 60 → 120 s backoff, 60 s respawn throttle). Both signal the supervisor via `force_respawn: Arc<Notify>`. `AgentEvent::EdgeUnhealthy { url, consecutive_failures }` is emitted for dashboard/tray surfaces. Reusable probe helpers live in `health_check.rs`.
+
 ### Self-update
 
 `oxiremote update` (`update.rs`) fetches the latest GitHub release, downloads the matching target triple archive, verifies SHA256 against `oxiremote-<version>-sha256.txt`, and atomic-replaces the running binary. Restart required. The release workflow (`.github/workflows/release.yml`) builds per-target on native runners and concatenates per-asset `.sha256` files into the manifest — its filename must stay in sync with `update.rs`.

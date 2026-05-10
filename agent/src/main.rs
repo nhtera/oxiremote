@@ -6,6 +6,7 @@ mod auth;
 mod autostart;
 mod db;
 mod discovery;
+mod edge_health_monitor;
 mod events;
 mod files;
 mod files_activity;
@@ -1217,10 +1218,26 @@ async fn server_main(
     });
 
     // Heartbeat: detects sleep/wake via wall vs monotonic clock skew, then
-    // probes the local agent. On probe failure, signals force_respawn so the
-    // supervisor kills and respawns cloudflared. Spawned at agent startup so
-    // it covers the window between agent boot and first tunnel ready.
-    heartbeat::spawn(addr, force_respawn, state.tunnel_shutdown.clone());
+    // probes the local agent AND the public tunnel URL. On either probe
+    // failing, signals force_respawn so the supervisor kills and respawns
+    // cloudflared. Spawned at agent startup so it covers the window between
+    // agent boot and first tunnel ready.
+    heartbeat::spawn(
+        addr,
+        state.event_bus.clone(),
+        force_respawn.clone(),
+        state.tunnel_shutdown.clone(),
+    );
+
+    // Long-running edge-health monitor: 30s HEAD probes against the public
+    // tunnel URL after first Ready; 3 consecutive failures → force_respawn.
+    // Catches the cloudflared "stuck retrying control stream" zombie state
+    // that the heartbeat-on-skew check can miss when no sleep/wake happened.
+    edge_health_monitor::spawn(
+        state.event_bus.clone(),
+        force_respawn,
+        state.tunnel_shutdown.clone(),
+    );
 
     // Health-probe task: fires on every TunnelUrlChanged (first spawn + every
     // respawn). Runs Verifying probes then emits Ready.

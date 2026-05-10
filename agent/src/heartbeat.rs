@@ -1,13 +1,19 @@
 // Sleep/wake detector using wall-clock vs monotonic-clock skew.
 //
 // A 1Hz tick loop compares SystemTime (wall) delta against Instant (monotonic)
-// delta. A gap of >5s indicates the OS was suspended. On detection the agent's
-// loopback health endpoint is probed; failure signals the tunnel supervisor to
-// kill and respawn cloudflared.
+// delta. A gap of >5s indicates the OS was suspended. On detection the agent
+// runs two probes:
+//   1. Loopback health endpoint — confirms the agent process is reachable.
+//   2. Public tunnel URL (if registered) — confirms the cloudflared edge
+//      connection survived the suspend. After sleep/wake, cloudflared can
+//      sit in a permanent control-stream-failure retry loop without exiting
+//      (root cause of today's pairing-after-wake bug); the loopback probe
+//      passes but the tunnel is dead. Probing the public URL catches that.
+// On EITHER probe failing, `force_respawn` is notified so the supervisor
+// kills + respawns cloudflared.
 //
 // Key design decisions:
-//   - Loopback probe only (http://127.0.0.1:{port}/api/health), no Bearer
-//     header. Avoids credential exposure to any rogue tunnel resolver.
+//   - No Bearer header on either probe (HEAD `/api/health` is unauthenticated).
 //   - Heartbeat does NOT kill the cloudflared child — supervisor owns all
 //     process operations (red-team Finding 10). We only call notify_one().
 //   - Probe is injected as a closure for unit-testability without spinning up
@@ -21,32 +27,70 @@ use std::time::{Duration, Instant, SystemTime};
 use tokio::sync::Notify;
 use tracing::{info, warn};
 
+use crate::events::EventBus;
+use crate::health_check::{ProbeOutcome, build_probe_client, probe_once};
+
 const TICK_INTERVAL: Duration = Duration::from_secs(1);
 const SKEW_THRESHOLD: Duration = Duration::from_secs(5);
 const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Spawn the heartbeat detector. Returns a `JoinHandle` that runs until
-/// `shutdown` is notified. On sleep/wake detection, probes the local agent
-/// at `local_addr`; on probe failure, calls `force_respawn.notify_one()`.
+/// `shutdown` is notified. On sleep/wake detection, probes both loopback and
+/// (if a tunnel URL is registered in `bus`) the public URL; on EITHER probe
+/// failing, calls `force_respawn.notify_one()`.
 pub fn spawn(
     local_addr: SocketAddr,
+    bus: Arc<EventBus>,
     force_respawn: Arc<Notify>,
     shutdown: Arc<Notify>,
 ) -> tokio::task::JoinHandle<()> {
     let probe = move || {
         let url = format!("http://127.0.0.1:{}/api/health", local_addr.port());
+        let snap_url = bus.snapshot().url;
         Box::pin(async move {
-            reqwest::Client::new()
+            let client = reqwest::Client::new();
+            let local_ok = client
                 .get(&url)
                 .timeout(PROBE_TIMEOUT)
                 .send()
                 .await
                 .map(|r| r.status().is_success())
-                .unwrap_or(false)
+                .unwrap_or(false);
+            // Skip the public probe when no tunnel URL has been registered yet
+            // (agent boot before first TunnelUrlChanged) — there's nothing to
+            // probe and the loopback result is the only signal we have.
+            let public_ok_fut = async move {
+                match snap_url {
+                    Some(public) => {
+                        let (probe_client, _diag) =
+                            build_probe_client(&public, &client).await;
+                        matches!(
+                            probe_once(&public, &probe_client).await,
+                            ProbeOutcome::Ok
+                        )
+                    }
+                    None => true,
+                }
+            };
+            combined_probe(local_ok, public_ok_fut).await
         }) as std::pin::Pin<Box<dyn Future<Output = bool> + Send>>
     };
 
     spawn_with_probe(Arc::new(probe), force_respawn, shutdown)
+}
+
+/// Combine the loopback result with an optional public probe.
+/// Returns `false` (signal respawn) if EITHER probe fails. Loopback short-
+/// circuits the public probe — if the agent itself isn't reachable, the
+/// public probe result tells us nothing useful.
+async fn combined_probe<Fut>(local_ok: bool, public_probe: Fut) -> bool
+where
+    Fut: Future<Output = bool>,
+{
+    if !local_ok {
+        return false;
+    }
+    public_probe.await
 }
 
 /// Internal spawn that accepts an injectable probe closure — used directly
@@ -189,5 +233,36 @@ mod tests {
         assert!(notified.is_err(), "force_respawn must NOT be notified on probe success");
 
         drop(shutdown);
+    }
+
+    // --- Combined probe (loopback + public) tests ---
+
+    #[tokio::test]
+    async fn combined_passes_when_both_pass() {
+        let public_ok = async { true };
+        assert!(combined_probe(true, public_ok).await);
+    }
+
+    #[tokio::test]
+    async fn combined_fails_when_loopback_fails() {
+        // Public probe should not even be awaited when loopback fails — model
+        // that with a panic-on-poll future. If we ever regress and remove the
+        // short-circuit, this test will explode loudly.
+        let public_panic = async { panic!("public probe must not run when loopback fails") };
+        assert!(!combined_probe(false, public_panic).await);
+    }
+
+    #[tokio::test]
+    async fn combined_fails_when_public_fails() {
+        let public_fail = async { false };
+        assert!(!combined_probe(true, public_fail).await);
+    }
+
+    #[tokio::test]
+    async fn combined_passes_when_no_public_url() {
+        // The production path passes `true` when no tunnel URL is registered
+        // yet — model that here as a future that yields `true`.
+        let no_public = async { true };
+        assert!(combined_probe(true, no_public).await);
     }
 }

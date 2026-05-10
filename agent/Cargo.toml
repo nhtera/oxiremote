@@ -148,6 +148,9 @@ optional = true
 [dev-dependencies]
 # XML round-trip test for Task Scheduler XML generation.
 quick-xml = { version = "0.37", features = ["serialize"] }
+# `test-util` enables tokio::time::pause + advance for the edge_health_monitor
+# unit tests so they can drive 30/60/120s probe intervals without real waits.
+tokio = { version = "1", features = ["test-util"] }
 
 [features]
 default = ["desktop"]

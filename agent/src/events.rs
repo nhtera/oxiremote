@@ -146,6 +146,15 @@ pub enum AgentEvent {
         reason: String,
         retry_in_secs: u64,
     },
+    /// Long-running edge-health monitor saw `consecutive_failures` HEAD probes
+    /// against the public tunnel URL fail in a row. Emitted right before the
+    /// monitor pokes `force_respawn` so the dashboard / tray can surface the
+    /// reason for the imminent cloudflared restart. One-shot — the next
+    /// successful probe resets the counter silently.
+    EdgeUnhealthy {
+        url: String,
+        consecutive_failures: u32,
+    },
     /// An AI coding agent CLI (claude/codex/cursor/opencode) was detected as
     /// the foreground process in a terminal session. Emitted at most once per
     /// state change — repeated polls that see the same agent are no-ops.
