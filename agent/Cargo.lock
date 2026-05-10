@@ -1247,7 +1247,7 @@ dependencies = [
 
 [[package]]
 name = "desktop"
-version = "0.1.51"
+version = "0.1.52"
 dependencies = [
  "anyhow",
  "bytes",
@@ -3706,7 +3706,7 @@ dependencies = [
 
 [[package]]
 name = "oxiremote"
-version = "0.1.51"
+version = "0.1.52"
 dependencies = [
  "aes-gcm",
  "anyhow",
