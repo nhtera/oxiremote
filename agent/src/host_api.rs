@@ -163,6 +163,12 @@ pub async fn api_desktop_capabilities(
             OperatorPref::H264 => "h264",
         };
 
+        // Phase-02 scaffold: `audio_supported` reports whether the binary
+        // can capture+encode system audio at all (no platform impl exists
+        // today → always `false`). `audio_enabled` echoes the persisted
+        // user toggle so the SPA can render an honest greyed-out state
+        // until phase-02 ships the cpal WASAPI pipeline.
+        let audio_enabled = crate::settings::get_desktop_audio_enabled(&state.db_path);
         let body = json!({
             "available": available,
             "quality_tiers": ["low", "med", "high"],
@@ -171,12 +177,15 @@ pub async fn api_desktop_capabilities(
             "preferred_pipeline": preferred_pipeline,
             "chosen_default": chosen_default,
             "default_reason": default_reason,
+            "audio_supported": false,
+            "audio_enabled": audio_enabled,
         });
         (StatusCode::OK, Json(body)).into_response()
     }
 
     #[cfg(not(feature = "desktop"))]
     {
+        let audio_enabled = crate::settings::get_desktop_audio_enabled(&state.db_path);
         let body = json!({
             "available": false,
             "quality_tiers": ["low", "med", "high"],
@@ -185,6 +194,8 @@ pub async fn api_desktop_capabilities(
             "preferred_pipeline": "jpeg",
             "chosen_default": "jpeg",
             "default_reason": "no-desktop-feature",
+            "audio_supported": false,
+            "audio_enabled": audio_enabled,
         });
         (StatusCode::OK, Json(body)).into_response()
     }

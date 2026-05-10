@@ -8,6 +8,9 @@ use anyhow::{Context, Result};
 use rusqlite::{Connection, params};
 
 const KEY_DESKTOP_ENABLED: &str = "desktop_enabled";
+// Phase-02 scaffold. Capture path not implemented yet — readers will see
+// `false` until phase-02 ships the cpal WASAPI pipeline.
+const KEY_DESKTOP_AUDIO_ENABLED: &str = "desktop_audio_enabled";
 
 fn get_bool(db_path: &PathBuf, key: &str, default: bool) -> bool {
     let Ok(conn) = Connection::open(db_path) else {
@@ -40,4 +43,8 @@ pub fn get_desktop_enabled(db_path: &PathBuf) -> bool {
 
 pub fn set_desktop_enabled(db_path: &PathBuf, enabled: bool) -> Result<()> {
     set_bool(db_path, KEY_DESKTOP_ENABLED, enabled)
+}
+
+pub fn get_desktop_audio_enabled(db_path: &PathBuf) -> bool {
+    get_bool(db_path, KEY_DESKTOP_AUDIO_ENABLED, false)
 }

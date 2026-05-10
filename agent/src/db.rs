@@ -139,6 +139,12 @@ pub fn init_db(db_path: &Path) -> anyhow::Result<()> {
         "INSERT OR IGNORE INTO settings(key, value) VALUES ('tunnel_mode', 'quick')",
         [],
     );
+    // Phase-02 scaffold: persistence key only; no capture path exists yet.
+    // Default off (privacy-first per phase-02 design).
+    let _ = conn.execute(
+        "INSERT OR IGNORE INTO settings(key, value) VALUES ('desktop_audio_enabled', 'false')",
+        [],
+    );
     // Operator can toggle remote desktop off so the WS upgrade returns 503
     // even when the binary was built with the desktop feature.
     let _ = conn.execute(
