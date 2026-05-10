@@ -138,6 +138,16 @@ async fn api_agent_state(State(state): State<Arc<AppState>>) -> Json<serde_json:
     let connected_devices = state.terminal_sessions.len();
     let auto_approve = approval::get_auto_approve(&state.db_path);
     let desktop_enabled = settings::get_desktop_enabled(&state.db_path);
+    // Phase-02 audio fields. `audio_supported` mirrors the desktop crate's
+    // probe (false everywhere until kill-switch passes); `audio_enabled` is
+    // the persisted user toggle. Surfaced on the localhost agent state so
+    // the host-side Settings page can render a greyed-out toggle without a
+    // tunnel round-trip to /api/hosts/{id}/desktop/capabilities.
+    let audio_enabled = settings::get_desktop_audio_enabled(&state.db_path);
+    #[cfg(feature = "desktop")]
+    let audio_supported = desktop::audio::probe_supported();
+    #[cfg(not(feature = "desktop"))]
+    let audio_supported = false;
     // Mirror the latest TunnelStepChanged event so SSE late-joiners can
     // hydrate the 5-step progress card. Shape matches the SSE frame so the
     // client can apply it via the same reducer.
@@ -176,6 +186,8 @@ async fn api_agent_state(State(state): State<Arc<AppState>>) -> Json<serde_json:
         "connected_devices": connected_devices,
         "auto_approve": auto_approve,
         "desktop_enabled": desktop_enabled,
+        "audio_supported": audio_supported,
+        "audio_enabled": audio_enabled,
         "version": env!("CARGO_PKG_VERSION"),
         "active_clients": active_clients,
         "otk": otk,

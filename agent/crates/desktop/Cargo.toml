@@ -17,6 +17,11 @@ h264 = [
     "dep:objc2-core-media",
     "dep:objc2-core-foundation",
 ]
+# Phase-02 audio (system-loopback → Opus → WebRTC). Off by default — pulls
+# vendored libopus (audiopus) + rubato resampler. Lit by phase-02 once the
+# Windows WASAPI kill-switch smoke (phase-02 step 1) passes; the encoder +
+# resampler wrappers compile + unit-test under this feature today.
+audio = ["dep:audiopus", "dep:rubato"]
 
 [dependencies]
 xcap = "0.9"
@@ -37,8 +42,17 @@ fast_image_resize = { version = "6", features = ["image"] }
 anyhow = "1"
 bytes = "1"
 tracing = "0.1"
-tokio = { version = "1", features = ["rt", "sync", "time"] }
+tokio = { version = "1", features = ["rt", "sync", "time", "macros"] }
 rayon = "1"
+# Async-friendly trait surface for `audio::AudioCapture` (phase-02). Tiny crate;
+# always pulled because the trait declaration lives outside the feature gate.
+async-trait = "0.1"
+
+# Phase-02 audio (gated by `audio` feature). Vendored libopus binding +
+# pure-Rust resampler. Pinned to last-stable lines (audiopus 0.2.x; rubato
+# 0.16.x) — newer 0.3 / 2.0 lines have breaking-API churn we can adopt later.
+audiopus = { version = "0.2", optional = true }
+rubato = { version = "0.16", optional = true }
 
 # Phase 03 SW fallback encoder. `source` feature statically compiles Cisco's
 # OpenH264 into the binary — no dlopen, no separate dylib. MPEG LA legal review

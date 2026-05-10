@@ -26,6 +26,11 @@ interface AgentState {
   label: string
   platform: string
   auto_approve?: boolean
+  // Phase-02 audio. `audio_supported` is the build-side capability probe
+  // (false everywhere until the cpal WASAPI kill-switch passes); the toggle
+  // renders read-only when false. `audio_enabled` is the persisted setting.
+  audio_supported?: boolean
+  audio_enabled?: boolean
 }
 
 const QUALITY_KEY = 'oxi:desktop:quality'
@@ -180,6 +185,22 @@ export default function AgentSettingsPage() {
             </Row>
             <Row label="HiDPI">
               <SwitchButton checked={hidpi} onToggle={() => setHidpiPersist(!hidpi)} />
+            </Row>
+            <Row label="Stream system audio">
+              {state?.audio_supported ? (
+                // Real toggle wires up once phase-02 lands the PUT endpoint.
+                // Until then the probe is always false, so this branch is
+                // only here to make the switch live the moment Windows
+                // capture is shipped.
+                <SwitchButton
+                  checked={state.audio_enabled ?? false}
+                  onToggle={() => { /* phase-02: PUT /api/agent/settings/audio */ }}
+                />
+              ) : (
+                <span className="text-text-muted text-[length:var(--text-meta)]">
+                  Coming soon — Windows host required
+                </span>
+              )}
             </Row>
           </Section>
 

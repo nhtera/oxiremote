@@ -5,6 +5,7 @@
 /// - `TileDiff` / `TileEncoder` — xxhash3 tile diff + mozjpeg JPEG encode
 /// - `InputInjector` / `InputEvent` — enigo-backed OS input synthesis
 /// - `desktop_available()` — platform permission probe (safe at boot)
+pub mod audio;
 pub mod capture;
 pub mod encode;
 #[cfg(feature = "h264")]

@@ -163,12 +163,14 @@ pub async fn api_desktop_capabilities(
             OperatorPref::H264 => "h264",
         };
 
-        // Phase-02 scaffold: `audio_supported` reports whether the binary
-        // can capture+encode system audio at all (no platform impl exists
-        // today → always `false`). `audio_enabled` echoes the persisted
-        // user toggle so the SPA can render an honest greyed-out state
-        // until phase-02 ships the cpal WASAPI pipeline.
+        // Phase-02: `audio_supported` is the single-source-of-truth probe
+        // (`desktop::audio::probe_supported()`) — true only when the build
+        // can actually capture+encode system audio (currently always false:
+        // every platform stub returns `Unsupported` until kill-switch
+        // passes). `audio_enabled` is the persisted user toggle, surfaced
+        // so the SPA renders an honest greyed-out state.
         let audio_enabled = crate::settings::get_desktop_audio_enabled(&state.db_path);
+        let audio_supported = desktop::audio::probe_supported();
         let body = json!({
             "available": available,
             "quality_tiers": ["low", "med", "high"],
@@ -177,7 +179,7 @@ pub async fn api_desktop_capabilities(
             "preferred_pipeline": preferred_pipeline,
             "chosen_default": chosen_default,
             "default_reason": default_reason,
-            "audio_supported": false,
+            "audio_supported": audio_supported,
             "audio_enabled": audio_enabled,
         });
         (StatusCode::OK, Json(body)).into_response()
@@ -185,6 +187,7 @@ pub async fn api_desktop_capabilities(
 
     #[cfg(not(feature = "desktop"))]
     {
+        // Headless build: no desktop crate, no audio. Probe is always false.
         let audio_enabled = crate::settings::get_desktop_audio_enabled(&state.db_path);
         let body = json!({
             "available": false,
