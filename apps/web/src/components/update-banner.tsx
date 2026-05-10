@@ -16,10 +16,22 @@ export default function UpdateBanner() {
 
   useEffect(() => {
     let cancelled = false
+    let intervalId: number | null = null
 
     const poll = async () => {
       try {
         const res = await fetch('/api/agent/update-check')
+        // 404 means this agent build doesn't expose the route — stop
+        // polling so we don't spam the DevTools network panel forever.
+        // (The endpoint may be added in a later release; the banner is
+        // best-effort and lazy-discovers it on next page load.)
+        if (res.status === 404) {
+          if (intervalId !== null) {
+            window.clearInterval(intervalId)
+            intervalId = null
+          }
+          return
+        }
         if (!res.ok) return
         const data = (await res.json()) as UpdateInfo
         if (!cancelled && data.available) {
@@ -31,10 +43,12 @@ export default function UpdateBanner() {
     }
 
     void poll()
-    const id = window.setInterval(poll, POLL_MS)
+    intervalId = window.setInterval(poll, POLL_MS)
     return () => {
       cancelled = true
-      window.clearInterval(id)
+      if (intervalId !== null) {
+        window.clearInterval(intervalId)
+      }
     }
   }, [])
 

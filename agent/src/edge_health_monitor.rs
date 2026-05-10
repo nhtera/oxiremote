@@ -63,10 +63,15 @@ where
     let mut rx = bus.subscribe();
     tokio::spawn(async move {
         let mut current_url: Option<String> = None;
-        // Probes only fire once the supervisor reports Ready — before that,
-        // the tunnel is still being set up and a probe would just race the
-        // verifying loop.
-        let mut ready = false;
+        // Probes fire once the supervisor has emitted *either* Ready (normal
+        // path) or Degraded (boot probe misclassified DNS-propagation lag,
+        // or genuine post-Ready breakage). Before that the tunnel is still
+        // being set up and a probe would just race the verifying loop.
+        let mut engaged = false;
+        // True while the dashboard's last known state was `Degraded` so the
+        // monitor knows to emit a synthetic `TunnelStepChanged{Ready}` on
+        // its first successful probe and unstick the UI.
+        let mut degraded_pending_recovery = false;
         let mut consecutive_failures: u32 = 0;
         let mut last_respawn_at: Option<Instant> = None;
         let mut interval = INITIAL_INTERVAL;
@@ -80,10 +85,16 @@ where
                         current_url = Some(url);
                         consecutive_failures = 0;
                         interval = INITIAL_INTERVAL;
-                        ready = false;
+                        engaged = false;
+                        degraded_pending_recovery = false;
                     }
                     Ok(AgentEvent::TunnelStepChanged { step: TunnelStep::Ready, .. }) => {
-                        ready = true;
+                        engaged = true;
+                        degraded_pending_recovery = false;
+                    }
+                    Ok(AgentEvent::TunnelStepChanged { step: TunnelStep::Degraded, .. }) => {
+                        engaged = true;
+                        degraded_pending_recovery = true;
                     }
                     Ok(_) => {}
                     Err(broadcast::error::RecvError::Lagged(_)) => continue,
@@ -91,7 +102,7 @@ where
                 },
                 _ = &mut sleep => {
                     if let Some(url) = current_url.clone()
-                        && ready
+                        && engaged
                     {
                         run_probe(
                             &bus,
@@ -101,6 +112,7 @@ where
                             &mut consecutive_failures,
                             &mut last_respawn_at,
                             &mut interval,
+                            &mut degraded_pending_recovery,
                         ).await;
                     }
                     sleep = Box::pin(tokio::time::sleep(interval));
@@ -110,6 +122,7 @@ where
     })
 }
 
+#[allow(clippy::too_many_arguments)] // internal helper; bundling into a struct is over-engineering for one call site
 async fn run_probe<F, Fut>(
     bus: &Arc<EventBus>,
     probe: &Arc<F>,
@@ -118,6 +131,7 @@ async fn run_probe<F, Fut>(
     consecutive_failures: &mut u32,
     last_respawn_at: &mut Option<Instant>,
     interval: &mut Duration,
+    degraded_pending_recovery: &mut bool,
 ) where
     F: Fn(String) -> Fut + Send + Sync + 'static,
     Fut: Future<Output = ProbeOutcome> + Send + 'static,
@@ -131,6 +145,23 @@ async fn run_probe<F, Fut>(
                 "edge probe recovered after {} failures",
                 *consecutive_failures
             );
+        }
+        // Recovery path: an Ok probe after the dashboard last saw Degraded
+        // (e.g. boot probe misclassified DNS lag as NXDOMAIN). Emit a
+        // synthetic TunnelStepChanged{Ready} so the SPA flips green.
+        if *degraded_pending_recovery {
+            info!(
+                target: "edge_health_monitor",
+                url = url,
+                "edge probe recovered from degraded — emitting Ready"
+            );
+            bus.send(AgentEvent::TunnelStepChanged {
+                step: TunnelStep::Ready,
+                attempt: 1,
+                info: Some(url.to_string()),
+                reason: None,
+            });
+            *degraded_pending_recovery = false;
         }
         *consecutive_failures = 0;
         *interval = INITIAL_INTERVAL;
@@ -374,6 +405,71 @@ mod tests {
         // Should return promptly.
         let res = tokio::time::timeout(TokioDuration::from_millis(200), handle).await;
         assert!(res.is_ok(), "monitor must stop within 200ms of shutdown notify");
+    }
+
+    /// Regression for the boot-stuck-Degraded bug: when the boot health probe
+    /// misclassifies DNS-propagation lag as NXDOMAIN, the dashboard shows
+    /// `Degraded` but the tunnel is actually fine. The monitor must engage
+    /// on `Degraded` (not only `Ready`), and on its first successful probe
+    /// emit a synthetic `TunnelStepChanged{Ready}` so the SPA recovers.
+    #[tokio::test(start_paused = true)]
+    async fn boot_degraded_recovers_to_ready_on_first_ok_probe() {
+        let bus = EventBus::new();
+        let mut rx = bus.subscribe();
+        let force_respawn = Arc::new(Notify::new());
+        let shutdown = Arc::new(Notify::new());
+        let probe = Arc::new(|_url: String| async { ProbeOutcome::Ok });
+
+        let handle = spawn_with_probe(
+            bus.clone(),
+            probe,
+            force_respawn.clone(),
+            shutdown.clone(),
+        );
+        bus.send(AgentEvent::TunnelUrlChanged {
+            url: "https://abc.trycloudflare.com".into(),
+        });
+        // Boot health-check landed in Degraded — NOT Ready.
+        bus.send(AgentEvent::TunnelStepChanged {
+            step: TunnelStep::Degraded,
+            attempt: 1,
+            info: Some("https://abc.trycloudflare.com".into()),
+            reason: Some("tunnel hostname not registered with Cloudflare".into()),
+        });
+        settle().await;
+
+        // First probe tick.
+        advance(TokioDuration::from_secs(31)).await;
+        settle().await;
+
+        // Drain the bus and look for a synthetic Ready emit.
+        let mut got_ready = false;
+        let mut got_extra_degraded = false;
+        while let Ok(ev) = rx.try_recv() {
+            match ev {
+                AgentEvent::TunnelStepChanged { step: TunnelStep::Ready, .. } => {
+                    got_ready = true;
+                }
+                AgentEvent::TunnelStepChanged { step: TunnelStep::Degraded, reason: Some(_), .. } => {
+                    // The seed event the test itself sent; ignore.
+                }
+                AgentEvent::TunnelStepChanged { step: TunnelStep::Degraded, .. } => {
+                    got_extra_degraded = true;
+                }
+                _ => {}
+            }
+        }
+        assert!(
+            got_ready,
+            "monitor must emit TunnelStepChanged{{Ready}} on first OK probe after Degraded"
+        );
+        assert!(
+            !got_extra_degraded,
+            "monitor must not emit a fresh Degraded on healthy probe"
+        );
+
+        shutdown.notify_one();
+        let _ = tokio::time::timeout(TokioDuration::from_millis(50), handle).await;
     }
 
     #[tokio::test(start_paused = true)]

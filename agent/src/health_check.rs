@@ -64,78 +64,63 @@ impl ProbeOutcome {
 
 /// Outcome of resolving the tunnel host via Cloudflare DoH.
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum DohResult {
+pub(crate) enum DohResult {
     Resolved(IpAddr),
-    /// 1.1.1.1 returned `Status:3` (NXDOMAIN). Authoritative — the host
-    /// genuinely does not exist in Cloudflare's DNS, no point retrying.
+    /// 1.1.1.1 returned `Status:3` (NXDOMAIN). For freshly-issued Quick
+    /// Tunnels this is *transient* — `cloudflared` registers with the edge
+    /// before Cloudflare's authoritative DNS has propagated the new record,
+    /// so a probe fired immediately after registration can land here while
+    /// the tunnel is genuinely healthy. The verifying loop now treats this
+    /// as retry-class within `HEALTH_TIMEOUT`; only a sustained NXDOMAIN
+    /// across the whole window is mapped to `ProbeOutcome::DohNxdomain`.
     Nxdomain,
     /// Network / parse failure. DoH unreachable on this network. Caller falls
     /// back to system DNS so probes still run on restricted networks.
     Unavailable,
 }
 
-/// Outcome of building a probe client. Carries a short diagnostic string for
-/// the `HealthProbe(attempt=0)` pre-probe event.
+/// Outcome of building a probe client.
 pub(crate) enum ClientOutcome {
     /// Client is pinned to a Cloudflare-resolved IP.
-    Pinned(reqwest::Client, String),
+    Pinned(reqwest::Client),
     /// Pinned-client construction failed — the supplied fallback is reused.
-    Fallback(reqwest::Client, String),
-    /// DoH said NXDOMAIN; caller should short-circuit before probing.
-    DefinitivelyBad(String),
-}
-
-impl ClientOutcome {
-    pub(crate) fn diagnostic(&self) -> &str {
-        match self {
-            ClientOutcome::Pinned(_, s)
-            | ClientOutcome::Fallback(_, s)
-            | ClientOutcome::DefinitivelyBad(s) => s,
-        }
-    }
+    Fallback(reqwest::Client),
+    /// DoH said NXDOMAIN; one-shot callers (`probe_url`) short-circuit. The
+    /// long-running monitor's 30 s tick gives DNS plenty of time to
+    /// propagate, so a sustained NXDOMAIN is meaningful at that cadence.
+    /// (`run_health_check` does its own per-attempt DoH retry instead.)
+    DefinitivelyBad,
 }
 
 /// Build a probe-only `reqwest::Client` that resolves `tunnel_url`'s host via
 /// Cloudflare DoH and pins the result to IP:443. Returns `DefinitivelyBad`
-/// when DoH says NXDOMAIN so the caller can skip the HEAD probe entirely
-/// (no point retrying — Cloudflare's authoritative DNS has spoken).
+/// when DoH says NXDOMAIN so one-shot callers (`probe_url`) skip the HEAD
+/// probe — this is correct only at the long-running monitor's tick cadence.
 pub(crate) async fn build_probe_client(
     tunnel_url: &str,
     fallback: &reqwest::Client,
 ) -> ClientOutcome {
     let Some(host) = extract_host(tunnel_url) else {
-        return ClientOutcome::Fallback(fallback.clone(), "non-https url; system dns".into());
+        return ClientOutcome::Fallback(fallback.clone());
     };
-    let doh_started = Instant::now();
-    let doh = doh_resolve(&host).await;
-    let elapsed = doh_started.elapsed().as_millis() as u64;
-    match doh {
+    match doh_resolve(&host).await {
         DohResult::Resolved(ip) => {
             info!(target: "health_check", host = %host, ip = %ip, "doh resolved");
             match build_pinned_client(&host, ip) {
-                Some(client) => ClientOutcome::Pinned(
-                    client,
-                    format!("doh resolved → {ip} ({elapsed}ms)"),
-                ),
+                Some(client) => ClientOutcome::Pinned(client),
                 None => {
                     warn!(target: "health_check", "pinned-client build failed; falling back");
-                    ClientOutcome::Fallback(
-                        fallback.clone(),
-                        format!("doh resolved → {ip}; pinned client build failed"),
-                    )
+                    ClientOutcome::Fallback(fallback.clone())
                 }
             }
         }
         DohResult::Nxdomain => {
             warn!(target: "health_check", host = %host, "doh nxdomain — tunnel host not registered");
-            ClientOutcome::DefinitivelyBad(format!("doh nxdomain ({elapsed}ms)"))
+            ClientOutcome::DefinitivelyBad
         }
         DohResult::Unavailable => {
             warn!(target: "health_check", host = %host, "doh unavailable; using system dns");
-            ClientOutcome::Fallback(
-                fallback.clone(),
-                format!("doh unavailable ({elapsed}ms) → system dns"),
-            )
+            ClientOutcome::Fallback(fallback.clone())
         }
     }
 }
@@ -173,8 +158,8 @@ pub(crate) async fn probe_once(tunnel_url: &str, client: &reqwest::Client) -> Pr
 /// monitor) that don't need to re-use the client across probes.
 pub async fn probe_url(tunnel_url: &str, fallback: &reqwest::Client) -> ProbeOutcome {
     match build_probe_client(tunnel_url, fallback).await {
-        ClientOutcome::DefinitivelyBad(_) => ProbeOutcome::DohNxdomain,
-        ClientOutcome::Pinned(client, _) | ClientOutcome::Fallback(client, _) => {
+        ClientOutcome::DefinitivelyBad => ProbeOutcome::DohNxdomain,
+        ClientOutcome::Pinned(client) | ClientOutcome::Fallback(client) => {
             probe_once(tunnel_url, &client).await
         }
     }
@@ -184,51 +169,122 @@ pub async fn probe_url(tunnel_url: &str, fallback: &reqwest::Client) -> ProbeOut
 /// should report:
 ///
 /// - First `Ok` short-circuits with `Ok`.
-/// - First `DohNxdomain` short-circuits with `DohNxdomain` (definitive).
 /// - First `HttpError(5xx)` short-circuits with that error (the server
 ///   answered, just unhealthy — no point retrying within an 8 s window).
-/// - `Timeout` / non-5xx `HttpError` / `Network` keep retrying until
-///   `HEALTH_TIMEOUT`; the last seen outcome is returned at end-of-window.
+/// - `DohNxdomain` / `Timeout` / non-5xx `HttpError` / `Network` keep
+///   retrying until `HEALTH_TIMEOUT`; the last seen outcome is returned at
+///   end-of-window.
+///
+/// NXDOMAIN was previously short-circuited as "definitive" but Quick Tunnels
+/// register with the Cloudflare edge ~100 ms before authoritative DNS has
+/// propagated the new hostname, so a probe fired immediately after
+/// registration commonly lands in NXDOMAIN while the tunnel is healthy.
+/// Treating it as retry-class gives propagation a chance within the window.
 pub async fn run_health_check(
     tunnel_url: String,
     bus: Arc<EventBus>,
     fallback_client: reqwest::Client,
 ) -> ProbeOutcome {
-    // Build a probe client that resolves the tunnel host via Cloudflare DoH
-    // instead of system DNS. On any failure fall back to the system-DNS
-    // client so behavior on restricted networks matches today. Surface the
-    // outcome via a HealthProbe(attempt=0) diagnostic event.
-    let client_outcome = build_probe_client(&tunnel_url, &fallback_client).await;
-    bus.send(AgentEvent::HealthProbe {
-        attempt: 0,
-        status: client_outcome.diagnostic().to_string(),
-        elapsed_ms: 0,
-        ok: false,
-    });
+    run_health_check_with_resolver(tunnel_url, bus, fallback_client, |h| async move {
+        doh_resolve(&h).await
+    })
+    .await
+}
 
-    let probe_client = match client_outcome {
-        ClientOutcome::DefinitivelyBad(_) => {
-            // DoH NXDOMAIN — Cloudflare itself doesn't know the hostname.
-            // No point running HEAD probes; surface immediately.
-            bus.send(AgentEvent::HealthProbe {
-                attempt: 1,
-                status: "doh nxdomain".into(),
-                elapsed_ms: 0,
-                ok: false,
-            });
-            return ProbeOutcome::DohNxdomain;
-        }
-        ClientOutcome::Pinned(c, _) | ClientOutcome::Fallback(c, _) => c,
-    };
-
+/// Test-injectable variant of [`run_health_check`]. The DoH resolver closure
+/// lets paused-time tests simulate "NXDOMAIN at t=0, Resolved at t=2s" —
+/// the canonical fresh-Quick-Tunnel propagation pattern this loop exists
+/// to mask.
+#[doc(hidden)]
+pub async fn run_health_check_with_resolver<R, Fut>(
+    tunnel_url: String,
+    bus: Arc<EventBus>,
+    fallback_client: reqwest::Client,
+    resolver: R,
+) -> ProbeOutcome
+where
+    R: Fn(String) -> Fut,
+    Fut: std::future::Future<Output = DohResult>,
+{
     let start = Instant::now();
     let mut attempt: u32 = 0;
+    // Default to Timeout so a probe loop that never even gets past DoH
+    // failure (e.g. immediate cancellation) returns a consistent outcome.
     let mut last = ProbeOutcome::Timeout;
+    // Once we get a Resolved DoH answer, pin the client and reuse it across
+    // attempts — no point burning DoH calls when the IP isn't going to
+    // change for a Quick Tunnel within an 8 s window.
+    let mut probe_client: Option<reqwest::Client> = None;
 
     while start.elapsed() < HEALTH_TIMEOUT {
         attempt += 1;
+
+        // Lazily build the probe client. We retry DoH on each NXDOMAIN /
+        // Unavailable iteration so DNS propagation gets a real chance.
+        if probe_client.is_none() {
+            let host_opt = extract_host(&tunnel_url);
+            let doh = match host_opt.as_deref() {
+                Some(h) => resolver(h.to_string()).await,
+                None => DohResult::Unavailable,
+            };
+            match doh {
+                DohResult::Resolved(ip) => {
+                    let host = host_opt.as_deref().unwrap_or("");
+                    if let Some(c) = build_pinned_client(host, ip) {
+                        info!(target: "health_check", host = %host, ip = %ip, "doh resolved");
+                        bus.send(AgentEvent::HealthProbe {
+                            attempt: 0,
+                            status: format!("doh resolved → {ip}"),
+                            elapsed_ms: 0,
+                            ok: false,
+                        });
+                        probe_client = Some(c);
+                    } else {
+                        warn!(target: "health_check", "pinned-client build failed; falling back");
+                        bus.send(AgentEvent::HealthProbe {
+                            attempt: 0,
+                            status: "doh resolved; pinned client build failed".into(),
+                            elapsed_ms: 0,
+                            ok: false,
+                        });
+                        probe_client = Some(fallback_client.clone());
+                    }
+                }
+                DohResult::Nxdomain => {
+                    // Transient for fresh Quick Tunnels. Log once, sleep,
+                    // and retry until the window closes.
+                    warn!(
+                        target: "health_check",
+                        host = ?host_opt,
+                        attempt,
+                        "doh nxdomain — retrying within window (DNS propagation)"
+                    );
+                    bus.send(AgentEvent::HealthProbe {
+                        attempt,
+                        status: "doh nxdomain (retrying)".into(),
+                        elapsed_ms: 0,
+                        ok: false,
+                    });
+                    last = ProbeOutcome::DohNxdomain;
+                    tokio::time::sleep(PROBE_INTERVAL).await;
+                    continue;
+                }
+                DohResult::Unavailable => {
+                    warn!(target: "health_check", "doh unavailable; using system dns");
+                    bus.send(AgentEvent::HealthProbe {
+                        attempt: 0,
+                        status: "doh unavailable → system dns".into(),
+                        elapsed_ms: 0,
+                        ok: false,
+                    });
+                    probe_client = Some(fallback_client.clone());
+                }
+            }
+        }
+        let client = probe_client.as_ref().expect("probe_client set above");
+
         let probe_start = Instant::now();
-        let outcome = probe_once(&tunnel_url, &probe_client).await;
+        let outcome = probe_once(&tunnel_url, client).await;
         let elapsed_ms = probe_start.elapsed().as_millis() as u64;
 
         bus.send(AgentEvent::HealthProbe {
@@ -405,5 +461,48 @@ mod tests {
         assert_eq!(urlencode("evil.com&injected=1"), "evil.cominjected1");
         assert_eq!(urlencode("a b c"), "abc");
         assert_eq!(urlencode("a/b"), "ab");
+    }
+
+    // ---- run_health_check NXDOMAIN-retry (regression for stuck-Degraded) ----
+
+    use crate::events::EventBus;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    /// Defensive: a sustained NXDOMAIN across the whole window still maps
+    /// to `DohNxdomain` so the dashboard still flips to red eventually.
+    /// (We don't paint over genuinely-broken tunnels.) Uses paused time so
+    /// the 8 s window elapses synthetically.
+    #[tokio::test(start_paused = true)]
+    async fn run_health_check_returns_nxdomain_when_never_resolves() {
+        let bus = EventBus::new();
+        let calls = Arc::new(AtomicU32::new(0));
+        let calls_c = calls.clone();
+        let resolver = move |_host: String| {
+            calls_c.fetch_add(1, Ordering::SeqCst);
+            async { DohResult::Nxdomain }
+        };
+
+        let probe = tokio::spawn(run_health_check_with_resolver(
+            "https://x.trycloudflare.com".into(),
+            bus.clone(),
+            reqwest::Client::new(),
+            resolver,
+        ));
+
+        // Advance well past HEALTH_TIMEOUT (8 s) plus slack so all internal
+        // PROBE_INTERVAL sleeps fire.
+        tokio::time::advance(HEALTH_TIMEOUT + Duration::from_secs(2)).await;
+
+        let outcome = probe.await.unwrap();
+        assert_eq!(outcome, ProbeOutcome::DohNxdomain);
+        // Crucial regression check: the loop must have asked the resolver
+        // multiple times within the window. The previous `run_health_check`
+        // short-circuited on first NXDOMAIN → resolver called once and the
+        // dashboard stuck Degraded forever.
+        assert!(
+            calls.load(Ordering::SeqCst) >= 2,
+            "loop must retry DoH on NXDOMAIN within window (was {})",
+            calls.load(Ordering::SeqCst)
+        );
     }
 }
