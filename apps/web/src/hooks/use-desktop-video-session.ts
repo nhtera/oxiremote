@@ -339,12 +339,27 @@ export function useDesktopVideoSession(
       setStatus('signaling')
       // Announce decoder capabilities BEFORE sending the offer so the server
       // can decide H.264 vs JPEG before the first ICE candidate arrives.
+      //
+      // `loopback` tells the server its receiver is on the same machine.
+      // The server uses this to bypass REMB → encoder bitrate updates:
+      // Chrome's GCC collapses to ~5 kbps on loopback because it interprets
+      // CPU-contention scheduling jitter as network congestion, killing
+      // screen-share quality. Parsec/Rustdesk skip generic BWE for the
+      // same reason. Detected by hostname rather than by ICE candidate
+      // (we don't have post-ICE info pre-offer) so it's an honest hint,
+      // not a guarantee — agent treats it as such.
+      const isLoopback =
+        location.hostname === 'localhost' ||
+        location.hostname === '127.0.0.1' ||
+        location.hostname === '[::1]' ||
+        location.hostname === '::1'
       ws.send(
         JSON.stringify({
           type: 'capabilitiesClient',
           codecs: ['h264-baseline-3.1'],
           webcodecs: false,
           audio: audioRefBool.current,
+          loopback: isLoopback,
         }),
       )
       // Push the persisted HiDPI preference before the offer so the encoder

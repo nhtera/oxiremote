@@ -34,6 +34,7 @@ use objc2_core_video::{kCVPixelFormatType_32BGRA, CVPixelBuffer, CVPixelBufferCr
 use objc2_video_toolbox::{
     kVTCompressionPropertyKey_AllowFrameReordering, kVTCompressionPropertyKey_AverageBitRate,
     kVTCompressionPropertyKey_H264EntropyMode, kVTCompressionPropertyKey_MaxKeyFrameInterval,
+    kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration,
     kVTCompressionPropertyKey_ProfileLevel, kVTCompressionPropertyKey_RealTime,
     kVTH264EntropyMode_CAVLC, kVTProfileLevel_H264_Baseline_AutoLevel,
     kVTVideoEncoderSpecification_EnableLowLatencyRateControl, VTCompressionSession,
@@ -121,6 +122,17 @@ fn configure_properties(
         // may emit sooner on scene cuts or on client PLI.
         let kf_interval = CFNumber::new_i32(120);
         set_cf(session, kVTCompressionPropertyKey_MaxKeyFrameInterval, &*kf_interval)?;
+        // Belt-and-braces: also cap the time-based interval. Without this,
+        // VT's RC may insert IDRs on detected scene changes — which fires
+        // every frame in a same-machine recursive view, blowing the
+        // bitrate budget on all-keyframe output. 4 s pairs cleanly with
+        // the frame-count cap above (whichever fires first wins).
+        let kf_interval_s = CFNumber::new_f64(4.0);
+        set_cf(
+            session,
+            kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration,
+            &*kf_interval_s,
+        )?;
         set_cf(
             session,
             kVTCompressionPropertyKey_AllowFrameReordering,

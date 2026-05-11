@@ -87,6 +87,12 @@ mod inner {
             webcodecs: bool,
             #[serde(default)]
             audio: bool,
+            /// Phase-03 hardening: SPA detected loopback origin. Server
+            /// disables REMB → encoder bitrate path; encoder stays at the
+            /// operator's tier bitrate. See `ClientCapabilities::loopback`
+            /// for the full why.
+            #[serde(default)]
+            loopback: bool,
         },
         /// Per-session capture settings. `hidpi=true` skips logical downscale
         /// so the encoder gets native physical pixels — costs ~4× pixel
@@ -572,8 +578,14 @@ mod inner {
         };
         #[cfg_attr(not(feature = "h264"), allow(unused_variables))]
         #[cfg_attr(not(feature = "audio"), allow(unused_variables))]
-        let (decision_pipeline, decision_reason, offer_sdp, initial_hidpi, client_audio_opt_in) =
-            match await_offer_with_caps(&mut socket, &pc, &mut close_rx, operator_pref).await {
+        let (
+            decision_pipeline,
+            decision_reason,
+            offer_sdp,
+            initial_hidpi,
+            client_audio_opt_in,
+            client_loopback,
+        ) = match await_offer_with_caps(&mut socket, &pc, &mut close_rx, operator_pref).await {
                 Ok(v) => v,
                 Err(e) => {
                     // Emit a telemetry event for the failure path so dashboards
@@ -693,6 +705,7 @@ mod inner {
                 screen_h,
                 scale_factor,
                 initial_hidpi,
+                client_loopback,
                 &quality_tx,
                 &mut quality_rx,
                 &settings_tx,
@@ -918,6 +931,10 @@ mod inner {
         screen_h: u32,
         scale_factor: f32,
         initial_hidpi: bool,
+        // SPA detected loopback origin. Disables REMB → encoder bitrate
+        // path so screen-share quality doesn't collapse on same-machine
+        // view (Chrome's GCC misreads CPU jitter as network congestion).
+        client_loopback: bool,
         quality_tx: &watch::Sender<QualityTier>,
         quality_rx: &mut watch::Receiver<QualityTier>,
         settings_tx: &watch::Sender<bool>,
@@ -1066,7 +1083,18 @@ mod inner {
             bitrate_tx.clone(),
             abr_tx.clone(),
             rtcp_shutdown_rx,
+            // Loopback bypass: when true the REMB handler still emits the
+            // observation (so stats SSE shows what Chrome thinks) but does
+            // NOT push to bitrate_tx. Encoder stays at the operator's tier
+            // bitrate, dodging GCC's loopback collapse.
+            client_loopback,
         );
+        if client_loopback {
+            info!(
+                device = %device_id,
+                "h264: client signalled loopback origin — REMB → encoder bitrate disabled"
+            );
+        }
 
         // Phase-03 step 5: register the broadcast publisher with the
         // session registry so the stats SSE endpoint can subscribe by
@@ -1404,7 +1432,7 @@ mod inner {
         pc: &RTCPeerConnection,
         close_rx: &mut tokio::sync::oneshot::Receiver<()>,
         operator: OperatorPref,
-    ) -> anyhow::Result<(Pipeline, &'static str, String, bool, bool)> {
+    ) -> anyhow::Result<(Pipeline, &'static str, String, bool, bool, bool)> {
         let mut client_caps = ClientCapabilities::default();
         let mut initial_hidpi = false;
 
@@ -1439,6 +1467,7 @@ mod inner {
                                         sdp,
                                         initial_hidpi,
                                         client_caps.audio,
+                                        client_caps.loopback,
                                     ));
                                 }
                                 Err(err) => {
@@ -1472,10 +1501,11 @@ mod inner {
                                 warn!(error = %e, "pre-offer ICE candidate rejected");
                             }
                         }
-                        Ok(SignalIn::CapabilitiesClient { codecs, webcodecs, audio }) => {
+                        Ok(SignalIn::CapabilitiesClient { codecs, webcodecs, audio, loopback }) => {
                             client_caps.codecs = codecs;
                             client_caps.webcodecs = webcodecs;
                             client_caps.audio = audio;
+                            client_caps.loopback = loopback;
                         }
                         Ok(SignalIn::Settings { hidpi }) => {
                             initial_hidpi = hidpi;

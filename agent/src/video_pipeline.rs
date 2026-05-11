@@ -386,12 +386,21 @@ async fn writer_task(
 
 /// Spawn the RTCP read loop. The task terminates when `shutdown_rx` fires,
 /// when the sender closes, or when `read_rtcp` returns a persistent error.
+///
+/// `loopback_bypass=true` — emitted by the SPA when its origin is
+/// localhost / 127.* / ::1 — disables the REMB → encoder-bitrate path. The
+/// encoder stays at the tier bitrate; REMB observations still reach the
+/// stats SSE so the overlay shows the (broken) Chrome BWE estimate. This
+/// matches Parsec's BUD2 / Rustdesk's TLS-direct posture: skip generic
+/// BWE on local paths because GCC misreads CPU-contention scheduling
+/// jitter as network congestion and collapses to ~5 kbps.
 pub fn spawn_rtcp_reader(
     sender: Arc<RTCRtpSender>,
     pli_tx: mpsc::Sender<()>,
     remb_tx: tokio::sync::watch::Sender<BitrateBps>,
     abr_tx: broadcast::Sender<AbrObservation>,
     mut shutdown_rx: oneshot::Receiver<()>,
+    loopback_bypass: bool,
 ) {
     tokio::spawn(async move {
         loop {
@@ -403,7 +412,13 @@ pub fn spawn_rtcp_reader(
                 }
                 result = sender.read_rtcp() => {
                     match result {
-                        Ok((packets, _attrs)) => handle_rtcp_batch(&packets, &pli_tx, &remb_tx, &abr_tx).await,
+                        Ok((packets, _attrs)) => handle_rtcp_batch(
+                            &packets,
+                            &pli_tx,
+                            &remb_tx,
+                            &abr_tx,
+                            loopback_bypass,
+                        ).await,
                         Err(e) => {
                             warn!(error = ?e, "rtcp reader: read_rtcp failed; stopping");
                             return;
@@ -463,6 +478,7 @@ async fn handle_rtcp_batch(
     pli_tx: &mpsc::Sender<()>,
     remb_tx: &tokio::sync::watch::Sender<BitrateBps>,
     abr_tx: &broadcast::Sender<AbrObservation>,
+    loopback_bypass: bool,
 ) {
     for pkt in packets {
         let any = pkt.as_any();
@@ -479,23 +495,29 @@ async fn handle_rtcp_batch(
             .downcast_ref::<rtcp::payload_feedbacks::receiver_estimated_maximum_bitrate::ReceiverEstimatedMaximumBitrate>(
             )
         {
-            // REMB's bitrate is f32 bps. Clamp to a safe range:
-            // - Floor 1.5 Mbps: a 500 Kbps floor on ~1 MP screen content
-            //   reduces to 0.6 bpp and produces unreadable text. 1.5 Mbps
-            //   keeps Low tier intact under transient congestion.
-            // - Ceiling 15 Mbps: lets High tier (12 Mbps) breathe so REMB
-            //   never artificially clips the configured target on LAN.
-            let bps = (remb.bitrate as u32).clamp(1_500_000, 15_000_000);
-            let _ = remb_tx.send(BitrateBps(bps));
-            // Phase-03: also fan out as an ABR Network observation so the
-            // controller/SSE see the *unclamped-by-policy* signal alongside
-            // loss + RTT.
+            // Always emit the raw REMB observation so the stats SSE shows
+            // what Chrome's BWE thinks, even when we're not honoring it.
             let _ = abr_tx.send(AbrObservation::Network {
                 remb_kbps: Some((remb.bitrate as u32) / 1_000),
                 loss_pct: None,
                 rtt_ms: None,
                 jitter_ms: None,
             });
+            // Loopback bypass: skip the encoder-bitrate update entirely.
+            // Chrome's GCC collapses to near-zero on same-machine paths;
+            // honoring it would starve the encoder. Operator's tier
+            // bitrate stays in effect via the initial `bitrate_tx` value.
+            if loopback_bypass {
+                continue;
+            }
+            // REMB's bitrate is f32 bps. Clamp to a safe range:
+            // - Floor 1.5 Mbps: keeps Low tier intact under transient
+            //   congestion. The encoder's resolution-aware floor is
+            //   computed elsewhere (TODO: bump for HiDPI sessions).
+            // - Ceiling 15 Mbps: lets High tier (12 Mbps) breathe so REMB
+            //   never artificially clips the configured target on LAN.
+            let bps = (remb.bitrate as u32).clamp(1_500_000, 15_000_000);
+            let _ = remb_tx.send(BitrateBps(bps));
             continue;
         }
         if let Some(rr) = any

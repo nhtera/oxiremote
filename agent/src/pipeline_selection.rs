@@ -146,6 +146,15 @@ pub struct ClientCapabilities {
     /// transceiver before `set_remote_description`. Defaults to false so
     /// older SPAs that don't send the field never get an audio m-line.
     pub audio: bool,
+    /// Client believes the connection terminates on the same machine (origin
+    /// is localhost / 127.* / ::1). When true the agent skips REMB-driven
+    /// encoder bitrate clamping for the H.264 pipeline: Chrome's GCC
+    /// collapses to ~5 kbps on loopback because it interprets CPU-contention
+    /// scheduling jitter as network congestion, killing screen-share
+    /// quality. Parsec and Rustdesk skip generic BWE for the same reason.
+    /// Stats SSE still surfaces the raw REMB value so the overlay shows
+    /// the broken estimate; only the encoder ignores it.
+    pub loopback: bool,
 }
 
 impl ClientCapabilities {
