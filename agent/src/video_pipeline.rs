@@ -38,6 +38,31 @@ use crate::desktop_abr::AbrObservation;
 /// samples carry the true elapsed wall-clock interval.
 const FIRST_FRAME_DURATION_MS: u64 = 33;
 
+/// Minimum spacing between PLI-driven IDRs. Caps the death-spiral on
+/// congested paths: when the decoder sends a PLI on every dropped frame,
+/// honoring every PLI floods the budget with keyframes (each ~5-10× a
+/// P-frame), exhausts the REMB-clamped bitrate, and starves new content —
+/// which loses more packets, which drives more PLIs. 1 s is the
+/// libwebrtc default and matches what Chrome's own sender does
+/// internally. Recovery latency upper bound is therefore ~1 RTT + 1 s
+/// in the worst case; observed quality wins outweigh the latency cost.
+///
+/// Natural keyframes (the encoder's `MaxKeyFrameInterval = 120 frames`
+/// pacing, and session-start `force_iframe`) are NOT rate-limited — only
+/// PLI-triggered forces.
+const PLI_MIN_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Decide whether a pending PLI should force the next frame to IDR. Pure
+/// function so the throttling decision is unit-testable without driving
+/// the whole encoder loop. Returns `true` on a cold start (no IDR yet) or
+/// when the last IDR is older than `PLI_MIN_INTERVAL`.
+fn pli_force_allowed(last_idr_at: Option<Instant>, now: Instant) -> bool {
+    match last_idr_at {
+        None => true,
+        Some(t) => now.duration_since(t) >= PLI_MIN_INTERVAL,
+    }
+}
+
 /// Alias for the canonical capture-layer type. Kept as a re-export so the
 /// transport-layer API (`VideoPipelineConfig`) stays self-contained.
 pub type BgraFrame = RawBgraFrame;
@@ -157,6 +182,11 @@ pub fn spawn_video_pipeline(mut cfg: VideoPipelineConfig) {
         let mut params_tx = Some(cfg.params_tx);
         let mut last_bitrate = cfg.initial_bitrate.0;
         let mut pli_pending = false;
+        // Tracks the most recent keyframe wall-clock time from ANY source
+        // (PLI force, session-start force, encoder's natural keyframe
+        // interval). Drives `pli_force_allowed`. None until the first IDR
+        // lands; the first force-IDR is always honored.
+        let mut last_idr_at: Option<Instant> = None;
         info!("video_pipeline: encoder task started");
 
         loop {
@@ -205,7 +235,16 @@ pub fn spawn_video_pipeline(mut cfg: VideoPipelineConfig) {
             // non-zero indicates capture out-pacing the encoder).
             let bgra_queue_depth = cfg.bgra_rx.len();
 
-            let force_idr = drained_force_idr || pli_pending;
+            // Decide whether to honor a pending PLI. `drained_force_idr`
+            // comes from the capture loop's session-start `force_iframe_rx`
+            // (oneshot, fires once); always honored. `pli_pending` is from
+            // the RTCP reader; honored only after `PLI_MIN_INTERVAL` since
+            // the last keyframe. Unhonored PLIs stay queued — they'll fire
+            // on the first eligible frame instead of being silently
+            // dropped, so a single recovery request can't be lost.
+            let now_pli = Instant::now();
+            let pli_honored = pli_pending && pli_force_allowed(last_idr_at, now_pli);
+            let force_idr = drained_force_idr || pli_honored;
             let encode_started = Instant::now();
             let encoded = match encoder.encode(
                 &frame.bytes,
@@ -214,7 +253,7 @@ pub fn spawn_video_pipeline(mut cfg: VideoPipelineConfig) {
                 force_idr,
             ) {
                 Ok(Some(f)) => {
-                    if force_idr {
+                    if pli_honored {
                         pli_pending = false;
                     }
                     f
@@ -226,6 +265,12 @@ pub fn spawn_video_pipeline(mut cfg: VideoPipelineConfig) {
                 }
             };
             let encode_ms = encode_started.elapsed().as_millis().min(u32::MAX as u128) as u32;
+            // Update the throttle anchor on any keyframe — including the
+            // encoder's spontaneous IDRs from `MaxKeyFrameInterval`, so the
+            // window doesn't restart from a force-IDR alone.
+            if encoded.is_keyframe {
+                last_idr_at = Some(Instant::now());
+            }
 
             // First-keyframe → forward SPS/PPS so the session layer can
             // build the avcC description blob for WebCodecs.
@@ -492,5 +537,34 @@ mod tests {
     fn new_h264_track_has_matching_codec() {
         let t = new_h264_track();
         assert_eq!(t.codec().mime_type, "video/H264");
+    }
+
+    #[test]
+    fn pli_force_allowed_cold_start() {
+        // No prior IDR — first PLI must be honored regardless of any
+        // notion of "now". Otherwise a flooded session never recovers.
+        assert!(pli_force_allowed(None, Instant::now()));
+    }
+
+    #[test]
+    fn pli_force_allowed_throttles_within_interval() {
+        let t0 = Instant::now();
+        // Half the interval — should reject.
+        let t1 = t0 + PLI_MIN_INTERVAL / 2;
+        assert!(!pli_force_allowed(Some(t0), t1));
+        // Just shy of the interval — still rejected.
+        let t2 = t0 + PLI_MIN_INTERVAL - Duration::from_millis(1);
+        assert!(!pli_force_allowed(Some(t0), t2));
+    }
+
+    #[test]
+    fn pli_force_allowed_releases_after_interval() {
+        let t0 = Instant::now();
+        // Exactly at the interval — boundary inclusive.
+        let t1 = t0 + PLI_MIN_INTERVAL;
+        assert!(pli_force_allowed(Some(t0), t1));
+        // Well past — definitely allowed.
+        let t2 = t0 + PLI_MIN_INTERVAL + Duration::from_secs(5);
+        assert!(pli_force_allowed(Some(t0), t2));
     }
 }
