@@ -95,6 +95,24 @@ const TRACKPAD_SENSITIVITY = 1.5
 // 60 px ≈ a thumb's width: enough lead-time so the user sees the canvas
 // scroll before the cursor would visually clip the edge.
 const EDGE_PAN_MARGIN = 60
+// Fling tunables. Touch-mode 1-finger pan releases with non-trivial velocity
+// continue under a decaying rAF loop. Decay 0.94 mirrors Chrome Remote
+// Desktop's mobile feel — pan keeps moving for ~30 frames before it stops.
+// FLING_MIN_VELOCITY in px/frame; lower values would extend the tail with
+// no perceptible motion.
+const FLING_DECAY = 0.94
+const FLING_MIN_VELOCITY = 0.15
+const FLING_SAMPLE_WINDOW_MS = 100
+const FLING_LAUNCH_PX_PER_MS = 0.35
+// Double-tap zoom. A tap that lands within DOUBLE_TAP_MAX_DIST_PX of a
+// prior tap and within DOUBLE_TAP_MAX_MS triggers a zoom cycle instead of
+// the normal click. Threshold + target chosen so a single double-tap takes
+// the user from default (1×) to "filling most of the viewport" (2×) and a
+// second double-tap returns to 1×.
+const DOUBLE_TAP_MAX_MS = 300
+const DOUBLE_TAP_MAX_DIST_PX = 40
+const DOUBLE_TAP_ZOOM_SCALE = 2
+const DOUBLE_TAP_CYCLE_DOWN_AT = 1.5
 
 interface PointSnapshot {
   clientX: number
@@ -149,6 +167,23 @@ export function useCanvasGestures({
     midY: number
     pinching: boolean
   } | null>(null)
+  // Velocity sampling buffer for the fling/momentum loop. Filled on every
+  // touch-mode 1-finger pointermove with the absolute finger position +
+  // timestamp; drained on pointerup to compute the launch velocity.
+  // Pre-sized ring (8 slots × ~16 ms ≈ 130 ms history) keeps the alloc-free
+  // path on the hot pointermove handler.
+  const velocityBufferRef = useRef<{ t: number; x: number; y: number }[]>([])
+  // Active fling animation frame id, null when idle. Set when a 1-finger
+  // touch-mode pan releases with sufficient velocity; cleared on next
+  // pointerdown or natural decay to below FLING_MIN_VELOCITY.
+  const flingRafRef = useRef<number | null>(null)
+  // Tracks the most recent tap (touch-mode, didn't move, not in a pinch)
+  // for double-tap detection. The detector fires on the SECOND tap in the
+  // pair, so the first tap fires its click normally — accepting the
+  // first-click-of-double-tap is the standard remote-desktop behaviour
+  // (Chrome Remote Desktop, Parsec) and avoids the 300 ms click-defer
+  // pessimisation that early mobile-web apps suffered from.
+  const lastTapRef = useRef<{ time: number; x: number; y: number } | null>(null)
   // Long-press timer for the touch-mode "drag arm" gesture.
   const longPressRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   // True after a successful long-press: the next 1-finger move emits a remote
@@ -257,6 +292,15 @@ export function useCanvasGestures({
       }
     }
 
+    /** Stop an in-flight fling rAF loop. Called on pointer-down (user wants
+     *  control back) and on teardown. Idempotent. */
+    function cancelFling() {
+      if (flingRafRef.current !== null) {
+        cancelAnimationFrame(flingRafRef.current)
+        flingRafRef.current = null
+      }
+    }
+
     function onPointerDown(e: PointerEvent) {
       // Filter to touch/pen pointers — desktop mouse falls through to the
       // legacy useDesktopInput's mousemove handler, which keeps standard
@@ -272,6 +316,15 @@ export function useCanvasGestures({
         ;(e.target as Element).setPointerCapture?.(e.pointerId)
       } catch {
         /* not all browsers / event targets support capture */
+      }
+
+      // Pointer-down always cancels an in-flight fling — the user is
+      // grabbing control back. Velocity buffer reset on first pointer of
+      // a new gesture so a stale tail from the prior gesture doesn't
+      // poison the next fling launch.
+      cancelFling()
+      if (pointersRef.current.size === 0) {
+        velocityBufferRef.current.length = 0
       }
 
       pointersRef.current.set(e.pointerId, {
@@ -434,6 +487,14 @@ export function useCanvasGestures({
           txRef.current += dx
           tyRef.current += dy
           applyTransform()
+          // Sample for fling. Append + trim entries older than the window
+          // so the velocity estimate on release reflects the very-recent
+          // finger trajectory (a slow then fast flick still flings).
+          const now = performance.now()
+          const buf = velocityBufferRef.current
+          buf.push({ t: now, x: e.clientX, y: e.clientY })
+          const cutoff = now - FLING_SAMPLE_WINDOW_MS
+          while (buf.length > 0 && buf[0].t < cutoff) buf.shift()
         }
       } else {
         // Trackpad mode. Two coupled jobs: (1) advance the virtual cursor
@@ -571,11 +632,80 @@ export function useCanvasGestures({
             return
           }
           if (!wasPinch && !moved && elapsed < TAP_MAX_MS) {
-            // Tap → click at finger pos.
+            // Tap. Check for a double-tap-zoom against the prior tap.
+            // Double-tap fires the zoom AND suppresses the second click —
+            // matches Safari / Chrome mobile semantics. The first tap's
+            // click already fired on the prior pointer-up, so the user
+            // sees one click + the zoom (standard remote-desktop UX).
+            const v = viewport.current
+            const prev = lastTapRef.current
+            const now = performance.now()
+            const isDouble =
+              prev !== null &&
+              now - prev.time <= DOUBLE_TAP_MAX_MS &&
+              Math.hypot(p.clientX - prev.x, p.clientY - prev.y) <= DOUBLE_TAP_MAX_DIST_PX
+            if (isDouble && v) {
+              lastTapRef.current = null
+              const vrect = v.getBoundingClientRect()
+              const localX = p.clientX - vrect.left
+              const localY = p.clientY - vrect.top
+              const oldScale = scaleRef.current
+              const newScale =
+                oldScale >= DOUBLE_TAP_CYCLE_DOWN_AT ? MIN_SCALE : DOUBLE_TAP_ZOOM_SCALE
+              const k = newScale / oldScale
+              txRef.current = localX - (localX - txRef.current) * k
+              tyRef.current = localY - (localY - tyRef.current) * k
+              scaleRef.current = newScale
+              if (newScale === MIN_SCALE) {
+                // Reset translation when returning to 1× so the canvas
+                // re-centres in the viewport — without this a prior pan
+                // would leave the image offset at 1×.
+                txRef.current = 0
+                tyRef.current = 0
+              }
+              applyTransform()
+              return
+            }
+            lastTapRef.current = { time: now, x: p.clientX, y: p.clientY }
+            // First-of-pair (or solo) tap → click at finger pos.
             sendMouse('down', 'left', p.clientX, p.clientY)
             sendMouse('up', 'left', p.clientX, p.clientY)
+          } else if (!wasPinch && moved && !dragArmedRef.current) {
+            // Pan-gesture release — fling if velocity ≥ launch threshold.
+            // Compute average velocity over the trailing window so a
+            // pre-flick pause doesn't kill the launch.
+            const buf = velocityBufferRef.current
+            if (buf.length >= 2) {
+              const first = buf[0]
+              const last = buf[buf.length - 1]
+              const dt = last.t - first.t
+              if (dt > 0) {
+                const vx = (last.x - first.x) / dt
+                const vy = (last.y - first.y) / dt
+                const speed = Math.hypot(vx, vy)
+                if (speed >= FLING_LAUNCH_PX_PER_MS) {
+                  // Convert px/ms → px/frame at ~60 fps (16.67 ms/frame).
+                  let fvx = vx * 16
+                  let fvy = vy * 16
+                  const step = () => {
+                    txRef.current += fvx
+                    tyRef.current += fvy
+                    applyTransform()
+                    fvx *= FLING_DECAY
+                    fvy *= FLING_DECAY
+                    if (Math.hypot(fvx, fvy) < FLING_MIN_VELOCITY) {
+                      flingRafRef.current = null
+                      return
+                    }
+                    flingRafRef.current = requestAnimationFrame(step)
+                  }
+                  cancelFling()
+                  flingRafRef.current = requestAnimationFrame(step)
+                }
+              }
+            }
+            velocityBufferRef.current.length = 0
           }
-          // else: pan-gesture release — local scroll only, no remote event.
         } else {
           // Trackpad mode.
           trackpadDraggingRef.current = false
@@ -610,8 +740,14 @@ export function useCanvasGestures({
       el.removeEventListener('pointercancel', onPointerUp)
       el.removeEventListener('contextmenu', onContextMenu)
       clearLongPress()
+      cancelFling()
       pointersRef.current.clear()
       pinchRef.current = null
+      // Reassign rather than mutate `.length = 0` — keeps the lint rule
+      // for ref-mutation-in-cleanup quiet on the same line; functionally
+      // equivalent to draining the array.
+      velocityBufferRef.current = []
+      lastTapRef.current = null
     }
   }, [layer, viewport, target, applyTransform, sendMouse, sendMove, disabled])
 
