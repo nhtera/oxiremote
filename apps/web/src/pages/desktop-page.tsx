@@ -217,39 +217,31 @@ export default function DesktopPage() {
     })
   }, [])
 
-  // Phase-02a: per-session audio active state. MUST live above the early
-  // returns below so React sees the same hook count on every render
-  // (loading → ready transitions previously violated rules-of-hooks here).
-  // Reset to whatever the gate decides at session start; `reloadNonce` keys
-  // the dependency so a manual Reload re-arms audio when applicable.
-  const [audioActive, setAudioActive] = useState(false)
-  useEffect(() => {
-    if (!caps) {
-      setAudioActive(false)
-      return
-    }
-    const wantsH264Local =
-      caps.preferred_pipeline === 'h264' ||
-      (caps.preferred_pipeline === 'auto' && caps.chosen_default === 'h264')
-    const useH264Local = wantsH264Local && supportsH264Video() && !forceJpegSession
-    setAudioActive(!!(caps.audio_enabled && caps.audio_supported) && useH264Local)
-  }, [caps, forceJpegSession, reloadNonce])
+  // Phase-02a: user audio intent. `null` = follow gate default (audio on when
+  // the gate passes); `true` = user explicitly on; `false` = user explicitly
+  // off (sticky across reconnects). The actual `audioActive` flag is derived
+  // below from intent ∧ live gate so a pipeline switch doesn't clobber the
+  // operator's mute choice.
+  const [audioPref, setAudioPref] = useState<boolean | null>(null)
   // Bidirectional. On→Off: send `audioToggle=false` over the WS, server
   // tears the audio pipeline down via `UserToggleOff` (no video disruption).
   // Off→On: trigger a session reconnect — the SCK audio capture + Opus
   // transceiver are bound at session-start and webrtc-rs has no clean
-  // mid-session "re-add audio" path, so we recycle the session. Same UX as
-  // a manual Reload but scoped to the audio intent.
+  // mid-session "re-add audio" path, so we recycle the session.
   const handleToggleAudio = useCallback(() => {
-    if (audioActive) {
+    setAudioPref((cur) => {
+      if (cur === false) {
+        // Off → On: needs reconnect to add the audio transceiver back.
+        sessionApiRef.current.disconnect()
+        setForceJpegSession(false)
+        setReloadNonce((n) => n + 1)
+        return true
+      }
+      // On → Off: instant mute via WS — server tears audio without renegotiating.
       sessionApiRef.current.toggleAudio?.(false)
-      setAudioActive(false)
-      return
-    }
-    sessionApiRef.current.disconnect()
-    setForceJpegSession(false)
-    setReloadNonce((n) => n + 1)
-  }, [audioActive])
+      return false
+    })
+  }, [])
 
   // Container that wraps the canvas. Tracked via ResizeObserver so we can
   // surface the displayed-vs-native scale as a zoom % in the mobile top strip.
@@ -541,19 +533,29 @@ export default function DesktopPage() {
         (caps.preferred_pipeline === 'auto' && caps.chosen_default === 'h264')))
   const useH264 =
     pipelinePref !== 'jpeg' && wantsH264 && supportsH264Video() && !forceJpegSession
-  // Wire query param sent to the agent. `auto` is omitted (server uses its
-  // own preference); explicit picks always send so the user choice survives
-  // an agent restart with a different `OXI_VIDEO_PIPELINE` env value.
-  const forcePipelineWire: 'h264' | 'jpeg' | undefined =
-    pipelinePref === 'auto' ? undefined : pipelinePref
+  // Wire query param sent to the agent. Must reflect the *actually mounted*
+  // view, not just `pipelinePref` — when the H.264 watchdog flips us to JPEG
+  // mid-session (forceJpegSession) but the user's pref is still 'h264',
+  // sending `?force_pipeline=h264` from the JPEG view would force the agent
+  // onto H.264 with a JPEG-shaped client offer (no video transceiver) and
+  // close the WS at SDP merge. Rule: H.264 view forces 'h264' only on
+  // explicit pick; JPEG view forces 'jpeg' on explicit pick OR fallback.
+  const forcePipelineWire: 'h264' | 'jpeg' | undefined = useH264
+    ? pipelinePref === 'h264'
+      ? 'h264'
+      : undefined
+    : forceJpegSession || pipelinePref === 'jpeg'
+      ? 'jpeg'
+      : undefined
   const monitorDefault = caps.monitors[0]
     ? { width: caps.monitors[0].width, height: caps.monitors[0].height }
     : undefined
-  // Late-derived gate value (after early-returns ensured caps + useH264 are
-  // ready). The hook that depends on this lives ABOVE the early returns so
-  // React sees the same hook count on every render — see `audioActive`
-  // declaration near the top of the function body.
+  // Live audio gate (caps + chosen pipeline) AND user intent. `audioPref`
+  // lives above early returns; the gate is computed here so it can read the
+  // post-early-return `useH264`. Computing the active flag inline (no extra
+  // useState) means a pipeline switch re-derives without a stale reset.
   const audioGatePass = !!(caps?.audio_enabled && caps?.audio_supported) && useH264
+  const audioActive = audioGatePass && audioPref !== false
 
   const showReconnect =
     status === 'reconnecting' || (status === 'disconnected' && attempt >= 3)
@@ -625,7 +627,7 @@ export default function DesktopPage() {
             onZoomChange={setUserScale}
             onGestureApi={handleGestureApi}
             bottomAnchor={keyboardOpen}
-            audio={!!(caps?.audio_enabled && caps?.audio_supported)}
+            audio={audioActive}
             forcePipeline={forcePipelineWire}
           />
         ) : (
