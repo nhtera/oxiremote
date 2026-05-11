@@ -28,9 +28,6 @@ pub mod resample;
 pub mod wasapi_loopback;
 
 #[cfg(target_os = "macos")]
-pub mod core_audio_loopback;
-
-#[cfg(target_os = "macos")]
 pub mod sck_audio;
 
 #[cfg(all(unix, not(target_os = "macos")))]
@@ -93,7 +90,12 @@ pub fn make_default() -> Result<Box<dyn AudioCapture>, AudioError> {
     }
     #[cfg(target_os = "macos")]
     {
-        core_audio_loopback::make()
+        // macOS audio is coupled to the video SCStream — see
+        // `crate::sck::SckCapture::new_with_audio`. The factory has no
+        // standalone path; callers wire the SCK-side receiver directly
+        // into `sck_audio::SckAudioCapture::from_receiver`. `probe_supported`
+        // above is the only honest signal the SPA can poll.
+        Err(AudioError::Unsupported("audio.macos.coupled-to-sck"))
     }
     #[cfg(all(unix, not(target_os = "macos")))]
     {
