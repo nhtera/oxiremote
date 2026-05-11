@@ -183,6 +183,29 @@ export default function DesktopPage() {
   const [forceJpegSession, setForceJpegSession] = useState(false)
   const sessionApiRef = useRef<SessionApi>(noopApi)
 
+  // Phase-02a: per-session audio active state. MUST live above the early
+  // returns below so React sees the same hook count on every render
+  // (loading → ready transitions previously violated rules-of-hooks here).
+  // Reset to whatever the gate decides at session start; `reloadNonce` keys
+  // the dependency so a manual Reload re-arms audio when applicable.
+  const [audioActive, setAudioActive] = useState(false)
+  useEffect(() => {
+    if (!caps) {
+      setAudioActive(false)
+      return
+    }
+    const wantsH264Local =
+      caps.preferred_pipeline === 'h264' ||
+      (caps.preferred_pipeline === 'auto' && caps.chosen_default === 'h264')
+    const useH264Local = wantsH264Local && supportsH264Video() && !forceJpegSession
+    setAudioActive(!!(caps.audio_enabled && caps.audio_supported) && useH264Local)
+  }, [caps, forceJpegSession, reloadNonce])
+  const handleToggleAudio = useCallback(() => {
+    if (!audioActive) return
+    sessionApiRef.current.toggleAudio?.(false)
+    setAudioActive(false)
+  }, [audioActive])
+
   // Container that wraps the canvas. Tracked via ResizeObserver so we can
   // surface the displayed-vs-native scale as a zoom % in the mobile top strip.
   const canvasWrapRef = useRef<HTMLDivElement | null>(null)
@@ -472,21 +495,11 @@ export default function DesktopPage() {
   const monitorDefault = caps.monitors[0]
     ? { width: caps.monitors[0].width, height: caps.monitors[0].height }
     : undefined
-
-  // Phase-02a: per-session audio active state. True when the gate passes
-  // at session-start (operator setting + probe + H.264 path); flips false
-  // when the user mutes via the sidebar. Reset on each fresh session via
-  // `reloadNonce` (re-enable mid-session needs reconnect).
+  // Late-derived gate value (after early-returns ensured caps + useH264 are
+  // ready). The hook that depends on this lives ABOVE the early returns so
+  // React sees the same hook count on every render — see `audioActive`
+  // declaration near the top of the function body.
   const audioGatePass = !!(caps?.audio_enabled && caps?.audio_supported) && useH264
-  const [audioActive, setAudioActive] = useState(false)
-  useEffect(() => {
-    setAudioActive(audioGatePass)
-  }, [audioGatePass, reloadNonce])
-  const handleToggleAudio = useCallback(() => {
-    if (!audioActive) return
-    sessionApiRef.current.toggleAudio?.(false)
-    setAudioActive(false)
-  }, [audioActive])
 
   const showReconnect =
     status === 'reconnecting' || (status === 'disconnected' && attempt >= 3)
