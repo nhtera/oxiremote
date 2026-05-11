@@ -26,10 +26,16 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # macOS ships with the `audio` feature enabled because phase-02a
+          # (ScreenCaptureKit audio → Opus → WebRTC) is operational on this
+          # platform. Linux/Windows stay on default features until the
+          # phase-02b kill-switch passes — flipping `audio` there today only
+          # pulls audiopus/rubato deps without a working capture path.
           - target: aarch64-apple-darwin
             runner: macos-14
             archive_ext: tar.gz
             bin: oxiremote
+            cargo_features: audio
           # Temporarily disabled — GitHub-hosted macos-13 runners are
           # heavily oversubscribed and jobs sit queued for 25+ minutes,
           # blocking the publish-release job. Apple Silicon is dominant;
@@ -40,18 +46,22 @@ jobs:
           #   runner: macos-13
           #   archive_ext: tar.gz
           #   bin: oxiremote
+          #   cargo_features: audio
           - target: x86_64-unknown-linux-gnu
             runner: ubuntu-latest
             archive_ext: tar.gz
             bin: oxiremote
+            cargo_features: ''
           - target: aarch64-unknown-linux-gnu
             runner: ubuntu-24.04-arm
             archive_ext: tar.gz
             bin: oxiremote
+            cargo_features: ''
           - target: x86_64-pc-windows-msvc
             runner: windows-latest
             archive_ext: zip
             bin: oxiremote.exe
+            cargo_features: ''
     steps:
       - uses: actions/checkout@v5
 
@@ -105,7 +115,12 @@ jobs:
       - name: Build release binary
         shell: bash
         run: |
-          cargo build --release --manifest-path agent/Cargo.toml --target ${{ matrix.target }}
+          features="${{ matrix.cargo_features }}"
+          extra=()
+          if [ -n "$features" ]; then
+            extra+=(--features "$features")
+          fi
+          cargo build --release --manifest-path agent/Cargo.toml --target ${{ matrix.target }} "${extra[@]}"
 
       - name: Stage artifact
         id: stage
