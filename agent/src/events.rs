@@ -205,6 +205,21 @@ pub enum AgentEvent {
         pipeline: String,
         reason: String,
     },
+    /// Phase-02 audio (scaffold). Emitted when the host begins streaming
+    /// system audio over the BUNDLE'd PC for `device_id`. No emitter wired
+    /// yet — the variant exists so SSE consumers (host dashboard, notifier)
+    /// can subscribe ahead of the WASAPI capture path landing.
+    AudioStarted {
+        device_id: String,
+    },
+    /// Phase-02 audio (scaffold). Emitted when the audio task tears down.
+    /// `reason` is a short stable identifier ("user_toggle_off",
+    /// "session_closed", "wasapi_error", …) — keep it free of host-side
+    /// detail strings so it is safe to surface in the dashboard.
+    AudioStopped {
+        device_id: String,
+        reason: String,
+    },
 }
 
 /// Lightweight tunnel-state snapshot kept in lockstep with broadcast events.

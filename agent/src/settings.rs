@@ -48,3 +48,7 @@ pub fn set_desktop_enabled(db_path: &PathBuf, enabled: bool) -> Result<()> {
 pub fn get_desktop_audio_enabled(db_path: &PathBuf) -> bool {
     get_bool(db_path, KEY_DESKTOP_AUDIO_ENABLED, false)
 }
+
+pub fn set_desktop_audio_enabled(db_path: &PathBuf, enabled: bool) -> Result<()> {
+    set_bool(db_path, KEY_DESKTOP_AUDIO_ENABLED, enabled)
+}

@@ -87,6 +87,23 @@ export default function AgentSettingsPage() {
     }
   }, [])
 
+  async function toggleAudio(next: boolean) {
+    // Optimistic — the endpoint is a single boolean upsert; revert on failure.
+    setState((s) => (s ? { ...s, audio_enabled: next } : s))
+    try {
+      const res = await fetch('/api/agent/settings/audio', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ enabled: next }),
+      })
+      if (!res.ok) {
+        setState((s) => (s ? { ...s, audio_enabled: !next } : s))
+      }
+    } catch {
+      setState((s) => (s ? { ...s, audio_enabled: !next } : s))
+    }
+  }
+
   async function toggleAutostart(next: boolean) {
     setAutostartBusy(true)
     try {
@@ -188,13 +205,9 @@ export default function AgentSettingsPage() {
             </Row>
             <Row label="Stream system audio">
               {state?.audio_supported ? (
-                // Real toggle wires up once phase-02 lands the PUT endpoint.
-                // Until then the probe is always false, so this branch is
-                // only here to make the switch live the moment Windows
-                // capture is shipped.
                 <SwitchButton
                   checked={state.audio_enabled ?? false}
-                  onToggle={() => { /* phase-02: PUT /api/agent/settings/audio */ }}
+                  onToggle={() => void toggleAudio(!(state.audio_enabled ?? false))}
                 />
               ) : (
                 <span className="text-text-muted text-[length:var(--text-meta)]">

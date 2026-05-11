@@ -100,6 +100,10 @@ export function useDesktopVideoSession(
   const pcRef = useRef<RTCPeerConnection | null>(null)
   const ctrlDcRef = useRef<RTCDataChannel | null>(null)
   const videoRef = useRef<HTMLVideoElement | null>(null)
+  // Phase-02 scaffold. Hidden <audio> sink for the BUNDLE'd Opus track once the
+  // server adds it (gated on Windows kill-switch). Detached element — never
+  // appended to DOM; `srcObject + play()` is enough for browser playback.
+  const audioRef = useRef<HTMLAudioElement | null>(null)
   const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const attemptRef = useRef(0)
   const destroyedRef = useRef(false)
@@ -135,9 +139,20 @@ export function useDesktopVideoSession(
     v.playsInline = true
     v.muted = true
     videoRef.current = v
+
+    // Phase-02 scaffold sink. Stays silent until the server attaches an audio
+    // transceiver (gated on Windows WASAPI kill-switch). The user-gesture for
+    // autoplay is already satisfied by the session-start tap on the desktop
+    // page (no `playsInline` — that's a video-only attribute).
+    const a = document.createElement('audio')
+    a.autoplay = true
+    audioRef.current = a
+
     return () => {
       v.srcObject = null
       videoRef.current = null
+      a.srcObject = null
+      audioRef.current = null
     }
   }, [])
 
@@ -247,6 +262,17 @@ export function useDesktopVideoSession(
     // Incoming video track — attach to the hidden video element and start
     // the draw loop.
     pc.ontrack = (e) => {
+      // Phase-02 scaffold: route audio to the hidden <audio> sink. The server
+      // does not add an audio transceiver yet, so this branch is dormant
+      // until the WASAPI kill-switch passes.
+      if (e.track.kind === 'audio') {
+        const audio = audioRef.current
+        if (!audio) return
+        const stream = e.streams[0] ?? new MediaStream([e.track])
+        audio.srcObject = stream
+        audio.play().catch(() => { /* iOS autoplay may reject — caller's gesture path retries */ })
+        return
+      }
       if (e.track.kind !== 'video') return
       const video = videoRef.current
       if (!video) return

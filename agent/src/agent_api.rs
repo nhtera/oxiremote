@@ -39,6 +39,7 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/api/agent/approvals/{id}/approve", post(api_agent_approve))
         .route("/api/agent/approvals/{id}/reject", post(api_agent_reject))
         .route("/api/agent/settings/auto-approve", post(api_agent_settings_auto_approve))
+        .route("/api/agent/settings/audio", post(api_agent_settings_audio))
         .route(
             "/api/agent/proxy/ports",
             get(api_agent_proxy_ports_list).post(api_agent_proxy_ports_set),
@@ -695,6 +696,31 @@ async fn api_agent_settings_auto_approve(
         }
         Err(err) => {
             warn!(error=%err, "set auto_approve failed");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct AudioEnabledBody {
+    enabled: bool,
+}
+
+/// POST /api/agent/settings/audio — upsert the `desktop_audio_enabled` toggle.
+/// Phase-02: persisted regardless of whether capture is supported, so the
+/// preference survives the kill-switch ship. The capture path itself only
+/// activates when both this flag AND `audio_supported` (probe) are true.
+async fn api_agent_settings_audio(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<AudioEnabledBody>,
+) -> impl IntoResponse {
+    match settings::set_desktop_audio_enabled(&state.db_path, body.enabled) {
+        Ok(()) => {
+            info!(enabled = body.enabled, "desktop_audio_enabled setting updated");
+            (StatusCode::OK, Json(json!({ "ok": true, "enabled": body.enabled }))).into_response()
+        }
+        Err(err) => {
+            warn!(error=%err, "set desktop_audio_enabled failed");
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }
