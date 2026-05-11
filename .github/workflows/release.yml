@@ -107,6 +107,16 @@ jobs:
             libxdo-dev libwayland-dev libgbm-dev libpipewire-0.3-dev \
             pkg-config nasm
 
+      # macOS: audiopus_sys 0.1.8 builds vendored libopus from source via
+      # autotools when pkg-config can't find a system Opus. The GitHub-hosted
+      # macos-14 runner doesn't have autoreconf on PATH by default, so the
+      # autogen.sh step fails. Install autoconf + automake + libtool only on
+      # rows that enable the audio feature, so audio-disabled builds (none
+      # today, but future-proof) stay cheap.
+      - name: Install macOS audio build deps
+        if: runner.os == 'macOS' && matrix.cargo_features == 'audio'
+        run: brew install autoconf automake libtool
+
       - name: Install JS deps + build web assets
         run: |
           bun install --frozen-lockfile
