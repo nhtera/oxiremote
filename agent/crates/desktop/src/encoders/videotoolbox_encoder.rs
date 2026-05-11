@@ -35,7 +35,7 @@ use objc2_video_toolbox::{
     kVTCompressionPropertyKey_AllowFrameReordering, kVTCompressionPropertyKey_AverageBitRate,
     kVTCompressionPropertyKey_H264EntropyMode, kVTCompressionPropertyKey_MaxKeyFrameInterval,
     kVTCompressionPropertyKey_ProfileLevel, kVTCompressionPropertyKey_RealTime,
-    kVTH264EntropyMode_CAVLC, kVTProfileLevel_H264_Baseline_3_1,
+    kVTH264EntropyMode_CAVLC, kVTProfileLevel_H264_Baseline_AutoLevel,
     kVTVideoEncoderSpecification_EnableLowLatencyRateControl, VTCompressionSession,
     VTEncodeInfoFlags, VTSessionSetProperty,
 };
@@ -105,10 +105,15 @@ fn configure_properties(
 ) -> anyhow::Result<()> {
     unsafe {
         set_cf(session, kVTCompressionPropertyKey_RealTime, CFBoolean::new(true))?;
+        // AutoLevel lets VT pick the right H.264 level (3.1 → 5.2) based on
+        // the configured width/height. Hardcoding Baseline 3.1 capped us at
+        // 1280×720 and caused kVTVideoEncoderMalfunctionErr (-12911) on
+        // every frame when HiDPI mode pushed the encoder up to 2268×1473
+        // (Retina 2× scale) — well above 3.1's max picture size.
         set_cf(
             session,
             kVTCompressionPropertyKey_ProfileLevel,
-            kVTProfileLevel_H264_Baseline_3_1,
+            kVTProfileLevel_H264_Baseline_AutoLevel,
         )?;
         let bitrate_num = CFNumber::new_i32(bitrate.0 as i32);
         set_cf(session, kVTCompressionPropertyKey_AverageBitRate, &*bitrate_num)?;

@@ -66,15 +66,22 @@ pub struct VideoPipelineConfig {
 }
 
 /// Build the `RTCRtpCodecCapability` we expose in the SDP offer — H.264
-/// baseline profile 3.1, 90 kHz clock, packetization-mode=1. Matches what
-/// `register_default_codecs` adds as PT 125.
+/// baseline profile, Level 5.0, 90 kHz clock, packetization-mode=1.
+///
+/// Level 5.0 (level_idc=0x32, max ~2560×1920 / 36 Mbps) covers HiDPI
+/// captures on Retina displays. The encoder runs at `AutoLevel` so VT
+/// emits the minimum level the actual resolution requires; advertising
+/// 5.0 here lets the SDP negotiate that envelope without false-rejection
+/// from browsers that strictly check `profile-level-id`. profile-iop=e0
+/// keeps the constrained-baseline flags (sets 0/1/2) so old decoders
+/// that only do baseline still accept the stream.
 pub fn h264_codec_capability() -> RTCRtpCodecCapability {
     RTCRtpCodecCapability {
         mime_type: MIME_TYPE_H264.to_string(),
         clock_rate: 90_000,
         channels: 0,
         sdp_fmtp_line:
-            "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f".to_string(),
+            "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e032".to_string(),
         rtcp_feedback: vec![],
     }
 }
@@ -371,7 +378,7 @@ mod tests {
         let cap = h264_codec_capability();
         assert_eq!(cap.mime_type, "video/H264");
         assert_eq!(cap.clock_rate, 90_000);
-        assert!(cap.sdp_fmtp_line.contains("profile-level-id=42e01f"));
+        assert!(cap.sdp_fmtp_line.contains("profile-level-id=42e032"));
         assert!(cap.sdp_fmtp_line.contains("packetization-mode=1"));
     }
 
