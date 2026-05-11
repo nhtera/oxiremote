@@ -47,6 +47,9 @@ interface Props {
   audioActive?: boolean
   /** Tap-to-toggle. On→Off mutes via WS (instant); Off→On reconnects. */
   onToggleAudio?: () => void
+  /** User-driven pipeline preference — forwarded to the overflow menu picker. */
+  pipelinePref?: 'auto' | 'h264' | 'jpeg'
+  onPipelinePrefChange?: (p: 'auto' | 'h264' | 'jpeg') => void
 }
 
 export default function DesktopTopStrip({
@@ -73,6 +76,8 @@ export default function DesktopTopStrip({
   audioGated = false,
   audioActive = false,
   onToggleAudio,
+  pipelinePref,
+  onPipelinePrefChange,
 }: Props) {
   const [menuOpen, setMenuOpen] = useState(false)
   const zoomLabel =
@@ -191,6 +196,8 @@ export default function DesktopTopStrip({
           onQualityChange={onQualityChange}
           onSettingsChange={onSettingsChange}
           pipeline={pipeline}
+          pipelinePref={pipelinePref}
+          onPipelinePrefChange={onPipelinePrefChange}
         />
       </div>
     </div>

@@ -66,6 +66,10 @@ interface Props {
    *  before adding an audio transceiver. Defaults to false so a missing prop
    *  never silently activates audio. */
   audio?: boolean
+  /** User-driven pipeline override. Sent to the agent via `?force_pipeline=`
+   *  on the WS upgrade so the choice survives mid-session reconnects without
+   *  touching the operator-side env preference. */
+  forcePipeline?: 'h264' | 'jpeg' | 'auto'
 }
 
 export default function DesktopH264View({
@@ -84,6 +88,7 @@ export default function DesktopH264View({
   onGestureApi,
   bottomAnchor = false,
   audio = false,
+  forcePipeline,
 }: Props) {
   const canvasRef = useRef<HTMLCanvasElement>(null)
   const ctx2dRef = useRef<CanvasRenderingContext2D | null>(null)
@@ -127,7 +132,7 @@ export default function DesktopH264View({
   }, [])
 
   const { status, sendInput, setQuality, setSettings, toggleAudio, disconnect, attempt, screenDims, pipelineInfo } =
-    useDesktopVideoSession(hostId, deviceId, onFrame, quality, hidpi, audio)
+    useDesktopVideoSession(hostId, deviceId, onFrame, quality, hidpi, audio, forcePipeline)
 
   useEffect(() => {
     onSessionChange({ status, attempt, screenDims, pipelineInfo })

@@ -62,6 +62,9 @@ interface Props {
   /** Bottom-anchor the painted image when the soft keyboard is open so it
    *  rides up with the keyboard (RVNC-style). Centred otherwise. */
   bottomAnchor?: boolean
+  /** User-driven pipeline override. Sent as `?force_pipeline=` on the WS
+   *  upgrade so the agent stays on this transport for the session. */
+  forcePipeline?: 'h264' | 'jpeg' | 'auto'
 }
 
 export default function DesktopJpegView({
@@ -79,6 +82,7 @@ export default function DesktopJpegView({
   onZoomChange,
   onGestureApi,
   bottomAnchor = false,
+  forcePipeline,
 }: Props) {
   const canvasRef = useRef<HTMLCanvasElement>(null)
   const workerRef = useRef<Worker | null>(null)
@@ -115,7 +119,7 @@ export default function DesktopJpegView({
   }, [])
 
   const { status, sendInput, setQuality, setSettings, disconnect, attempt, screenDims, tileSize, pipelineInfo } =
-    useDesktopSession(hostId, deviceId, onTile, quality, hidpi)
+    useDesktopSession(hostId, deviceId, onTile, quality, hidpi, forcePipeline)
 
   // Push session state to the parent whenever it changes.
   useEffect(() => {

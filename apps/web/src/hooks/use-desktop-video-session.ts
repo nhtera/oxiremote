@@ -62,17 +62,20 @@ const STUN_CONFIG: RTCConfiguration = {
 const RECONNECT_DELAY_MS = 1500
 const MAX_ATTEMPTS = 3
 
-function wsUrl(deviceId: string): string {
+function wsUrl(deviceId: string, forcePipeline?: 'jpeg' | 'h264' | 'auto'): string {
   const path = `/ws/desktop/${encodeURIComponent(deviceId)}`
+  // Server validates `?force_pipeline=jpeg|h264|auto`; unknown values fall
+  // back to the operator preference, so it's safe to always append when set.
+  const query = forcePipeline ? `?force_pipeline=${forcePipeline}` : ''
   if (isDiscoveryMode()) {
     const base = loadTunnelBase()
     if (base) {
       const wsBase = base.replace(/^http:/, 'ws:').replace(/^https:/, 'wss:')
-      return `${wsBase}${path}`
+      return `${wsBase}${path}${query}`
     }
   }
   const proto = location.protocol === 'https:' ? 'wss:' : 'ws:'
-  return `${proto}//${location.host}${path}`
+  return `${proto}//${location.host}${path}${query}`
 }
 
 function wsProtocols(): string[] | undefined {
@@ -95,6 +98,7 @@ export function useDesktopVideoSession(
   tier: QualityTier = 'med',
   hidpi: boolean = false,
   audio: boolean = false,
+  forcePipeline?: 'h264' | 'jpeg' | 'auto',
 ): VideoSessionApi {
   const [status, setStatus] = useState<DesktopStatus>('idle')
   const [attempt, setAttempt] = useState(0)
@@ -244,9 +248,8 @@ export function useDesktopVideoSession(
 
     setStatus('connecting')
     const protocols = wsProtocols()
-    const ws = protocols
-      ? new WebSocket(wsUrl(deviceId), protocols)
-      : new WebSocket(wsUrl(deviceId))
+    const url = wsUrl(deviceId, forcePipeline)
+    const ws = protocols ? new WebSocket(url, protocols) : new WebSocket(url)
     ws.binaryType = 'arraybuffer'
     wsRef.current = ws
 

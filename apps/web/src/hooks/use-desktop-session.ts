@@ -148,6 +148,10 @@ export function useDesktopSession(
   onTile: TileCallback,
   tier: QualityTier = 'med',
   hidpi: boolean = false,
+  /** User-driven pipeline override. Sent on the WS upgrade as
+   *  `?force_pipeline=`; takes precedence over the sessionStorage fallback
+   *  flag (which only carries the watchdog-derived JPEG bail-out). */
+  forcePipeline?: 'h264' | 'jpeg' | 'auto',
 ): SessionApi {
   const [status, setStatus] = useState<DesktopStatus>('idle')
   const [attempt, setAttempt] = useState(0)
@@ -220,15 +224,16 @@ export function useDesktopSession(
 
     setStatus('connecting')
 
-    // Read from the mount-scoped ref (populated by useEffect below from the
-    // sessionStorage flag). The flag is cleared on the first `connect()` of
-    // this mount so reconnects within the same mount don't re-force JPEG
-    // forever — the user's Reload button clears the page-level state to
-    // retry H.264.
-    const forcePipeline = forceJpegRef.current ? 'jpeg' : undefined
+    // Pipeline override resolution: explicit user pick (passed by the page
+    // via `forcePipeline` prop) wins over the watchdog-derived sessionStorage
+    // fallback flag. The flag is cleared on the first `connect()` of this
+    // mount so reconnects within the same mount don't re-force JPEG forever
+    // — the user's Reload button clears the page-level state to retry H.264.
+    const fallbackForce = forceJpegRef.current ? 'jpeg' : undefined
     if (forceJpegRef.current) forceJpegRef.current = false
+    const effectiveForce = forcePipeline ?? fallbackForce
     const protocols = wsProtocols()
-    const url = wsUrl(deviceId, forcePipeline)
+    const url = wsUrl(deviceId, effectiveForce)
     const ws = protocols ? new WebSocket(url, protocols) : new WebSocket(url)
     ws.binaryType = 'arraybuffer'
     wsRef.current = ws

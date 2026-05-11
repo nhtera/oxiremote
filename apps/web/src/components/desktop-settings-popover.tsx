@@ -14,6 +14,8 @@
 import type { QualityTier } from '../hooks/use-desktop-session'
 import StatusChip from './ui/status-chip'
 
+type PipelinePref = 'auto' | 'h264' | 'jpeg'
+
 interface Props {
   hidpi: boolean
   smoothScaling: boolean
@@ -21,6 +23,10 @@ interface Props {
   quality: QualityTier
   onQualityChange: (tier: QualityTier) => void
   pipeline: 'h264' | 'jpeg'
+  /** User-driven pipeline preference. `auto` defers to the agent's chosen
+   *  default; explicit picks override per-session via `?force_pipeline=`. */
+  pipelinePref?: PipelinePref
+  onPipelinePrefChange?: (p: PipelinePref) => void
 }
 
 const QUALITY_OPTIONS: { value: QualityTier; label: string }[] = [
@@ -41,6 +47,8 @@ export default function DesktopSettingsPopover({
   quality,
   onQualityChange,
   pipeline,
+  pipelinePref = 'auto',
+  onPipelinePrefChange,
 }: Props) {
   return (
     <div
@@ -79,6 +87,43 @@ export default function DesktopSettingsPopover({
           ))}
         </select>
       </label>
+
+      {/* Pipeline picker — segmented control. `Auto` defers to the agent's
+          chosen default (which itself respects OXI_VIDEO_PIPELINE); explicit
+          picks ride on `?force_pipeline=` over the WS upgrade. Mid-session
+          change triggers a session reconnect (~1–2 s blip, same as HiDPI). */}
+      {onPipelinePrefChange && (
+        <div className="flex items-center gap-2 py-1.5">
+          <span className="text-xs text-text-muted shrink-0 w-16">Pipeline</span>
+          <div className="flex-1 grid grid-cols-3 gap-1">
+            {(['auto', 'h264', 'jpeg'] as PipelinePref[]).map((p) => {
+              const active = pipelinePref === p
+              return (
+                <button
+                  key={p}
+                  type="button"
+                  onClick={() => onPipelinePrefChange(p)}
+                  title={
+                    p === 'auto'
+                      ? 'Let the agent pick (recommended)'
+                      : p === 'h264'
+                        ? 'Force H.264 — lower bandwidth, hardware-decoded when available'
+                        : 'Force JPEG tiles — broader compatibility, more bandwidth'
+                  }
+                  className={[
+                    'h-7 text-[11px] font-medium rounded border transition-colors',
+                    active
+                      ? 'bg-[hsl(var(--accent-primary)/0.2)] text-[hsl(var(--accent-primary))] border-[hsl(var(--accent-primary)/0.4)]'
+                      : 'bg-surface-alt text-text-muted border-border hover:text-text-primary',
+                  ].join(' ')}
+                >
+                  {p === 'auto' ? 'Auto' : p === 'h264' ? 'H.264' : 'JPEG'}
+                </button>
+              )
+            })}
+          </div>
+        </div>
+      )}
 
       <div className="border-t border-border/60 mt-2 pt-2">
         <label className="flex items-start gap-2 cursor-pointer py-1">

@@ -82,6 +82,20 @@ interface DisplaySettings {
 const SETTINGS_KEY = 'oxi.desktop.settings'
 const DEFAULT_SETTINGS: DisplaySettings = { hidpi: false, smoothScaling: false }
 
+// User-driven pipeline preference. Persisted globally (not per-host) since
+// it tracks browser-side decode capability + bandwidth preference, which is
+// generally machine-uniform. `'auto'` defers to the agent's chosen-default
+// (which itself respects `OXI_VIDEO_PIPELINE`); `'h264'` and `'jpeg'` are
+// session-scoped overrides that ride on the WS upgrade as
+// `?force_pipeline=...`.
+type PipelinePref = 'auto' | 'h264' | 'jpeg'
+const PIPELINE_PREF_KEY = 'oxi.desktop.pipeline_pref'
+function loadPipelinePref(): PipelinePref {
+  if (typeof localStorage === 'undefined') return 'auto'
+  const v = localStorage.getItem(PIPELINE_PREF_KEY)
+  return v === 'h264' || v === 'jpeg' ? v : 'auto'
+}
+
 function loadSettings(): DisplaySettings {
   if (typeof localStorage === 'undefined') return DEFAULT_SETTINGS
   try {
@@ -182,6 +196,26 @@ export default function DesktopPage() {
   // retry H.264 deliberately.
   const [forceJpegSession, setForceJpegSession] = useState(false)
   const sessionApiRef = useRef<SessionApi>(noopApi)
+
+  // User-driven pipeline preference (Auto/H.264/JPEG). Mid-session change
+  // triggers a reconnect via `reloadNonce` so the WS upgrade picks up the
+  // new `?force_pipeline=` query param. `setForceJpegSession(false)` clears
+  // any prior fallback flag so user intent always wins.
+  const [pipelinePref, setPipelinePrefState] = useState<PipelinePref>(() => loadPipelinePref())
+  const setPipelinePref = useCallback((p: PipelinePref) => {
+    setPipelinePrefState((prev) => {
+      if (prev === p) return prev
+      try {
+        localStorage.setItem(PIPELINE_PREF_KEY, p)
+      } catch {
+        /* private mode / quota — best-effort */
+      }
+      sessionApiRef.current.disconnect()
+      setForceJpegSession(false)
+      setReloadNonce((n) => n + 1)
+      return p
+    })
+  }, [])
 
   // Phase-02a: per-session audio active state. MUST live above the early
   // returns below so React sees the same hook count on every render
@@ -495,14 +529,23 @@ export default function DesktopPage() {
     )
   }
 
-  // Pick H.264 when: client can decode AND (operator forced H.264 OR Auto
-  // resolves to H.264) AND no per-session fallback flag is set. The
-  // `chosen_default` hint covers the new `Auto` preference; the legacy
-  // `'h264'` branch is kept for compatibility with older agents.
+  // Pick H.264 when: client can decode AND (user picked h264 OR (auto AND
+  // operator/agent default resolves to H.264)) AND no per-session fallback.
+  // User pref takes precedence over auto-resolution; on `pipelinePref='jpeg'`
+  // we mount JPEG view + ride `?force_pipeline=jpeg` over the WS so the
+  // server bypasses H.264 negotiation entirely.
   const wantsH264 =
-    caps.preferred_pipeline === 'h264' ||
-    (caps.preferred_pipeline === 'auto' && caps.chosen_default === 'h264')
-  const useH264 = wantsH264 && supportsH264Video() && !forceJpegSession
+    pipelinePref === 'h264' ||
+    (pipelinePref === 'auto' &&
+      (caps.preferred_pipeline === 'h264' ||
+        (caps.preferred_pipeline === 'auto' && caps.chosen_default === 'h264')))
+  const useH264 =
+    pipelinePref !== 'jpeg' && wantsH264 && supportsH264Video() && !forceJpegSession
+  // Wire query param sent to the agent. `auto` is omitted (server uses its
+  // own preference); explicit picks always send so the user choice survives
+  // an agent restart with a different `OXI_VIDEO_PIPELINE` env value.
+  const forcePipelineWire: 'h264' | 'jpeg' | undefined =
+    pipelinePref === 'auto' ? undefined : pipelinePref
   const monitorDefault = caps.monitors[0]
     ? { width: caps.monitors[0].width, height: caps.monitors[0].height }
     : undefined
@@ -544,6 +587,8 @@ export default function DesktopPage() {
         audioGated={audioGatePass}
         audioActive={audioActive}
         onToggleAudio={handleToggleAudio}
+        pipelinePref={pipelinePref}
+        onPipelinePrefChange={setPipelinePref}
       />
 
       {/* Disable touch/pointer events on the canvas while text-batch sheet is open
@@ -581,6 +626,7 @@ export default function DesktopPage() {
             onGestureApi={handleGestureApi}
             bottomAnchor={keyboardOpen}
             audio={!!(caps?.audio_enabled && caps?.audio_supported)}
+            forcePipeline={forcePipelineWire}
           />
         ) : (
           <DesktopJpegView
@@ -599,6 +645,7 @@ export default function DesktopPage() {
             onZoomChange={setUserScale}
             onGestureApi={handleGestureApi}
             bottomAnchor={keyboardOpen}
+            forcePipeline={forcePipelineWire}
           />
         )}
       </div>
@@ -643,6 +690,8 @@ export default function DesktopPage() {
           audioGated={audioGatePass}
           audioActive={audioActive}
           onToggleAudio={handleToggleAudio}
+          pipelinePref={pipelinePref}
+          onPipelinePrefChange={setPipelinePref}
         />
       </div>
 
