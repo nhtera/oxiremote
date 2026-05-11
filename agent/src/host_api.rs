@@ -16,10 +16,13 @@ use crate::env_defaults;
 use crate::AppState;
 
 pub fn router() -> Router<Arc<AppState>> {
-    Router::new()
+    let r = Router::new()
         .route("/api/host", get(api_host_info))
         .route("/api/hosts/{id}/desktop/capabilities", get(api_desktop_capabilities))
-        .route("/api/devices/{id}", patch(api_device_rename))
+        .route("/api/devices/{id}", patch(api_device_rename));
+    #[cfg(feature = "h264")]
+    let r = r.route("/api/hosts/{id}/desktop/stats", get(api_desktop_stats));
+    r
 }
 
 #[derive(Deserialize)]
@@ -203,4 +206,46 @@ pub async fn api_desktop_capabilities(
         });
         (StatusCode::OK, Json(body)).into_response()
     }
+}
+
+/// GET /api/hosts/{id}/desktop/stats
+///
+/// 1 Hz Server-Sent Events stream of `StatsSnapshot` JSON for the
+/// authenticated device's active H.264 desktop session. Returns 404
+/// when no h264 session is active for this device — no polling
+/// required, the SPA can `EventSource` and trust that an open stream
+/// means a live session.
+///
+/// Auth: same as `/desktop/capabilities` — Bearer + cookie session.
+/// `host_id` must match this agent's own id.
+#[cfg(feature = "h264")]
+async fn api_desktop_stats(
+    State(state): State<Arc<AppState>>,
+    jar: CookieJar,
+    headers: axum::http::HeaderMap,
+    Path(host_id): Path<String>,
+) -> axum::response::Response {
+    let bearer = crate::auth::extract_bearer(&headers);
+    let Some(device_id) = crate::auth::require_tunnel_auth(
+        &state.db_path,
+        &state.signing_key,
+        &jar,
+        bearer.as_deref(),
+    )
+    .await
+    else {
+        return StatusCode::UNAUTHORIZED.into_response();
+    };
+    if host_id != state.host_info.host_id {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    let Some(svc) = state.desktop_service.as_ref() else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let Some(rx) = svc.subscribe_abr(&device_id) else {
+        // No active h264 session for this device — JPEG sessions don't
+        // produce observations yet. SPA renders an empty overlay state.
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    crate::desktop_stats_sse::make_stream(rx).into_response()
 }

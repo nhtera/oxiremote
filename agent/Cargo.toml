@@ -51,6 +51,11 @@ portable-pty = "0.9"
 dashmap = "6"
 tokio-tungstenite = { version = "0.26", features = ["connect"] }
 futures-util = "0.3"
+# Macro for building async streams via `stream! { ... yield ... }`.
+# Used by the phase-03 stats SSE aggregator (1 Hz tick + drain pattern
+# is awkward to express via futures::stream::unfold). Tiny crate, no
+# transitive deps beyond what we already pull in.
+async-stream = "0.3"
 rust-embed = { version = "8", features = ["compression"] }
 mime_guess = "2"
 

@@ -7,9 +7,17 @@ use dashmap::DashMap;
 
 /// A lightweight token that represents one active desktop WS session.
 /// The actual heavy state (RTCPeerConnection, capture task) lives inside
-/// the session task; this registry only holds the close signal.
+/// the session task; this registry only holds the close signal plus
+/// optional ABR observation publisher (phase-03; Some only when the
+/// h264 pipeline is the active video transport).
 pub struct SessionHandle {
     pub close_tx: tokio::sync::oneshot::Sender<()>,
+    /// Phase-03: snapshot subscription point for the stats SSE endpoint.
+    /// Populated by `attach_abr_tx` once the h264 pipeline has wired its
+    /// own broadcast. JPEG sessions leave this `None` (no per-session
+    /// observations until phase-03 extends to the JPEG path).
+    #[cfg(feature = "h264")]
+    pub abr_tx: Option<tokio::sync::broadcast::Sender<crate::desktop_abr::AbrObservation>>,
 }
 
 /// Central registry of active desktop sessions, keyed by device ID.
@@ -34,9 +42,45 @@ impl DesktopService {
             let _ = old.close_tx.send(());
         }
 
-        self.sessions
-            .insert(device_id.to_string(), SessionHandle { close_tx: tx });
+        self.sessions.insert(
+            device_id.to_string(),
+            SessionHandle {
+                close_tx: tx,
+                #[cfg(feature = "h264")]
+                abr_tx: None,
+            },
+        );
         rx
+    }
+
+    /// Attach the h264 pipeline's ABR observation publisher to the active
+    /// session for `device_id`. Called from `run_h264_session` after the
+    /// pipeline is spawned. No-op if the session has been evicted in the
+    /// gap between `register` and this call (race tolerated — observations
+    /// just aren't routable until the next register).
+    #[cfg(feature = "h264")]
+    pub fn attach_abr_tx(
+        &self,
+        device_id: &str,
+        tx: tokio::sync::broadcast::Sender<crate::desktop_abr::AbrObservation>,
+    ) {
+        if let Some(mut entry) = self.sessions.get_mut(device_id) {
+            entry.abr_tx = Some(tx);
+        }
+    }
+
+    /// Subscribe a new ABR observation receiver for `device_id`. Returns
+    /// `None` when no h264 session is currently registered (caller should
+    /// 404). Each call yields an independent receiver — the broadcast
+    /// fan-out lets controller + stats SSE attach concurrently.
+    #[cfg(feature = "h264")]
+    pub fn subscribe_abr(
+        &self,
+        device_id: &str,
+    ) -> Option<tokio::sync::broadcast::Receiver<crate::desktop_abr::AbrObservation>> {
+        self.sessions
+            .get(device_id)
+            .and_then(|entry| entry.abr_tx.as_ref().map(|tx| tx.subscribe()))
     }
 
     /// Remove a session (called on WS close).

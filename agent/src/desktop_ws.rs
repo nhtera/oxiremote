@@ -1064,9 +1064,17 @@ mod inner {
             sender,
             pli_tx,
             bitrate_tx.clone(),
-            abr_tx,
+            abr_tx.clone(),
             rtcp_shutdown_rx,
         );
+
+        // Phase-03 step 5: register the broadcast publisher with the
+        // session registry so the stats SSE endpoint can subscribe by
+        // device_id without reaching into pipeline internals. Optional
+        // because non-desktop builds carry `Option<Arc<DesktopService>>`.
+        if let Some(svc) = state.desktop_service.as_ref() {
+            svc.attach_abr_tx(device_id, abr_tx);
+        }
 
         info!(
             width = out_w,

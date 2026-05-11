@@ -52,6 +52,11 @@ mod video_pipeline;
 // the JPEG path (`desktop_ws_capture.rs` same emit pattern).
 #[cfg(feature = "h264")]
 mod desktop_abr;
+// Phase-03 step 5: 1 Hz stats SSE aggregator. Subscribes to the per-session
+// `AbrObservation` broadcast, folds it into a rolling `StatsSnapshot`, and
+// streams JSON over Server-Sent Events on `/api/hosts/{id}/desktop/stats`.
+#[cfg(feature = "h264")]
+mod desktop_stats_sse;
 // Audio pipeline — gated on the agent's `audio` feature (forwards to
 // desktop/audio). Off by default until phase-02a + 02b both ship.
 #[cfg(feature = "audio")]
