@@ -56,6 +56,12 @@ interface Props {
   onGestureApi?: (api: DesktopGestureApi) => void
   /** See JPEG view: bottom-anchor only while the soft keyboard is open. */
   bottomAnchor?: boolean
+  /** Phase-02a: operator toggle ON + build-side probe true. SPA advertises
+   *  `audio: true` in the WS `capabilitiesClient` only when this is true,
+   *  and the agent independently AND-merges it with its own settings + probe
+   *  before adding an audio transceiver. Defaults to false so a missing prop
+   *  never silently activates audio. */
+  audio?: boolean
 }
 
 export default function DesktopH264View({
@@ -73,6 +79,7 @@ export default function DesktopH264View({
   onZoomChange,
   onGestureApi,
   bottomAnchor = false,
+  audio = false,
 }: Props) {
   const canvasRef = useRef<HTMLCanvasElement>(null)
   const ctx2dRef = useRef<CanvasRenderingContext2D | null>(null)
@@ -116,7 +123,7 @@ export default function DesktopH264View({
   }, [])
 
   const { status, sendInput, setQuality, setSettings, disconnect, attempt, screenDims, pipelineInfo } =
-    useDesktopVideoSession(hostId, deviceId, onFrame, quality, hidpi)
+    useDesktopVideoSession(hostId, deviceId, onFrame, quality, hidpi, audio)
 
   useEffect(() => {
     onSessionChange({ status, attempt, screenDims, pipelineInfo })

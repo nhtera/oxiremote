@@ -75,12 +75,18 @@ mod inner {
         Ice { candidate: RTCIceCandidateInit },
         /// Client announces decoder support. Agent uses this to pick JPEG vs
         /// H.264 pipeline. Presence of `webcodecs: true` and a codec in
-        /// `codecs` matching our fmtp means H.264 is viable.
+        /// `codecs` matching our fmtp means H.264 is viable. `audio: true`
+        /// is the SPA's opt-in for an Opus receive sink — only honoured
+        /// when the operator's `desktop_audio_enabled` setting is also true
+        /// AND `desktop::audio::probe_supported()` returns true. Defaults
+        /// false so a missing field never silently activates audio.
         CapabilitiesClient {
             #[serde(default)]
             codecs: Vec<String>,
             #[serde(default)]
             webcodecs: bool,
+            #[serde(default)]
+            audio: bool,
         },
         /// Per-session capture settings. `hidpi=true` skips logical downscale
         /// so the encoder gets native physical pixels — costs ~4× pixel
@@ -552,7 +558,8 @@ mod inner {
             (None, env) => env,
         };
         #[cfg_attr(not(feature = "h264"), allow(unused_variables))]
-        let (decision_pipeline, decision_reason, offer_sdp, initial_hidpi) =
+        #[cfg_attr(not(feature = "audio"), allow(unused_variables))]
+        let (decision_pipeline, decision_reason, offer_sdp, initial_hidpi, client_audio_opt_in) =
             match await_offer_with_caps(&mut socket, &pc, &mut close_rx, operator_pref).await {
                 Ok(v) => v,
                 Err(e) => {
@@ -617,7 +624,42 @@ mod inner {
         #[cfg(not(feature = "h264"))]
         let sending_track: Option<Arc<dyn TrackLocal + Send + Sync>> = None;
 
-        let h264_sender = complete_answer(&pc, offer_sdp, &ws_out_tx, sending_track).await?;
+        // Phase-02a: audio gate AND-merges three sources of truth — operator
+        // settings (`desktop_audio_enabled`), client opt-in (`client_caps.audio`,
+        // already validated by serde default-false), and the build-side probe
+        // (`desktop::audio::probe_supported`). All three must agree before we
+        // build the Opus track + add the audio transceiver. Privacy posture:
+        // default-OFF wins on any disagreement, no silent activation.
+        #[cfg(feature = "audio")]
+        let (opus_track, audio_sending_track): (
+            Option<Arc<webrtc::track::track_local::track_local_static_sample::TrackLocalStaticSample>>,
+            Option<Arc<dyn TrackLocal + Send + Sync>>,
+        ) = if matches!(pipeline, Pipeline::H264)
+            && client_audio_opt_in
+            && crate::settings::get_desktop_audio_enabled(&state.db_path)
+            && desktop::audio::probe_supported()
+        {
+            let t = crate::desktop_audio_pipeline::new_opus_track();
+            let as_trait: Arc<dyn TrackLocal + Send + Sync> = t.clone();
+            info!("audio gate passed: opus transceiver will be added before SRD");
+            (Some(t), Some(as_trait))
+        } else {
+            tracing::debug!(
+                client_audio = client_audio_opt_in,
+                "audio gate did not pass (any of: pipeline!=h264, client opt-out, setting off, probe failed)"
+            );
+            (None, None)
+        };
+        #[cfg(not(feature = "audio"))]
+        let audio_sending_track: Option<Arc<dyn TrackLocal + Send + Sync>> = None;
+        // Silence the unused-binding warning when feature="audio" is on but
+        // we don't yet pass `opus_track` to spawn_audio_pipeline (step 6e).
+        #[cfg(feature = "audio")]
+        let _ = &opus_track;
+
+        let h264_sender =
+            complete_answer(&pc, offer_sdp, &ws_out_tx, sending_track, audio_sending_track)
+                .await?;
         let _ = &h264_sender; // silence unused when feature = "h264" is off
 
         // Branch the transport pipeline now that the answer is on the wire.
@@ -646,6 +688,8 @@ mod inner {
                 decision_reason,
                 device_id,
                 &state,
+                #[cfg(feature = "audio")]
+                opus_track.clone(),
             )
             .await;
             let _ = pc.close().await;
@@ -869,6 +913,14 @@ mod inner {
         decision_reason: &'static str,
         device_id: &str,
         state: &Arc<AppState>,
+        // Phase-02a: Some when the audio gate passed AND the Opus
+        // transceiver was added before SRD. None elides the audio capture
+        // path entirely — `run_bgra` is called with `audio_tx = None`, the
+        // SCStream stays video-only, and `desktop_audio_pipeline` is never
+        // spawned.
+        #[cfg(feature = "audio")] audio_track: Option<
+            Arc<webrtc::track::track_local::track_local_static_sample::TrackLocalStaticSample>,
+        >,
     ) -> anyhow::Result<()> {
         use base64::{engine::general_purpose::STANDARD as B64_STD, Engine as _};
         use desktop::capture::CaptureLoop;
@@ -902,11 +954,32 @@ mod inner {
         // where the starter tile-set is always complete.
         let _ = cap_iframe_tx.send(());
 
+        // Phase-02a: when audio_track is Some, set up the audio mpsc + the
+        // audio-pipeline shutdown oneshot. Capture-loop receives the tx side
+        // and the SCK backend opens with audio. The rx side wraps into
+        // SckAudioCapture, fed to spawn_audio_pipeline below.
+        #[cfg(feature = "audio")]
+        let (audio_tx, audio_rx_opt) = if audio_track.is_some() {
+            // 8-slot cap matches the per-SCStream audio mpsc inside sck.rs —
+            // total buffered audio across the two channels stays bounded at
+            // ~160 ms before the pipeline starts dropping frames.
+            let (tx, rx) = mpsc::channel::<Vec<i16>>(8);
+            (Some(tx), Some(rx))
+        } else {
+            (None, None)
+        };
+        #[cfg(feature = "audio")]
+        let (ap_shutdown_tx, ap_shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+
         // ── Spawn tasks ───────────────────────────────────────────────────────
         // Capture: resolution + HiDPI locked at session start (encoder dims are
         // fixed at init), but FPS tracks the live tier slider via `quality_rx`
         // so High delivers ~30 fps, Med ~15 fps, Low ~8 fps without restart.
         let cap_fps_rx = quality_tx.subscribe();
+        #[cfg(feature = "audio")]
+        let capture_audio_tx = audio_tx.clone();
+        #[cfg(not(feature = "audio"))]
+        let capture_audio_tx: Option<mpsc::Sender<Vec<i16>>> = None;
         tokio::task::spawn_blocking(move || {
             CaptureLoop::run_bgra(
                 initial_tier,
@@ -915,8 +988,33 @@ mod inner {
                 scale_factor,
                 hidpi,
                 Some(cap_iframe_rx),
+                capture_audio_tx,
             )
         });
+
+        // Audio pipeline: only spawned when the gate passed (audio_track is
+        // Some). The capture loop already opened the SCStream in audio mode
+        // and is forwarding PCM to `audio_rx_opt`.
+        #[cfg(feature = "audio")]
+        if let (Some(track), Some(rx)) = (audio_track.as_ref(), audio_rx_opt) {
+            let capture: Box<dyn desktop::audio::AudioCapture> =
+                Box::new(desktop::audio::sck_audio::SckAudioCapture::from_receiver(rx));
+            crate::desktop_audio_pipeline::spawn_audio_pipeline(
+                crate::desktop_audio_pipeline::AudioPipelineConfig {
+                    track: track.clone(),
+                    capture,
+                    shutdown_rx: ap_shutdown_rx,
+                },
+            );
+            state.event_bus.send(crate::events::AgentEvent::AudioStarted {
+                device_id: device_id.to_string(),
+            });
+            info!("audio pipeline spawned (SCK → Opus → RTP)");
+        }
+        // Drop the audio_tx clone we held only to thread into capture; the
+        // capture loop owns its own clone now.
+        #[cfg(feature = "audio")]
+        drop(audio_tx);
 
         crate::video_pipeline::spawn_video_pipeline(crate::video_pipeline::VideoPipelineConfig {
             width: out_w,
@@ -1111,6 +1209,21 @@ mod inner {
         // ── Teardown ──────────────────────────────────────────────────────────
         let _ = vp_shutdown_tx.send(());
         let _ = rtcp_shutdown_tx.send(());
+        #[cfg(feature = "audio")]
+        {
+            // Audio pipeline teardown: fire shutdown so the encoder task exits
+            // its capture.next_frame await without leaking the SckAudioCapture
+            // (which holds the SCK audio mpsc rx). Emit AudioStopped after
+            // the signal so the dashboard reflects the actual teardown order.
+            let was_audio_on = audio_track.is_some();
+            let _ = ap_shutdown_tx.send(());
+            if was_audio_on {
+                state.event_bus.send(crate::events::AgentEvent::AudioStopped {
+                    device_id: device_id.to_string(),
+                    reason: "session_closed".to_string(),
+                });
+            }
+        }
         Ok(())
     }
 
@@ -1176,7 +1289,7 @@ mod inner {
         pc: &RTCPeerConnection,
         close_rx: &mut tokio::sync::oneshot::Receiver<()>,
         operator: OperatorPref,
-    ) -> anyhow::Result<(Pipeline, &'static str, String, bool)> {
+    ) -> anyhow::Result<(Pipeline, &'static str, String, bool, bool)> {
         let mut client_caps = ClientCapabilities::default();
         let mut initial_hidpi = false;
 
@@ -1210,6 +1323,7 @@ mod inner {
                                         decision.reason,
                                         sdp,
                                         initial_hidpi,
+                                        client_caps.audio,
                                     ));
                                 }
                                 Err(err) => {
@@ -1243,9 +1357,10 @@ mod inner {
                                 warn!(error = %e, "pre-offer ICE candidate rejected");
                             }
                         }
-                        Ok(SignalIn::CapabilitiesClient { codecs, webcodecs }) => {
+                        Ok(SignalIn::CapabilitiesClient { codecs, webcodecs, audio }) => {
                             client_caps.codecs = codecs;
                             client_caps.webcodecs = webcodecs;
+                            client_caps.audio = audio;
                         }
                         Ok(SignalIn::Settings { hidpi }) => {
                             initial_hidpi = hidpi;
@@ -1269,6 +1384,7 @@ mod inner {
         offer_sdp: String,
         ws_out_tx: &mpsc::Sender<String>,
         sending_track: Option<Arc<dyn TrackLocal + Send + Sync>>,
+        audio_sending_track: Option<Arc<dyn TrackLocal + Send + Sync>>,
     ) -> anyhow::Result<Option<Arc<RTCRtpSender>>> {
         // Pre-bind the sendonly transceiver BEFORE set_remote_description so
         // `satisfy_type_and_direction` pairs it with the client's recvonly
@@ -1278,6 +1394,13 @@ mod inner {
         // it spawns a second transceiver that doesn't map to any m-line and
         // the frames we write go nowhere. This change moves the binding
         // earlier so the single mid:0 m-line in the answer carries our RTP.
+        //
+        // Audio track (phase-02a): same gotcha applies. The Opus transceiver
+        // must be added BEFORE SRD so the BUNDLE'd answer carries an audio
+        // m-line matching the client's recvonly request. Order between
+        // video + audio doesn't matter for SDP correctness, but we bind
+        // video first to keep the video-only `rtp_sender` returned below
+        // unaffected.
         let rtp_sender = if let Some(track) = sending_track {
             let transceiver = pc
                 .add_transceiver_from_track(
@@ -1292,6 +1415,16 @@ mod inner {
         } else {
             None
         };
+        if let Some(audio_track) = audio_sending_track {
+            pc.add_transceiver_from_track(
+                audio_track,
+                Some(RTCRtpTransceiverInit {
+                    direction: RTCRtpTransceiverDirection::Sendonly,
+                    send_encodings: vec![],
+                }),
+            )
+            .await?;
+        }
         pc.set_remote_description(RTCSessionDescription::offer(offer_sdp)?)
             .await?;
         let answer = pc.create_answer(None).await?;

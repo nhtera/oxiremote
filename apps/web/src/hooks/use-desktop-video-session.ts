@@ -90,6 +90,7 @@ export function useDesktopVideoSession(
   onFrame: FrameCallback,
   tier: QualityTier = 'med',
   hidpi: boolean = false,
+  audio: boolean = false,
 ): VideoSessionApi {
   const [status, setStatus] = useState<DesktopStatus>('idle')
   const [attempt, setAttempt] = useState(0)
@@ -127,6 +128,15 @@ export function useDesktopVideoSession(
   useEffect(() => {
     hidpiRef.current = hidpi
   }, [hidpi])
+
+  // Phase-02a audio opt-in. Sent inside `capabilitiesClient` so the agent
+  // can AND-merge with its own settings + probe and add the audio
+  // transceiver BEFORE `set_remote_description`. A change after session-start
+  // does NOT renegotiate (matches H.264 fallback policy — applies next session).
+  const audioRefBool = useRef<boolean>(audio)
+  useEffect(() => {
+    audioRefBool.current = audio
+  }, [audio])
 
   // ── Hidden <video> element lifecycle ────────────────────────────────────
   //
@@ -311,7 +321,12 @@ export function useDesktopVideoSession(
       // Announce decoder capabilities BEFORE sending the offer so the server
       // can decide H.264 vs JPEG before the first ICE candidate arrives.
       ws.send(
-        JSON.stringify({ type: 'capabilitiesClient', codecs: ['h264-baseline-3.1'], webcodecs: false }),
+        JSON.stringify({
+          type: 'capabilitiesClient',
+          codecs: ['h264-baseline-3.1'],
+          webcodecs: false,
+          audio: audioRefBool.current,
+        }),
       )
       // Push the persisted HiDPI preference before the offer so the encoder
       // is built at the right resolution from session-start. Skipping this

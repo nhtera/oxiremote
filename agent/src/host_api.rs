@@ -138,6 +138,7 @@ pub async fn api_desktop_capabilities(
         let optimistic_caps = ClientCapabilities {
             codecs: vec!["h264-baseline-3.1".to_string()],
             webcodecs: true,
+            ..Default::default()
         };
         let (chosen_default, default_reason) =
             match crate::pipeline_selection::choose(op, &optimistic_caps) {

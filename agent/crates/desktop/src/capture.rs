@@ -303,6 +303,12 @@ impl CaptureLoop {
         scale_factor: f32,
         hidpi_mode: bool,
         force_iframe_rx: Option<oneshot::Receiver<()>>,
+        // Phase-02a: when `Some`, the SCK backend opens the SCStream with
+        // `with_captures_audio(true)` and forwards 20 ms i16 stereo PCM
+        // frames out through this sender. xcap fallback ignores audio
+        // (Linux + older macOS deferred per phase-02c plan). Passing
+        // `None` preserves the pre-phase-02 video-only behaviour exactly.
+        audio_tx: Option<Sender<Vec<i16>>>,
     ) {
         // ── Pick a capture backend ────────────────────────────────────────
         // Prefer ScreenCaptureKit on macOS 12.3+: GPU-resized BGRA arrives
@@ -326,6 +332,45 @@ impl CaptureLoop {
             // hot loop. Pass the highest tier's FPS so SCK never throttles
             // below what the user might select mid-session.
             let target_fps = max_tier_fps_hz();
+            if let Some(audio_tx) = audio_tx.clone() {
+                // Audio path: open one SCStream for both video + audio so
+                // BUNDLE'd A/V sync is structural at capture time. Spawn an
+                // async forwarder for the audio frames since the blocking
+                // capture loop below can't await an mpsc.
+                match crate::sck::SckCapture::new_with_audio(target_w, target_h, target_fps) {
+                    Ok((sck, mut audio_rx)) => {
+                        info!(
+                            resolution_tier = ?resolution_tier,
+                            initial_fps_tier = ?*fps_rx.borrow(),
+                            target_w, target_h, target_fps, hidpi_mode,
+                            "CaptureLoop::run_bgra started (ScreenCaptureKit, +audio)"
+                        );
+                        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                            handle.spawn(async move {
+                                while let Some(frame) = audio_rx.recv().await {
+                                    if audio_tx.send(frame).await.is_err() {
+                                        // Consumer dropped the audio pipeline
+                                        // (session closed). Drop the rx so the
+                                        // SCK handler stops trying to send;
+                                        // video keeps running.
+                                        break;
+                                    }
+                                }
+                            });
+                        } else {
+                            warn!(
+                                "no tokio runtime handle inside spawn_blocking; \
+                                 audio forwarder not started"
+                            );
+                        }
+                        return run_bgra_sck(sck, fps_rx, tx, force_iframe_rx);
+                    }
+                    Err(err) => warn!(
+                        error = %err,
+                        "ScreenCaptureKit (audio) init failed; trying video-only SCK"
+                    ),
+                }
+            }
             match crate::sck::SckCapture::new(target_w, target_h, target_fps) {
                 Ok(sck) => {
                     info!(
@@ -339,6 +384,10 @@ impl CaptureLoop {
                 Err(err) => warn!(error = %err, "ScreenCaptureKit init failed, falling back to xcap"),
             }
         }
+        // xcap fallback: audio is not supported on this path. Drop the sender
+        // so the consumer's recv returns None and the audio pipeline shuts
+        // down cleanly instead of hanging.
+        let _ = audio_tx;
 
         let capture = match ScreenCapture::primary() {
             Ok(c) => c,

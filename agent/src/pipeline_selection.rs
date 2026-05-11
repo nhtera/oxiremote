@@ -140,6 +140,12 @@ fn parse_preference(input: Option<&str>) -> OperatorPref {
 pub struct ClientCapabilities {
     pub codecs: Vec<String>,
     pub webcodecs: bool,
+    /// Client opts in to a receive-side `<audio>` sink for an Opus track.
+    /// Combined with the operator's `desktop_audio_enabled` setting + a
+    /// successful `desktop::audio::probe_supported()` to gate the audio
+    /// transceiver before `set_remote_description`. Defaults to false so
+    /// older SPAs that don't send the field never get an audio m-line.
+    pub audio: bool,
 }
 
 impl ClientCapabilities {

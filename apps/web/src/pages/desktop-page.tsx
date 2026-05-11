@@ -48,6 +48,12 @@ interface Capabilities {
   /** What `Auto` would resolve to right now given an optimistic client cap
    *  set. Used as the SPA's pre-mount hint when `preferred_pipeline === 'auto'`. */
   chosen_default?: 'jpeg' | 'h264'
+  /** Phase-02a: operator has flipped the desktop_audio_enabled setting on. */
+  audio_enabled?: boolean
+  /** Phase-02a: build-side `desktop::audio::probe_supported()` outcome — only
+   *  AND-merged with `audio_enabled` does the SPA advertise `audio: true` in
+   *  the WS `capabilitiesClient`. */
+  audio_supported?: boolean
 }
 
 interface SessionApi {
@@ -530,6 +536,7 @@ export default function DesktopPage() {
             onZoomChange={setUserScale}
             onGestureApi={handleGestureApi}
             bottomAnchor={keyboardOpen}
+            audio={!!(caps?.audio_enabled && caps?.audio_supported)}
           />
         ) : (
           <DesktopJpegView
