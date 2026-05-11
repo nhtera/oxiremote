@@ -39,6 +39,14 @@ interface Props {
   onQualityChange: (tier: QualityTier) => void
   onSettingsChange: (next: { hidpi: boolean; smoothScaling: boolean }) => void
   pipeline: 'h264' | 'jpeg'
+  /** Phase-02a: whether the audio gate passed at session-start (operator
+   *  setting + probe + H.264 path). Drives chip visibility — hidden entirely
+   *  when no audio path exists for this session. */
+  audioGated?: boolean
+  /** True when the audio pipeline is alive on the wire right now. */
+  audioActive?: boolean
+  /** Tap-to-toggle. On→Off mutes via WS (instant); Off→On reconnects. */
+  onToggleAudio?: () => void
 }
 
 export default function DesktopTopStrip({
@@ -62,6 +70,9 @@ export default function DesktopTopStrip({
   onQualityChange,
   onSettingsChange,
   pipeline,
+  audioGated = false,
+  audioActive = false,
+  onToggleAudio,
 }: Props) {
   const [menuOpen, setMenuOpen] = useState(false)
   const zoomLabel =
@@ -118,6 +129,34 @@ export default function DesktopTopStrip({
           {zoomLabel}
         </span>
         <TransportPill compact />
+
+        {audioGated && (
+          <button
+            type="button"
+            onClick={onToggleAudio}
+            aria-pressed={audioActive}
+            title={
+              audioActive
+                ? 'Mute audio for this session'
+                : 'Re-enable audio (triggers a session reconnect)'
+            }
+            className={[
+              'inline-flex items-center gap-1 h-6 px-2 rounded-full text-[11px] font-medium border transition-colors',
+              audioActive
+                ? 'border-[hsl(var(--accent-primary)/0.4)] bg-[hsl(var(--accent-primary)/0.18)] text-[hsl(var(--accent-primary))]'
+                : 'border-border bg-surface-alt text-text-secondary hover:text-text-primary hover:bg-surface-hover',
+            ].join(' ')}
+          >
+            <span
+              className={
+                'inline-block w-1.5 h-1.5 rounded-full ' +
+                (audioActive ? 'bg-[hsl(var(--accent-primary))]' : 'bg-text-muted')
+              }
+              aria-hidden="true"
+            />
+            {audioActive ? 'On' : 'Off'}
+          </button>
+        )}
 
         <div className="flex-1" />
 

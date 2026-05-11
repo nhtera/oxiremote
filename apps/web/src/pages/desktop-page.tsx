@@ -541,6 +541,9 @@ export default function DesktopPage() {
         onQualityChange={handleQualityChange}
         onSettingsChange={handleSettingsChange}
         pipeline={useH264 ? 'h264' : 'jpeg'}
+        audioGated={audioGatePass}
+        audioActive={audioActive}
+        onToggleAudio={handleToggleAudio}
       />
 
       {/* Disable touch/pointer events on the canvas while text-batch sheet is open
