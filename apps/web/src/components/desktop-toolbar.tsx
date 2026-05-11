@@ -32,6 +32,16 @@ interface Props {
   textBatchOpen?: boolean
   /** Toggle the text-batch sheet. */
   onToggleTextBatch?: () => void
+  /** Phase-02a: whether the audio gate passed at session-start. Drives row
+   *  visibility — hidden entirely when no audio path exists for this session. */
+  audioGated?: boolean
+  /** True when the audio pipeline is alive on the wire right now. Flips
+   *  false after `onToggleAudio` fires; cannot flip back without reconnect. */
+  audioActive?: boolean
+  /** Sidebar mute action — fires the per-session `audioToggle` over the WS,
+   *  triggering server-side teardown with `UserToggleOff`. Re-enable requires
+   *  reconnect (matches hidpi-flip / H.264 fallback policy). */
+  onToggleAudio?: () => void
 }
 
 // Sticky modifier keys — toggled on tap, cleared after next key dispatch
@@ -89,6 +99,9 @@ export default function DesktopToolbar({
   onExit,
   textBatchOpen = false,
   onToggleTextBatch,
+  audioGated = false,
+  audioActive = false,
+  onToggleAudio,
 }: Props) {
   const [activeModifiers, setActiveModifiers] = useState<Set<ModKey>>(new Set())
   const [settingsOpen, setSettingsOpen] = useState(false)
@@ -332,6 +345,44 @@ export default function DesktopToolbar({
           </button>
         ))}
       </div>
+
+      {/* Phase-02a audio toggle — visible only when the gate passed at
+          session-start (operator setting + probe + H.264 path). One-way
+          mute: clicking off fires `audioToggle` over the WS, server tears
+          the audio pipeline down via `UserToggleOff`, video continues.
+          Re-enable requires reconnect (matches hidpi-flip policy). */}
+      {audioGated && (
+        <div className="hidden lg:flex items-center justify-between gap-2 pt-1">
+          <span className="text-[10px] uppercase tracking-[0.12em] text-text-muted">
+            Audio
+          </span>
+          <button
+            type="button"
+            onClick={() => audioActive && onToggleAudio?.()}
+            disabled={!audioActive}
+            title={
+              audioActive
+                ? 'Mute audio for this session'
+                : 'Audio off — reconnect to re-enable'
+            }
+            className={
+              'inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full text-[11px] border transition-colors ' +
+              (audioActive
+                ? 'border-accent/40 bg-accent/10 text-accent hover:bg-accent/20'
+                : 'border-border bg-surface-alt text-text-muted cursor-not-allowed')
+            }
+          >
+            <span
+              className={
+                'inline-block w-1.5 h-1.5 rounded-full ' +
+                (audioActive ? 'bg-accent' : 'bg-text-muted')
+              }
+              aria-hidden="true"
+            />
+            {audioActive ? 'On' : 'Off'}
+          </button>
+        </div>
+      )}
 
       {/* Transport indicator — lg only. Labelled so it doesn't read as an
           orphan pill; mobile sees the same info via DesktopTopStrip. */}

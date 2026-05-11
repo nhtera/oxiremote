@@ -41,6 +41,10 @@ interface VideoSessionApi {
   sendInput: (ev: DesktopInputEvent) => void
   setQuality: (tier: QualityTier) => void
   setSettings: (next: { hidpi: boolean }) => void
+  /** Phase-02a: client-driven audio mute. `false` tears down the audio
+   *  pipeline server-side via `UserToggleOff`; `true` is a no-op (re-enable
+   *  needs reconnect — matches hidpi-flip / H.264 fallback policy). */
+  toggleAudio: (enabled: boolean) => void
   disconnect: () => void
   attempt: number
   /** Set once the agent announces the stream dimensions via `capabilities`. */
@@ -502,6 +506,15 @@ export function useDesktopVideoSession(
     (next: { hidpi: boolean }) => sendCtrl({ t: 'settings', hidpi: next.hidpi }),
     [],
   )
+  // Phase-02a: audio toggle goes over the signaling WS only (not ctrl DC).
+  // The ctrl DC parses WireInput (t-tagged); the signaling WS parses SignalIn
+  // (type-tagged), and only the latter knows `audioToggle`. Sending via DC
+  // would be silently dropped by the WireInput parser.
+  const toggleAudio = useCallback((enabled: boolean) => {
+    if (wsRef.current?.readyState === WebSocket.OPEN) {
+      wsRef.current.send(JSON.stringify({ type: 'audioToggle', enabled }))
+    }
+  }, [])
 
   const disconnect = useCallback(() => {
     destroyedRef.current = true
@@ -539,6 +552,7 @@ export function useDesktopVideoSession(
     sendInput,
     setQuality,
     setSettings,
+    toggleAudio,
     disconnect,
     attempt,
     screenDims,

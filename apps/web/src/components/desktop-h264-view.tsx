@@ -31,6 +31,10 @@ interface SessionApi {
   sendInput: (ev: DesktopInputEvent) => void
   setQuality: (tier: QualityTier) => void
   setSettings: (next: { hidpi: boolean }) => void
+  /** Phase-02a: client-driven audio mute. Sends `audioToggle` over the
+   *  signaling WS. `false` tears down the audio pipeline server-side via
+   *  `UserToggleOff`; `true` requires reconnect (server logs + ignores). */
+  toggleAudio?: (enabled: boolean) => void
   disconnect: () => void
   screenshot?: () => Promise<void>
 }
@@ -122,7 +126,7 @@ export default function DesktopH264View({
     ctx.drawImage(video, 0, 0, w, h)
   }, [])
 
-  const { status, sendInput, setQuality, setSettings, disconnect, attempt, screenDims, pipelineInfo } =
+  const { status, sendInput, setQuality, setSettings, toggleAudio, disconnect, attempt, screenDims, pipelineInfo } =
     useDesktopVideoSession(hostId, deviceId, onFrame, quality, hidpi, audio)
 
   useEffect(() => {
@@ -138,8 +142,8 @@ export default function DesktopH264View({
   }, [hostLabel])
 
   useEffect(() => {
-    onSessionApi({ sendInput, setQuality, setSettings, disconnect, screenshot })
-  }, [sendInput, setQuality, setSettings, disconnect, screenshot, onSessionApi])
+    onSessionApi({ sendInput, setQuality, setSettings, toggleAudio, disconnect, screenshot })
+  }, [sendInput, setQuality, setSettings, toggleAudio, disconnect, screenshot, onSessionApi])
 
   // Set an initial canvas size from the monitor hint so the layout doesn't
   // pop when the first frame arrives; the onFrame loop adjusts precisely.

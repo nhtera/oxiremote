@@ -97,6 +97,19 @@ mod inner {
             #[serde(default)]
             hidpi: bool,
         },
+        /// Phase-02a: client-driven audio mute mid-session. `enabled=false`
+        /// fires the audio pipeline shutdown with `UserToggleOff`; video
+        /// continues. `enabled=true` is logged + ignored (re-enabling needs
+        /// reconnect — matches the hidpi-flip / H.264 fallback policy since
+        /// the SCK audio mpsc + Opus transceiver were never created if the
+        /// gate didn't pass at session-start). `enabled` is read only on
+        /// `feature = "audio"` builds — dead-code allow scoped to the
+        /// variant so the default build stays warning-clean.
+        #[cfg_attr(not(feature = "audio"), allow(dead_code))]
+        AudioToggle {
+            #[serde(default)]
+            enabled: bool,
+        },
     }
 
     /// Signaling messages the agent sends to the client (WS text channel).
@@ -1239,6 +1252,34 @@ mod inner {
                 msg = socket.recv() => {
                     match msg {
                         Some(Ok(Message::Text(text))) => {
+                            // Phase-02a: client-driven audio mute is handled
+                            // here (not in `on_incoming_text`) because the
+                            // shutdown sender is owned by this session and
+                            // is feature-gated. Cheap substring pre-check
+                            // avoids a JSON parse on every input/quality msg.
+                            #[cfg(feature = "audio")]
+                            if text.contains("audioToggle")
+                                && let Ok(SignalIn::AudioToggle { enabled }) =
+                                    serde_json::from_str::<SignalIn>(&text)
+                            {
+                                if !enabled {
+                                    if let Some(tx) = ap_shutdown_tx.take() {
+                                        info!(
+                                            device = %device_id,
+                                            "client requested audio mute mid-session"
+                                        );
+                                        let _ = tx.send(
+                                            crate::desktop_audio_pipeline::StopReason::UserToggleOff,
+                                        );
+                                    }
+                                } else {
+                                    info!(
+                                        device = %device_id,
+                                        "client audioToggle=true ignored (reconnect required)"
+                                    );
+                                }
+                                continue;
+                            }
                             on_incoming_text(
                                 &text,
                                 pc,
@@ -1415,6 +1456,14 @@ mod inner {
                         }
                         Ok(SignalIn::Settings { hidpi }) => {
                             initial_hidpi = hidpi;
+                        }
+                        Ok(SignalIn::AudioToggle { .. }) => {
+                            // Pre-offer phase: the audio pipeline isn't
+                            // spawned yet (it boots inside `run_h264_session`
+                            // after SDP exchange). Ignoring keeps clients
+                            // from racing the toggle ahead of the offer.
+                            // Post-session toggle is honoured in the WS arm
+                            // of `run_h264_session` once the pipeline lives.
                         }
                         Err(e) => warn!(error = %e, "unknown signaling message — ignored"),
                     }

@@ -60,6 +60,8 @@ interface SessionApi {
   sendInput: (ev: DesktopInputEvent) => void
   setQuality: (tier: QualityTier) => void
   setSettings: (next: { hidpi: boolean }) => void
+  /** Phase-02a: H.264 view exposes this; JPEG view doesn't (no audio path). */
+  toggleAudio?: (enabled: boolean) => void
   disconnect: () => void
   /** Trigger a PNG screenshot download. View-specific implementation. */
   screenshot?: () => Promise<void>
@@ -471,6 +473,21 @@ export default function DesktopPage() {
     ? { width: caps.monitors[0].width, height: caps.monitors[0].height }
     : undefined
 
+  // Phase-02a: per-session audio active state. True when the gate passes
+  // at session-start (operator setting + probe + H.264 path); flips false
+  // when the user mutes via the sidebar. Reset on each fresh session via
+  // `reloadNonce` (re-enable mid-session needs reconnect).
+  const audioGatePass = !!(caps?.audio_enabled && caps?.audio_supported) && useH264
+  const [audioActive, setAudioActive] = useState(false)
+  useEffect(() => {
+    setAudioActive(audioGatePass)
+  }, [audioGatePass, reloadNonce])
+  const handleToggleAudio = useCallback(() => {
+    if (!audioActive) return
+    sessionApiRef.current.toggleAudio?.(false)
+    setAudioActive(false)
+  }, [audioActive])
+
   const showReconnect =
     status === 'reconnecting' || (status === 'disconnected' && attempt >= 3)
 
@@ -596,6 +613,9 @@ export default function DesktopPage() {
           onExit={handleExit}
           textBatchOpen={showTextBatch}
           onToggleTextBatch={() => setShowTextBatch((v) => !v)}
+          audioGated={audioGatePass}
+          audioActive={audioActive}
+          onToggleAudio={handleToggleAudio}
         />
       </div>
 
