@@ -46,6 +46,10 @@ mod pipeline_selection;
 // VT/OpenH264 toolchain.
 #[cfg(feature = "h264")]
 mod video_pipeline;
+// Audio pipeline — gated on the agent's `audio` feature (forwards to
+// desktop/audio). Off by default until phase-02a + 02b both ship.
+#[cfg(feature = "audio")]
+mod desktop_audio_pipeline;
 mod terminal_api;
 mod terminal_buffer;
 mod terminal_pty;

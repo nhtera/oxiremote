@@ -30,6 +30,9 @@ pub mod wasapi_loopback;
 #[cfg(target_os = "macos")]
 pub mod core_audio_loopback;
 
+#[cfg(target_os = "macos")]
+pub mod sck_audio;
+
 #[cfg(all(unix, not(target_os = "macos")))]
 pub mod linux_pulse;
 
@@ -57,13 +60,27 @@ pub trait AudioCapture: Send {
 /// endpoint + agent-state endpoint so the SPA renders an honest greyed-out
 /// toggle without paying a device-open round-trip.
 ///
-/// Today every platform stub returns `Unsupported` immediately (no system
-/// calls), so calling this is essentially free. When the real Windows
-/// WASAPI impl lands, it MUST keep this contract — probe shape only,
-/// no device acquisition. Open the device lazily when the operator
-/// actually flips audio on for a session.
+/// Per-platform implementations:
+/// - **macOS**: delegates to `sck_audio::probe_supported` which checks
+///   Screen Recording permission via `SCShareableContent::get` and caches
+///   the result for the binary lifetime. The audio capture itself is
+///   coupled to the video SCStream (`crate::sck::SckCapture::new_with_audio`),
+///   so the trait factory below returns `Unsupported` on macOS — this
+///   function is the only honest signal the SPA can poll.
+/// - **Other platforms**: falls back to `make_default().is_ok()`. Windows
+///   WASAPI is the only other in-scope path (phase-02b); when it lands it
+///   MUST keep the contract — probe shape only, no device acquisition.
+///   Open the device lazily when the operator actually flips audio on for
+///   a session.
 pub fn probe_supported() -> bool {
-    make_default().is_ok()
+    #[cfg(target_os = "macos")]
+    {
+        sck_audio::probe_supported()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        make_default().is_ok()
+    }
 }
 
 /// Construct the platform-default capture. Returns `Unsupported` on every

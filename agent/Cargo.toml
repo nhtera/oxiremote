@@ -163,3 +163,7 @@ desktop = ["dep:desktop", "dep:webrtc"]
 # (`--no-default-features --features desktop`) still compiles cleanly so the
 # transport split survives a feature-flag rollback.
 h264 = ["desktop", "desktop/h264", "dep:rtcp"]
+# Audio pipeline (Opus over WebRTC). Forwards to the desktop subcrate's
+# `audio` feature so the OpusEncoder + per-platform AudioCapture compile.
+# NOT in default — opt-in until phase-02a (macOS) + 02b (Windows) both ship.
+audio = ["desktop", "desktop/audio"]
