@@ -1101,7 +1101,46 @@ mod inner {
         // device_id without reaching into pipeline internals. Optional
         // because non-desktop builds carry `Option<Arc<DesktopService>>`.
         if let Some(svc) = state.desktop_service.as_ref() {
-            svc.attach_abr_tx(device_id, abr_tx);
+            svc.attach_abr_tx(device_id, abr_tx.clone());
+        }
+
+        // Phase-03 step 3: spawn the ABR controller. Skipped entirely on
+        // loopback origins — same-machine paths have 0% loss + ~0 ms RTT,
+        // so the controller has no signal to act on and would stay in
+        // Comfort forever. The encoder keeps the operator's tier_bitrate
+        // via the existing watch wiring; this matches the REMB-bypass
+        // posture in `spawn_rtcp_reader`.
+        let (abr_shutdown_tx, abr_shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        let mut abr_shutdown_tx = Some(abr_shutdown_tx);
+        if !client_loopback {
+            let initial_kbps = tier_bitrate(initial_tier, hidpi).0 / 1_000;
+            // Floor = Low-tier preset (no HiDPI scaling) — controller can
+            // cut bitrate aggressively in Recovery but never drops below a
+            // value where the encoder produces visible artifacts. Ceiling =
+            // current operator tier bitrate; mid-session tier changes
+            // briefly override via the existing `quality_rx.changed()` arm,
+            // and the controller re-establishes over its next few ticks.
+            let floor_kbps = BitrateBps::LOW.0 / 1_000;
+            crate::desktop_abr::spawn_controller(crate::desktop_abr::ControllerConfig {
+                abr_rx: abr_tx.subscribe(),
+                bitrate_tx: bitrate_tx.clone(),
+                event_bus: Arc::clone(&state.event_bus),
+                device_id: device_id.to_string(),
+                floor_kbps,
+                ceiling_kbps: initial_kbps,
+                tunables: crate::desktop_abr::AbrTunables::from_env(),
+                shutdown_rx: abr_shutdown_rx,
+            });
+        } else {
+            // Drop the receiver so the channel doesn't hold a dangling
+            // sender on shutdown teardown below. The Option-take keeps
+            // teardown idempotent.
+            drop(abr_shutdown_rx);
+            abr_shutdown_tx = None;
+            info!(
+                device = %device_id,
+                "h264: client signalled loopback origin — ABR controller skipped"
+            );
         }
 
         info!(
@@ -1354,6 +1393,9 @@ mod inner {
         // ── Teardown ──────────────────────────────────────────────────────────
         let _ = vp_shutdown_tx.send(());
         let _ = rtcp_shutdown_tx.send(());
+        if let Some(tx) = abr_shutdown_tx.take() {
+            let _ = tx.send(());
+        }
         #[cfg(feature = "audio")]
         {
             // Audio pipeline teardown: fire shutdown so the encoder task exits

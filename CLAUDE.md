@@ -112,6 +112,11 @@ The dashboard `TunnelStatusPill` and `TunnelStatusCard` render a tri-state: gree
 | `OXIREMOTE_INSTALL_DIR` | Override install target dir for `scripts/install.sh`. |
 | `OXIREMOTE_BINARY_URL` | npm-wrapper download base URL (corp proxies / mirrors). |
 | `OXIREMOTE_VERSION` | Pin a specific release tag in the install script (`oxiremote update` always tracks `latest`). |
+| `OXI_ABR_PROBE_INTERVAL_S` | **Advanced/debug.** Seconds in Comfort before the H.264 ABR controller probes for headroom. Default `5`, min `1`. |
+| `OXI_ABR_RECOVERY_CUT_PCT` | **Advanced/debug.** Bitrate cut % applied on entry to Recovery zone. Default `30`, clamped `5-90`. |
+| `OXI_ABR_PROBE_STEP_PCT` | **Advanced/debug.** Bitrate bump % per Probe tick. Default `10`, clamped `1-50`. |
+| `OXI_ABR_HYSTERESIS_TICKS` | **Advanced/debug.** Consecutive 1 Hz ticks of agreement required for a non-Recovery zone transition. Default `2`, clamped `1-10`. (Recovery always skips hysteresis.) |
+| `OXI_ABR_ANTI_THRASH_S` | **Advanced/debug.** Minimum seconds between any two zone transitions (Recovery exempt). Default `4`, min `1`. |
 
 ## Macros and gotchas
 

@@ -220,6 +220,18 @@ pub enum AgentEvent {
         device_id: String,
         reason: String,
     },
+    /// Phase-03 ABR controller transitioned between zones (Comfort/Probe/
+    /// Recovery). `reason` is a short stable identifier ("loss_5pct",
+    /// "rtt_500ms", "recovered", "probe_interval") suitable for dashboards
+    /// and metric labels — keep it free of float values so cardinality stays
+    /// bounded.
+    AbrZoneChange {
+        device_id: String,
+        from: String,
+        to: String,
+        reason: String,
+        target_bitrate_kbps: u32,
+    },
 }
 
 /// Lightweight tunnel-state snapshot kept in lockstep with broadcast events.
