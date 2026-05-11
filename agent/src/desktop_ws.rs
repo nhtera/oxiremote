@@ -164,7 +164,7 @@ mod inner {
         /// Phase-01: session-start IDR watchdog tripped. The agent has
         /// already initiated PC teardown; the client is expected to reconnect
         /// with `?force_pipeline=jpeg` so the rescue session bypasses H.264.
-        /// `reason` is a stable identifier (e.g. `"no-idr-3s"`) — keep it
+        /// `reason` is a stable identifier (e.g. `"no-idr-5s"`) — keep it
         /// short, it goes into the pill tooltip on the next session.
         FallbackPending {
             reason: &'a str,
@@ -1074,14 +1074,21 @@ mod inner {
 
         // ── Main WS loop, pumping signaling + watching for first IDR ──────────
         //
-        // Phase-01 session-start watchdog: 3 s budget from
+        // Phase-01 session-start watchdog: budget from
         // `RTCPeerConnectionState::Connected` to first IDR. Starting the
         // timer at session entry (before ICE) would false-positive on slow
         // cellular paths where ICE itself can take 3-5 s. We register a
         // PC-state-change callback that signals a Notify when Connected;
-        // the watchdog future awaits the notify then sleeps 3 s. If the
-        // first IDR arrives before the timer fires we set `params_rx =
-        // None` and the watchdog arm becomes unselectable.
+        // the watchdog future awaits the notify then sleeps. If the first
+        // IDR arrives before the timer fires we set `params_rx = None` and
+        // the watchdog arm becomes unselectable.
+        //
+        // Budget breakdown (worst case observed): PC connected → SCK init
+        // ~450 ms → first BGRA frame with audio + HiDPI 3.3 MP up to ~3 s
+        // → encode + params → ~50 ms. The original 3 s was too tight when
+        // both audio and HiDPI were enabled, causing spurious JPEG
+        // fallbacks. 5 s gives 2 s headroom while keeping the user wait
+        // bounded.
         let mut params_rx = Some(params_rx);
         let connected_notify = Arc::new(tokio::sync::Notify::new());
         {
@@ -1108,7 +1115,7 @@ mod inner {
         let watchdog_notify = Arc::clone(&connected_notify);
         let watchdog = async move {
             watchdog_notify.notified().await;
-            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
         };
         tokio::pin!(watchdog);
 
@@ -1180,7 +1187,7 @@ mod inner {
                         "h264: session-start IDR watchdog tripped — signaling FallbackPending"
                     );
                     if let Ok(txt) = serde_json::to_string(&SignalOut::FallbackPending {
-                        reason: "no-idr-3s",
+                        reason: "no-idr-5s",
                     }) {
                         let _ = socket.send(Message::Text(txt.into())).await;
                     }
