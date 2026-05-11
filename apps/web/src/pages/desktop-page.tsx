@@ -8,7 +8,7 @@
 // Both views push session state + API up to this shell, which owns the
 // shared toolbar, gesture help sheet, and reconnect modal.
 
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { lazy, Suspense, useCallback, useEffect, useRef, useState } from 'react'
 import { useNavigate, useParams } from 'react-router-dom'
 import { useHostStore } from '../state/host-store'
 import type {
@@ -32,6 +32,11 @@ import DesktopTextBatchSheet from '../components/desktop-text-batch-sheet'
 import DesktopTextStrip from '../components/desktop-text-strip'
 import DesktopExitConfirm from '../components/desktop-exit-confirm'
 import ReconnectModal from '../components/reconnect-modal'
+// Phase-03 step 6: stats overlay is lazy-loaded so the main bundle stays
+// under the 250 KB cap. Mount only when `?stats=1` URL param OR persisted
+// "Show stream stats" toggle is on. Suspense fallback is null — we'd
+// rather render nothing than flash a placeholder for ~50 ms.
+const DesktopStatsOverlay = lazy(() => import('../components/desktop-stats-overlay'))
 import { useConfirm } from '../components/ui'
 import { useSendTextLiteral } from '../hooks/use-desktop-input'
 import { useDesktopKeyboardCapture } from '../hooks/use-desktop-keyboard-capture'
@@ -94,6 +99,20 @@ function loadPipelinePref(): PipelinePref {
   if (typeof localStorage === 'undefined') return 'auto'
   const v = localStorage.getItem(PIPELINE_PREF_KEY)
   return v === 'h264' || v === 'jpeg' ? v : 'auto'
+}
+
+// Phase-03 step 7: stats overlay gate. URL `?stats=1` enables for the
+// current session only (debug ergonomics — leave the URL, refresh, gone).
+// Persisted setting `oxi.desktop.show_stats` enables across sessions.
+// Either is sufficient to render the overlay.
+const STATS_PREF_KEY = 'oxi.desktop.show_stats'
+function urlWantsStats(): boolean {
+  if (typeof window === 'undefined') return false
+  return new URLSearchParams(window.location.search).get('stats') === '1'
+}
+function loadStatsPref(): boolean {
+  if (typeof localStorage === 'undefined') return false
+  return localStorage.getItem(STATS_PREF_KEY) === '1'
 }
 
 function loadSettings(): DisplaySettings {
@@ -196,6 +215,22 @@ export default function DesktopPage() {
   // retry H.264 deliberately.
   const [forceJpegSession, setForceJpegSession] = useState(false)
   const sessionApiRef = useRef<SessionApi>(noopApi)
+
+  // Phase-03 step 7: stats overlay gate. Initial value composes the URL
+  // hint with the persisted setting; further changes only flow through the
+  // popover toggle (URL is read-once at mount).
+  const [showStats, setShowStatsState] = useState<boolean>(
+    () => urlWantsStats() || loadStatsPref(),
+  )
+  const setShowStats = useCallback((next: boolean) => {
+    setShowStatsState(next)
+    try {
+      if (next) localStorage.setItem(STATS_PREF_KEY, '1')
+      else localStorage.removeItem(STATS_PREF_KEY)
+    } catch {
+      /* private mode / quota — best-effort */
+    }
+  }, [])
 
   // User-driven pipeline preference (Auto/H.264/JPEG). Mid-session change
   // triggers a reconnect via `reloadNonce` so the WS upgrade picks up the
@@ -591,7 +626,18 @@ export default function DesktopPage() {
         onToggleAudio={handleToggleAudio}
         pipelinePref={pipelinePref}
         onPipelinePrefChange={setPipelinePref}
+        showStats={showStats}
+        onShowStatsChange={setShowStats}
       />
+
+      {/* Phase-03 step 6: stats overlay. Lazy-loaded, mounts only when
+          gated on. The H.264 view is the only producer right now — JPEG
+          sessions get a 404 and the overlay renders "stats: closed". */}
+      {showStats && useH264 && (
+        <Suspense fallback={null}>
+          <DesktopStatsOverlay hostId={hostId} />
+        </Suspense>
+      )}
 
       {/* Disable touch/pointer events on the canvas while text-batch sheet is open
           so taps on the visible canvas don't register as remote clicks. */}
@@ -694,6 +740,8 @@ export default function DesktopPage() {
           onToggleAudio={handleToggleAudio}
           pipelinePref={pipelinePref}
           onPipelinePrefChange={setPipelinePref}
+          showStats={showStats}
+          onShowStatsChange={setShowStats}
         />
       </div>
 

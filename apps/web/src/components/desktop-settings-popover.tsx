@@ -27,6 +27,11 @@ interface Props {
    *  default; explicit picks override per-session via `?force_pipeline=`. */
   pipelinePref?: PipelinePref
   onPipelinePrefChange?: (p: PipelinePref) => void
+  /** Phase-03 step 7: persisted "Show stream stats" toggle. Persists across
+   *  sessions in localStorage; `?stats=1` URL is a separate session-only
+   *  trigger handled in `desktop-page.tsx`. */
+  showStats?: boolean
+  onShowStatsChange?: (v: boolean) => void
 }
 
 const QUALITY_OPTIONS: { value: QualityTier; label: string }[] = [
@@ -49,6 +54,8 @@ export default function DesktopSettingsPopover({
   pipeline,
   pipelinePref = 'auto',
   onPipelinePrefChange,
+  showStats = false,
+  onShowStatsChange,
 }: Props) {
   return (
     <div
@@ -155,6 +162,26 @@ export default function DesktopSettingsPopover({
             </div>
           </div>
         </label>
+
+        {/* Phase-03 step 7: persisted overlay toggle. The `?stats=1` URL
+            param is a separate session-only path handled in desktop-page;
+            this toggle drives the cross-session preference. */}
+        {onShowStatsChange && (
+          <label className="flex items-start gap-2 cursor-pointer py-1">
+            <input
+              type="checkbox"
+              checked={showStats}
+              onChange={(e) => onShowStatsChange(e.target.checked)}
+              className="mt-0.5 accent-accent"
+            />
+            <div className="flex-1 min-w-0">
+              <div className="text-xs text-text-primary">Show stream stats</div>
+              <div className="text-[10px] text-text-muted leading-tight">
+                Bottom-right overlay: bitrate, RTT, loss, encode timing.
+              </div>
+            </div>
+          </label>
+        )}
       </div>
     </div>
   )

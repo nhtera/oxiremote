@@ -70,25 +70,29 @@ if (total > MAX_GZIP_BYTES) {
 
 console.log('✓ bundle-size within budget')
 
-// Secondary gate: lazy desktop chunk (Phase 04) must stay under 60 KB gz.
+// Secondary gate: every lazy desktop chunk (page + workers + overlays)
+// must stay under 60 KB gz. We iterate instead of picking the first match
+// because phase-03 added `desktop-stats-overlay-*.js`, and pre-phase-03
+// the alphabetically-first chunk happened to be the heaviest one — that
+// coincidence stops holding once siblings exist.
 const assetsDir = join(distDir, 'assets')
-const desktopChunks = readdirSync(assetsDir).filter(
-  (f) => /^desktop(-page)?-.*\.js$/.test(f),
-)
+const desktopChunks = readdirSync(assetsDir).filter((f) => /^desktop-.*\.js$/.test(f))
 if (desktopChunks.length === 0) {
   console.warn('desktop-chunk: no desktop-*.js found in assets/ (skipping gate)')
 } else {
-  const chunk = desktopChunks[0]
-  const raw = readFileSync(join(assetsDir, chunk))
-  const gz = gzipSync(raw).byteLength
-  console.log(
-    `\ndesktop-chunk: ${chunk} ${gz} B / limit ${MAX_DESKTOP_CHUNK_GZIP_BYTES} B`,
-  )
-  if (gz > MAX_DESKTOP_CHUNK_GZIP_BYTES) {
-    console.error(
-      `✖ desktop-chunk: exceeds budget by ${gz - MAX_DESKTOP_CHUNK_GZIP_BYTES} bytes.`,
+  let anyOver = false
+  for (const chunk of desktopChunks) {
+    const raw = readFileSync(join(assetsDir, chunk))
+    const gz = gzipSync(raw).byteLength
+    const over = gz > MAX_DESKTOP_CHUNK_GZIP_BYTES
+    console.log(
+      `\ndesktop-chunk: ${chunk.padEnd(44)} ${String(gz).padStart(6)} B / limit ${MAX_DESKTOP_CHUNK_GZIP_BYTES} B`,
     )
-    process.exit(1)
+    if (over) {
+      console.error(`✖ exceeds budget by ${gz - MAX_DESKTOP_CHUNK_GZIP_BYTES} bytes.`)
+      anyOver = true
+    }
   }
-  console.log('✓ desktop-chunk within budget')
+  if (anyOver) process.exit(1)
+  console.log('✓ all desktop chunks within budget')
 }

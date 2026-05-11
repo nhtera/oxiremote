@@ -45,6 +45,10 @@ interface Props {
   /** User-driven pipeline preference — forwarded into the Display popover. */
   pipelinePref?: 'auto' | 'h264' | 'jpeg'
   onPipelinePrefChange?: (p: 'auto' | 'h264' | 'jpeg') => void
+  /** Phase-03 step 7: persisted "Show stream stats" checkbox in the Display
+   *  popover. Drives the lazy-loaded stats overlay in `desktop-page.tsx`. */
+  showStats?: boolean
+  onShowStatsChange?: (v: boolean) => void
 }
 
 // Sticky modifier keys — toggled on tap, cleared after next key dispatch
@@ -107,6 +111,8 @@ export default function DesktopToolbar({
   onToggleAudio,
   pipelinePref,
   onPipelinePrefChange,
+  showStats,
+  onShowStatsChange,
 }: Props) {
   const [activeModifiers, setActiveModifiers] = useState<Set<ModKey>>(new Set())
   const [settingsOpen, setSettingsOpen] = useState(false)
@@ -332,6 +338,8 @@ export default function DesktopToolbar({
               pipeline={pipeline}
               pipelinePref={pipelinePref}
               onPipelinePrefChange={onPipelinePrefChange}
+              showStats={showStats}
+              onShowStatsChange={onShowStatsChange}
             />
           )}
         </div>

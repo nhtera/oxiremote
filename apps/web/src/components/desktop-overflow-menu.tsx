@@ -35,6 +35,9 @@ interface Props {
   /** User-driven pipeline preference. `auto` defers to agent default. */
   pipelinePref?: 'auto' | 'h264' | 'jpeg'
   onPipelinePrefChange?: (p: 'auto' | 'h264' | 'jpeg') => void
+  /** Phase-03 step 7: persisted "Show stream stats" toggle. */
+  showStats?: boolean
+  onShowStatsChange?: (v: boolean) => void
 }
 
 export default function DesktopOverflowMenu({
@@ -57,6 +60,8 @@ export default function DesktopOverflowMenu({
   pipeline,
   pipelinePref = 'auto',
   onPipelinePrefChange,
+  showStats = false,
+  onShowStatsChange,
 }: Props) {
   const ref = useRef<HTMLDivElement>(null)
 
@@ -141,6 +146,14 @@ export default function DesktopOverflowMenu({
           trailing={<ToggleChip on={smoothScaling} />}
           onClick={close(() => onSettingsChange({ hidpi, smoothScaling: !smoothScaling }))}
         />
+        {onShowStatsChange && (
+          <Item
+            icon={<StatsIcon />}
+            label="Stream stats"
+            trailing={<ToggleChip on={showStats} />}
+            onClick={close(() => onShowStatsChange(!showStats))}
+          />
+        )}
         <div className="px-3 py-2 flex items-center gap-2">
           <span className="text-[11px] uppercase tracking-widest text-text-muted">Quality</span>
           <div className="flex-1 grid grid-cols-3 gap-1">
@@ -328,6 +341,14 @@ function SmoothIcon() {
   return (
     <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
       <path d="M2 11c2-4 4-4 6 0s4 4 6 0" />
+    </svg>
+  )
+}
+
+function StatsIcon() {
+  return (
+    <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+      <path d="M3 13V8M7 13V4M11 13v-3M14 13H2" />
     </svg>
   )
 }

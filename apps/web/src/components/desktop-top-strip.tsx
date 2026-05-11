@@ -50,6 +50,10 @@ interface Props {
   /** User-driven pipeline preference — forwarded to the overflow menu picker. */
   pipelinePref?: 'auto' | 'h264' | 'jpeg'
   onPipelinePrefChange?: (p: 'auto' | 'h264' | 'jpeg') => void
+  /** Phase-03 step 7: persisted "Show stream stats" toggle, forwarded to
+   *  the overflow menu's Display section. */
+  showStats?: boolean
+  onShowStatsChange?: (v: boolean) => void
 }
 
 export default function DesktopTopStrip({
@@ -78,6 +82,8 @@ export default function DesktopTopStrip({
   onToggleAudio,
   pipelinePref,
   onPipelinePrefChange,
+  showStats,
+  onShowStatsChange,
 }: Props) {
   const [menuOpen, setMenuOpen] = useState(false)
   const zoomLabel =
@@ -198,6 +204,8 @@ export default function DesktopTopStrip({
           pipeline={pipeline}
           pipelinePref={pipelinePref}
           onPipelinePrefChange={onPipelinePrefChange}
+          showStats={showStats}
+          onShowStatsChange={onShowStatsChange}
         />
       </div>
     </div>
