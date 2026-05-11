@@ -1037,6 +1037,12 @@ mod inner {
         #[cfg(feature = "audio")]
         drop(audio_tx);
 
+        // Phase-03 step 2: ABR observation channel. Producers (encoder +
+        // RTCP reader) push observations; consumers (controller + stats
+        // SSE) attach in later steps. Broadcast capacity ≥ frame burst so
+        // a slow consumer sees `Lagged` rather than blocking producers.
+        let (abr_tx, _abr_rx_dropped) = crate::desktop_abr::channel();
+
         crate::video_pipeline::spawn_video_pipeline(crate::video_pipeline::VideoPipelineConfig {
             width: out_w,
             height: out_h,
@@ -1051,12 +1057,14 @@ mod inner {
             shutdown_rx: vp_shutdown_rx,
             pli_rx,
             params_tx,
+            abr_tx: abr_tx.clone(),
         });
 
         crate::video_pipeline::spawn_rtcp_reader(
             sender,
             pli_tx,
             bitrate_tx.clone(),
+            abr_tx,
             rtcp_shutdown_rx,
         );
 

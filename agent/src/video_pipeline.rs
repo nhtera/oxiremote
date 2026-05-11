@@ -18,18 +18,20 @@
 #![cfg(feature = "h264")]
 
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
 use desktop::encoders::{BitrateBps, EncodedFrame, H264Encoder, ParameterSets};
 use desktop::{QualityTier, RawBgraFrame};
-use tokio::sync::{mpsc, oneshot, watch};
+use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use tracing::{debug, info, warn};
 use webrtc::api::media_engine::MIME_TYPE_H264;
 use webrtc::media::Sample;
 use webrtc::rtp_transceiver::rtp_codec::RTCRtpCodecCapability;
 use webrtc::rtp_transceiver::rtp_sender::RTCRtpSender;
 use webrtc::track::track_local::track_local_static_sample::TrackLocalStaticSample;
+
+use crate::desktop_abr::AbrObservation;
 
 /// Default duration for the very first sample (no prior frame to measure
 /// from). 33 ms ≈ 30 fps — a reasonable seed at any tier; subsequent
@@ -63,6 +65,12 @@ pub struct VideoPipelineConfig {
     /// over the ctrl DC before the first RTP frame. Only one send per
     /// pipeline lifetime — treat subsequent calls as no-op.
     pub params_tx: oneshot::Sender<ParameterSets>,
+    /// Phase-03 ABR observation channel. Encoder task pushes `Encode`
+    /// observations per frame (timing + queue depth + current bitrate);
+    /// `spawn_rtcp_reader` pushes `Network` observations per RR/REMB. The
+    /// controller + stats SSE subscribe via `tx.subscribe()`. Slow
+    /// consumers see `Lagged` and skip ahead — never block producers.
+    pub abr_tx: broadcast::Sender<AbrObservation>,
 }
 
 /// Build the `RTCRtpCodecCapability` we expose in the SDP offer — H.264
@@ -192,7 +200,13 @@ pub fn spawn_video_pipeline(mut cfg: VideoPipelineConfig) {
                 frame = newer;
             }
 
+            // Snapshot bgra queue depth BEFORE encode — `len()` reflects
+            // backlog left after the drain loop above (so a sustained
+            // non-zero indicates capture out-pacing the encoder).
+            let bgra_queue_depth = cfg.bgra_rx.len();
+
             let force_idr = drained_force_idr || pli_pending;
+            let encode_started = Instant::now();
             let encoded = match encoder.encode(
                 &frame.bytes,
                 frame.width,
@@ -211,6 +225,7 @@ pub fn spawn_video_pipeline(mut cfg: VideoPipelineConfig) {
                     continue;
                 }
             };
+            let encode_ms = encode_started.elapsed().as_millis().min(u32::MAX as u128) as u32;
 
             // First-keyframe → forward SPS/PPS so the session layer can
             // build the avcC description blob for WebCodecs.
@@ -219,6 +234,23 @@ pub fn spawn_video_pipeline(mut cfg: VideoPipelineConfig) {
             {
                 let _ = tx.send(p);
             }
+
+            // Phase-03: emit per-frame ABR observation. `sample_tx` cap=1 so
+            // queue depth ∈ {0,1}; the difference (cap − permits) is the live
+            // fill. Send is fire-and-forget — broadcast returns Err only when
+            // there are no receivers, which is the steady state until the
+            // controller/SSE attach.
+            let is_keyframe = encoded.is_keyframe;
+            let sample_queue_depth = sample_tx
+                .max_capacity()
+                .saturating_sub(sample_tx.capacity());
+            let _ = cfg.abr_tx.send(AbrObservation::Encode {
+                encode_ms,
+                is_keyframe,
+                bgra_queue_depth,
+                sample_queue_depth,
+                current_bitrate_kbps: last_bitrate / 1_000,
+            });
 
             // Bounded channel: drop the oldest if writer is behind.
             if sample_tx.try_send(encoded).is_err() {
@@ -313,6 +345,7 @@ pub fn spawn_rtcp_reader(
     sender: Arc<RTCRtpSender>,
     pli_tx: mpsc::Sender<()>,
     remb_tx: tokio::sync::watch::Sender<BitrateBps>,
+    abr_tx: broadcast::Sender<AbrObservation>,
     mut shutdown_rx: oneshot::Receiver<()>,
 ) {
     tokio::spawn(async move {
@@ -325,7 +358,7 @@ pub fn spawn_rtcp_reader(
                 }
                 result = sender.read_rtcp() => {
                     match result {
-                        Ok((packets, _attrs)) => handle_rtcp_batch(&packets, &pli_tx, &remb_tx).await,
+                        Ok((packets, _attrs)) => handle_rtcp_batch(&packets, &pli_tx, &remb_tx, &abr_tx).await,
                         Err(e) => {
                             warn!(error = ?e, "rtcp reader: read_rtcp failed; stopping");
                             return;
@@ -337,10 +370,54 @@ pub fn spawn_rtcp_reader(
     });
 }
 
+/// Middle 32 bits of the current NTP timestamp (low 16 of seconds since
+/// 1900 || high 16 of fractional second). Matches the `last_sender_report`
+/// field's encoding so RTT can be derived without a 64-bit subtraction.
+fn ntp_middle32_now() -> u32 {
+    // NTP epoch (1900) → UNIX epoch (1970) offset = 70 y + 17 leap days.
+    const NTP_UNIX_OFFSET_SECS: u64 = 2_208_988_800;
+    let dur = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    let secs = dur.as_secs().wrapping_add(NTP_UNIX_OFFSET_SECS);
+    let frac = (dur.subsec_nanos() as u64).saturating_mul(1u64 << 32) / 1_000_000_000;
+    (((secs & 0xFFFF) << 16) as u32) | (((frac >> 16) & 0xFFFF) as u32)
+}
+
+/// Convert a `ReceptionReport` into the `Network` observation fields.
+/// Loss is Q.8 → percentage; jitter is RTP timestamp units → ms via the
+/// 90 kHz video clock; RTT uses the standard RFC 3550 derivation. RTT is
+/// `None` until the receiver has acknowledged at least one of our SRs
+/// (LSR=0 means "no SR seen yet").
+fn report_to_network_obs(
+    report: &rtcp::reception_report::ReceptionReport,
+) -> AbrObservation {
+    let loss_pct = (report.fraction_lost as f32) * 100.0 / 256.0;
+    let jitter_ms = report.jitter / 90;
+    let rtt_ms = if report.last_sender_report == 0 {
+        None
+    } else {
+        let now32 = ntp_middle32_now();
+        let elapsed = now32
+            .wrapping_sub(report.last_sender_report)
+            .wrapping_sub(report.delay);
+        // 1/65536-second units → ms. >>16 gives whole seconds; multiply
+        // first to keep sub-second precision.
+        Some((((elapsed as u64) * 1000) >> 16) as u32)
+    };
+    AbrObservation::Network {
+        remb_kbps: None,
+        loss_pct: Some(loss_pct),
+        rtt_ms,
+        jitter_ms: Some(jitter_ms),
+    }
+}
+
 async fn handle_rtcp_batch(
     packets: &[Box<dyn rtcp::packet::Packet + Send + Sync>],
     pli_tx: &mpsc::Sender<()>,
     remb_tx: &tokio::sync::watch::Sender<BitrateBps>,
+    abr_tx: &broadcast::Sender<AbrObservation>,
 ) {
     for pkt in packets {
         let any = pkt.as_any();
@@ -365,6 +442,35 @@ async fn handle_rtcp_batch(
             //   never artificially clips the configured target on LAN.
             let bps = (remb.bitrate as u32).clamp(1_500_000, 15_000_000);
             let _ = remb_tx.send(BitrateBps(bps));
+            // Phase-03: also fan out as an ABR Network observation so the
+            // controller/SSE see the *unclamped-by-policy* signal alongside
+            // loss + RTT.
+            let _ = abr_tx.send(AbrObservation::Network {
+                remb_kbps: Some((remb.bitrate as u32) / 1_000),
+                loss_pct: None,
+                rtt_ms: None,
+                jitter_ms: None,
+            });
+            continue;
+        }
+        if let Some(rr) = any
+            .downcast_ref::<rtcp::receiver_report::ReceiverReport>()
+        {
+            for report in &rr.reports {
+                let _ = abr_tx.send(report_to_network_obs(report));
+            }
+            continue;
+        }
+        if let Some(sr) = any
+            .downcast_ref::<rtcp::sender_report::SenderReport>()
+        {
+            // SRs from the receiver carry their own reception reports about
+            // any media they're sending us. We don't currently send media
+            // back, but the path is symmetric — propagate any reports we do
+            // see so the controller sees them uniformly.
+            for report in &sr.reports {
+                let _ = abr_tx.send(report_to_network_obs(report));
+            }
         }
     }
 }

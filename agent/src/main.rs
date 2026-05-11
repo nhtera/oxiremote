@@ -46,6 +46,12 @@ mod pipeline_selection;
 // VT/OpenH264 toolchain.
 #[cfg(feature = "h264")]
 mod video_pipeline;
+// Adaptive-bitrate observation channel — wire format only (phase-03 step 2);
+// state machine + stats SSE consumers land in later steps. Currently only
+// the h264 pipeline produces; widen the cfg gate when phase-03 extends to
+// the JPEG path (`desktop_ws_capture.rs` same emit pattern).
+#[cfg(feature = "h264")]
+mod desktop_abr;
 // Audio pipeline — gated on the agent's `audio` feature (forwards to
 // desktop/audio). Off by default until phase-02a + 02b both ship.
 #[cfg(feature = "audio")]
