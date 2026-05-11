@@ -1349,17 +1349,60 @@ async fn server_main(
         });
     }
 
+    let shutdown_state = state.clone();
     axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
+        .with_graceful_shutdown(shutdown_signal(shutdown_state))
         .await
         .context("server error")?;
 
     Ok(())
 }
 
-async fn shutdown_signal() {
-    let _ = tokio::signal::ctrl_c().await;
-    info!("shutdown signal received");
+/// Wait for any of the unix-y termination signals (SIGINT / SIGTERM / SIGHUP)
+/// and trigger a graceful tunnel teardown before axum drains.
+///
+/// Why three signals: `bun run dev:agent` propagates SIGTERM (not SIGINT) on
+/// Ctrl+C of the parent terminal, and closing the terminal entirely sends
+/// SIGHUP. The pre-existing `ctrl_c` listener only caught SIGINT, so SIGTERM
+/// / SIGHUP fell through, axum never drained, the runtime never dropped its
+/// tasks cleanly, and the cloudflared child outlived the agent — leaving an
+/// orphan reparented to launchd. Each `dev:agent` restart accumulated another.
+///
+/// The explicit `tunnel_shutdown.notify_one()` is belt-and-braces: even when
+/// the runtime DOES drop the supervisor task and `kill_on_drop` fires, the
+/// supervisor's spawned wait task explicitly calls `child.kill().await +
+/// child.wait().await` on the notify path — guaranteeing reap (no zombie),
+/// not just a race-prone Drop-driven SIGKILL.
+async fn shutdown_signal(state: std::sync::Arc<AppState>) {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        // Each `signal()` call returns a `Signal` stream; we own one per
+        // kind and `select!` the first arrival.
+        let mut sigterm = signal(SignalKind::terminate()).ok();
+        let mut sighup = signal(SignalKind::hangup()).ok();
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => info!("shutdown signal: SIGINT"),
+            _ = async { sigterm.as_mut().unwrap().recv().await }, if sigterm.is_some() => {
+                info!("shutdown signal: SIGTERM");
+            }
+            _ = async { sighup.as_mut().unwrap().recv().await }, if sighup.is_some() => {
+                info!("shutdown signal: SIGHUP");
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+        info!("shutdown signal: ctrl_c");
+    }
+
+    // Tell the tunnel supervisor's wait task to kill+reap cloudflared NOW,
+    // before axum's graceful_shutdown returns and the runtime starts
+    // dropping tasks. Without this, cloudflared lingers as an orphan when
+    // the agent is killed via SIGTERM/SIGHUP rather than SIGINT.
+    state.tunnel_shutdown.notify_waiters();
+
     // Wake any parked main thread (background mode) so the process can exit
     // cleanly. The server thread will return from axum::serve right after.
     crate::tui::wake_background_main();
