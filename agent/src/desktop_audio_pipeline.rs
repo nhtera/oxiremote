@@ -28,10 +28,6 @@
 //! this module assumes the caller has already passed them.
 
 #![cfg(feature = "audio")]
-// Wired up in phase-02a step 6 (desktop_ws.rs handshake gate). Until then
-// the module is intentionally unreferenced — keep the allow scoped here
-// rather than module-wide silencing of future genuine dead code.
-#![allow(dead_code)]
 
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -43,6 +39,32 @@ use webrtc::api::media_engine::MIME_TYPE_OPUS;
 use webrtc::media::Sample;
 use webrtc::rtp_transceiver::rtp_codec::RTCRtpCodecCapability;
 use webrtc::track::track_local::track_local_static_sample::TrackLocalStaticSample;
+
+use crate::events::{AgentEvent, EventBus};
+
+/// Why the audio pipeline stopped. Single source of truth for the wire
+/// `reason` field on `AgentEvent::AudioStopped` — keep these strings stable
+/// so dashboard filters and SSE consumers can pattern-match without parsing
+/// free text. The pipeline emits `AudioStopped` exactly once at exit; the
+/// caller signals `SessionClosed` / `UserToggleOff` via the shutdown
+/// oneshot, while `SckError` is decided internally on any capture or
+/// encoder failure.
+#[derive(Debug, Clone, Copy)]
+pub enum StopReason {
+    SessionClosed,
+    UserToggleOff,
+    SckError,
+}
+
+impl StopReason {
+    pub fn as_wire(&self) -> &'static str {
+        match self {
+            StopReason::SessionClosed => "session_closed",
+            StopReason::UserToggleOff => "user_toggle_off",
+            StopReason::SckError => "sck_error",
+        }
+    }
+}
 
 /// 20 ms Opus frame duration. Stays a strict constant — the packetizer uses
 /// it for RTP timestamp deltas, so any lying duration drifts the receiver
@@ -57,10 +79,18 @@ const SAMPLE_CHANNEL_CAP: usize = 4;
 
 /// Configuration for `spawn_audio_pipeline`. Caller owns all channels so
 /// session teardown can fire `shutdown_rx` and drop the capture in any order.
+///
+/// `event_bus` + `device_id` let the pipeline emit `AgentEvent::AudioStopped`
+/// from a single point with the correct reason — `SessionClosed` /
+/// `UserToggleOff` as signalled by the caller through `shutdown_rx`, or
+/// `SckError` decided internally on capture/encoder failure. The caller does
+/// NOT emit `AudioStopped` itself; the pipeline owns the lifecycle.
 pub struct AudioPipelineConfig {
     pub track: Arc<TrackLocalStaticSample>,
     pub capture: Box<dyn AudioCapture>,
-    pub shutdown_rx: oneshot::Receiver<()>,
+    pub shutdown_rx: oneshot::Receiver<StopReason>,
+    pub event_bus: Arc<EventBus>,
+    pub device_id: String,
 }
 
 /// `RTCRtpCodecCapability` matching what `register_default_codecs` exposes
@@ -92,10 +122,10 @@ pub fn new_opus_track() -> Arc<TrackLocalStaticSample> {
 /// Spawn the encoder + writer tasks. Returns immediately. Both tasks
 /// terminate when `shutdown_rx` fires or when the channels close.
 ///
-/// Errors surface via tracing — there's no public completion handle because
-/// the session layer treats an audio failure as non-fatal (video keeps
-/// running). The eventual `AgentEvent::AudioStopped { reason }` emitter
-/// (step 8) will hook into the warn paths below.
+/// The encoder task emits exactly one `AgentEvent::AudioStopped` at exit —
+/// reason carried by the shutdown signal (caller-decided) or `SckError`
+/// when capture / encoder init fails internally. Callers must NOT emit
+/// `AudioStopped` themselves.
 pub fn spawn_audio_pipeline(cfg: AudioPipelineConfig) {
     let (sample_tx, sample_rx) = mpsc::channel::<Vec<u8>>(SAMPLE_CHANNEL_CAP);
 
@@ -106,18 +136,27 @@ pub fn spawn_audio_pipeline(cfg: AudioPipelineConfig) {
     // Encoder task — async, owns the capture + encoder. Holds the shutdown
     // oneshot so it can break the next_frame await without leaking the
     // capture.
-    tokio::spawn(encoder_task(cfg.capture, sample_tx, cfg.shutdown_rx));
+    tokio::spawn(encoder_task(
+        cfg.capture,
+        sample_tx,
+        cfg.shutdown_rx,
+        cfg.event_bus,
+        cfg.device_id,
+    ));
 }
 
 async fn encoder_task(
     mut capture: Box<dyn AudioCapture>,
     sample_tx: mpsc::Sender<Vec<u8>>,
-    mut shutdown_rx: oneshot::Receiver<()>,
+    mut shutdown_rx: oneshot::Receiver<StopReason>,
+    event_bus: Arc<EventBus>,
+    device_id: String,
 ) {
     let mut encoder = match OpusEncoder::new() {
         Ok(e) => e,
         Err(err) => {
             warn!(error = %err, "audio_pipeline: OpusEncoder init failed; aborting");
+            emit_stopped(&event_bus, &device_id, StopReason::SckError);
             return;
         }
     };
@@ -127,11 +166,16 @@ async fn encoder_task(
         "audio_pipeline: encoder task started"
     );
 
+    // Reason for exiting the loop. Default `SckError`; overwritten by the
+    // shutdown arm with whatever the caller chose, or left as-is on any
+    // capture / encoder failure path.
+    let mut exit_reason = StopReason::SckError;
     loop {
         tokio::select! {
             biased;
-            _ = &mut shutdown_rx => {
-                info!("audio_pipeline: shutdown received");
+            r = &mut shutdown_rx => {
+                exit_reason = r.unwrap_or(StopReason::SessionClosed);
+                info!(reason = exit_reason.as_wire(), "audio_pipeline: shutdown received");
                 break;
             }
             next = capture.next_frame() => {
@@ -171,6 +215,15 @@ async fn encoder_task(
 
     // Drop sample_tx so the writer's recv loop exits cleanly.
     drop(sample_tx);
+
+    emit_stopped(&event_bus, &device_id, exit_reason);
+}
+
+fn emit_stopped(event_bus: &EventBus, device_id: &str, reason: StopReason) {
+    event_bus.send(AgentEvent::AudioStopped {
+        device_id: device_id.to_string(),
+        reason: reason.as_wire().to_string(),
+    });
 }
 
 async fn writer_task(
@@ -211,6 +264,15 @@ mod tests {
     fn new_opus_track_has_matching_codec() {
         let t = new_opus_track();
         assert_eq!(t.codec().mime_type, "audio/opus");
+    }
+
+    #[test]
+    fn stop_reason_wire_strings_are_stable() {
+        // Dashboard / SSE consumers pattern-match these strings — pinning the
+        // mapping in a test keeps a rename from silently breaking them.
+        assert_eq!(StopReason::SessionClosed.as_wire(), "session_closed");
+        assert_eq!(StopReason::UserToggleOff.as_wire(), "user_toggle_off");
+        assert_eq!(StopReason::SckError.as_wire(), "sck_error");
     }
 
     #[test]

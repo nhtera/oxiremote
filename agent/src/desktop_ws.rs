@@ -969,7 +969,12 @@ mod inner {
             (None, None)
         };
         #[cfg(feature = "audio")]
-        let (ap_shutdown_tx, ap_shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        let (ap_shutdown_tx, ap_shutdown_rx) =
+            tokio::sync::oneshot::channel::<crate::desktop_audio_pipeline::StopReason>();
+        // Option-wrapped so the toggle-poll arm can `.take()` it for an
+        // early teardown without consuming the value that teardown needs.
+        #[cfg(feature = "audio")]
+        let mut ap_shutdown_tx = Some(ap_shutdown_tx);
 
         // ── Spawn tasks ───────────────────────────────────────────────────────
         // Capture: resolution + HiDPI locked at session start (encoder dims are
@@ -1004,11 +1009,14 @@ mod inner {
                     track: track.clone(),
                     capture,
                     shutdown_rx: ap_shutdown_rx,
+                    event_bus: Arc::clone(&state.event_bus),
+                    device_id: device_id.to_string(),
                 },
             );
             state.event_bus.send(crate::events::AgentEvent::AudioStarted {
                 device_id: device_id.to_string(),
             });
+            state.telemetry.record_audio_session_started();
             info!("audio pipeline spawned (SCK → Opus → RTP)");
         }
         // Drop the audio_tx clone we held only to thread into capture; the
@@ -1090,6 +1098,30 @@ mod inner {
             tokio::time::sleep(std::time::Duration::from_secs(3)).await;
         };
         tokio::pin!(watchdog);
+
+        // Phase-02a step 10b: detector future that resolves once when the
+        // operator flips `desktop_audio_enabled` to false mid-session. Polls
+        // settings every 2 s while the audio pipeline is live. When audio
+        // never started (gate didn't pass) OR the feature is compiled out,
+        // the future is pending forever — the arm below is a no-op. Single
+        // future rather than a cfg-gated select arm because tokio::select!
+        // doesn't parse `#[cfg]` on arms.
+        let toggle_off_detector = async {
+            #[cfg(feature = "audio")]
+            if audio_track.is_some() {
+                let mut i = tokio::time::interval(std::time::Duration::from_secs(2));
+                i.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                loop {
+                    i.tick().await;
+                    if !crate::settings::get_desktop_audio_enabled(&state.db_path) {
+                        return;
+                    }
+                }
+            }
+            std::future::pending::<()>().await;
+        };
+        tokio::pin!(toggle_off_detector);
+
         loop {
             tokio::select! {
                 biased;
@@ -1182,6 +1214,27 @@ mod inner {
                     }
                 }
 
+                // Phase-02a step 10b: operator flipped `desktop_audio_enabled`
+                // to false mid-session. Hand the shutdown sender a
+                // `UserToggleOff` reason and let the pipeline emit
+                // `AudioStopped` from its single emit point. No-op on builds
+                // without `feature = "audio"` (the detector future is pending
+                // there). The arm is selectable forever, but `tokio::pin!`
+                // means a resolved future stays resolved; the `take()` makes
+                // re-entry a no-op so we don't double-fire on the same flip.
+                _ = &mut toggle_off_detector => {
+                    #[cfg(feature = "audio")]
+                    if let Some(tx) = ap_shutdown_tx.take() {
+                        info!(
+                            device = %device_id,
+                            "audio toggle flipped off mid-session — tearing down audio"
+                        );
+                        let _ = tx.send(
+                            crate::desktop_audio_pipeline::StopReason::UserToggleOff,
+                        );
+                    }
+                }
+
                 // Incoming WS text: late ICE + ctrl-over-ws fallback.
                 msg = socket.recv() => {
                     match msg {
@@ -1213,15 +1266,13 @@ mod inner {
         {
             // Audio pipeline teardown: fire shutdown so the encoder task exits
             // its capture.next_frame await without leaking the SckAudioCapture
-            // (which holds the SCK audio mpsc rx). Emit AudioStopped after
-            // the signal so the dashboard reflects the actual teardown order.
-            let was_audio_on = audio_track.is_some();
-            let _ = ap_shutdown_tx.send(());
-            if was_audio_on {
-                state.event_bus.send(crate::events::AgentEvent::AudioStopped {
-                    device_id: device_id.to_string(),
-                    reason: "session_closed".to_string(),
-                });
+            // (which holds the SCK audio mpsc rx). The pipeline owns the
+            // `AudioStopped` emit point — passing `SessionClosed` lets it tag
+            // the event with the right wire reason. The Option-take pattern
+            // is a no-op if a mid-session toggle-off (UserToggleOff) already
+            // consumed the sender; the pipeline already emitted in that case.
+            if let Some(tx) = ap_shutdown_tx.take() {
+                let _ = tx.send(crate::desktop_audio_pipeline::StopReason::SessionClosed);
             }
         }
         Ok(())

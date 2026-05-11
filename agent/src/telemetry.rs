@@ -42,6 +42,12 @@ pub struct TelemetryState {
     /// How many latency samples have been recorded. Capped at LATENCY_RING_CAP
     /// for the `snapshot_latencies` return value.
     latency_count: AtomicU32,
+
+    /// Total remote-desktop sessions that started an Opus audio pipeline since
+    /// agent boot. Phase-02a soak metric — `audio_sessions_started /
+    /// h264_sessions_started` answers "how often does the audio path engage
+    /// when video does." Incremented at the `AudioStarted` event emit site.
+    pub audio_sessions_started: AtomicU64,
 }
 
 impl TelemetryState {
@@ -54,7 +60,16 @@ impl TelemetryState {
             latencies: Mutex::new([0u64; LATENCY_RING_CAP]),
             latency_idx: AtomicU32::new(0),
             latency_count: AtomicU32::new(0),
+            audio_sessions_started: AtomicU64::new(0),
         }
+    }
+
+    /// Bump the audio-session counter. Called once per `AudioStarted` event
+    /// (i.e. once the operator + client + probe gate all agree and the
+    /// `spawn_audio_pipeline` task is in flight).
+    #[inline]
+    pub fn record_audio_session_started(&self) {
+        self.audio_sessions_started.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Add `bytes` to the cumulative tunnel byte counter. Relaxed — no
@@ -187,6 +202,15 @@ mod tests {
         assert_eq!(t.reconnect_count.load(Ordering::Relaxed), 1);
         t.mark_tunnel_ready();
         assert_eq!(t.reconnect_count.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn audio_sessions_counter_increments() {
+        let t = TelemetryState::new();
+        assert_eq!(t.audio_sessions_started.load(Ordering::Relaxed), 0);
+        t.record_audio_session_started();
+        t.record_audio_session_started();
+        assert_eq!(t.audio_sessions_started.load(Ordering::Relaxed), 2);
     }
 
     #[test]

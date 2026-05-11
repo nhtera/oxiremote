@@ -1155,6 +1155,9 @@ async fn api_agent_tunnel_telemetry(State(state): State<Arc<AppState>>) -> impl 
     let last_reconnect_at =
         t.last_reconnect_at_ms.load(std::sync::atomic::Ordering::Relaxed);
     let probe_latencies = t.snapshot_latencies();
+    let audio_sessions_started = t
+        .audio_sessions_started
+        .load(std::sync::atomic::Ordering::Relaxed);
 
     Json(json!({
         "uptime_s": uptime_s,
@@ -1162,6 +1165,7 @@ async fn api_agent_tunnel_telemetry(State(state): State<Arc<AppState>>) -> impl 
         "reconnect_count": reconnect_count,
         "bytes_proxied": bytes_proxied,
         "probe_latencies_p50_ms": probe_latencies,
+        "audio_sessions_started": audio_sessions_started,
     }))
     .into_response()
 }
