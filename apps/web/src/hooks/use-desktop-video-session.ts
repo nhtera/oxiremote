@@ -253,6 +253,18 @@ export function useDesktopVideoSession(
     // offer so it can add its TrackLocalStaticSample without renegotiation.
     pc.addTransceiver('video', { direction: 'recvonly' })
 
+    // Phase-02a: recvonly audio transceiver when the operator + probe + client
+    // agree on audio. Must be declared on the client offer so the server's
+    // sendonly Opus transceiver (added BEFORE set_remote_description on the
+    // agent side) has a matching m-line to pair with. Without this, the
+    // agent's audio transceiver becomes orphaned — the answer carries an
+    // unpaired m-section and zero RTP packets flow despite the audio
+    // pipeline running server-side. `audioRefBool` is read at session-start
+    // (mid-session toggle does not renegotiate, matches H.264 policy).
+    if (audioRefBool.current) {
+      pc.addTransceiver('audio', { direction: 'recvonly' })
+    }
+
     // Ctrl DC: reliable ordered (same as JPEG path — input events must not be
     // reordered). Externally-negotiated with id=2 so the server's peer
     // creates a matching DC.
