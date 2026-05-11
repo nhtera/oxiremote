@@ -200,10 +200,21 @@ export default function DesktopPage() {
     const useH264Local = wantsH264Local && supportsH264Video() && !forceJpegSession
     setAudioActive(!!(caps.audio_enabled && caps.audio_supported) && useH264Local)
   }, [caps, forceJpegSession, reloadNonce])
+  // Bidirectional. On→Off: send `audioToggle=false` over the WS, server
+  // tears the audio pipeline down via `UserToggleOff` (no video disruption).
+  // Off→On: trigger a session reconnect — the SCK audio capture + Opus
+  // transceiver are bound at session-start and webrtc-rs has no clean
+  // mid-session "re-add audio" path, so we recycle the session. Same UX as
+  // a manual Reload but scoped to the audio intent.
   const handleToggleAudio = useCallback(() => {
-    if (!audioActive) return
-    sessionApiRef.current.toggleAudio?.(false)
-    setAudioActive(false)
+    if (audioActive) {
+      sessionApiRef.current.toggleAudio?.(false)
+      setAudioActive(false)
+      return
+    }
+    sessionApiRef.current.disconnect()
+    setForceJpegSession(false)
+    setReloadNonce((n) => n + 1)
   }, [audioActive])
 
   // Container that wraps the canvas. Tracked via ResizeObserver so we can

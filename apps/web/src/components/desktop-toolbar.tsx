@@ -347,10 +347,13 @@ export default function DesktopToolbar({
       </div>
 
       {/* Phase-02a audio toggle — visible only when the gate passed at
-          session-start (operator setting + probe + H.264 path). One-way
-          mute: clicking off fires `audioToggle` over the WS, server tears
-          the audio pipeline down via `UserToggleOff`, video continues.
-          Re-enable requires reconnect (matches hidpi-flip policy). */}
+          session-start (operator setting + probe + H.264 path).
+          On → Off: instant client-driven mute via `audioToggle` over the WS;
+          server tears the audio pipeline down with `UserToggleOff`, video
+          continues uninterrupted.
+          Off → On: triggers a session reconnect (same UX as Reload), since
+          the SCK audio capture + Opus transceiver are bound at session start
+          and webrtc-rs has no clean mid-session re-add path. ~1–2 s blip. */}
       {audioGated && (
         <div className="hidden lg:flex items-center justify-between gap-2 pt-1">
           <span className="text-[10px] uppercase tracking-[0.12em] text-text-muted">
@@ -358,18 +361,17 @@ export default function DesktopToolbar({
           </span>
           <button
             type="button"
-            onClick={() => audioActive && onToggleAudio?.()}
-            disabled={!audioActive}
+            onClick={() => onToggleAudio?.()}
             title={
               audioActive
                 ? 'Mute audio for this session'
-                : 'Audio off — reconnect to re-enable'
+                : 'Re-enable audio (triggers a session reconnect)'
             }
             className={
               'inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full text-[11px] border transition-colors ' +
               (audioActive
                 ? 'border-accent/40 bg-accent/10 text-accent hover:bg-accent/20'
-                : 'border-border bg-surface-alt text-text-muted cursor-not-allowed')
+                : 'border-border bg-surface-alt text-text-secondary hover:bg-surface-hover hover:text-text-primary')
             }
           >
             <span
