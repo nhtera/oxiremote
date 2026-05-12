@@ -381,9 +381,14 @@ export default function DesktopPage() {
   const sendInput = useCallback((ev: DesktopInputEvent) => {
     sessionApiRef.current.sendInput(ev)
   }, [])
-  const disconnect = useCallback(() => {
+  // Reconnect-modal Exit: tear down the session AND leave the page. Just
+  // calling disconnect() is a no-op in the exhausted branch — status is
+  // already 'disconnected' and attempt stays >= 3, so the modal's open
+  // predicate (showReconnect) never flips and the user gets stuck.
+  const handleReconnectExit = useCallback(() => {
     sessionApiRef.current.disconnect()
-  }, [])
+    navigate(`/h/${hostId}`)
+  }, [hostId, navigate])
 
   const confirm = useConfirm()
 
@@ -771,7 +776,7 @@ export default function DesktopPage() {
         attempt={attempt}
         maxAttempts={3}
         exhausted={status === 'disconnected'}
-        onCancel={disconnect}
+        onCancel={handleReconnectExit}
         onRetry={status !== 'disconnected' ? handleReload : undefined}
       />
     </div>
