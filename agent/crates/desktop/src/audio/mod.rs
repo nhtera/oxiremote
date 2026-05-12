@@ -24,7 +24,12 @@ pub mod errors;
 pub mod opus_encoder;
 pub mod resample;
 
-#[cfg(target_os = "windows")]
+// wasapi_loopback `use`s `cpal` directly, and `cpal` is an optional dep gated
+// on the `audio` feature (see crates/desktop/Cargo.toml). Without the feature
+// flag a Windows build can't compile this module — so the cfg gates on both
+// target + feature, and the `probe_supported` / `make_default` arms mirror the
+// same gating so audio-disabled Windows builds stay green.
+#[cfg(all(target_os = "windows", feature = "audio"))]
 pub mod wasapi_loopback;
 
 #[cfg(target_os = "macos")]
@@ -74,9 +79,13 @@ pub fn probe_supported() -> bool {
     {
         sck_audio::probe_supported()
     }
-    #[cfg(target_os = "windows")]
+    #[cfg(all(target_os = "windows", feature = "audio"))]
     {
         wasapi_loopback::probe_supported()
+    }
+    #[cfg(all(target_os = "windows", not(feature = "audio")))]
+    {
+        false
     }
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
@@ -88,9 +97,13 @@ pub fn probe_supported() -> bool {
 /// platform until phase-02's per-platform impls land. Callers MUST treat
 /// `Unsupported` as a normal "audio off" outcome, not a fatal error.
 pub fn make_default() -> Result<Box<dyn AudioCapture>, AudioError> {
-    #[cfg(target_os = "windows")]
+    #[cfg(all(target_os = "windows", feature = "audio"))]
     {
         wasapi_loopback::make()
+    }
+    #[cfg(all(target_os = "windows", not(feature = "audio")))]
+    {
+        Err(AudioError::Unsupported("audio.windows.feature-disabled"))
     }
     #[cfg(target_os = "macos")]
     {

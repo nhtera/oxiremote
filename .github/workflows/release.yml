@@ -26,11 +26,11 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # macOS ships with the `audio` feature enabled because phase-02a
-          # (ScreenCaptureKit audio → Opus → WebRTC) is operational on this
-          # platform. Linux/Windows stay on default features until the
-          # phase-02b kill-switch passes — flipping `audio` there today only
-          # pulls audiopus/rubato deps without a working capture path.
+          # macOS + Windows ship with the `audio` feature enabled — phase-02a
+          # (ScreenCaptureKit single SCStream) on macOS and phase-02b (cpal
+          # default-host WASAPI shared-mode loopback) on Windows. Linux stays
+          # on default features (no audio backend wired yet); flipping `audio`
+          # there would pull audiopus/rubato without a capture path.
           - target: aarch64-apple-darwin
             runner: macos-14
             archive_ext: tar.gz
@@ -61,7 +61,7 @@ jobs:
             runner: windows-latest
             archive_ext: zip
             bin: oxiremote.exe
-            cargo_features: ''
+            cargo_features: audio
     steps:
       - uses: actions/checkout@v5
 
