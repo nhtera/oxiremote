@@ -19,7 +19,7 @@ import type {
 } from '../hooks/use-desktop-session'
 import { DESKTOP_FALLBACK_PENDING_EVENT } from '../hooks/use-desktop-session'
 import type { InputMode, GestureMode } from '../hooks/use-desktop-input'
-import { supportsH264Video } from '../hooks/use-desktop-video-session'
+import { supportsH264Video, supportsHEVCVideo } from '../hooks/use-desktop-video-session'
 import PipelineStatusPill from '../components/pipeline-status-pill'
 import DesktopJpegView from '../components/desktop-jpeg-view'
 import DesktopH264View from '../components/desktop-h264-view'
@@ -46,14 +46,15 @@ interface Capabilities {
   available: boolean
   quality_tiers: QualityTier[]
   monitors: { id: number; label: string; width: number; height: number }[]
-  /** Operator preference: 'auto' (default) | 'h264' | 'jpeg'. Phase-01: the
-   *  old binary surface was 'h264'|'jpeg'; new agents emit 'auto'. SPA treats
-   *  'auto' as "try H.264 if the client supports it" — same effect as the old
-   *  'h264' preference but without the fail-closed semantics. */
-  preferred_pipeline?: 'auto' | 'jpeg' | 'h264'
-  /** What `Auto` would resolve to right now given an optimistic client cap
-   *  set. Used as the SPA's pre-mount hint when `preferred_pipeline === 'auto'`. */
-  chosen_default?: 'jpeg' | 'h264'
+  /** Operator preference: 'auto' (default) | 'h264' | 'hevc' | 'jpeg'. Phase-01:
+   *  the old binary surface was 'h264'|'jpeg'; new agents emit 'auto'. Phase-05
+   *  adds 'hevc' when the server resolves to the HEVC pipeline. SPA treats 'auto'
+   *  as "try H.264 if the client supports it". */
+  preferred_pipeline?: 'auto' | 'jpeg' | 'h264' | 'hevc'
+  /** What `Auto` would resolve to right now given an optimistic client cap set.
+   *  Used as the SPA's pre-mount hint when `preferred_pipeline === 'auto'`.
+   *  Note: wire format uses 'h265' (not 'hevc') for the chosen_default value. */
+  chosen_default?: 'jpeg' | 'h264' | 'h265'
   /** Phase-02a: operator has flipped the desktop_audio_enabled setting on. */
   audio_enabled?: boolean
   /** Phase-02a: build-side `desktop::audio::probe_supported()` outcome — only
@@ -91,15 +92,15 @@ const DEFAULT_SETTINGS: DisplaySettings = { hidpi: false, smoothScaling: false }
 // User-driven pipeline preference. Persisted globally (not per-host) since
 // it tracks browser-side decode capability + bandwidth preference, which is
 // generally machine-uniform. `'auto'` defers to the agent's chosen-default
-// (which itself respects `OXI_VIDEO_PIPELINE`); `'h264'` and `'jpeg'` are
-// session-scoped overrides that ride on the WS upgrade as
+// (which itself respects `OXI_VIDEO_PIPELINE`); `'h264'`, `'hevc'`, and
+// `'jpeg'` are session-scoped overrides that ride on the WS upgrade as
 // `?force_pipeline=...`.
-type PipelinePref = 'auto' | 'h264' | 'jpeg'
+type PipelinePref = 'auto' | 'h264' | 'hevc' | 'jpeg'
 const PIPELINE_PREF_KEY = 'oxi.desktop.pipeline_pref'
 function loadPipelinePref(): PipelinePref {
   if (typeof localStorage === 'undefined') return 'auto'
   const v = localStorage.getItem(PIPELINE_PREF_KEY)
-  return v === 'h264' || v === 'jpeg' ? v : 'auto'
+  return v === 'h264' || v === 'jpeg' || v === 'hevc' ? v : 'auto'
 }
 
 // Phase-03 step 7: stats overlay gate. URL `?stats=1` enables for the
@@ -568,40 +569,63 @@ export default function DesktopPage() {
     )
   }
 
-  // Pick H.264 when: client can decode AND (user picked h264 OR (auto AND
-  // operator/agent default resolves to H.264)) AND no per-session fallback.
+  // Phase-05: HEVC takes priority over H.264 when:
+  //   - server resolved preference is 'hevc', OR auto-mode resolved
+  //     `chosen_default` to 'h265' (server's own `choose()` picked HEVC
+  //     given an optimistic client cap-set)
+  //   - client browser supports HEVC WebRTC (Chrome 136+, Safari 18+)
+  //   - user has not explicitly pinned 'jpeg' or 'h264'
+  //   - no per-session JPEG fallback is active
+  const useHevc =
+    !forceJpegSession &&
+    (caps.preferred_pipeline === 'hevc' ||
+      (caps.preferred_pipeline === 'auto' && caps.chosen_default === 'h265')) &&
+    supportsHEVCVideo() &&
+    pipelinePref !== 'jpeg' &&
+    pipelinePref !== 'h264'
+
+  // Pick H.264 when: HEVC is not selected AND client can decode AND (user
+  // picked h264 OR (auto AND operator/agent default resolves to H.264 or HEVC
+  // but client can't decode HEVC)) AND no per-session fallback.
   // User pref takes precedence over auto-resolution; on `pipelinePref='jpeg'`
   // we mount JPEG view + ride `?force_pipeline=jpeg` over the WS so the
-  // server bypasses H.264 negotiation entirely.
+  // server bypasses negotiation entirely. `chosen_default === 'h265'` falls
+  // through here too so HEVC-incapable browsers still land on H.264 (not JPEG).
   const wantsH264 =
     pipelinePref === 'h264' ||
     (pipelinePref === 'auto' &&
       (caps.preferred_pipeline === 'h264' ||
-        (caps.preferred_pipeline === 'auto' && caps.chosen_default === 'h264')))
+        caps.preferred_pipeline === 'hevc' ||
+        (caps.preferred_pipeline === 'auto' &&
+          (caps.chosen_default === 'h264' || caps.chosen_default === 'h265'))))
   const useH264 =
-    pipelinePref !== 'jpeg' && wantsH264 && supportsH264Video() && !forceJpegSession
+    !useHevc && pipelinePref !== 'jpeg' && wantsH264 && supportsH264Video() && !forceJpegSession
+
   // Wire query param sent to the agent. Must reflect the *actually mounted*
-  // view, not just `pipelinePref` — when the H.264 watchdog flips us to JPEG
-  // mid-session (forceJpegSession) but the user's pref is still 'h264',
-  // sending `?force_pipeline=h264` from the JPEG view would force the agent
-  // onto H.264 with a JPEG-shaped client offer (no video transceiver) and
-  // close the WS at SDP merge. Rule: H.264 view forces 'h264' only on
-  // explicit pick; JPEG view forces 'jpeg' on explicit pick OR fallback.
-  const forcePipelineWire: 'h264' | 'jpeg' | undefined = useH264
-    ? pipelinePref === 'h264'
-      ? 'h264'
+  // view — when the H.264 watchdog flips us to JPEG mid-session (forceJpegSession)
+  // but the user's pref is still 'h264'/'hevc', sending the wrong param would
+  // mismatch the client offer shape. Rule: video view (H.264 or HEVC) forces
+  // the codec param only on explicit user pick; JPEG view forces 'jpeg' on
+  // explicit pick OR watchdog fallback.
+  const forcePipelineWire: 'h264' | 'hevc' | 'jpeg' | undefined = useHevc
+    ? pipelinePref === 'hevc'
+      ? 'hevc'
       : undefined
-    : forceJpegSession || pipelinePref === 'jpeg'
-      ? 'jpeg'
-      : undefined
+    : useH264
+      ? pipelinePref === 'h264'
+        ? 'h264'
+        : undefined
+      : forceJpegSession || pipelinePref === 'jpeg'
+        ? 'jpeg'
+        : undefined
   const monitorDefault = caps.monitors[0]
     ? { width: caps.monitors[0].width, height: caps.monitors[0].height }
     : undefined
   // Live audio gate (caps + chosen pipeline) AND user intent. `audioPref`
   // lives above early returns; the gate is computed here so it can read the
-  // post-early-return `useH264`. Computing the active flag inline (no extra
-  // useState) means a pipeline switch re-derives without a stale reset.
-  const audioGatePass = !!(caps?.audio_enabled && caps?.audio_supported) && useH264
+  // post-early-return `useH264`/`useHevc`. HEVC sessions share the same
+  // WebRTC video + audio transceiver path, so audio is valid for both.
+  const audioGatePass = !!(caps?.audio_enabled && caps?.audio_supported) && (useH264 || useHevc)
   const audioActive = audioGatePass && audioPref !== false
 
   const showReconnect =
@@ -632,20 +656,20 @@ export default function DesktopPage() {
         quality={quality}
         onQualityChange={handleQualityChange}
         onSettingsChange={handleSettingsChange}
-        pipeline={useH264 ? 'h264' : 'jpeg'}
+        pipeline={(useH264 || useHevc) ? 'h264' : 'jpeg'}
         audioGated={audioGatePass}
         audioActive={audioActive}
         onToggleAudio={handleToggleAudio}
-        pipelinePref={pipelinePref}
+        pipelinePref={pipelinePref === 'hevc' ? 'auto' : pipelinePref}
         onPipelinePrefChange={setPipelinePref}
         showStats={showStats}
         onShowStatsChange={setShowStats}
       />
 
       {/* Phase-03 step 6: stats overlay. Lazy-loaded, mounts only when
-          gated on. The H.264 view is the only producer right now — JPEG
-          sessions get a 404 and the overlay renders "stats: closed". */}
-      {showStats && useH264 && (
+          gated on. The H.264/HEVC view is the producer — JPEG sessions
+          get a 404 and the overlay renders "stats: closed". */}
+      {showStats && (useH264 || useHevc) && (
         <Suspense fallback={null}>
           <DesktopStatsOverlay hostId={hostId} />
         </Suspense>
@@ -688,7 +712,7 @@ export default function DesktopPage() {
             unlock the agent forces an IDR, so the next frame on the wire is
             clean — the SPA just clears `hostLockState`. */}
         {hostLockState === 'locked' && <LockedOverlay />}
-        {useH264 ? (
+        {(useH264 || useHevc) ? (
           <DesktopH264View
             key={`h264-${reloadNonce}`}
             hostId={hostId}
@@ -706,7 +730,12 @@ export default function DesktopPage() {
             onGestureApi={handleGestureApi}
             bottomAnchor={keyboardOpen}
             audio={audioActive}
-            forcePipeline={forcePipelineWire}
+            forcePipeline={
+              // DesktopH264View.forcePipeline not yet widened to 'hevc'; the
+              // prop flows into useDesktopVideoSession which accepts 'hevc'.
+              // Cast until desktop-h264-view.tsx is updated in a follow-up phase.
+              forcePipelineWire as 'h264' | 'jpeg' | 'auto' | undefined
+            }
           />
         ) : (
           <DesktopJpegView
@@ -725,7 +754,12 @@ export default function DesktopPage() {
             onZoomChange={setUserScale}
             onGestureApi={handleGestureApi}
             bottomAnchor={keyboardOpen}
-            forcePipeline={forcePipelineWire}
+            forcePipeline={
+              // JPEG view is only mounted when !useH264 && !useHevc, so
+              // forcePipelineWire is 'jpeg' | undefined here. The cast handles
+              // the type-level 'hevc' possibility which is unreachable at runtime.
+              forcePipelineWire as 'h264' | 'jpeg' | 'auto' | undefined
+            }
           />
         )}
       </div>
@@ -763,14 +797,14 @@ export default function DesktopPage() {
           hidpi={settings.hidpi}
           smoothScaling={settings.smoothScaling}
           onSettingsChange={handleSettingsChange}
-          pipeline={useH264 ? 'h264' : 'jpeg'}
+          pipeline={(useH264 || useHevc) ? 'h264' : 'jpeg'}
           onExit={handleExit}
           textBatchOpen={showTextBatch}
           onToggleTextBatch={() => setShowTextBatch((v) => !v)}
           audioGated={audioGatePass}
           audioActive={audioActive}
           onToggleAudio={handleToggleAudio}
-          pipelinePref={pipelinePref}
+          pipelinePref={pipelinePref === 'hevc' ? 'auto' : pipelinePref}
           onPipelinePrefChange={setPipelinePref}
           showStats={showStats}
           onShowStatsChange={setShowStats}

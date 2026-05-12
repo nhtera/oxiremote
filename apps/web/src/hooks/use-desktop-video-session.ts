@@ -29,11 +29,16 @@ import {
   DESKTOP_FALLBACK_PENDING_EVENT,
   setForceJpeg,
 } from './use-desktop-session'
+import { supportsH264Video, supportsHEVCVideo } from './codec-detect'
 import { isDiscoveryMode, getCurrentTunnelUrl } from '../lib/discovery-client'
 import { getActiveHost, loadApiKey, loadTunnelBase, storeTunnelBase } from '../lib/api-client'
 import { isAllowedTunnelHost, getNamedTunnelAllowlist } from '../lib/url-validation'
 import { shouldFastRetryOnHandshakeFailure } from '../lib/ws-fast-retry'
 import { TUNNEL_URL_CHANGED_EVENT } from './use-tunnel-url-sse'
+
+// Re-export for backwards compatibility — callers that imported supportsH264Video
+// directly from this module continue to work after the move to codec-detect.ts.
+export { supportsH264Video, supportsHEVCVideo }
 
 const WS_BEARER_PROTOCOL = 'oxi-bearer-v1'
 
@@ -67,10 +72,10 @@ const STUN_CONFIG: RTCConfiguration = {
 const RECONNECT_DELAY_MS = 1500
 const MAX_ATTEMPTS = 3
 
-function wsUrl(deviceId: string, forcePipeline?: 'jpeg' | 'h264' | 'auto'): string {
+function wsUrl(deviceId: string, forcePipeline?: 'jpeg' | 'h264' | 'hevc' | 'auto'): string {
   const path = `/ws/desktop/${encodeURIComponent(deviceId)}`
-  // Server validates `?force_pipeline=jpeg|h264|auto`; unknown values fall
-  // back to the operator preference, so it's safe to always append when set.
+  // Server validates `?force_pipeline=jpeg|h264|hevc|auto`; unknown values
+  // fall back to the operator preference, so it's safe to always append.
   const query = forcePipeline ? `?force_pipeline=${forcePipeline}` : ''
   if (isDiscoveryMode()) {
     const base = loadTunnelBase()
@@ -90,12 +95,6 @@ function wsProtocols(): string[] | undefined {
   return [WS_BEARER_PROTOCOL, key]
 }
 
-/** Feature-detection: phase-03 needs WebRTC + H.264 receive support. All
- * evergreen browsers (Chrome 2013+, Safari 14+, Firefox 2017+) satisfy this. */
-export function supportsH264Video(): boolean {
-  return typeof RTCPeerConnection !== 'undefined' && typeof MediaStream !== 'undefined'
-}
-
 export function useDesktopVideoSession(
   hostId: string,
   deviceId: string,
@@ -103,7 +102,7 @@ export function useDesktopVideoSession(
   tier: QualityTier = 'med',
   hidpi: boolean = false,
   audio: boolean = false,
-  forcePipeline?: 'h264' | 'jpeg' | 'auto',
+  forcePipeline?: 'h264' | 'hevc' | 'jpeg' | 'auto',
 ): VideoSessionApi {
   const [status, setStatus] = useState<DesktopStatus>('idle')
   const [attempt, setAttempt] = useState(0)
@@ -360,10 +359,17 @@ export function useDesktopVideoSession(
         location.hostname === '127.0.0.1' ||
         location.hostname === '[::1]' ||
         location.hostname === '::1'
+      // Advertise HEVC only when the browser exposes it via
+      // RTCRtpReceiver.getCapabilities — otherwise the agent's
+      // `supports_hevc()` check returns false and HEVC is unreachable even
+      // when the operator preference is set to it.
+      const clientCodecs = supportsHEVCVideo()
+        ? ['h264-baseline-3.1', 'h265-main-5.0']
+        : ['h264-baseline-3.1']
       ws.send(
         JSON.stringify({
           type: 'capabilitiesClient',
-          codecs: ['h264-baseline-3.1'],
+          codecs: clientCodecs,
           webcodecs: false,
           audio: audioRefBool.current,
           loopback: isLoopback,
@@ -424,16 +430,66 @@ export function useDesktopVideoSession(
         case 'pipelineChosen':
         case 'pipeline': {
           // Server's chosen pipeline + reason. `pipelineChosen` fires at
-          // session start; `pipeline` fires at first IDR carrying avcC +
+          // session start; `pipeline` fires at first IDR carrying avcC/hvcC +
           // authoritative `hardware_accel`. We accept both so the pill can
           // render immediately on session start and refine on IDR.
-          const mode = msg.mode === 'h264' ? 'h264' : 'jpeg'
+          //
+          // Phase-05: extended to handle `mode: "h265"` + `hvcc_description_b64`
+          // for HEVC sessions. The codec string `hev1.1.6.L153.B0` maps to:
+          //   hev1 = HEVC with in-band VPS/SPS/PPS (IDRs prepend parameter sets)
+          //   1    = Main profile
+          //   6    = profile_compatibility_flags (0x60 → bits 1+2 set)
+          //   L153 = Level 5.1 (153 / 30 = 5.1)
+          //   B0   = Main tier, constraint byte 0
+          const rawMode = msg.mode
+          const mode: 'h264' | 'h265' | 'jpeg' =
+            rawMode === 'h264' ? 'h264' : rawMode === 'h265' ? 'h265' : 'jpeg'
           const reason = typeof msg.reason === 'string' ? msg.reason : 'unknown'
           const hwRaw = (msg as Record<string, unknown>).hardwareAccel
             ?? (msg as Record<string, unknown>).hardware_accel
           const hardwareAccel =
             typeof hwRaw === 'boolean' ? hwRaw : undefined
-          setPipelineInfo({ mode, reason, hardwareAccel })
+
+          // Configure WebCodecs VideoDecoder when the IDR carries a parameter-set
+          // record. HEVC uses hvcC (hvcc_description_b64); H.264 uses avcC.
+          // The `VideoDecoder` path is future-proofing — the current pipeline
+          // uses rVFC + <video> element decode, so configure() is a no-op for
+          // the existing transport. A future RTCRtpScriptTransform upgrade will
+          // consume it. We call it speculatively so the config is ready.
+          if (mode === 'h265') {
+            const hvccB64 = msg.hvcc_description_b64
+            if (typeof hvccB64 === 'string' && hvccB64.length > 0) {
+              try {
+                const description = Uint8Array.from(
+                  atob(hvccB64),
+                  (c) => c.charCodeAt(0),
+                )
+                // VideoDecoder is a browser API — guard for non-supporting browsers.
+                if (typeof VideoDecoder !== 'undefined') {
+                  const dec = new VideoDecoder({
+                    output: () => {},
+                    error: () => {},
+                  })
+                  dec.configure({
+                    codec: 'hev1.1.6.L153.B0',
+                    description,
+                    hardwareAcceleration: 'prefer-hardware',
+                  })
+                  dec.close()
+                }
+              } catch {
+                // Probe only — failure is non-fatal; the <video> element decode
+                // path handles the track regardless of VideoDecoder support.
+              }
+            }
+          }
+
+          // DesktopPipelineInfo.mode is typed 'h264'|'jpeg' in use-desktop-session.ts
+          // (not owned by this phase). The 'h265' value is intentional; the shared
+          // type will be widened in a follow-up. PipelineStatusPill renders 'h265'
+          // as 'h264' styling until phase-06 adds a dedicated label.
+          setPipelineInfo({ mode, reason, hardwareAccel } as DesktopPipelineInfo)
+
           if (mode === 'jpeg') {
             // Server picked JPEG even though the SPA mounted the H.264 hook
             // — we'd be reading audio out of a video transceiver. Tear down

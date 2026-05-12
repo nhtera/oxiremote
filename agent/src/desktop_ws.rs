@@ -149,21 +149,27 @@ mod inner {
             hardware_accel: Option<bool>,
         },
         /// Server tells client which pipeline was selected and the per-tier
-        /// bitrate presets. On H.264 mode `avcc_description` carries the
+        /// bitrate presets. On H.264 mode `avcc_description_b64` carries the
         /// base64-encoded `avcC` box built from the first IDR's SPS+PPS,
         /// ready for `VideoDecoder.configure({ description })`.
+        /// On H.265 mode `hvcc_description_b64` carries the base64-encoded
+        /// `hvcC` box (ISO 14496-15 §8.3.3.1). The SPA matches on `mode` to
+        /// decide which field to decode. Both are `None` on JPEG.
         ///
         /// Phase-01 additions: `reason` mirrors `PipelineChosen.reason` so a
         /// client that missed the first message can still self-describe;
         /// `hardware_accel` is authoritative once this message lands (the
         /// encoder backend is locked at that point).
         Pipeline {
-            mode: &'a str, // "h264" | "jpeg"
+            mode: &'a str, // "h264" | "h265" | "jpeg"
             codec: Option<&'a str>,
             tier_bitrates_kbps_low: u32,
             tier_bitrates_kbps_med: u32,
             tier_bitrates_kbps_high: u32,
             avcc_description_b64: Option<String>,
+            /// Phase-04: `hvcC` config blob for HEVC sessions.
+            /// `Some(base64)` when mode="h265"; `None` otherwise.
+            hvcc_description_b64: Option<String>,
             reason: &'a str,
             hardware_accel: bool,
         },
@@ -427,67 +433,6 @@ mod inner {
         mut close_rx: tokio::sync::oneshot::Receiver<()>,
         force_override: Option<OperatorPref>,
     ) -> anyhow::Result<()> {
-        // ── Peer connection ───────────────────────────────────────────────────
-        // Register the default codec set so the H.264 track the server adds
-        // matches a payload type in the client's offer. Without this, the
-        // MediaEngine is empty and the answer rejects the video m-line with
-        // `m=video 0 ... 0` (port 0 = disabled); the client's `ontrack`
-        // never fires and the canvas stays black.
-        let mut media_engine = MediaEngine::default();
-        media_engine.register_default_codecs()?;
-        let api = APIBuilder::new().with_media_engine(media_engine).build();
-        let pc = Arc::new(
-            api.new_peer_connection(RTCConfiguration {
-                ice_servers: vec![RTCIceServer {
-                    urls: vec!["stun:stun.l.google.com:19302".into()],
-                    ..Default::default()
-                }],
-                ..Default::default()
-            })
-            .await?,
-        );
-
-        // ── DataChannels ──────────────────────────────────────────────────────
-        // Externally negotiated: each peer pre-binds a stream id so no DCEP
-        // OPEN handshake is exchanged. Asymmetry is fatal here — if the
-        // server pre-binds a stream id the client never creates, the
-        // browser's SCTP receives chunks on an unassigned stream and answers
-        // with ERROR, collapsing the whole association ~5 s in.
-        //
-        // "ctrl" (id=2) is created in BOTH modes and is safe to build now —
-        // the client creates it from both JPEG and H.264 hooks. "desktop"
-        // (id=1) is JPEG-only and is deferred until `Pipeline::Jpeg` is
-        // confirmed by `await_offer_with_caps` below.
-        let ctrl_dc = pc
-            .create_data_channel(
-                "ctrl",
-                Some(RTCDataChannelInit {
-                    ordered: Some(true),
-                    negotiated: Some(2),
-                    ..Default::default()
-                }),
-            )
-            .await?;
-
-        // ── Outgoing WS text channel (ICE candidates + answer) ────────────────
-        // Callbacks cannot hold &mut socket, so we push through an mpsc.
-        let (ws_out_tx, mut ws_out_rx) = mpsc::channel::<String>(32);
-
-        // ── ICE callback → WS text ────────────────────────────────────────────
-        let ice_ws_tx = ws_out_tx.clone();
-        pc.on_ice_candidate(Box::new(move |candidate| {
-            let tx = ice_ws_tx.clone();
-            Box::pin(async move {
-                let Some(c) = candidate else { return };
-                let Ok(init) = c.to_json() else { return };
-                let Ok(msg) = serde_json::to_string(&SignalOut::Ice { candidate: init })
-                else {
-                    return;
-                };
-                let _ = tx.send(msg).await;
-            })
-        }));
-
         // ── Quality watch channel ─────────────────────────────────────────────
         // Default to Med to match the web client's default dropdown value —
         // if the client's `quality` ctrl message is delayed we don't waste
@@ -526,6 +471,151 @@ mod inner {
         // keyframe + RTCP PLI loop instead).
         let input_wake: desktop::capture::InputWake =
             Arc::new(tokio::sync::Notify::new());
+
+        // ── Offer / answer exchange ───────────────────────────────────────────
+        // Two-phase: read the offer + capabilities FIRST (without a PC),
+        // then build the MediaEngine with the correct codec set (registering
+        // HEVC only when `Pipeline::Hevc` is chosen), then build the PC and
+        // create DataChannels.
+        //
+        // This ordering is required because webrtc-rs `MediaEngine::register_codec`
+        // must be called BEFORE `APIBuilder::build()` + `new_peer_connection`.
+        // Pre-offer ICE candidates are buffered in `await_offer_with_caps`
+        // and applied to the freshly-built PC afterwards.
+        //
+        // Per-session pipeline override from `?force_pipeline=` is honored
+        // ONLY when the operator's env preference is `Auto`. Forced env
+        // (`jpeg` or `h264`) pins intent and is immutable from the client —
+        // closes a privilege-escalation path where an authenticated tunnel
+        // client could bypass `OXI_VIDEO_PIPELINE=jpeg` by passing
+        // `?force_pipeline=h264`. Matches the plan's downgrade-only contract;
+        // the watchdog-driven JPEG fallback flow still works because that
+        // flow only fires when the operator was Auto in the first place
+        // (the agent never picks H.264 under forced JPEG).
+        let env_pref = operator_preference();
+        let operator_pref = match (force_override, env_pref) {
+            (Some(ov), OperatorPref::Auto) => ov,
+            (Some(_), forced) => forced,
+            (None, env) => env,
+        };
+        #[cfg_attr(not(feature = "h264"), allow(unused_variables))]
+        #[cfg_attr(not(feature = "audio"), allow(unused_variables))]
+        let (
+            decision_pipeline,
+            decision_reason,
+            offer_sdp,
+            initial_hidpi,
+            client_audio_opt_in,
+            client_loopback,
+            buffered_ice,
+        ) = match await_offer_with_caps(&mut socket, &mut close_rx, operator_pref).await {
+                Ok(v) => v,
+                Err(e) => {
+                    // Emit a telemetry event for the failure path so dashboards
+                    // can count forced-h264-no-client and other negotiation
+                    // failures. Without this the success metric "auto-h264
+                    // rate" is computed against only successful sessions and
+                    // hides the fail-closed denominator.
+                    // `e` is an anyhow error whose Display string is the
+                    // stable reason identifier (e.g. "forced-h264-no-client",
+                    // "forced-hevc-no-client", or "WS closed during negotiation").
+                    // Extract it directly; no concrete type downcast needed.
+                    let reason = e.to_string();
+                    state.event_bus.send(AgentEvent::PipelineChosen {
+                        device_id: device_id.to_string(),
+                        pipeline: "none".to_string(),
+                        reason,
+                    });
+                    return Err(e);
+                }
+            };
+        #[cfg_attr(not(feature = "h264"), allow(unused_variables))]
+        let pipeline = decision_pipeline;
+
+        // ── Peer connection ───────────────────────────────────────────────────
+        // Build MediaEngine with the codec set determined by the pipeline
+        // decision above. HEVC requires explicit `register_codec` because
+        // webrtc-rs has no built-in H.265 payloader; H.264 and audio codecs
+        // come from `register_default_codecs`. The MediaEngine must be fully
+        // configured before `APIBuilder::build()` + `new_peer_connection`.
+        let mut media_engine = MediaEngine::default();
+        media_engine.register_default_codecs()?;
+        #[cfg(feature = "hevc")]
+        if matches!(pipeline, Pipeline::Hevc) {
+            use webrtc::rtp_transceiver::rtp_codec::{RTCRtpCodecParameters, RTPCodecType};
+            media_engine.register_codec(
+                RTCRtpCodecParameters {
+                    capability: crate::video_pipeline::hevc_codec_capability(),
+                    // PT 99 — `register_default_codecs` already claims 98 for VP9
+                    // (webrtc-rs media_engine/mod.rs). Doubling up there would
+                    // emit a malformed SDP answer and break HEVC negotiation.
+                    payload_type: 99,
+                    ..Default::default()
+                },
+                RTPCodecType::Video,
+            )?;
+        }
+        let api = APIBuilder::new().with_media_engine(media_engine).build();
+        let pc = Arc::new(
+            api.new_peer_connection(RTCConfiguration {
+                ice_servers: vec![RTCIceServer {
+                    urls: vec!["stun:stun.l.google.com:19302".into()],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            })
+            .await?,
+        );
+
+        // Apply any ICE candidates that arrived before the PC existed.
+        // Doing this after PC construction avoids a TOCTOU where a buffered
+        // candidate arrives before ICE gathering starts.
+        for ice in buffered_ice {
+            if let Err(e) = pc.add_ice_candidate(ice).await {
+                warn!(error = %e, "buffered pre-offer ICE candidate rejected");
+            }
+        }
+
+        // ── DataChannels ──────────────────────────────────────────────────────
+        // Externally negotiated: each peer pre-binds a stream id so no DCEP
+        // OPEN handshake is exchanged. Asymmetry is fatal here — if the
+        // server pre-binds a stream id the client never creates, the
+        // browser's SCTP receives chunks on an unassigned stream and answers
+        // with ERROR, collapsing the whole association ~5 s in.
+        //
+        // "ctrl" (id=2) is created in BOTH modes and is safe to build now —
+        // the client creates it from both JPEG and H.264 hooks. "desktop"
+        // (id=1) is JPEG-only and is deferred until `Pipeline::Jpeg` is
+        // confirmed by `await_offer_with_caps` above.
+        let ctrl_dc = pc
+            .create_data_channel(
+                "ctrl",
+                Some(RTCDataChannelInit {
+                    ordered: Some(true),
+                    negotiated: Some(2),
+                    ..Default::default()
+                }),
+            )
+            .await?;
+
+        // ── Outgoing WS text channel (ICE candidates + answer) ────────────────
+        // Callbacks cannot hold &mut socket, so we push through an mpsc.
+        let (ws_out_tx, mut ws_out_rx) = mpsc::channel::<String>(32);
+
+        // ── ICE callback → WS text ────────────────────────────────────────────
+        let ice_ws_tx = ws_out_tx.clone();
+        pc.on_ice_candidate(Box::new(move |candidate| {
+            let tx = ice_ws_tx.clone();
+            Box::pin(async move {
+                let Some(c) = candidate else { return };
+                let Ok(init) = c.to_json() else { return };
+                let Ok(msg) = serde_json::to_string(&SignalOut::Ice { candidate: init })
+                else {
+                    return;
+                };
+                let _ = tx.send(msg).await;
+            })
+        }));
 
         // ── Ctrl DC: parse and dispatch input events ──────────────────────────
         // The dispatch closure also needs to re-emit `Capabilities` over the
@@ -566,61 +656,6 @@ mod inner {
                 })
             }));
         }
-
-        // ── Offer / answer exchange ───────────────────────────────────────────
-        // Split in two: read the offer + capabilities first, then complete
-        // the SDP exchange. Between the two, when Pipeline::H264 we attach
-        // a sendonly video track so the server's answer matches the client's
-        // recvonly video m-line. The returned RTCRtpSender feeds
-        // `spawn_rtcp_reader` for PLI + REMB feedback.
-        //
-        // Per-session pipeline override from `?force_pipeline=` is honored
-        // ONLY when the operator's env preference is `Auto`. Forced env
-        // (`jpeg` or `h264`) pins intent and is immutable from the client —
-        // closes a privilege-escalation path where an authenticated tunnel
-        // client could bypass `OXI_VIDEO_PIPELINE=jpeg` by passing
-        // `?force_pipeline=h264`. Matches the plan's downgrade-only contract;
-        // the watchdog-driven JPEG fallback flow still works because that
-        // flow only fires when the operator was Auto in the first place
-        // (the agent never picks H.264 under forced JPEG).
-        let env_pref = operator_preference();
-        let operator_pref = match (force_override, env_pref) {
-            (Some(ov), OperatorPref::Auto) => ov,
-            (Some(_), forced) => forced,
-            (None, env) => env,
-        };
-        #[cfg_attr(not(feature = "h264"), allow(unused_variables))]
-        #[cfg_attr(not(feature = "audio"), allow(unused_variables))]
-        let (
-            decision_pipeline,
-            decision_reason,
-            offer_sdp,
-            initial_hidpi,
-            client_audio_opt_in,
-            client_loopback,
-        ) = match await_offer_with_caps(&mut socket, &pc, &mut close_rx, operator_pref).await {
-                Ok(v) => v,
-                Err(e) => {
-                    // Emit a telemetry event for the failure path so dashboards
-                    // can count forced-h264-no-client and other negotiation
-                    // failures. Without this the success metric "auto-h264
-                    // rate" is computed against only successful sessions and
-                    // hides the fail-closed denominator.
-                    // `e` is an anyhow error whose Display string is the
-                    // stable reason identifier (e.g. "forced-h264-no-client",
-                    // "forced-hevc-no-client", or "WS closed during negotiation").
-                    // Extract it directly; no concrete type downcast needed.
-                    let reason = e.to_string();
-                    state.event_bus.send(AgentEvent::PipelineChosen {
-                        device_id: device_id.to_string(),
-                        pipeline: "none".to_string(),
-                        reason,
-                    });
-                    return Err(e);
-                }
-            };
-        #[cfg_attr(not(feature = "h264"), allow(unused_variables))]
-        let pipeline = decision_pipeline;
 
         // Emit the immediate pill signal + telemetry event. `hardware_accel`
         // is unknown for H.264 until the encoder builds; JPEG is always SW.
@@ -794,9 +829,11 @@ mod inner {
         }
         // ─── end macOS lock-screen handling ──────────────────────────────────
 
-        // Build the H.264 sending track iff the Pipeline chose H.264 AND the
-        // feature is compiled in. For the JPEG path `sending_track` is None
-        // and `complete_answer` skips `pc.add_track`.
+        // Build the video sending track based on the chosen pipeline.
+        // H.264: `TrackLocalStaticSample` with the built-in H264 payloader.
+        // HEVC: `HevcTrack` wrapping `TrackLocalStaticRTP` + our RFC 7798 payloader.
+        // JPEG: no video track (DataChannel / WS binary tiles instead).
+        // `sending_track` is None for JPEG; `complete_answer` skips `add_transceiver`.
         #[cfg(feature = "h264")]
         let (h264_track, sending_track): (
             Option<Arc<webrtc::track::track_local::track_local_static_sample::TrackLocalStaticSample>>,
@@ -810,6 +847,29 @@ mod inner {
         };
         #[cfg(not(feature = "h264"))]
         let sending_track: Option<Arc<dyn TrackLocal + Send + Sync>> = None;
+
+        // HEVC track — only when pipeline=Hevc AND feature is compiled in.
+        // `HevcTrack::as_track_local()` returns `Arc<dyn TrackLocal + Send + Sync>`
+        // pointing at the inner `TrackLocalStaticRTP`, which webrtc-rs can bind.
+        // When not Hevc, preserve whatever `sending_track` the H.264 arm set.
+        #[cfg(feature = "hevc")]
+        let (hevc_track, sending_track): (
+            Option<Arc<crate::hevc_pipeline::HevcTrack>>,
+            Option<Arc<dyn TrackLocal + Send + Sync>>,
+        ) = if matches!(pipeline, Pipeline::Hevc) {
+            let t = crate::video_pipeline::new_hevc_track();
+            let as_tl = t.as_track_local();
+            (Some(t), Some(as_tl))
+        } else {
+            // Preserve the sending_track already set by the H.264 path above.
+            // This block is compiled alongside h264 when both features are
+            // active — must not clobber the H.264 track assignment.
+            #[cfg(feature = "h264")]
+            let existing = sending_track;
+            #[cfg(not(feature = "h264"))]
+            let existing = None::<Arc<dyn TrackLocal + Send + Sync>>;
+            (None, existing)
+        };
 
         // Phase-02a: audio gate AND-merges three sources of truth — operator
         // settings (`desktop_audio_enabled`), client opt-in (`client_caps.audio`,
@@ -844,16 +904,16 @@ mod inner {
         #[cfg(feature = "audio")]
         let _ = &opus_track;
 
-        let h264_sender =
+        let video_sender =
             complete_answer(&pc, offer_sdp, &ws_out_tx, sending_track, audio_sending_track)
                 .await?;
-        let _ = &h264_sender; // silence unused when feature = "h264" is off
+        let _ = &video_sender; // silence unused when neither h264 nor hevc feature is on
 
         // Branch the transport pipeline now that the answer is on the wire.
         // H.264 uses an RTP track — no DC-open race, no JPEG tile encoder.
         #[cfg(feature = "h264")]
         if let (Pipeline::H264, Some(track), Some(sender)) =
-            (pipeline, h264_track.as_ref(), h264_sender.as_ref())
+            (pipeline, h264_track.as_ref(), video_sender.as_ref())
         {
             let result = run_h264_session(
                 &mut socket,
@@ -882,6 +942,237 @@ mod inner {
             .await;
             let _ = pc.close().await;
             return result;
+        }
+
+        // HEVC dispatch — mirrors the H.264 path but uses `spawn_hevc_pipeline`
+        // and `build_hvcc` to produce the `hvcC` config blob for the SPA.
+        #[cfg(feature = "hevc")]
+        if let (Pipeline::Hevc, Some(track)) = (pipeline, hevc_track.as_ref()) {
+            use base64::{engine::general_purpose::STANDARD as B64_STD, Engine as _};
+            use desktop::capture::CaptureLoop;
+            use desktop::encoders::BitrateBps;
+            use desktop::resize_dims;
+
+            let initial_tier = *quality_rx.borrow();
+            let hidpi = initial_hidpi;
+            let (out_w, out_h) =
+                resize_dims(screen_w, screen_h, initial_tier, scale_factor, hidpi);
+
+            // Emit Capabilities so the client can size its <video> backing canvas.
+            if let Ok(msg) = serde_json::to_string(&SignalOut::Capabilities {
+                width: out_w,
+                height: out_h,
+                scale_factor,
+                tile_size: desktop::TILE_SIZE,
+            }) {
+                let _ = ws_out_tx.send(msg).await;
+            }
+
+            // RTCRtpSender for RTCP feedback (PLI + REMB). `complete_answer`
+            // returns Some when a track was added (always true for HEVC here).
+            let Some(hevc_sender) = video_sender else {
+                warn!("hevc: complete_answer returned no sender — RTCP feedback unavailable");
+                let _ = pc.close().await;
+                return Ok(());
+            };
+
+            // Channels for the pipeline + RTCP reader lifecycle.
+            let (bgra_tx, bgra_rx) = mpsc::channel::<desktop::RawBgraFrame>(2);
+            let (bitrate_tx, bitrate_rx) = watch::channel(tier_bitrate_hevc(initial_tier, hidpi));
+            let (pli_tx, pli_rx) = mpsc::channel::<()>(4);
+            let (params_tx, params_rx) = tokio::sync::oneshot::channel();
+            let (vp_shutdown_tx, vp_shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+            let (rtcp_shutdown_tx, rtcp_shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+            let (cap_iframe_tx, cap_iframe_rx) = tokio::sync::oneshot::channel::<()>();
+            let _ = cap_iframe_tx.send(()); // force first frame to be IDR
+
+            let (abr_tx, _abr_rx_dropped) = crate::desktop_abr::channel();
+
+            // Capture: BGRA frames → bgra_tx.
+            let cap_fps_rx = quality_tx.subscribe();
+            tokio::task::spawn_blocking(move || {
+                CaptureLoop::run_bgra(
+                    initial_tier,
+                    cap_fps_rx,
+                    bgra_tx,
+                    scale_factor,
+                    hidpi,
+                    Some(cap_iframe_rx),
+                    None, // no audio on HEVC path for now
+                )
+            });
+
+            crate::hevc_pipeline::spawn_hevc_pipeline(
+                crate::hevc_pipeline::HevcPipelineConfig {
+                    width: out_w,
+                    height: out_h,
+                    initial_bitrate: tier_bitrate_hevc(initial_tier, hidpi),
+                    initial_max_qp: tier_max_qp_hevc(initial_tier),
+                    track: Arc::clone(track),
+                    bgra_rx,
+                    bitrate_rx,
+                    fps_rx: quality_tx.subscribe(),
+                    shutdown_rx: vp_shutdown_rx,
+                    pli_rx,
+                    params_tx,
+                    abr_tx: abr_tx.clone(),
+                },
+            );
+
+            crate::video_pipeline::spawn_rtcp_reader(
+                hevc_sender,
+                pli_tx,
+                bitrate_tx.clone(),
+                abr_tx.clone(),
+                rtcp_shutdown_rx,
+                client_loopback,
+            );
+
+            // Attach ABR publisher so the stats SSE endpoint can subscribe.
+            if let Some(svc) = state.desktop_service.as_ref() {
+                svc.attach_abr_tx(device_id, abr_tx.clone());
+            }
+
+            info!(
+                width = out_w,
+                height = out_h,
+                tier = ?initial_tier,
+                hidpi,
+                "hevc pipeline spawned"
+            );
+
+            // Session-start IDR watchdog: same 5-second budget as H.264.
+            let mut params_rx = Some(params_rx);
+            let connected_notify = Arc::new(tokio::sync::Notify::new());
+            {
+                let notify = Arc::clone(&connected_notify);
+                let fired = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                pc.on_peer_connection_state_change(Box::new(move |state| {
+                    let notify = Arc::clone(&notify);
+                    let fired = Arc::clone(&fired);
+                    Box::pin(async move {
+                        use std::sync::atomic::Ordering;
+                        use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
+                        if matches!(state, RTCPeerConnectionState::Connected)
+                            && !fired.swap(true, Ordering::SeqCst)
+                        {
+                            notify.notify_waiters();
+                        }
+                    })
+                }));
+            }
+            let watchdog_notify = Arc::clone(&connected_notify);
+            let watchdog = async move {
+                watchdog_notify.notified().await;
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            };
+            tokio::pin!(watchdog);
+
+            // Main WS event loop for HEVC session.
+            let current_hidpi = hidpi;
+            loop {
+                tokio::select! {
+                    biased;
+
+                    _ = &mut close_rx => break,
+
+                    // First IDR's VPS+SPS+PPS → build hvcC, send over signaling WS.
+                    res = wait_hevc_params(params_rx.as_mut()), if params_rx.is_some() => {
+                        params_rx = None;
+                        if let Some(params) = res {
+                            let hw_accel = params.is_hardware;
+                            let hvcc = crate::video_pipeline::build_hvcc(&params);
+                            let b64 = B64_STD.encode(&hvcc);
+                            let msg = SignalOut::Pipeline {
+                                mode: "h265",
+                                codec: Some("h265-main-5.0"),
+                                tier_bitrates_kbps_low: BitrateBps::LOW.0 / 1_000,
+                                tier_bitrates_kbps_med: BitrateBps::MED.0 / 1_000,
+                                tier_bitrates_kbps_high: BitrateBps::HIGH.0 / 1_000,
+                                avcc_description_b64: None,
+                                hvcc_description_b64: Some(b64),
+                                reason: decision_reason,
+                                hardware_accel: hw_accel,
+                            };
+                            if let Ok(txt) = serde_json::to_string(&msg) {
+                                let _ = ws_out_tx.send(txt).await;
+                            }
+                            info!(hardware_accel = hw_accel, "hevc: hvcC description sent");
+                        }
+                    }
+
+                    // Session-start IDR watchdog.
+                    _ = &mut watchdog, if params_rx.is_some() => {
+                        warn!(
+                            device = %device_id,
+                            "hevc: session-start IDR watchdog tripped — signaling FallbackPending"
+                        );
+                        if let Ok(txt) = serde_json::to_string(&SignalOut::FallbackPending {
+                            reason: "no-idr-5s",
+                        }) {
+                            let _ = socket.send(Message::Text(txt.into())).await;
+                        }
+                        state.event_bus.send(AgentEvent::PipelineChosen {
+                            device_id: device_id.to_string(),
+                            pipeline: "jpeg".to_string(),
+                            reason: "fallback-idr-watchdog".to_string(),
+                        });
+                        break;
+                    }
+
+                    Some(text) = ws_out_rx.recv() => {
+                        if socket.send(Message::Text(text.into())).await.is_err() { break; }
+                    }
+
+                    Ok(_) = quality_rx.changed() => {
+                        let new_tier = *quality_rx.borrow();
+                        let _ = bitrate_tx.send(tier_bitrate_hevc(new_tier, current_hidpi));
+                        let (w, h) = resize_dims(
+                            screen_w, screen_h, new_tier, scale_factor, current_hidpi,
+                        );
+                        if let Ok(msg) = serde_json::to_string(&SignalOut::Capabilities {
+                            width: w, height: h, scale_factor, tile_size: desktop::TILE_SIZE,
+                        }) {
+                            let _ = ws_out_tx.send(msg).await;
+                        }
+                    }
+
+                    Ok(_) = settings_rx.changed() => {
+                        let new_hidpi = *settings_rx.borrow();
+                        if new_hidpi != current_hidpi {
+                            info!(old = current_hidpi, new = new_hidpi,
+                                "hevc: hidpi change → session restart");
+                            break;
+                        }
+                    }
+
+                    msg = socket.recv() => {
+                        match msg {
+                            Some(Ok(Message::Text(text))) => {
+                                on_incoming_text(
+                                    &text,
+                                    &pc,
+                                    &injector,
+                                    screen_w,
+                                    screen_h,
+                                    &quality_tx,
+                                    &settings_tx,
+                                    scale_factor,
+                                    &ws_out_tx,
+                                    None,
+                                ).await;
+                            }
+                            Some(Ok(Message::Close(_))) | None => break,
+                            _ => {}
+                        }
+                    }
+                }
+            }
+
+            let _ = vp_shutdown_tx.send(());
+            let _ = rtcp_shutdown_tx.send(());
+            let _ = pc.close().await;
+            return Ok(());
         }
 
         // ── JPEG path: desktop DC + 5-second fallback race ────────────────────
@@ -1503,6 +1794,7 @@ mod inner {
                             tier_bitrates_kbps_med: BitrateBps::MED.0 / 1_000,
                             tier_bitrates_kbps_high: BitrateBps::HIGH.0 / 1_000,
                             avcc_description_b64: Some(b64),
+                            hvcc_description_b64: None,
                             reason: decision_reason,
                             hardware_accel: hw_accel,
                         };
@@ -1682,6 +1974,48 @@ mod inner {
         }
     }
 
+    /// Poll the HEVC first-IDR oneshot for VPS+SPS+PPS.
+    #[cfg(feature = "hevc")]
+    async fn wait_hevc_params(
+        rx: Option<&mut tokio::sync::oneshot::Receiver<desktop::encoders::HevcParameterSets>>,
+    ) -> Option<desktop::encoders::HevcParameterSets> {
+        match rx {
+            Some(r) => r.await.ok(),
+            None => std::future::pending().await,
+        }
+    }
+
+    /// Map quality tier + HiDPI flag to HEVC bitrate. Mirrors the H.264
+    /// `tier_bitrate` function — same presets, same 2× HiDPI multiplier,
+    /// same 30 Mbps cap. HEVC compresses screen content better than H.264
+    /// at equal bitrate but we start at the same presets so operators get
+    /// consistent behaviour when toggling between codecs.
+    #[cfg(feature = "hevc")]
+    fn tier_bitrate_hevc(tier: QualityTier, hidpi: bool) -> desktop::encoders::BitrateBps {
+        use desktop::encoders::BitrateBps;
+        let base = match tier {
+            QualityTier::High => BitrateBps::HIGH,
+            QualityTier::Med => BitrateBps::MED,
+            QualityTier::Low => BitrateBps::LOW,
+        };
+        if hidpi {
+            BitrateBps((base.0.saturating_mul(2)).min(30_000_000))
+        } else {
+            base
+        }
+    }
+
+    /// Map quality tier to HEVC `MaxAllowedFrameQP` cap. Mirrors the H.264
+    /// `tier_max_qp` function — same thresholds (HIGH=23, MED=28, LOW=None).
+    #[cfg(feature = "hevc")]
+    fn tier_max_qp_hevc(tier: QualityTier) -> Option<u32> {
+        match tier {
+            QualityTier::High => Some(23),
+            QualityTier::Med => Some(28),
+            QualityTier::Low => None,
+        }
+    }
+
     /// Map a quality tier to its VideoToolbox `MaxAllowedFrameQP` cap.
     /// H.264 QP is 0-51 (0=lossless, 51=worst). Tier mapping:
     /// - HIGH → Some(23): "visually-OK" floor for text-heavy UI. Encoder
@@ -1736,32 +2070,41 @@ mod inner {
     // ── Signaling: offer → answer ─────────────────────────────────────────────
 
     /// Read WS messages until an "offer" arrives. Does NOT process the offer
-    /// — the caller may need to `pc.add_track(video_track)` after learning
-    /// the Pipeline choice but before `create_answer` binds the SDP. ICE
-    /// candidates that arrive before the offer are applied immediately.
+    /// — the caller needs to build a `RTCPeerConnection` with the right
+    /// `MediaEngine` codec set AFTER learning the pipeline choice.
     ///
-    /// Also collects any pre-offer `Settings` so the encoder gets initialised
-    /// with the user's persisted HiDPI preference on first frame — saves a
-    /// reconnect round-trip when the client has toggled HiDPI on previously.
+    /// Pre-offer ICE candidates are buffered and returned so the caller can
+    /// apply them to the freshly-built PC after construction. This is
+    /// necessary because HEVC codec registration must happen before
+    /// `APIBuilder::build()` + `new_peer_connection`, which in turn must
+    /// happen after we know the pipeline (from `CapabilitiesClient`+`Offer`).
     ///
-    /// Returns the chosen `Pipeline`, the stable reason code for the SPA
-    /// pill / telemetry, the offer SDP for `complete_answer`, and the
-    /// initial HiDPI flag.
+    /// Also collects any pre-offer `Settings` so the encoder starts with
+    /// the user's persisted HiDPI preference without a reconnect round-trip.
+    ///
+    /// Returns: `(pipeline, reason, offer_sdp, initial_hidpi, client_audio,
+    ///            client_loopback, buffered_ice_candidates)`.
     ///
     /// `operator` is the per-session preference (env var unless overridden
-    /// by `?force_pipeline=` on the WS upgrade). When the operator has
-    /// forced H.264 and the client lacks decode support, this function ships
-    /// a clear `CaptureEnded` message to the client and returns an error —
-    /// the caller closes the PC. Silent JPEG fallback is intentionally NOT
-    /// applied in that case (fail-closed matches operator intent).
+    /// by `?force_pipeline=` on the WS upgrade). When the operator forces a
+    /// pipeline the client can't decode, ships `CaptureEnded` and returns
+    /// `Err` (fail-closed, no silent JPEG fallback).
     async fn await_offer_with_caps(
         socket: &mut WebSocket,
-        pc: &RTCPeerConnection,
         close_rx: &mut tokio::sync::oneshot::Receiver<()>,
         operator: OperatorPref,
-    ) -> anyhow::Result<(Pipeline, &'static str, String, bool, bool, bool)> {
+    ) -> anyhow::Result<(
+        Pipeline,
+        &'static str,
+        String,
+        bool,
+        bool,
+        bool,
+        Vec<RTCIceCandidateInit>,
+    )> {
         let mut client_caps = ClientCapabilities::default();
         let mut initial_hidpi = false;
+        let mut buffered_ice: Vec<RTCIceCandidateInit> = Vec::new();
 
         loop {
             tokio::select! {
@@ -1795,6 +2138,7 @@ mod inner {
                                         initial_hidpi,
                                         client_caps.audio,
                                         client_caps.loopback,
+                                        buffered_ice,
                                     ));
                                 }
                                 Err(err) => {
@@ -1824,9 +2168,11 @@ mod inner {
                             }
                         }
                         Ok(SignalIn::Ice { candidate }) => {
-                            if let Err(e) = pc.add_ice_candidate(candidate).await {
-                                warn!(error = %e, "pre-offer ICE candidate rejected");
-                            }
+                            // Buffer pre-offer ICE candidates. The PC is built
+                            // AFTER capability negotiation (so HEVC codec can
+                            // be registered before `new_peer_connection`);
+                            // the caller applies them once the PC exists.
+                            buffered_ice.push(candidate);
                         }
                         Ok(SignalIn::CapabilitiesClient { codecs, webcodecs, audio, loopback }) => {
                             client_caps.codecs = codecs;

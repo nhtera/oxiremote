@@ -61,6 +61,10 @@ mod desktop_stats_sse;
 // Gated independently so the h264-only build does not pull this module.
 #[cfg(feature = "hevc")]
 mod hevc_payloader;
+// HEVC pipeline — HevcTrack, HevcPipelineConfig, spawn_hevc_pipeline,
+// build_hevc_encoder. macOS VideoToolbox only; no software HEVC fallback.
+#[cfg(feature = "hevc")]
+mod hevc_pipeline;
 // Audio pipeline — gated on the agent's `audio` feature (forwards to
 // desktop/audio). Off by default until phase-02a + 02b both ship.
 #[cfg(feature = "audio")]
