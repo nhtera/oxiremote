@@ -73,6 +73,13 @@ pub struct VideoPipelineConfig {
     pub width: u32,
     pub height: u32,
     pub initial_bitrate: BitrateBps,
+    /// Per-frame quality floor for VideoToolbox (H.264 QP 0-51). `Some(n)`
+    /// caps QP at `n` — encoder must spend bits to keep QP ≤ `n` or drop
+    /// the frame. `None` disables the cap (bandwidth-first behavior).
+    /// Computed from the operator's initial tier in `desktop_ws.rs`.
+    /// Session-lifetime constant; mid-session tier changes do NOT update
+    /// the cap (VT requires session rebuild for that — out of scope).
+    pub initial_max_qp: Option<u32>,
     pub track: Arc<TrackLocalStaticSample>,
     pub bgra_rx: mpsc::Receiver<BgraFrame>,
     pub bitrate_rx: watch::Receiver<BitrateBps>,
@@ -138,23 +145,30 @@ pub fn new_h264_track() -> Arc<TrackLocalStaticSample> {
 /// Construct the correct encoder backend for the current platform. Returns
 /// a heap-allocated trait object so the pipeline is oblivious to which
 /// backend is driving.
+///
+/// `max_qp` is the per-frame quality floor for VT (H.264 QP 0-51). Plumbed
+/// from the operator's initial tier — typically HIGH=23, MED=28, LOW=None.
+/// OpenH264 (software fallback) ignores this — its high-level binding
+/// doesn't expose ISVCEncoder::SetOption today.
 fn build_encoder(
     width: u32,
     height: u32,
     bitrate: BitrateBps,
+    max_qp: Option<u32>,
 ) -> Result<Box<dyn H264Encoder>> {
     #[cfg(target_os = "macos")]
     {
         match desktop::encoders::videotoolbox_encoder::VideoToolboxEncoder::new(
-            width, height, bitrate,
+            width, height, bitrate, max_qp,
         ) {
             Ok(enc) => {
-                info!("video_pipeline: using VideoToolbox (hardware)");
+                info!(max_qp = ?max_qp, "video_pipeline: using VideoToolbox (hardware)");
                 return Ok(Box::new(enc));
             }
             Err(e) => warn!(error = %e, "VideoToolbox init failed, falling back to OpenH264"),
         }
     }
+    let _ = max_qp; // OpenH264 has no equivalent knob today.
     let enc = desktop::encoders::openh264_encoder::OpenH264Encoder::new(width, height, bitrate)?;
     info!("video_pipeline: using OpenH264 (software)");
     Ok(Box::new(enc))
@@ -177,7 +191,7 @@ pub fn spawn_video_pipeline(mut cfg: VideoPipelineConfig) {
 
     // Encoder task — blocking, owns the encoder + params_tx oneshot.
     std::thread::spawn(move || {
-        let mut encoder = match build_encoder(cfg.width, cfg.height, cfg.initial_bitrate) {
+        let mut encoder = match build_encoder(cfg.width, cfg.height, cfg.initial_bitrate, cfg.initial_max_qp) {
             Ok(e) => e,
             Err(e) => {
                 warn!(error = %e, "video_pipeline: encoder build failed, pipeline stopping");

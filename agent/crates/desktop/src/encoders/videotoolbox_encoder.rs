@@ -42,7 +42,8 @@ use objc2_core_media::{
 use objc2_core_video::{kCVPixelFormatType_32BGRA, CVPixelBuffer, CVPixelBufferCreateWithBytes};
 use objc2_video_toolbox::{
     kVTCompressionPropertyKey_AllowFrameReordering, kVTCompressionPropertyKey_AverageBitRate,
-    kVTCompressionPropertyKey_H264EntropyMode, kVTCompressionPropertyKey_MaxKeyFrameInterval,
+    kVTCompressionPropertyKey_H264EntropyMode, kVTCompressionPropertyKey_MaxAllowedFrameQP,
+    kVTCompressionPropertyKey_MaxKeyFrameInterval,
     kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration,
     kVTCompressionPropertyKey_ProfileLevel, kVTCompressionPropertyKey_Quality,
     kVTCompressionPropertyKey_RealTime, kVTH264EntropyMode_CABAC,
@@ -113,6 +114,7 @@ fn build_encoder_spec() -> CFRetained<CFDictionary> {
 fn configure_properties(
     session: &VTCompressionSession,
     bitrate: BitrateBps,
+    max_qp: Option<u32>,
 ) -> anyhow::Result<()> {
     unsafe {
         set_cf(session, kVTCompressionPropertyKey_RealTime, CFBoolean::new(true))?;
@@ -169,16 +171,33 @@ fn configure_properties(
             &*quality,
             "Quality=0.75",
         )?;
-        // NOTE: `kVTCompressionPropertyKey_MaxAllowedFrameQP` was tried
-        // in commit `ded2caf` (Phase 02) and reverted same day — the
-        // hard QP cap caused the encoder to drop ~50% of frames
-        // (60 fps → 28 fps) when REMB clamped the effective bitrate
-        // far below the tier target (typical Chrome loopback REMB
-        // behavior). Per Apple docs: "the encoder may drop frames to
-        // maintain bitrate and QP goals". A dropped-frame cascade hurts
-        // UX more than soft text. Use bitrate-tier raises (Phase 01)
-        // for crisper text instead. Leaving this note so future
-        // contributors don't re-introduce the same regression.
+        // Tier-aware MaxAllowedFrameQP quality floor. H.264 QP is 0-51
+        // (0=lossless, 51=worst). When `Some(qp)` is passed:
+        // - HIGH tier (qp=23): "visually-OK" floor — encoder must spend
+        //   bits to keep QP ≤ 23, or drop the frame on real bandwidth
+        //   starvation. On HIGH tier the user has the 24 Mbps HiDPI
+        //   budget to support this on screen content.
+        // - MED tier (qp=28): "OK natural video" — text mildly soft
+        //   but no drops at 12 Mbps.
+        // - LOW tier (None): skip the cap entirely. LOW tier is
+        //   bandwidth-prioritised; preserving frame rate matters more
+        //   than text crispness.
+        //
+        // First attempt (commit `ded2caf`, reverted `3273dca`) used a
+        // constant cap of 28 across all tiers. The earlier diagnosis of
+        // "encoder dropping frames" turned out to be misread SCK static-
+        // scene rate, not actual encoder drops. Tier-aware reintroduction
+        // gives HIGH-tier users the sharper-text win that was originally
+        // intended.
+        if let Some(qp) = max_qp {
+            let qp_num = CFNumber::new_i32(qp as i32);
+            try_set_cf(
+                session,
+                kVTCompressionPropertyKey_MaxAllowedFrameQP,
+                &*qp_num,
+                "MaxAllowedFrameQP",
+            )?;
+        }
     }
     Ok(())
 }
@@ -466,7 +485,20 @@ fn wrap_bgra_as_pixel_buffer(
 // ─── Public encoder API ─────────────────────────────────────────────────────
 
 impl VideoToolboxEncoder {
-    pub fn new(width: u32, height: u32, initial_bitrate: BitrateBps) -> anyhow::Result<Self> {
+    /// Build a new VT H.264 compression session.
+    ///
+    /// `max_qp` is the per-frame quality floor (H.264 QP, range 0-51).
+    /// `Some(n)` enforces `kVTCompressionPropertyKey_MaxAllowedFrameQP = n`
+    /// — encoder must spend bits to keep QP ≤ n, dropping frames on real
+    /// bandwidth starvation. `None` skips the cap entirely (bandwidth-
+    /// first behavior). Typical tier mapping: HIGH=23, MED=28, LOW=None.
+    /// See `configure_properties` for rationale.
+    pub fn new(
+        width: u32,
+        height: u32,
+        initial_bitrate: BitrateBps,
+        max_qp: Option<u32>,
+    ) -> anyhow::Result<Self> {
         anyhow::ensure!(
             width > 0 && height > 0 && width <= i32::MAX as u32 && height <= i32::MAX as u32,
             "invalid encoder dimensions {}x{}",
@@ -510,7 +542,7 @@ impl VideoToolboxEncoder {
             .context("VTCompressionSessionCreate returned success but null pointer")?;
         let session = unsafe { CFRetained::from_raw(session_nn) };
 
-        configure_properties(&session, initial_bitrate)?;
+        configure_properties(&session, initial_bitrate, max_qp)?;
 
         Ok(Self {
             session,

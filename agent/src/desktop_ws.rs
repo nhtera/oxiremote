@@ -1308,6 +1308,7 @@ mod inner {
             width: out_w,
             height: out_h,
             initial_bitrate: tier_bitrate(initial_tier, hidpi),
+            initial_max_qp: tier_max_qp(initial_tier),
             track,
             bgra_rx,
             bitrate_rx,
@@ -1673,6 +1674,30 @@ mod inner {
         match rx {
             Some(r) => r.await.ok(),
             None => std::future::pending().await,
+        }
+    }
+
+    /// Map a quality tier to its VideoToolbox `MaxAllowedFrameQP` cap.
+    /// H.264 QP is 0-51 (0=lossless, 51=worst). Tier mapping:
+    /// - HIGH → Some(23): "visually-OK" floor for text-heavy UI. Encoder
+    ///   must spend bits to keep QP ≤ 23. At 24 Mbps HiDPI HIGH this is
+    ///   sustainable on screen content.
+    /// - MED  → Some(28): "OK natural video" — text mildly soft but no
+    ///   real-bandwidth-starvation drops at 12 Mbps.
+    /// - LOW  → None: bandwidth-first; preserving frame rate matters
+    ///   more than text crispness at the LOW tier preset.
+    ///
+    /// Session-lifetime constant — VT does not support live QP-cap
+    /// updates without session rebuild. Mid-session tier changes update
+    /// only bitrate via `bitrate_tx`; the QP cap stays at whatever
+    /// `initial_tier` selected. Acceptable since users rarely flip
+    /// between LOW and HIGH mid-session.
+    #[cfg(feature = "h264")]
+    fn tier_max_qp(tier: QualityTier) -> Option<u32> {
+        match tier {
+            QualityTier::High => Some(23),
+            QualityTier::Med => Some(28),
+            QualityTier::Low => None,
         }
     }
 
