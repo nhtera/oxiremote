@@ -145,6 +145,18 @@ pub fn init_db(db_path: &Path) -> anyhow::Result<()> {
         "INSERT OR IGNORE INTO settings(key, value) VALUES ('desktop_audio_enabled', 'false')",
         [],
     );
+    // macOS lock-screen handling: hold caffeinate + zero screensaver idleTime
+    // for the desktop session lifetime. Default true on macOS only — on
+    // Linux/Windows the toggle is hidden via the capability snapshot and the
+    // setting reads back as false.
+    #[cfg(target_os = "macos")]
+    let stay_awake_default = "true";
+    #[cfg(not(target_os = "macos"))]
+    let stay_awake_default = "false";
+    let _ = conn.execute(
+        "INSERT OR IGNORE INTO settings(key, value) VALUES ('desktop_stay_awake_during_session', ?1)",
+        [stay_awake_default],
+    );
     // Operator can toggle remote desktop off so the WS upgrade returns 503
     // even when the binary was built with the desktop feature.
     let _ = conn.execute(

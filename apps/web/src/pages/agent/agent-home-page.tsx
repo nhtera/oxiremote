@@ -9,6 +9,7 @@ import NamedTunnelBanner from '../../components/agent/named-tunnel-banner'
 import OnboardingView from '../../components/agent/onboarding-view'
 import OtkConfirmModal from '../../components/agent/otk-confirm-modal'
 import HostShell from '../../components/agent/host-shell'
+import HostStatePill from '../../components/agent/host-state-pill'
 import ServicesStrip from '../../components/agent/services-strip'
 import ActiveSessionsList from '../../components/active-sessions-list'
 import TunnelTelemetryBlock from '../../components/tunnel-telemetry-block'
@@ -337,6 +338,12 @@ export default function AgentHomePage() {
                 setState((s) => (s ? { ...s, desktop_enabled: next } : s))
               }
             />
+
+            {state?.platform === 'macos' && (
+              <div className="flex items-center gap-2">
+                <HostStatePill />
+              </div>
+            )}
 
             <ActiveSessionsList />
             <TunnelTelemetryBlock />

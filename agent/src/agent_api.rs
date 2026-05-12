@@ -40,6 +40,7 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/api/agent/approvals/{id}/reject", post(api_agent_reject))
         .route("/api/agent/settings/auto-approve", post(api_agent_settings_auto_approve))
         .route("/api/agent/settings/audio", post(api_agent_settings_audio))
+        .route("/api/agent/settings/stay-awake", post(api_agent_settings_stay_awake))
         .route(
             "/api/agent/proxy/ports",
             get(api_agent_proxy_ports_list).post(api_agent_proxy_ports_set),
@@ -149,6 +150,11 @@ async fn api_agent_state(State(state): State<Arc<AppState>>) -> Json<serde_json:
     let audio_supported = desktop::audio::probe_supported();
     #[cfg(not(feature = "desktop"))]
     let audio_supported = false;
+    // Stay-awake (macOS lock-screen handling). `supported` is a static
+    // build-time check — only macOS hosts the caffeinate + screensaver
+    // suppression path. `enabled` is the persisted operator preference.
+    let stay_awake_supported = cfg!(target_os = "macos");
+    let stay_awake_enabled = settings::get_desktop_stay_awake(&state.db_path);
     // Mirror the latest TunnelStepChanged event so SSE late-joiners can
     // hydrate the 5-step progress card. Shape matches the SSE frame so the
     // client can apply it via the same reducer.
@@ -189,6 +195,8 @@ async fn api_agent_state(State(state): State<Arc<AppState>>) -> Json<serde_json:
         "desktop_enabled": desktop_enabled,
         "audio_supported": audio_supported,
         "audio_enabled": audio_enabled,
+        "stay_awake_supported": stay_awake_supported,
+        "stay_awake_enabled": stay_awake_enabled,
         "version": env!("CARGO_PKG_VERSION"),
         "active_clients": active_clients,
         "otk": otk,
@@ -721,6 +729,32 @@ async fn api_agent_settings_audio(
         }
         Err(err) => {
             warn!(error=%err, "set desktop_audio_enabled failed");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct StayAwakeBody {
+    enabled: bool,
+}
+
+/// POST /api/agent/settings/stay-awake — upsert the
+/// `desktop_stay_awake_during_session` toggle. Takes effect on the next
+/// desktop session (mid-session changes are ignored on purpose — matches the
+/// "session-scoped guard" model and avoids tearing down a live caffeinate
+/// child while the operator is mid-task).
+async fn api_agent_settings_stay_awake(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<StayAwakeBody>,
+) -> impl IntoResponse {
+    match settings::set_desktop_stay_awake(&state.db_path, body.enabled) {
+        Ok(()) => {
+            info!(enabled = body.enabled, "desktop_stay_awake setting updated");
+            (StatusCode::OK, Json(json!({ "ok": true, "enabled": body.enabled }))).into_response()
+        }
+        Err(err) => {
+            warn!(error=%err, "set desktop_stay_awake failed");
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }

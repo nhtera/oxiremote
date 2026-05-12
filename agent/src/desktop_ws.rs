@@ -181,6 +181,19 @@ mod inner {
         CaptureEnded {
             reason: String,
         },
+        /// macOS lock-screen handling (Phase 04). Forwarded from
+        /// `AgentEvent::HostLocked` into the per-session WS so the SPA can
+        /// render the locked overlay without subscribing to the
+        /// localhost-only `/api/agent/events` SSE.
+        HostLocked { unix_ms: i64 },
+        /// Mate of `HostLocked`. SPA hides the overlay and asks the active
+        /// video session for an IDR so the first frame after unlock is clean.
+        HostUnlocked { unix_ms: i64 },
+        /// Per-session warning: agent is missing OS Accessibility permission,
+        /// keyboard / mouse input may be unreliable. SPA renders an inline
+        /// banner with a deep link to System Settings. Sent at most once
+        /// per session, right after capability negotiation.
+        AccessibilityMissing { platform: &'a str },
     }
 
     /// Input events the client sends on the "ctrl" DataChannel (or WS in fallback).
@@ -632,6 +645,150 @@ mod inner {
         // reconnect round-trip.
         let _ = settings_tx.send(initial_hidpi);
 
+        // ── macOS lock-screen handling (plan 260512-2314) ────────────────────
+        //
+        // 1. Stay-awake guard. Drops at end of `run_session`; that drop kills
+        //    the caffeinate child + restores the screensaver idleTime. Gated
+        //    behind the operator setting (default true on macOS only).
+        // 2. Lock-state observer fan-out. Forwards macOS screenIsLocked /
+        //    screenIsUnlocked notifications onto BOTH the global event bus
+        //    (for SSE consumers like the host dashboard) AND the per-session
+        //    WS (so the SPA can render its overlay without subscribing to the
+        //    localhost-only SSE).
+        // 3. Accessibility pre-flight: warn the SPA if input injection will
+        //    be unreliable so the operator gets an actionable banner instead
+        //    of "why won't my modifier keys work" frustration.
+        //
+        // All three are best-effort and should never block session bring-up.
+        let _stay_awake_guard = if cfg!(target_os = "macos")
+            && crate::settings::get_desktop_stay_awake(&state.db_path)
+        {
+            match desktop::macos_stay_awake::StayAwakeGuard::acquire() {
+                Ok(g) => {
+                    state
+                        .event_bus
+                        .send(AgentEvent::StayAwakeChanged { active: true });
+                    Some(g)
+                }
+                Err(e) => {
+                    warn!(error = %e, "stay-awake guard failed; session will lock normally");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        // RAII counterpart to the StayAwakeChanged{active:true} above. Bound
+        // to the same scope so the "active:false" event always fires when the
+        // session ends, even on panic.
+        struct StayAwakeNotifier {
+            bus: Arc<crate::events::EventBus>,
+            active: bool,
+        }
+        impl Drop for StayAwakeNotifier {
+            fn drop(&mut self) {
+                if self.active {
+                    self.bus
+                        .send(AgentEvent::StayAwakeChanged { active: false });
+                }
+            }
+        }
+        let _stay_awake_notifier = StayAwakeNotifier {
+            bus: Arc::clone(&state.event_bus),
+            active: _stay_awake_guard.is_some(),
+        };
+
+        // Re-emit the last known lock state once on session start so a SPA
+        // joining mid-lock sees the overlay without waiting for a fresh
+        // notification. macOS-only; the non-macOS shim returns None.
+        if let Some(initial_lock) = desktop::macos_lock_observer::current_state() {
+            let now_ms = chrono::Utc::now().timestamp_millis();
+            let frame = match initial_lock {
+                desktop::macos_lock_observer::LockEvent::Locked => {
+                    SignalOut::HostLocked { unix_ms: now_ms }
+                }
+                desktop::macos_lock_observer::LockEvent::Unlocked => {
+                    SignalOut::HostUnlocked { unix_ms: now_ms }
+                }
+            };
+            if let Ok(msg) = serde_json::to_string(&frame) {
+                let _ = ws_out_tx.send(msg).await;
+            }
+        }
+
+        // Spawn the lock fan-out. Holds clones of ws_out_tx + event_bus and
+        // forwards every observed lock/unlock until the channel closes (which
+        // happens when both ws_out_tx clones are dropped at session end). The
+        // task is also explicitly aborted via the AbortHandle held on the
+        // stack guard below — ws_out_tx clones bleed into other tasks (the
+        // ICE callback, etc.) so relying on send-error alone could leak the
+        // task past session end.
+        let lock_fanout_handle = {
+            let lock_ws_tx = ws_out_tx.clone();
+            let lock_bus = Arc::clone(&state.event_bus);
+            let mut lock_rx = desktop::macos_lock_observer::subscribe();
+            tokio::spawn(async move {
+                while let Some(ev) = lock_rx.recv().await {
+                    let now_ms = chrono::Utc::now().timestamp_millis();
+                    let (bus_event, frame) = match ev {
+                        desktop::macos_lock_observer::LockEvent::Locked => (
+                            AgentEvent::HostLocked { unix_ms: now_ms },
+                            SignalOut::HostLocked { unix_ms: now_ms },
+                        ),
+                        desktop::macos_lock_observer::LockEvent::Unlocked => (
+                            AgentEvent::HostUnlocked { unix_ms: now_ms },
+                            SignalOut::HostUnlocked { unix_ms: now_ms },
+                        ),
+                    };
+                    lock_bus.send(bus_event);
+                    if let Ok(msg) = serde_json::to_string(&frame)
+                        && lock_ws_tx.send(msg).await.is_err()
+                    {
+                        // WS receiver gone — session ended. Stop pumping.
+                        break;
+                    }
+                }
+            })
+        };
+        struct AbortOnDrop(tokio::task::JoinHandle<()>);
+        impl Drop for AbortOnDrop {
+            fn drop(&mut self) {
+                self.0.abort();
+            }
+        }
+        let _lock_fanout_guard = AbortOnDrop(lock_fanout_handle);
+
+        // Accessibility pre-flight: cheap (~1ms AXIsProcessTrusted call), but
+        // run on a blocking thread anyway so we don't pay it in the async
+        // hot path. macOS-only; non-macOS hosts have no Accessibility concept.
+        #[cfg(target_os = "macos")]
+        {
+            let event_bus = Arc::clone(&state.event_bus);
+            let acc_ws_tx = ws_out_tx.clone();
+            tokio::task::spawn_blocking(move || {
+                let status = desktop::permissions::PermissionStatus::check();
+                if !status.accessibility {
+                    warn!(
+                        "session started without Accessibility permission; \
+                         keyboard/mouse input will be unreliable. Grant via \
+                         System Settings > Privacy & Security > Accessibility"
+                    );
+                    event_bus.send(AgentEvent::AccessibilityMissing { platform: "macos" });
+                    if let Ok(msg) = serde_json::to_string(&SignalOut::AccessibilityMissing {
+                        platform: "macos",
+                    }) {
+                        // Spawn a tiny task to bridge sync → async; the
+                        // ws_out_tx is owned by the async runtime and we are
+                        // on a blocking thread.
+                        tokio::spawn(async move {
+                            let _ = acc_ws_tx.send(msg).await;
+                        });
+                    }
+                }
+            });
+        }
+        // ─── end macOS lock-screen handling ──────────────────────────────────
+
         // Build the H.264 sending track iff the Pipeline chose H.264 AND the
         // feature is compiled in. For the JPEG path `sending_track` is None
         // and `complete_answer` skips `pc.add_track`.
@@ -975,6 +1132,25 @@ mod inner {
         let (bgra_tx, bgra_rx) = mpsc::channel::<desktop::RawBgraFrame>(2);
         let (bitrate_tx, bitrate_rx) = watch::channel(tier_bitrate(initial_tier, hidpi));
         let (pli_tx, pli_rx) = mpsc::channel::<()>(4);
+        // Force an IDR after the host unlocks so the first frame after the
+        // lock-screen overlay clears is clean (no decoder green-block from a
+        // P-frame referencing pre-lock content). Spawns a tiny task that
+        // owns its own lock-observer subscription + a clone of pli_tx; the
+        // task exits naturally when pli_tx is dropped at session teardown.
+        {
+            let pli_tx = pli_tx.clone();
+            tokio::spawn(async move {
+                let mut rx = desktop::macos_lock_observer::subscribe();
+                while let Some(ev) = rx.recv().await {
+                    if matches!(ev, desktop::macos_lock_observer::LockEvent::Unlocked) {
+                        // try_send so a full pli queue (already-pending forced
+                        // IDR) doesn't backpressure the observer; the encoder
+                        // only needs one IDR per unlock anyway.
+                        let _ = pli_tx.try_send(());
+                    }
+                }
+            });
+        }
         let (params_tx, params_rx) = tokio::sync::oneshot::channel();
         let (vp_shutdown_tx, vp_shutdown_rx) = tokio::sync::oneshot::channel::<()>();
         let (rtcp_shutdown_tx, rtcp_shutdown_rx) = tokio::sync::oneshot::channel::<()>();

@@ -12,6 +12,8 @@ pub mod encode;
 pub mod encoders;
 pub mod h264_format;
 pub mod input;
+pub mod macos_lock_observer;
+pub mod macos_stay_awake;
 pub mod permissions;
 #[cfg(target_os = "macos")]
 pub mod sck;

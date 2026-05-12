@@ -25,6 +25,8 @@ interface SessionSnapshot {
   attempt: number
   screenDims?: { width: number; height: number }
   pipelineInfo?: import('../hooks/use-desktop-session').DesktopPipelineInfo
+  hostLockState?: import('../hooks/use-desktop-session').HostLockState
+  accessibilityMissing?: boolean
 }
 
 interface SessionApi {
@@ -118,13 +120,31 @@ export default function DesktopJpegView({
     }
   }, [])
 
-  const { status, sendInput, setQuality, setSettings, disconnect, attempt, screenDims, tileSize, pipelineInfo } =
-    useDesktopSession(hostId, deviceId, onTile, quality, hidpi, forcePipeline)
+  const {
+    status,
+    sendInput,
+    setQuality,
+    setSettings,
+    disconnect,
+    attempt,
+    screenDims,
+    tileSize,
+    pipelineInfo,
+    hostLockState,
+    accessibilityMissing,
+  } = useDesktopSession(hostId, deviceId, onTile, quality, hidpi, forcePipeline)
 
   // Push session state to the parent whenever it changes.
   useEffect(() => {
-    onSessionChange({ status, attempt, screenDims, pipelineInfo })
-  }, [status, attempt, screenDims, pipelineInfo, onSessionChange])
+    onSessionChange({
+      status,
+      attempt,
+      screenDims,
+      pipelineInfo,
+      hostLockState,
+      accessibilityMissing,
+    })
+  }, [status, attempt, screenDims, pipelineInfo, hostLockState, accessibilityMissing, onSessionChange])
 
   // Stable screenshot callback — needs access to the worker (offscreen path)
   // OR the main-thread canvas (fallback path). Defined via callback so the

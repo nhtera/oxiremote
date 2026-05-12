@@ -175,6 +175,8 @@ pub async fn api_desktop_capabilities(
         // so the SPA renders an honest greyed-out state.
         let audio_enabled = crate::settings::get_desktop_audio_enabled(&state.db_path);
         let audio_supported = desktop::audio::probe_supported();
+        let stay_awake_supported = cfg!(target_os = "macos");
+        let stay_awake_enabled = crate::settings::get_desktop_stay_awake(&state.db_path);
         let body = json!({
             "available": available,
             "quality_tiers": ["low", "med", "high"],
@@ -185,6 +187,8 @@ pub async fn api_desktop_capabilities(
             "default_reason": default_reason,
             "audio_supported": audio_supported,
             "audio_enabled": audio_enabled,
+            "stay_awake_supported": stay_awake_supported,
+            "stay_awake_enabled": stay_awake_enabled,
         });
         (StatusCode::OK, Json(body)).into_response()
     }
@@ -193,6 +197,8 @@ pub async fn api_desktop_capabilities(
     {
         // Headless build: no desktop crate, no audio. Probe is always false.
         let audio_enabled = crate::settings::get_desktop_audio_enabled(&state.db_path);
+        let stay_awake_supported = cfg!(target_os = "macos");
+        let stay_awake_enabled = crate::settings::get_desktop_stay_awake(&state.db_path);
         let body = json!({
             "available": false,
             "quality_tiers": ["low", "med", "high"],
@@ -203,6 +209,8 @@ pub async fn api_desktop_capabilities(
             "default_reason": "no-desktop-feature",
             "audio_supported": false,
             "audio_enabled": audio_enabled,
+            "stay_awake_supported": stay_awake_supported,
+            "stay_awake_enabled": stay_awake_enabled,
         });
         (StatusCode::OK, Json(body)).into_response()
     }

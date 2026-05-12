@@ -31,6 +31,12 @@ interface AgentState {
   // renders read-only when false. `audio_enabled` is the persisted setting.
   audio_supported?: boolean
   audio_enabled?: boolean
+  // macOS lock-screen handling. `stay_awake_supported` is true only on macOS
+  // hosts (the caffeinate + screensaver suppression path is macOS-only); the
+  // toggle is hidden everywhere else. `stay_awake_enabled` defaults to true
+  // on macOS so the out-of-the-box behaviour matches the user's expectation.
+  stay_awake_supported?: boolean
+  stay_awake_enabled?: boolean
 }
 
 const QUALITY_KEY = 'oxi:desktop:quality'
@@ -101,6 +107,22 @@ export default function AgentSettingsPage() {
       }
     } catch {
       setState((s) => (s ? { ...s, audio_enabled: !next } : s))
+    }
+  }
+
+  async function toggleStayAwake(next: boolean) {
+    setState((s) => (s ? { ...s, stay_awake_enabled: next } : s))
+    try {
+      const res = await fetch('/api/agent/settings/stay-awake', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ enabled: next }),
+      })
+      if (!res.ok) {
+        setState((s) => (s ? { ...s, stay_awake_enabled: !next } : s))
+      }
+    } catch {
+      setState((s) => (s ? { ...s, stay_awake_enabled: !next } : s))
     }
   }
 
@@ -215,6 +237,21 @@ export default function AgentSettingsPage() {
                 </span>
               )}
             </Row>
+            {state?.stay_awake_supported && (
+              <Row label="Keep Mac awake during sessions">
+                <div className="flex items-center gap-2">
+                  <SwitchButton
+                    checked={state.stay_awake_enabled ?? true}
+                    onToggle={() =>
+                      void toggleStayAwake(!(state.stay_awake_enabled ?? true))
+                    }
+                  />
+                  <span className="text-text-muted text-[length:var(--text-meta)] hidden sm:inline">
+                    Takes effect on next session
+                  </span>
+                </div>
+              </Row>
+            )}
           </Section>
 
           {/* PermissionsWidget wired here — previously dead code */}

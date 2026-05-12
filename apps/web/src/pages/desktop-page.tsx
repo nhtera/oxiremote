@@ -23,6 +23,7 @@ import { supportsH264Video } from '../hooks/use-desktop-video-session'
 import PipelineStatusPill from '../components/pipeline-status-pill'
 import DesktopJpegView from '../components/desktop-jpeg-view'
 import DesktopH264View from '../components/desktop-h264-view'
+import LockedOverlay from '../components/locked-overlay'
 import type { DesktopGestureApi } from '../components/desktop-jpeg-view'
 import DesktopToolbar from '../components/desktop-toolbar'
 import DesktopTopStrip from '../components/desktop-top-strip'
@@ -208,6 +209,8 @@ export default function DesktopPage() {
     undefined,
   )
   const [pipelineInfo, setPipelineInfo] = useState<DesktopPipelineInfo | undefined>()
+  const [hostLockState, setHostLockState] = useState<'unknown' | 'locked' | 'unlocked'>('unknown')
+  const [accessibilityMissing, setAccessibilityMissing] = useState(false)
   // Per-session force-JPEG flag — flipped true when the H.264 hook reports
   // `fallbackPending`. Causes the next render to mount the JPEG view; the
   // JPEG hook then appends `?force_pipeline=jpeg` to its WS upgrade so the
@@ -347,11 +350,15 @@ export default function DesktopPage() {
       attempt: number
       screenDims?: { width: number; height: number }
       pipelineInfo?: DesktopPipelineInfo
+      hostLockState?: 'unknown' | 'locked' | 'unlocked'
+      accessibilityMissing?: boolean
     }) => {
       setStatus(s.status)
       setAttempt(s.attempt)
       if (s.screenDims) setScreenDims(s.screenDims)
       if (s.pipelineInfo) setPipelineInfo(s.pipelineInfo)
+      if (s.hostLockState) setHostLockState(s.hostLockState)
+      if (s.accessibilityMissing) setAccessibilityMissing(true)
     },
     [],
   )
@@ -644,6 +651,21 @@ export default function DesktopPage() {
         </Suspense>
       )}
 
+      {/* Plan 260512-2314: yellow accessibility banner when the agent reports
+          OS Accessibility permission is missing. Sits above the canvas (not
+          inside it) so it doesn't intercept canvas pointer events. */}
+      {accessibilityMissing && (
+        <div className="px-3 py-2 text-sm bg-yellow-500/10 border-b border-yellow-500/30 text-yellow-200">
+          ⚠ Keyboard / mouse input may be unreliable. Grant Accessibility permission:{' '}
+          <a
+            href="x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility"
+            className="underline"
+          >
+            Open Settings
+          </a>
+        </div>
+      )}
+
       {/* Disable touch/pointer events on the canvas while text-batch sheet is open
           so taps on the visible canvas don't register as remote clicks. */}
       <div ref={canvasWrapRef} className={`flex-1 relative min-h-0${showTextBatch ? ' pointer-events-none' : ''}`}>
@@ -661,6 +683,11 @@ export default function DesktopPage() {
             />
           </div>
         )}
+        {/* Plan 260512-2314: locked-screen overlay. Renders above the video
+            element via absolute inset-0 + z-20 (pipeline pill is z-10). On
+            unlock the agent forces an IDR, so the next frame on the wire is
+            clean — the SPA just clears `hostLockState`. */}
+        {hostLockState === 'locked' && <LockedOverlay />}
         {useH264 ? (
           <DesktopH264View
             key={`h264-${reloadNonce}`}

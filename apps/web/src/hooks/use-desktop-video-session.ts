@@ -22,6 +22,7 @@ import type {
   DesktopInputEvent,
   DesktopPipelineInfo,
   DesktopStatus,
+  HostLockState,
   QualityTier,
 } from './use-desktop-session'
 import {
@@ -51,6 +52,10 @@ interface VideoSessionApi {
   screenDims?: { width: number; height: number }
   /** Latest pipeline info — see `use-desktop-session.ts`. */
   pipelineInfo?: DesktopPipelineInfo
+  /** macOS host-lock state — see `use-desktop-session.ts`. */
+  hostLockState: HostLockState
+  /** True when the agent reports OS Accessibility permission is missing. */
+  accessibilityMissing: boolean
 }
 
 /** Callback invoked once per decoded video frame. Caller draws to canvas. */
@@ -104,6 +109,8 @@ export function useDesktopVideoSession(
   const [attempt, setAttempt] = useState(0)
   const [screenDims, setScreenDims] = useState<{ width: number; height: number } | undefined>()
   const [pipelineInfo, setPipelineInfo] = useState<DesktopPipelineInfo | undefined>()
+  const [hostLockState, setHostLockState] = useState<HostLockState>('unknown')
+  const [accessibilityMissing, setAccessibilityMissing] = useState(false)
 
   const wsRef = useRef<WebSocket | null>(null)
   const pcRef = useRef<RTCPeerConnection | null>(null)
@@ -450,6 +457,19 @@ export function useDesktopVideoSession(
           if (!destroyedRef.current) handleDisconnect()
           break
         }
+        case 'hostLocked':
+          setHostLockState('locked')
+          break
+        case 'hostUnlocked':
+          setHostLockState('unlocked')
+          // H.264 path: the agent's per-session unlock subscriber pushes a
+          // PLI into the encoder's pli channel, so the next frame on the
+          // wire is a fresh IDR. Nothing for the client to do beyond
+          // clearing the overlay state.
+          break
+        case 'accessibilityMissing':
+          setAccessibilityMissing(true)
+          break
       }
     }
 
@@ -575,5 +595,7 @@ export function useDesktopVideoSession(
     attempt,
     screenDims,
     pipelineInfo,
+    hostLockState,
+    accessibilityMissing,
   }
 }

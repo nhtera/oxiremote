@@ -232,6 +232,26 @@ pub enum AgentEvent {
         reason: String,
         target_bitrate_kbps: u32,
     },
+    /// macOS host went to the lock screen (`com.apple.screenIsLocked`). Drives
+    /// the SPA's locked overlay and the host-dashboard pill. `unix_ms` is the
+    /// agent's observation timestamp — useful for "locked Xm ago" copy.
+    HostLocked { unix_ms: i64 },
+    /// macOS host returned from the lock screen (`com.apple.screenIsUnlocked`).
+    /// SPA hides the overlay and asks the active video session for an IDR so
+    /// the first frame after unlock is clean.
+    HostUnlocked { unix_ms: i64 },
+    /// Stay-awake assertion state changed for this agent. Drives the
+    /// "Keeping awake" host-dashboard pill so the user can see when the
+    /// agent is suppressing auto-lock and screensaver.
+    StayAwakeChanged { active: bool },
+    /// One-shot per-session warning: the agent started a desktop session
+    /// without the OS Accessibility permission, so synthesised input
+    /// (keyboard / mouse) will be unreliable. Surfaced inline above the
+    /// remote-desktop video as a yellow banner with a deep link to the
+    /// System Settings pane.
+    AccessibilityMissing {
+        platform: &'static str,
+    },
 }
 
 /// Lightweight tunnel-state snapshot kept in lockstep with broadcast events.
@@ -322,6 +342,28 @@ mod tests {
             Some(AgentEvent::TunnelStepChanged { step: TunnelStep::Ready, .. })
         ));
         assert!(snap.down_reason.is_none());
+    }
+
+    #[test]
+    fn lock_screen_event_wire_shape() {
+        // SPA branches on `type` + `unix_ms`; flatten check guards against a
+        // future serde tag rename or accidental envelope wrapper.
+        let locked = serde_json::to_value(AgentEvent::HostLocked { unix_ms: 42 }).unwrap();
+        assert_eq!(locked["type"], "host_locked");
+        assert_eq!(locked["unix_ms"], 42);
+
+        let unlocked = serde_json::to_value(AgentEvent::HostUnlocked { unix_ms: 99 }).unwrap();
+        assert_eq!(unlocked["type"], "host_unlocked");
+        assert_eq!(unlocked["unix_ms"], 99);
+
+        let stay = serde_json::to_value(AgentEvent::StayAwakeChanged { active: true }).unwrap();
+        assert_eq!(stay["type"], "stay_awake_changed");
+        assert_eq!(stay["active"], true);
+
+        let acc =
+            serde_json::to_value(AgentEvent::AccessibilityMissing { platform: "macos" }).unwrap();
+        assert_eq!(acc["type"], "accessibility_missing");
+        assert_eq!(acc["platform"], "macos");
     }
 
     #[test]

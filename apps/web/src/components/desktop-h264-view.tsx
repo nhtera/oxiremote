@@ -25,6 +25,8 @@ interface SessionSnapshot {
   attempt: number
   screenDims?: { width: number; height: number }
   pipelineInfo?: import('../hooks/use-desktop-session').DesktopPipelineInfo
+  hostLockState?: import('../hooks/use-desktop-session').HostLockState
+  accessibilityMissing?: boolean
 }
 
 interface SessionApi {
@@ -131,12 +133,30 @@ export default function DesktopH264View({
     ctx.drawImage(video, 0, 0, w, h)
   }, [])
 
-  const { status, sendInput, setQuality, setSettings, toggleAudio, disconnect, attempt, screenDims, pipelineInfo } =
-    useDesktopVideoSession(hostId, deviceId, onFrame, quality, hidpi, audio, forcePipeline)
+  const {
+    status,
+    sendInput,
+    setQuality,
+    setSettings,
+    toggleAudio,
+    disconnect,
+    attempt,
+    screenDims,
+    pipelineInfo,
+    hostLockState,
+    accessibilityMissing,
+  } = useDesktopVideoSession(hostId, deviceId, onFrame, quality, hidpi, audio, forcePipeline)
 
   useEffect(() => {
-    onSessionChange({ status, attempt, screenDims, pipelineInfo })
-  }, [status, attempt, screenDims, pipelineInfo, onSessionChange])
+    onSessionChange({
+      status,
+      attempt,
+      screenDims,
+      pipelineInfo,
+      hostLockState,
+      accessibilityMissing,
+    })
+  }, [status, attempt, screenDims, pipelineInfo, hostLockState, accessibilityMissing, onSessionChange])
 
   // The H.264 view paints to a main-thread canvas (drawImage from <video>),
   // so toBlob can read pixels directly — no worker round-trip.

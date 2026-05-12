@@ -89,6 +89,22 @@ objc2-core-video = { version = "0.3", optional = true }
 objc2-core-media = { version = "0.3", optional = true }
 objc2-core-foundation = { version = "0.3", optional = true }
 screencapturekit = "1.5"
+# Lock-state observer (`macos_lock_observer.rs`): subscribes to
+# NSDistributedNotificationCenter for `com.apple.screenIs{Locked,Unlocked}`
+# from a dedicated NSRunLoop thread. objc2 + objc2-foundation are pulled in
+# transitively by screencapturekit today, but listing them explicitly here
+# locks the version range and lets us pick the exact features the observer
+# subclass needs (define_class! requires NSObject + NSObjCRuntime).
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", features = [
+    "NSDistributedNotificationCenter",
+    "NSNotification",
+    "NSString",
+    "NSObjCRuntime",
+    "NSRunLoop",
+    "NSDate",
+    "NSThread",
+] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

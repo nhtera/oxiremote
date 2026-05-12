@@ -41,6 +41,13 @@ export interface DesktopPipelineInfo {
   hardwareAccel?: boolean
 }
 
+/**
+ * macOS lock-screen UX (plan 260512-2314). `unknown` until the agent reports
+ * either via session-start re-emit or a fresh observation; `locked` triggers
+ * the SPA's locked overlay; `unlocked` clears it.
+ */
+export type HostLockState = 'unknown' | 'locked' | 'unlocked'
+
 export interface DesktopInputEvent {
   // 'text' is Unicode-safe literal-string injection; routed server-side to
   // `enigo.text()` and skips the dom_code_to_key path entirely. Modifier
@@ -70,6 +77,12 @@ interface SessionApi {
   /// signals. Drives the toolbar `PipelineStatusPill`. `undefined` between
   /// session start and the first signaling exchange.
   pipelineInfo?: DesktopPipelineInfo
+  /// macOS host-lock state (plan 260512-2314). `unknown` until the agent
+  /// reports; SPA renders the locked overlay only when `locked`.
+  hostLockState: HostLockState
+  /// True when the agent reports the OS Accessibility permission is missing.
+  /// SPA shows an inline yellow banner with a deep link to System Settings.
+  accessibilityMissing: boolean
 }
 
 // Callback invoked for every raw tile binary message (DC or WS fallback).
@@ -159,6 +172,8 @@ export function useDesktopSession(
   const [tileSize, setTileSize] = useState<number | undefined>()
   const [lastEndReason, setLastEndReason] = useState<string | undefined>()
   const [pipelineInfo, setPipelineInfo] = useState<DesktopPipelineInfo | undefined>()
+  const [hostLockState, setHostLockState] = useState<HostLockState>('unknown')
+  const [accessibilityMissing, setAccessibilityMissing] = useState(false)
 
   // Refs hold live handles so reconnect logic can tear down and rebuild.
   const wsRef = useRef<WebSocket | null>(null)
@@ -419,6 +434,20 @@ export function useDesktopSession(
           setPipelineInfo({ mode, reason, hardwareAccel })
           break
         }
+
+        case 'hostLocked':
+          setHostLockState('locked')
+          break
+        case 'hostUnlocked':
+          setHostLockState('unlocked')
+          // JPEG path: agent's lock-observer sees the unlock and the next
+          // capture frame is full-tiles already (the diff cache will produce
+          // a full set when content snaps back), so no client-side action is
+          // needed beyond clearing the overlay.
+          break
+        case 'accessibilityMissing':
+          setAccessibilityMissing(true)
+          break
       }
     }
 
@@ -566,5 +595,7 @@ export function useDesktopSession(
     tileSize,
     lastEndReason,
     pipelineInfo,
+    hostLockState,
+    accessibilityMissing,
   }
 }
