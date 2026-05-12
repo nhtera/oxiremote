@@ -42,8 +42,7 @@ use objc2_core_media::{
 use objc2_core_video::{kCVPixelFormatType_32BGRA, CVPixelBuffer, CVPixelBufferCreateWithBytes};
 use objc2_video_toolbox::{
     kVTCompressionPropertyKey_AllowFrameReordering, kVTCompressionPropertyKey_AverageBitRate,
-    kVTCompressionPropertyKey_H264EntropyMode, kVTCompressionPropertyKey_MaxAllowedFrameQP,
-    kVTCompressionPropertyKey_MaxKeyFrameInterval,
+    kVTCompressionPropertyKey_H264EntropyMode, kVTCompressionPropertyKey_MaxKeyFrameInterval,
     kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration,
     kVTCompressionPropertyKey_ProfileLevel, kVTCompressionPropertyKey_Quality,
     kVTCompressionPropertyKey_RealTime, kVTH264EntropyMode_CABAC,
@@ -160,9 +159,9 @@ fn configure_properties(
             kVTH264EntropyMode_CABAC,
         )?;
         // Quality-target hint (0.0-1.0). H.264 encoders use this as a
-        // bit-allocation bias; less authoritative than the QP cap below
-        // but cheap belt-and-braces. 0.75 = "high" per Apple's documented
-        // mapping (kVTCompressionPropertyKey_Quality docs).
+        // bit-allocation bias on top of rate control. 0.75 = "high" per
+        // Apple's documented mapping (kVTCompressionPropertyKey_Quality
+        // docs). Harmless when ignored by the encoder.
         let quality = CFNumber::new_f32(0.75);
         try_set_cf(
             session,
@@ -170,20 +169,16 @@ fn configure_properties(
             &*quality,
             "Quality=0.75",
         )?;
-        // Quality floor: encoder may NOT exceed QP=28 on any frame. H.264
-        // QP is 0-51 (0=lossless, 51=worst). 28 ≈ visually OK natural
-        // video but borderline-soft text on UI; capping here forces the
-        // encoder to spend bits — or drop the frame — rather than over-
-        // quantize static screen content. Dropped frames are far less
-        // visible than smeared text on UI. Tied to the 2026-05-13 Phase 02
-        // quality uplift; back off to 32 if sustained drop rate hurts UX.
-        let max_qp = CFNumber::new_i32(28);
-        try_set_cf(
-            session,
-            kVTCompressionPropertyKey_MaxAllowedFrameQP,
-            &*max_qp,
-            "MaxAllowedFrameQP=28",
-        )?;
+        // NOTE: `kVTCompressionPropertyKey_MaxAllowedFrameQP` was tried
+        // in commit `ded2caf` (Phase 02) and reverted same day — the
+        // hard QP cap caused the encoder to drop ~50% of frames
+        // (60 fps → 28 fps) when REMB clamped the effective bitrate
+        // far below the tier target (typical Chrome loopback REMB
+        // behavior). Per Apple docs: "the encoder may drop frames to
+        // maintain bitrate and QP goals". A dropped-frame cascade hurts
+        // UX more than soft text. Use bitrate-tier raises (Phase 01)
+        // for crisper text instead. Leaving this note so future
+        // contributors don't re-introduce the same regression.
     }
     Ok(())
 }

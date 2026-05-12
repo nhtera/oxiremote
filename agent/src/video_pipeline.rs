@@ -516,15 +516,19 @@ async fn handle_rtcp_batch(
                 continue;
             }
             // REMB's bitrate is f32 bps. Clamp to a safe range:
-            // - Floor 1.5 Mbps: keeps Low tier intact under transient
-            //   congestion. The encoder's resolution-aware floor is
-            //   computed elsewhere (TODO: bump for HiDPI sessions).
-            // - Ceiling 30 Mbps: matches the post-2026-05-13 HiDPI High
-            //   ceiling so REMB never artificially clips the configured
-            //   target on LAN. (Was 15 Mbps when High tier was 12 Mbps
-            //   non-HiDPI; HiDPI doubled to 24 Mbps, and bumped to
-            //   30 Mbps via `tier_bitrate` cap raise in same plan.)
-            let bps = (remb.bitrate as u32).clamp(1_500_000, 30_000_000);
+            // - Floor 6 Mbps (= MED tier preset): below this, screen
+            //   content becomes unreadable regardless of any other
+            //   encoder knob. Raised from 1.5 Mbps on 2026-05-13 after
+            //   observing Chrome's GCC reporting REMB=3.9M on Cloudflared
+            //   tunnel traffic despite 0% packet loss and a sustainable
+            //   24 Mbps encoder target — Chrome's REMB is known to
+            //   underestimate over tunneled paths. The 1.5 Mbps floor
+            //   was originally chosen to "keep Low tier intact" but Low
+            //   tier is itself 2.5 Mbps; the gap was load-bearing for
+            //   nothing.
+            // - Ceiling 30 Mbps: matches the HiDPI High tier
+            //   (12 Mbps × 2 = 24 Mbps clamped at the tier_bitrate cap).
+            let bps = (remb.bitrate as u32).clamp(6_000_000, 30_000_000);
             let _ = remb_tx.send(BitrateBps(bps));
             continue;
         }
