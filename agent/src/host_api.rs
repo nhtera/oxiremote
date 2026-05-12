@@ -138,18 +138,26 @@ pub async fn api_desktop_capabilities(
         // the SPA the "what would Auto resolve to right now" answer, which is
         // what the pill tooltip references as `chosen_default`.
         let op = operator_preference();
+        // Optimistic caps advertise every codec this binary can negotiate, so
+        // `choose()` never hits the forced-unavailable error path for the SPA
+        // pre-handshake hint.
         let optimistic_caps = ClientCapabilities {
-            codecs: vec!["h264-baseline-3.1".to_string()],
+            codecs: {
+                #[cfg_attr(not(feature = "hevc"), allow(unused_mut))]
+                let mut v = vec!["h264-baseline-3.1".to_string()];
+                #[cfg(feature = "hevc")]
+                v.push("h265-main-5.0".to_string());
+                v
+            },
             webcodecs: true,
             ..Default::default()
         };
         let (chosen_default, default_reason) =
             match crate::pipeline_selection::choose(op, &optimistic_caps) {
                 Ok(d) => (d.pipeline.wire_name(), d.reason),
-                // `forced-h264-no-client` is unreachable with the optimistic
-                // caps above; if a future refactor makes it reachable we'd
-                // rather surface `h264` + an explanatory reason than 500.
-                Err(e) => ("h264", e.reason),
+                // Unreachable with the optimistic caps above. Defensive default
+                // so a future refactor still surfaces something rather than 500.
+                Err(_e) => ("h264", "forced-unavailable"),
             };
 
         // `available_pipelines` is the *transport list* the binary can speak
@@ -160,11 +168,16 @@ pub async fn api_desktop_capabilities(
         if crate::pipeline_selection::H264_COMPILED {
             available_pipelines.push("h264".to_string());
         }
+        if crate::pipeline_selection::HEVC_COMPILED {
+            available_pipelines.push("h265".to_string());
+        }
         let preferred_pipeline = match op {
             OperatorPref::Jpeg => "jpeg",
             OperatorPref::Auto => "auto",
             #[cfg(feature = "h264")]
             OperatorPref::H264 => "h264",
+            #[cfg(feature = "hevc")]
+            OperatorPref::Hevc => "hevc",
         };
 
         // Phase-02: `audio_supported` is the single-source-of-truth probe

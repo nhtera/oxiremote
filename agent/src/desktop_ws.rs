@@ -46,7 +46,7 @@ mod inner {
     use crate::desktop_ws_capture::{spawn_capture_pipeline, Sink};
     use crate::pipeline_selection::{
         choose as choose_pipeline, operator_preference, parse_force_pipeline, ClientCapabilities,
-        ForcedH264Unavailable, OperatorPref, Pipeline,
+        OperatorPref, Pipeline,
     };
     use crate::AppState;
 
@@ -606,10 +606,11 @@ mod inner {
                     // failures. Without this the success metric "auto-h264
                     // rate" is computed against only successful sessions and
                     // hides the fail-closed denominator.
-                    let reason = e
-                        .downcast_ref::<ForcedH264Unavailable>()
-                        .map(|f| f.reason.to_string())
-                        .unwrap_or_else(|| "negotiation-failed".to_string());
+                    // `e` is an anyhow error whose Display string is the
+                    // stable reason identifier (e.g. "forced-h264-no-client",
+                    // "forced-hevc-no-client", or "WS closed during negotiation").
+                    // Extract it directly; no concrete type downcast needed.
+                    let reason = e.to_string();
                     state.event_bus.send(AgentEvent::PipelineChosen {
                         device_id: device_id.to_string(),
                         pipeline: "none".to_string(),
@@ -627,6 +628,10 @@ mod inner {
             Pipeline::Jpeg => Some(false),
             #[cfg(feature = "h264")]
             Pipeline::H264 => None,
+            // HEVC uses platform encoder (VideoToolbox on macOS); hardware
+            // acceleration status is determined after encoder init, not here.
+            #[cfg(feature = "hevc")]
+            Pipeline::Hevc => None,
         };
         if let Ok(msg) = serde_json::to_string(&SignalOut::PipelineChosen {
             mode: pipeline.wire_name(),
@@ -1793,28 +1798,28 @@ mod inner {
                                     ));
                                 }
                                 Err(err) => {
-                                    // Operator forced H.264 but client can't
-                                    // decode. Tell the client clearly before
-                                    // tearing down — the SPA's `captureEnded`
-                                    // handler surfaces the reason in the
-                                    // reconnect modal.
+                                    // Operator forced a pipeline but the client
+                                    // can't decode it. Tell the client clearly
+                                    // before tearing down — the SPA's
+                                    // `captureEnded` handler surfaces the
+                                    // reason in the reconnect modal.
                                     warn!(
                                         operator = ?operator,
-                                        reason = err.reason,
+                                        reason = %err,
                                         "pipeline forced but unsatisfiable"
                                     );
                                     if let Ok(msg) =
                                         serde_json::to_string(&SignalOut::CaptureEnded {
                                             reason: format!(
-                                                "Server forced H.264 but this client lacks decode support ({})",
-                                                err.reason
+                                                "Server pipeline forced but client lacks decode support ({})",
+                                                err
                                             ),
                                         })
                                     {
                                         let _ =
                                             socket.send(Message::Text(msg.into())).await;
                                     }
-                                    return Err(anyhow::Error::new(err));
+                                    return Err(anyhow::anyhow!("{}", err));
                                 }
                             }
                         }

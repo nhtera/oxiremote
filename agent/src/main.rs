@@ -57,6 +57,10 @@ mod desktop_abr;
 // streams JSON over Server-Sent Events on `/api/hosts/{id}/desktop/stats`.
 #[cfg(feature = "h264")]
 mod desktop_stats_sse;
+// HEVC RTP payloader — RFC 7798 FU/AP packetizer used by the HEVC pipeline.
+// Gated independently so the h264-only build does not pull this module.
+#[cfg(feature = "hevc")]
+mod hevc_payloader;
 // Audio pipeline — gated on the agent's `audio` feature (forwards to
 // desktop/audio). Off by default until phase-02a + 02b both ship.
 #[cfg(feature = "audio")]
