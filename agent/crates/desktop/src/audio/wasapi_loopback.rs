@@ -35,7 +35,10 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use async_trait::async_trait;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use cpal::{FromSample, SampleFormat, SizedSample, StreamConfig};
+// `Sample` is needed in scope so the `f32::from_sample(...)` call resolves —
+// the conversion method lives on the `Sample` trait (defaulted, dispatches to
+// `FromSample::from_sample_`). Importing only `FromSample` is not enough.
+use cpal::{FromSample, Sample, SampleFormat, SizedSample, StreamConfig};
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
