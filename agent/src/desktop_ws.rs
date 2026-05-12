@@ -1028,26 +1028,94 @@ mod inner {
         });
 
         // Audio pipeline: only spawned when the gate passed (audio_track is
-        // Some). The capture loop already opened the SCStream in audio mode
-        // and is forwarding PCM to `audio_rx_opt`.
+        // Some). Capture construction is platform-specific — macOS bridges
+        // the SCStream's audio mpsc (the capture loop already opened the
+        // SCStream in audio mode and is forwarding PCM into `audio_rx_opt`),
+        // Windows opens an independent cpal WASAPI loopback stream via
+        // `desktop::audio::make_default()` (the mpsc pair is vestigial there).
         #[cfg(feature = "audio")]
-        if let (Some(track), Some(rx)) = (audio_track.as_ref(), audio_rx_opt) {
-            let capture: Box<dyn desktop::audio::AudioCapture> =
-                Box::new(desktop::audio::sck_audio::SckAudioCapture::from_receiver(rx));
-            crate::desktop_audio_pipeline::spawn_audio_pipeline(
-                crate::desktop_audio_pipeline::AudioPipelineConfig {
-                    track: track.clone(),
-                    capture,
-                    shutdown_rx: ap_shutdown_rx,
-                    event_bus: Arc::clone(&state.event_bus),
-                    device_id: device_id.to_string(),
-                },
-            );
-            state.event_bus.send(crate::events::AgentEvent::AudioStarted {
-                device_id: device_id.to_string(),
-            });
-            state.telemetry.record_audio_session_started();
-            info!("audio pipeline spawned (SCK → Opus → RTP)");
+        {
+            #[cfg(target_os = "windows")]
+            let capture_error_reason =
+                crate::desktop_audio_pipeline::StopReason::WasapiError;
+            #[cfg(not(target_os = "windows"))]
+            let capture_error_reason =
+                crate::desktop_audio_pipeline::StopReason::SckError;
+
+            let capture_init: Option<
+                Result<Box<dyn desktop::audio::AudioCapture>, desktop::audio::AudioError>,
+            > = if audio_track.is_some() {
+                #[cfg(target_os = "macos")]
+                {
+                    Some(match audio_rx_opt {
+                        Some(rx) => Ok(Box::new(
+                            desktop::audio::sck_audio::SckAudioCapture::from_receiver(rx),
+                        )),
+                        None => Err(desktop::audio::AudioError::CaptureFailed(
+                            "sck audio rx absent".into(),
+                        )),
+                    })
+                }
+                #[cfg(target_os = "windows")]
+                {
+                    let _ = audio_rx_opt;
+                    Some(desktop::audio::make_default())
+                }
+                #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+                {
+                    let _ = audio_rx_opt;
+                    Some(Err(desktop::audio::AudioError::Unsupported(
+                        "audio.platform.unsupported",
+                    )))
+                }
+            } else {
+                let _ = audio_rx_opt;
+                None
+            };
+
+            if let (Some(track), Some(init)) = (audio_track.as_ref(), capture_init) {
+                match init {
+                    Ok(capture) => {
+                        crate::desktop_audio_pipeline::spawn_audio_pipeline(
+                            crate::desktop_audio_pipeline::AudioPipelineConfig {
+                                track: track.clone(),
+                                capture,
+                                shutdown_rx: ap_shutdown_rx,
+                                event_bus: Arc::clone(&state.event_bus),
+                                device_id: device_id.to_string(),
+                                capture_error_reason,
+                            },
+                        );
+                        state
+                            .event_bus
+                            .send(crate::events::AgentEvent::AudioStarted {
+                                device_id: device_id.to_string(),
+                            });
+                        state.telemetry.record_audio_session_started();
+                        info!("audio pipeline spawned (Opus → RTP)");
+                    }
+                    Err(err) => {
+                        // Gate passed but the capture backend wouldn't open
+                        // (e.g. WASAPI device gone). The audio transceiver is
+                        // already on the PC so the client sees a dormant
+                        // receiver — surface that via AudioStopped so
+                        // dashboards reflect reality. Consume the shutdown
+                        // sender so the later teardown path doesn't try to
+                        // fire SessionClosed into a pipeline that never
+                        // started.
+                        warn!(
+                            error = %err,
+                            "audio capture init failed; pipeline not spawned"
+                        );
+                        state.event_bus.send(crate::events::AgentEvent::AudioStopped {
+                            device_id: device_id.to_string(),
+                            reason: capture_error_reason.as_wire().to_string(),
+                        });
+                        let _ = ap_shutdown_tx.take();
+                        drop(ap_shutdown_rx);
+                    }
+                }
+            }
         }
         // Drop the audio_tx clone we held only to thread into capture; the
         // capture loop owns its own clone now.

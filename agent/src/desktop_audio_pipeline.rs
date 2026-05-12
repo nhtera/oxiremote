@@ -47,13 +47,20 @@ use crate::events::{AgentEvent, EventBus};
 /// so dashboard filters and SSE consumers can pattern-match without parsing
 /// free text. The pipeline emits `AudioStopped` exactly once at exit; the
 /// caller signals `SessionClosed` / `UserToggleOff` via the shutdown
-/// oneshot, while `SckError` is decided internally on any capture or
-/// encoder failure.
+/// oneshot, while `SckError` / `WasapiError` are decided internally on any
+/// capture or encoder failure (the caller picks which one applies for the
+/// active backend via `AudioPipelineConfig::capture_error_reason`).
 #[derive(Debug, Clone, Copy)]
 pub enum StopReason {
     SessionClosed,
     UserToggleOff,
+    // SckError is only constructed on macOS, WasapiError only on Windows.
+    // Cross-platform consumers (tests, dashboard parsers) still want both
+    // visible; per-target dead-code allows keep the build warning-free.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     SckError,
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+    WasapiError,
 }
 
 impl StopReason {
@@ -62,6 +69,7 @@ impl StopReason {
             StopReason::SessionClosed => "session_closed",
             StopReason::UserToggleOff => "user_toggle_off",
             StopReason::SckError => "sck_error",
+            StopReason::WasapiError => "wasapi_error",
         }
     }
 }
@@ -83,14 +91,20 @@ const SAMPLE_CHANNEL_CAP: usize = 4;
 /// `event_bus` + `device_id` let the pipeline emit `AgentEvent::AudioStopped`
 /// from a single point with the correct reason — `SessionClosed` /
 /// `UserToggleOff` as signalled by the caller through `shutdown_rx`, or
-/// `SckError` decided internally on capture/encoder failure. The caller does
-/// NOT emit `AudioStopped` itself; the pipeline owns the lifecycle.
+/// `capture_error_reason` (typically `SckError` on macOS, `WasapiError` on
+/// Windows) when a capture/encoder failure forces the loop to exit. The
+/// caller does NOT emit `AudioStopped` itself; the pipeline owns the
+/// lifecycle.
 pub struct AudioPipelineConfig {
     pub track: Arc<TrackLocalStaticSample>,
     pub capture: Box<dyn AudioCapture>,
     pub shutdown_rx: oneshot::Receiver<StopReason>,
     pub event_bus: Arc<EventBus>,
     pub device_id: String,
+    /// Wire reason emitted on an internal capture/encoder failure. The
+    /// pipeline can't know which backend the capture is — caller picks the
+    /// right variant for the platform it built.
+    pub capture_error_reason: StopReason,
 }
 
 /// `RTCRtpCodecCapability` matching what `register_default_codecs` exposes
@@ -142,6 +156,7 @@ pub fn spawn_audio_pipeline(cfg: AudioPipelineConfig) {
         cfg.shutdown_rx,
         cfg.event_bus,
         cfg.device_id,
+        cfg.capture_error_reason,
     ));
 }
 
@@ -151,12 +166,13 @@ async fn encoder_task(
     mut shutdown_rx: oneshot::Receiver<StopReason>,
     event_bus: Arc<EventBus>,
     device_id: String,
+    capture_error_reason: StopReason,
 ) {
     let mut encoder = match OpusEncoder::new() {
         Ok(e) => e,
         Err(err) => {
             warn!(error = %err, "audio_pipeline: OpusEncoder init failed; aborting");
-            emit_stopped(&event_bus, &device_id, StopReason::SckError);
+            emit_stopped(&event_bus, &device_id, capture_error_reason);
             return;
         }
     };
@@ -166,10 +182,10 @@ async fn encoder_task(
         "audio_pipeline: encoder task started"
     );
 
-    // Reason for exiting the loop. Default `SckError`; overwritten by the
-    // shutdown arm with whatever the caller chose, or left as-is on any
-    // capture / encoder failure path.
-    let mut exit_reason = StopReason::SckError;
+    // Reason for exiting the loop. Default to the caller-supplied capture
+    // error reason; overwritten by the shutdown arm with whatever the caller
+    // chose, or left as-is on any capture / encoder failure path.
+    let mut exit_reason = capture_error_reason;
     loop {
         tokio::select! {
             biased;
@@ -273,6 +289,7 @@ mod tests {
         assert_eq!(StopReason::SessionClosed.as_wire(), "session_closed");
         assert_eq!(StopReason::UserToggleOff.as_wire(), "user_toggle_off");
         assert_eq!(StopReason::SckError.as_wire(), "sck_error");
+        assert_eq!(StopReason::WasapiError.as_wire(), "wasapi_error");
     }
 
     #[test]

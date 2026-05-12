@@ -18,10 +18,11 @@ h264 = [
     "dep:objc2-core-foundation",
 ]
 # Phase-02 audio (system-loopback → Opus → WebRTC). Off by default — pulls
-# vendored libopus (audiopus) + rubato resampler. Lit by phase-02 once the
-# Windows WASAPI kill-switch smoke (phase-02 step 1) passes; the encoder +
-# resampler wrappers compile + unit-test under this feature today.
-audio = ["dep:audiopus", "dep:rubato"]
+# vendored libopus (audiopus) + rubato resampler. `dep:cpal` resolves only
+# under the Windows target dependency table below, so macOS / Linux builds
+# pull audiopus + rubato but not cpal (which would drag Core Audio / ALSA
+# backends they don't use).
+audio = ["dep:audiopus", "dep:rubato", "dep:cpal"]
 
 [dependencies]
 xcap = "0.9"
@@ -61,6 +62,15 @@ openh264 = { version = "0.9", features = ["source"], optional = true }
 # BGRA→I420 conversion for the OpenH264 input path (NEON on Apple Silicon,
 # AVX2 on x86). Pure Rust; no C toolchain dependency unlike libyuv-sys.
 yuvutils-rs = { version = "0.8", optional = true }
+
+# Phase-02b: cpal is the Windows WASAPI loopback backend. Pure-Rust,
+# rustdesk-proven path: opening an input stream on the default *output*
+# device auto-selects WASAPI loopback shared mode. macOS audio rides
+# ScreenCaptureKit instead (see `audio/sck_audio.rs`) and Linux is
+# deferred, so cpal is gated on the Windows target to keep non-Windows
+# builds from pulling Core Audio / ALSA backends they don't use.
+[target.'cfg(target_os = "windows")'.dependencies]
+cpal = { version = "0.15", optional = true }
 
 # Phase 03 macOS hardware encoder. Raw FFI to VideoToolbox/CoreMedia via the
 # madsmtm/objc2 ecosystem — auto-generated from Apple SDK headers. All four
