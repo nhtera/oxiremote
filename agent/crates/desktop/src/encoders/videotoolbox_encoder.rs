@@ -42,10 +42,12 @@ use objc2_core_media::{
 use objc2_core_video::{kCVPixelFormatType_32BGRA, CVPixelBuffer, CVPixelBufferCreateWithBytes};
 use objc2_video_toolbox::{
     kVTCompressionPropertyKey_AllowFrameReordering, kVTCompressionPropertyKey_AverageBitRate,
-    kVTCompressionPropertyKey_H264EntropyMode, kVTCompressionPropertyKey_MaxKeyFrameInterval,
+    kVTCompressionPropertyKey_H264EntropyMode, kVTCompressionPropertyKey_MaxAllowedFrameQP,
+    kVTCompressionPropertyKey_MaxKeyFrameInterval,
     kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration,
-    kVTCompressionPropertyKey_ProfileLevel, kVTCompressionPropertyKey_RealTime,
-    kVTH264EntropyMode_CABAC, kVTProfileLevel_H264_High_AutoLevel,
+    kVTCompressionPropertyKey_ProfileLevel, kVTCompressionPropertyKey_Quality,
+    kVTCompressionPropertyKey_RealTime, kVTH264EntropyMode_CABAC,
+    kVTProfileLevel_H264_High_AutoLevel,
     kVTVideoEncoderSpecification_EnableLowLatencyRateControl, VTCompressionSession,
     VTEncodeInfoFlags, VTSessionSetProperty,
 };
@@ -157,6 +159,31 @@ fn configure_properties(
             kVTCompressionPropertyKey_H264EntropyMode,
             kVTH264EntropyMode_CABAC,
         )?;
+        // Quality-target hint (0.0-1.0). H.264 encoders use this as a
+        // bit-allocation bias; less authoritative than the QP cap below
+        // but cheap belt-and-braces. 0.75 = "high" per Apple's documented
+        // mapping (kVTCompressionPropertyKey_Quality docs).
+        let quality = CFNumber::new_f32(0.75);
+        try_set_cf(
+            session,
+            kVTCompressionPropertyKey_Quality,
+            &*quality,
+            "Quality=0.75",
+        )?;
+        // Quality floor: encoder may NOT exceed QP=28 on any frame. H.264
+        // QP is 0-51 (0=lossless, 51=worst). 28 ≈ visually OK natural
+        // video but borderline-soft text on UI; capping here forces the
+        // encoder to spend bits — or drop the frame — rather than over-
+        // quantize static screen content. Dropped frames are far less
+        // visible than smeared text on UI. Tied to the 2026-05-13 Phase 02
+        // quality uplift; back off to 32 if sustained drop rate hurts UX.
+        let max_qp = CFNumber::new_i32(28);
+        try_set_cf(
+            session,
+            kVTCompressionPropertyKey_MaxAllowedFrameQP,
+            &*max_qp,
+            "MaxAllowedFrameQP=28",
+        )?;
     }
     Ok(())
 }
@@ -174,6 +201,34 @@ where
         anyhow::bail!("VTSessionSetProperty failed, OSStatus={}", status);
     }
     Ok(())
+}
+
+/// Like [`set_cf`] but tolerates `kVTPropertyNotSupportedErr` (-12900).
+/// Use for *optional* encoder properties that may not be implemented by
+/// every VideoToolbox encoder variant (older macOS releases, software
+/// fallback paths, etc.) — the property is skipped instead of failing
+/// session init. `desc` is included in the log/error message so the
+/// caller doesn't have to plumb a separate context string.
+unsafe fn try_set_cf<V>(
+    session: &VTCompressionSession,
+    key: &CFString,
+    value: &V,
+    desc: &'static str,
+) -> anyhow::Result<()>
+where
+    V: AsRef<CFType> + ?Sized,
+{
+    let status = unsafe { VTSessionSetProperty(session, key, Some(value.as_ref())) };
+    match status {
+        0 => Ok(()),
+        // kVTPropertyNotSupportedErr — encoder doesn't implement this
+        // knob; not fatal, just continue without it.
+        -12900 => {
+            debug!(property = desc, "VT property not supported by encoder, skipping");
+            Ok(())
+        }
+        other => anyhow::bail!("VTSessionSetProperty({desc}) failed, OSStatus={other}"),
+    }
 }
 
 // ─── Compression output callback ────────────────────────────────────────────
