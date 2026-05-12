@@ -6,14 +6,20 @@
 // hook follows Chrome Remote Desktop's mobile model instead:
 //
 //   Touch mode (default):
-//     - 1-finger drag = pan the local canvas (zero remote input)
 //     - 1-finger tap (no drag) = single click at finger position
-//     - 1-finger long-press (>500 ms, no drag) = ARM left-button drag — the
-//       next finger movement emits remote mousedown/move/up so the user can
-//       intentionally select / drag a remote window
+//     - 1-finger double-tap = double click at finger position
+//     - 1-finger drag at 1× = click-and-drag (mousedown at start, moves
+//       follow the finger, mouseup on release) — drives real remote drags
+//       like window-title-bar drags and marquee selection
+//     - 1-finger drag while zoomed in = pan the local canvas (zero remote
+//       input); release with velocity launches a fling
+//     - 1-finger long-press (>500 ms, no drag) = right click at finger
 //     - 2-finger tap = right click at midpoint
+//     - 3-finger tap = middle click at the centroid recorded at gesture
+//       start (CRD parity — middle-click for new tabs, paste-X11, etc.)
 //     - 2-finger pinch = zoom canvas about the finger midpoint
-//     - 2-finger pan = pan canvas (delegates to centroid translation)
+//     - 2-finger swipe = scroll (wheel events emitted from centroid
+//       translation; matches CRD and trackpad-mode behaviour)
 //
 //   Trackpad mode:
 //     - 1-finger drag = move a local virtual cursor (no immediate remote
@@ -24,7 +30,7 @@
 //       the local layer translation by user input.
 //     - 1-finger tap (no drag) = click at the virtual cursor's position
 //     - 1-finger long-press = right-click at cursor position
-//     - 2-finger drag = scroll wheel ONLY (the layer never pans on a
+//     - 2-finger swipe = scroll wheel ONLY (the layer never pans on a
 //       2-finger gesture in trackpad mode — pairing a local pan with a
 //       remote-scroll-induced repaint double-counts the finger motion
 //       and makes the screen feel like it's jumping).
@@ -104,15 +110,14 @@ const FLING_DECAY = 0.94
 const FLING_MIN_VELOCITY = 0.15
 const FLING_SAMPLE_WINDOW_MS = 100
 const FLING_LAUNCH_PX_PER_MS = 0.35
-// Double-tap zoom. A tap that lands within DOUBLE_TAP_MAX_DIST_PX of a
-// prior tap and within DOUBLE_TAP_MAX_MS triggers a zoom cycle instead of
-// the normal click. Threshold + target chosen so a single double-tap takes
-// the user from default (1×) to "filling most of the viewport" (2×) and a
-// second double-tap returns to 1×.
+// Double-tap detection. A tap that lands within DOUBLE_TAP_MAX_DIST_PX of a
+// prior tap and within DOUBLE_TAP_MAX_MS fires a SECOND left-click pair
+// immediately after the normal one, producing a real double-click on the
+// remote. Pinch is the only way to zoom — double-tap zoom would steal a
+// gesture users expect to mean "double click" (Chrome Remote Desktop and
+// Microsoft Remote Desktop both behave this way).
 const DOUBLE_TAP_MAX_MS = 300
 const DOUBLE_TAP_MAX_DIST_PX = 40
-const DOUBLE_TAP_ZOOM_SCALE = 2
-const DOUBLE_TAP_CYCLE_DOWN_AT = 1.5
 
 interface PointSnapshot {
   clientX: number
@@ -178,10 +183,12 @@ export function useCanvasGestures({
   // pointerdown or natural decay to below FLING_MIN_VELOCITY.
   const flingRafRef = useRef<number | null>(null)
   // Tracks the most recent tap (touch-mode, didn't move, not in a pinch)
-  // for double-tap detection. The detector fires on the SECOND tap in the
-  // pair, so the first tap fires its click normally — accepting the
-  // first-click-of-double-tap is the standard remote-desktop behaviour
-  // (Chrome Remote Desktop, Parsec) and avoids the 300 ms click-defer
+  // for double-tap detection. The first tap fires its click normally; if
+  // the second tap arrives within DOUBLE_TAP_MAX_MS / DOUBLE_TAP_MAX_DIST_PX,
+  // we emit an EXTRA click pair right after the second tap's normal click
+  // — the OS then sees down/up/down/up within ~300 ms and treats it as a
+  // double-click. Accepting the first click of a double-tap matches
+  // Chrome Remote Desktop / Parsec and avoids the 300 ms click-defer
   // pessimisation that early mobile-web apps suffered from.
   const lastTapRef = useRef<{ time: number; x: number; y: number } | null>(null)
   // Long-press timer for the touch-mode "drag arm" gesture.
@@ -189,9 +196,27 @@ export function useCanvasGestures({
   // True after a successful long-press: the next 1-finger move emits a remote
   // mousedown and the eventual pointerup emits mouseup.
   const dragArmedRef = useRef(false)
+  // True once a 1-finger drag at scale==1 has crossed the pan threshold and
+  // we've emitted an implicit mousedown for click-and-drag. Held for the
+  // duration of the gesture; cleared on pointerup. Distinct from
+  // dragArmedRef (which requires a long-press first) — this is the default
+  // behaviour at no-zoom: drag = click-and-drag, no long-press needed.
+  const implicitDragRef = useRef(false)
   // Trackpad-mode flag: while a single pointer is down, finger delta moves
   // the virtual cursor (no remote drag). Cleared on pointer-up.
   const trackpadDraggingRef = useRef(false)
+  // 3-finger tap detection (Chrome Remote Desktop parity → middle click).
+  // Captured on the third pointerdown; cancelled if any pointer moves past
+  // PAN_THRESHOLD_PX from its start, or if the window expires. Anchored at
+  // the centroid recorded at gesture start (not at lift) so the click
+  // doesn't slide as fingers leave at slightly different moments. The
+  // `fired` flag suppresses the tap-on-last-finger-lift fallthrough.
+  const threeFingerRef = useRef<{
+    startTime: number
+    midX: number
+    midY: number
+    fired: boolean
+  } | null>(null)
 
   const modeRef = useRef(mode)
   useEffect(() => {
@@ -246,7 +271,7 @@ export function useCanvasGestures({
    *  `clientX`/`clientY` are the finger position in viewport pixels; the
    *  canvas's bounding rect handles the rest. */
   const sendMouse = useCallback(
-    (action: 'down' | 'up' | 'move', btn: 'left' | 'right', clientX: number, clientY: number) => {
+    (action: 'down' | 'up' | 'move', btn: 'left' | 'right' | 'middle', clientX: number, clientY: number) => {
       const el = target.current
       if (!el) return
       const { x, y } = clientToRemote(el, clientX, clientY)
@@ -351,6 +376,28 @@ export function useCanvasGestures({
         return
       }
 
+      if (pointersRef.current.size === 3) {
+        // Three fingers down → arm a 3-finger tap. Cancel any pinch we
+        // were tracking so the third finger doesn't get treated as the
+        // tail end of a 2-finger gesture.
+        clearLongPress()
+        pinchRef.current = null
+        const pts = Array.from(pointersRef.current.values())
+        threeFingerRef.current = {
+          startTime: performance.now(),
+          midX: (pts[0].clientX + pts[1].clientX + pts[2].clientX) / 3,
+          midY: (pts[0].clientY + pts[1].clientY + pts[2].clientY) / 3,
+          fired: false,
+        }
+        return
+      }
+
+      if (pointersRef.current.size > 3) {
+        // 4+ fingers — abort the 3-finger tap; user is doing something else.
+        threeFingerRef.current = null
+        return
+      }
+
       // Single finger:
       if (modeRef.current === 'touch') {
         // Arm the long-press timer; if the finger doesn't move past
@@ -397,6 +444,12 @@ export function useCanvasGestures({
       if (Math.hypot(totalDx, totalDy) > PAN_THRESHOLD_PX) {
         p.moved = true
         clearLongPress()
+        // Any movement past the pan threshold cancels a pending 3-finger
+        // tap — the user is panning / pinching / something other than
+        // tapping with three fingers.
+        if (threeFingerRef.current && !threeFingerRef.current.fired) {
+          threeFingerRef.current = null
+        }
       }
 
       if (pointersRef.current.size === 2 && pinchRef.current) {
@@ -445,25 +498,16 @@ export function useCanvasGestures({
           }
         }
 
-        // Midpoint translation. Touch mode: pan the layer locally so the
-        // canvas follows the fingers. Trackpad mode: emit scroll wheel
-        // ONLY — never pan the layer. Local layer-pan + remote-scroll
-        // repaint is the double-counting that made trackpad 2-finger
-        // drags feel jumpy: same finger motion shifted the visible image
-        // twice. CRD's trackpad model is "fingers send wheel, screen
-        // updates from the host," and that's what we mirror.
-        if (modeRef.current === 'touch') {
-          if (midDx !== 0 || midDy !== 0) {
-            txRef.current += midDx
-            tyRef.current += midDy
-            transformChanged = true
-          }
-        } else {
-          const wdx = Math.round(midDx / 8)
-          const wdy = Math.round(midDy / 8)
-          if (wdx !== 0 || wdy !== 0) {
-            sendInputRef.current({ t: 'wheel', dx: -wdx, dy: -wdy })
-          }
+        // Midpoint translation → scroll wheel in BOTH modes. CRD's
+        // touch + trackpad model is "two fingers always scroll, never
+        // pan locally" — pairing a local pan with a remote-scroll repaint
+        // double-counts the finger motion and makes the screen feel like
+        // it's jumping. The user pans the local layer with a 1-finger
+        // drag while zoomed in, not by 2-finger gestures.
+        const wdx = Math.round(midDx / 8)
+        const wdy = Math.round(midDy / 8)
+        if (wdx !== 0 || wdy !== 0) {
+          sendInputRef.current({ t: 'wheel', dx: -wdx, dy: -wdy })
         }
 
         pinchRef.current.midX = newMidX
@@ -481,9 +525,23 @@ export function useCanvasGestures({
           sendMouse('move', 'left', e.clientX, e.clientY)
           return
         }
-        // Default: 1-finger drag pans the local canvas. NEVER emits a remote
-        // mouse event — that's the bug fix vs the legacy useDesktopInput.
-        if (p.moved) {
+        if (scaleRef.current === MIN_SCALE) {
+          // No-zoom 1-finger drag = click-and-drag on the remote. Fire an
+          // implicit mousedown the first time the finger crosses the pan
+          // threshold, then stream moves until release. Anchor the press
+          // at the gesture START (not current pos) so the click lands
+          // where the user actually touched, not PAN_THRESHOLD_PX away.
+          if (p.moved && !implicitDragRef.current) {
+            implicitDragRef.current = true
+            sendMouse('down', 'left', p.startX, p.startY)
+          }
+          if (implicitDragRef.current) {
+            sendMouse('move', 'left', e.clientX, e.clientY)
+          }
+        } else if (p.moved) {
+          // Zoomed in: 1-finger drag pans the local canvas. Never emits
+          // a remote mouse event — the canvas already exceeds the
+          // viewport so panning lets the user reach the edges.
           txRef.current += dx
           tyRef.current += dy
           applyTransform()
@@ -609,16 +667,50 @@ export function useCanvasGestures({
       pointersRef.current.delete(e.pointerId)
       clearLongPress()
 
+      // 3-finger tap detection: fire the middle click on the FIRST lift
+      // (before we fall into the size===N branches below, which would
+      // otherwise mark remaining fingers as "moved" and suppress the tap).
+      if (threeFingerRef.current && !threeFingerRef.current.fired) {
+        const elapsed = performance.now() - threeFingerRef.current.startTime
+        if (elapsed < TAP_MAX_MS) {
+          const { midX, midY } = threeFingerRef.current
+          sendMouse('down', 'middle', midX, midY)
+          sendMouse('up', 'middle', midX, midY)
+          threeFingerRef.current.fired = true
+        } else {
+          threeFingerRef.current = null
+        }
+      }
+
       if (pointersRef.current.size === 1) {
         // Just dropped from 2 fingers to 1 — clear pinch state but DON'T
-        // treat the remaining finger as a fresh tap.
+        // treat the remaining finger as a fresh tap. Same suppression for
+        // any pointer remaining after a 3-finger tap fired.
         pinchRef.current = null
-        const [remaining] = Array.from(pointersRef.current.values())
-        remaining.moved = true // suppress any spurious tap on lift
+        for (const remaining of pointersRef.current.values()) {
+          remaining.moved = true
+        }
+        return
+      }
+
+      if (pointersRef.current.size === 2) {
+        // Dropped from 3 → 2 after a 3-finger tap fired. Suppress the
+        // pinch handler from re-engaging on the remaining two fingers and
+        // mark them moved so their lift doesn't register as a 2-finger tap.
+        pinchRef.current = null
+        for (const remaining of pointersRef.current.values()) {
+          remaining.moved = true
+        }
         return
       }
 
       if (pointersRef.current.size === 0 && p) {
+        // Final-finger lift. If a 3-finger tap fired, suppress the
+        // single-tap fallthrough — the gesture's intent was middle-click.
+        if (threeFingerRef.current?.fired) {
+          threeFingerRef.current = null
+          return
+        }
         const elapsed = performance.now() - p.startTime
         const moved = p.moved
         const wasPinch = pinchRef.current !== null
@@ -631,45 +723,37 @@ export function useCanvasGestures({
             dragArmedRef.current = false
             return
           }
+          if (implicitDragRef.current) {
+            // End the implicit click-and-drag — release the left button.
+            // No fling here: click-and-drag is a remote intent, not a
+            // local layer pan; momentum would keep the cursor moving on
+            // the host after the user lifted their finger.
+            sendMouse('up', 'left', p.clientX, p.clientY)
+            implicitDragRef.current = false
+            velocityBufferRef.current.length = 0
+            return
+          }
           if (!wasPinch && !moved && elapsed < TAP_MAX_MS) {
-            // Tap. Check for a double-tap-zoom against the prior tap.
-            // Double-tap fires the zoom AND suppresses the second click —
-            // matches Safari / Chrome mobile semantics. The first tap's
-            // click already fired on the prior pointer-up, so the user
-            // sees one click + the zoom (standard remote-desktop UX).
-            const v = viewport.current
+            // Tap → fire one click at the finger position. If this lands
+            // inside the double-tap window of a prior tap, emit a second
+            // click pair so the host sees down/up/down/up within ~300 ms
+            // and treats it as a double-click (selects a word, opens an
+            // app, etc.). Pinch is the only zoom path.
             const prev = lastTapRef.current
             const now = performance.now()
             const isDouble =
               prev !== null &&
               now - prev.time <= DOUBLE_TAP_MAX_MS &&
               Math.hypot(p.clientX - prev.x, p.clientY - prev.y) <= DOUBLE_TAP_MAX_DIST_PX
-            if (isDouble && v) {
-              lastTapRef.current = null
-              const vrect = v.getBoundingClientRect()
-              const localX = p.clientX - vrect.left
-              const localY = p.clientY - vrect.top
-              const oldScale = scaleRef.current
-              const newScale =
-                oldScale >= DOUBLE_TAP_CYCLE_DOWN_AT ? MIN_SCALE : DOUBLE_TAP_ZOOM_SCALE
-              const k = newScale / oldScale
-              txRef.current = localX - (localX - txRef.current) * k
-              tyRef.current = localY - (localY - tyRef.current) * k
-              scaleRef.current = newScale
-              if (newScale === MIN_SCALE) {
-                // Reset translation when returning to 1× so the canvas
-                // re-centres in the viewport — without this a prior pan
-                // would leave the image offset at 1×.
-                txRef.current = 0
-                tyRef.current = 0
-              }
-              applyTransform()
-              return
-            }
-            lastTapRef.current = { time: now, x: p.clientX, y: p.clientY }
-            // First-of-pair (or solo) tap → click at finger pos.
             sendMouse('down', 'left', p.clientX, p.clientY)
             sendMouse('up', 'left', p.clientX, p.clientY)
+            if (isDouble) {
+              sendMouse('down', 'left', p.clientX, p.clientY)
+              sendMouse('up', 'left', p.clientX, p.clientY)
+              lastTapRef.current = null
+            } else {
+              lastTapRef.current = { time: now, x: p.clientX, y: p.clientY }
+            }
           } else if (!wasPinch && moved && !dragArmedRef.current) {
             // Pan-gesture release — fling if velocity ≥ launch threshold.
             // Compute average velocity over the trailing window so a
@@ -748,6 +832,10 @@ export function useCanvasGestures({
       // equivalent to draining the array.
       velocityBufferRef.current = []
       lastTapRef.current = null
+      dragArmedRef.current = false
+      implicitDragRef.current = false
+      trackpadDraggingRef.current = false
+      threeFingerRef.current = null
     }
   }, [layer, viewport, target, applyTransform, sendMouse, sendMove, disabled])
 

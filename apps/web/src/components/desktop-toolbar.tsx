@@ -191,7 +191,7 @@ export default function DesktopToolbar({
         <button
           onClick={inputMode === 'touch' ? undefined : onInputModeToggle}
           aria-pressed={inputMode === 'touch'}
-          title="Touch (Direct): tap = click at finger position. Drag with one finger to move the pointer."
+          title="Touch (Direct): tap = click. Long press = right-click. Pinch to zoom; 2-finger swipe scrolls."
           className={[
             'h-8 text-xs font-medium rounded transition-colors',
             inputMode === 'touch'
@@ -204,7 +204,7 @@ export default function DesktopToolbar({
         <button
           onClick={inputMode === 'trackpad' ? undefined : onInputModeToggle}
           aria-pressed={inputMode === 'trackpad'}
-          title="Trackpad: relative cursor. Two-finger swipe scrolls; tap clicks at the cursor."
+          title="Trackpad: relative cursor. Tap = click. Long press = right-click. 2-finger swipe scrolls."
           className={[
             'h-8 text-xs font-medium rounded transition-colors',
             inputMode === 'trackpad'
