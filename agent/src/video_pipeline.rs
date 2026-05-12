@@ -47,7 +47,7 @@ const FIRST_FRAME_DURATION_MS: u64 = 33;
 /// internally. Recovery latency upper bound is therefore ~1 RTT + 1 s
 /// in the worst case; observed quality wins outweigh the latency cost.
 ///
-/// Natural keyframes (the encoder's `MaxKeyFrameInterval = 120 frames`
+/// Natural keyframes (the encoder's `MaxKeyFrameInterval = 60 frames`
 /// pacing, and session-start `force_iframe`) are NOT rate-limited — only
 /// PLI-triggered forces.
 const PLI_MIN_INTERVAL: Duration = Duration::from_secs(1);
@@ -99,22 +99,27 @@ pub struct VideoPipelineConfig {
 }
 
 /// Build the `RTCRtpCodecCapability` we expose in the SDP offer — H.264
-/// baseline profile, Level 5.0, 90 kHz clock, packetization-mode=1.
+/// **High** profile, Level 5.0, 90 kHz clock, packetization-mode=1.
 ///
-/// Level 5.0 (level_idc=0x32, max ~2560×1920 / 36 Mbps) covers HiDPI
-/// captures on Retina displays. The encoder runs at `AutoLevel` so VT
-/// emits the minimum level the actual resolution requires; advertising
-/// 5.0 here lets the SDP negotiate that envelope without false-rejection
-/// from browsers that strictly check `profile-level-id`. profile-iop=e0
-/// keeps the constrained-baseline flags (sets 0/1/2) so old decoders
-/// that only do baseline still accept the stream.
+/// `profile-level-id=640032` decodes as: profile_idc=0x64 (100, High),
+/// profile-iop=0x00 (no constraint flags — High doesn't carry the
+/// baseline-compatibility bits), level_idc=0x32 (Level 5.0,
+/// max ~2560×1920 / 36 Mbps). Bumped from `42e032` (Constrained Baseline)
+/// on 2026-05-13 — plan `260513-0009-h264-quality-uplift-vt-high-profile`.
+/// All target browsers (iPad Safari 17+, Chrome desktop/Android,
+/// Firefox 130+) hardware-decode H.264 High 4:2:0 over WebRTC in 2026.
+///
+/// The encoder runs at `AutoLevel` so VT emits the minimum level the
+/// actual resolution requires; advertising 5.0 here lets the SDP
+/// negotiate that envelope without false-rejection from browsers that
+/// strictly check `profile-level-id`.
 pub fn h264_codec_capability() -> RTCRtpCodecCapability {
     RTCRtpCodecCapability {
         mime_type: MIME_TYPE_H264.to_string(),
         clock_rate: 90_000,
         channels: 0,
         sdp_fmtp_line:
-            "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e032".to_string(),
+            "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=640032".to_string(),
         rtcp_feedback: vec![],
     }
 }
@@ -514,9 +519,12 @@ async fn handle_rtcp_batch(
             // - Floor 1.5 Mbps: keeps Low tier intact under transient
             //   congestion. The encoder's resolution-aware floor is
             //   computed elsewhere (TODO: bump for HiDPI sessions).
-            // - Ceiling 15 Mbps: lets High tier (12 Mbps) breathe so REMB
-            //   never artificially clips the configured target on LAN.
-            let bps = (remb.bitrate as u32).clamp(1_500_000, 15_000_000);
+            // - Ceiling 30 Mbps: matches the post-2026-05-13 HiDPI High
+            //   ceiling so REMB never artificially clips the configured
+            //   target on LAN. (Was 15 Mbps when High tier was 12 Mbps
+            //   non-HiDPI; HiDPI doubled to 24 Mbps, and bumped to
+            //   30 Mbps via `tier_bitrate` cap raise in same plan.)
+            let bps = (remb.bitrate as u32).clamp(1_500_000, 30_000_000);
             let _ = remb_tx.send(BitrateBps(bps));
             continue;
         }
@@ -547,12 +555,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn h264_capability_has_baseline_3_1_fmtp() {
+    fn h264_capability_has_high_5_0_fmtp() {
+        // Post 2026-05-13 quality uplift: High profile (`profile_idc=100`),
+        // Level 5.0 (`level_idc=0x32`). High enables 8×8 transform + CABAC
+        // for sharp text on screen content. Browsers in 2026 universally
+        // hardware-decode H.264 High 4:2:0 over WebRTC.
         let cap = h264_codec_capability();
         assert_eq!(cap.mime_type, "video/H264");
         assert_eq!(cap.clock_rate, 90_000);
-        assert!(cap.sdp_fmtp_line.contains("profile-level-id=42e032"));
+        assert!(cap.sdp_fmtp_line.contains("profile-level-id=640032"));
         assert!(cap.sdp_fmtp_line.contains("packetization-mode=1"));
+        // Regression guard: the prior Baseline fmtp must NOT reappear.
+        assert!(!cap.sdp_fmtp_line.contains("42e032"));
     }
 
     #[test]

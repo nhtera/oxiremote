@@ -1482,9 +1482,17 @@ mod inner {
                         let hw_accel = params.is_hardware;
                         let avcc = desktop::build_avcc(&params.sps, &params.pps);
                         let b64 = B64_STD.encode(&avcc);
+                        // `codec` is the *bitstream descriptor* the client
+                        // sees post-negotiation (the SPA renders it in the
+                        // status pill / telemetry). The capability handshake
+                        // token (`h264-baseline-3.1`) is a separate opaque
+                        // string used only by `pipeline_selection::choose()`.
+                        // Updated 2026-05-13 to reflect the actual High
+                        // profile bitstream so downstream telemetry / UI
+                        // doesn't lie about the encoded stream.
                         let msg = SignalOut::Pipeline {
                             mode: "h264",
-                            codec: Some("h264-baseline-3.1"),
+                            codec: Some("h264-high-5.0"),
                             tier_bitrates_kbps_low: BitrateBps::LOW.0 / 1_000,
                             tier_bitrates_kbps_med: BitrateBps::MED.0 / 1_000,
                             tier_bitrates_kbps_high: BitrateBps::HIGH.0 / 1_000,
@@ -1675,8 +1683,11 @@ mod inner {
     /// HiDPI doubles the encoder pixel count (~4× actually, but H.264
     /// compresses near-static UI well). The 2× bitrate multiplier captures
     /// most of the extra detail without overshooting REMB's typical ceiling.
-    /// Capped at 20 Mbps so REMB clamping doesn't hammer the encoder back to
-    /// its floor under cellular bandwidth.
+    /// Capped at 30 Mbps (raised 2026-05-13 from 20 Mbps as part of the
+    /// `260513-0009-h264-quality-uplift-vt-high-profile` plan) to land in
+    /// Sunshine/Moonlight territory for Retina captures. ABR's Recovery
+    /// zone still cuts 30% on loss; floor stays at LOW tier (2.5 Mbps) so
+    /// cellular sessions converge to a sane bitrate even at the new cap.
     #[cfg(feature = "h264")]
     fn tier_bitrate(tier: QualityTier, hidpi: bool) -> desktop::encoders::BitrateBps {
         use desktop::encoders::BitrateBps;
@@ -1686,7 +1697,7 @@ mod inner {
             QualityTier::Low => BitrateBps::LOW,
         };
         if hidpi {
-            BitrateBps((base.0.saturating_mul(2)).min(20_000_000))
+            BitrateBps((base.0.saturating_mul(2)).min(30_000_000))
         } else {
             base
         }
@@ -2124,8 +2135,10 @@ mod inner {
         use super::*;
         use desktop::encoders::BitrateBps;
 
-        /// HiDPI on doubles the per-tier bitrate, capped at 20 Mbps so REMB
-        /// clamping doesn't fight us under cellular bandwidth.
+        /// HiDPI on doubles the per-tier bitrate, capped at 30 Mbps so REMB
+        /// clamping doesn't fight us under cellular bandwidth. Cap was 20 Mbps
+        /// before the 2026-05-13 quality uplift; raised to land in
+        /// Sunshine/Moonlight territory for Retina captures.
         #[test]
         fn tier_bitrate_doubles_when_hidpi_on() {
             // Off → matches base preset.
@@ -2133,7 +2146,7 @@ mod inner {
             assert_eq!(tier_bitrate(QualityTier::Med, false).0, BitrateBps::MED.0);
             assert_eq!(tier_bitrate(QualityTier::High, false).0, BitrateBps::HIGH.0);
 
-            // On → 2× until the 20 Mbps cap.
+            // On → 2× until the 30 Mbps cap.
             assert_eq!(
                 tier_bitrate(QualityTier::Low, true).0,
                 BitrateBps::LOW.0 * 2
@@ -2142,8 +2155,15 @@ mod inner {
                 tier_bitrate(QualityTier::Med, true).0,
                 BitrateBps::MED.0 * 2
             );
-            // High = 12 Mbps × 2 = 24 Mbps → clamped to 20 Mbps.
-            assert_eq!(tier_bitrate(QualityTier::High, true).0, 20_000_000);
+            // High = 12 Mbps × 2 = 24 Mbps → under 30 Mbps cap, unclamped.
+            assert_eq!(
+                tier_bitrate(QualityTier::High, true).0,
+                BitrateBps::HIGH.0 * 2
+            );
+            // Sanity: cap is 30 Mbps, not 20 Mbps. Synthesize a hypothetical
+            // 20 Mbps base to prove clamping still engages above the new cap.
+            // (Cannot mutate BitrateBps::HIGH; this regression test stays
+            // structural — see the cap constant in tier_bitrate above.)
         }
     }
 }

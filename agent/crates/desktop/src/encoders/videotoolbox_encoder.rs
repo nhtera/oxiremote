@@ -1,5 +1,14 @@
 //! VideoToolbox H.264 encoder — macOS hardware path.
 //!
+//! Profile: **High (`profile_idc=100`)** + **CABAC** entropy + AutoLevel.
+//! Bumped from phase-01's Constrained Baseline + CAVLC on 2026-05-13 (plan
+//! `260513-0009-h264-quality-uplift-vt-high-profile`). High enables 8×8
+//! adaptive transform + CABAC, both critical for sharp text on screen
+//! content. All target browsers (iPad Safari 17+, Chrome desktop/Android,
+//! Firefox 130+) hardware-decode H.264 High 4:2:0 over WebRTC in 2026.
+//! The matching SDP `profile-level-id=640032` lives in
+//! `agent/src/video_pipeline.rs`.
+//!
 //! Reference lines (in `~/.cargo/registry/src/…`):
 //! - `objc2-video-toolbox-0.3.2/.../VTCompressionSession.rs:131` create
 //! - `objc2-video-toolbox-0.3.2/.../VTCompressionSession.rs:293` encode_frame
@@ -36,11 +45,11 @@ use objc2_video_toolbox::{
     kVTCompressionPropertyKey_H264EntropyMode, kVTCompressionPropertyKey_MaxKeyFrameInterval,
     kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration,
     kVTCompressionPropertyKey_ProfileLevel, kVTCompressionPropertyKey_RealTime,
-    kVTH264EntropyMode_CAVLC, kVTProfileLevel_H264_Baseline_AutoLevel,
+    kVTH264EntropyMode_CABAC, kVTProfileLevel_H264_High_AutoLevel,
     kVTVideoEncoderSpecification_EnableLowLatencyRateControl, VTCompressionSession,
     VTEncodeInfoFlags, VTSessionSetProperty,
 };
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use super::{BitrateBps, EncodedFrame, H264Encoder, ParameterSets};
 use crate::h264_format::{avcc_to_annexb, build_avcc};
@@ -106,28 +115,31 @@ fn configure_properties(
 ) -> anyhow::Result<()> {
     unsafe {
         set_cf(session, kVTCompressionPropertyKey_RealTime, CFBoolean::new(true))?;
-        // AutoLevel lets VT pick the right H.264 level (3.1 → 5.2) based on
-        // the configured width/height. Hardcoding Baseline 3.1 capped us at
-        // 1280×720 and caused kVTVideoEncoderMalfunctionErr (-12911) on
-        // every frame when HiDPI mode pushed the encoder up to 2268×1473
-        // (Retina 2× scale) — well above 3.1's max picture size.
+        // High profile + AutoLevel: enables 8×8 adaptive transform + CABAC,
+        // both critical for sharp text on screen content. AutoLevel keeps
+        // the HiDPI safety from phase-01's `e7235a2` fix — Baseline 3.1
+        // capped us at 1280×720 and HiDPI mode (2268×1473) tripped
+        // kVTVideoEncoderMalfunctionErr (-12911) on every frame. AutoLevel
+        // lets VT pick the right level (3.1 → 5.2) based on width/height.
         set_cf(
             session,
             kVTCompressionPropertyKey_ProfileLevel,
-            kVTProfileLevel_H264_Baseline_AutoLevel,
+            kVTProfileLevel_H264_High_AutoLevel,
         )?;
         let bitrate_num = CFNumber::new_i32(bitrate.0 as i32);
         set_cf(session, kVTCompressionPropertyKey_AverageBitRate, &*bitrate_num)?;
-        // 120 frames ≈ 2 s @ 60 fps between forced IDRs. Acts as a cap; VT
-        // may emit sooner on scene cuts or on client PLI.
-        let kf_interval = CFNumber::new_i32(120);
+        // 60 frames = 1 s @ 60 fps between forced IDRs. Shorter GOP than
+        // phase-01's 120 frames halves the P-frame drift window — important
+        // for crisp text on UI motion (scrolling, cursor). VT may emit
+        // sooner on scene cuts or on client PLI. ~3% bitrate overhead trade.
+        let kf_interval = CFNumber::new_i32(60);
         set_cf(session, kVTCompressionPropertyKey_MaxKeyFrameInterval, &*kf_interval)?;
         // Belt-and-braces: also cap the time-based interval. Without this,
         // VT's RC may insert IDRs on detected scene changes — which fires
         // every frame in a same-machine recursive view, blowing the
-        // bitrate budget on all-keyframe output. 4 s pairs cleanly with
-        // the frame-count cap above (whichever fires first wins).
-        let kf_interval_s = CFNumber::new_f64(4.0);
+        // bitrate budget on all-keyframe output. 2 s pairs cleanly with
+        // the 60-frame cap above (whichever fires first wins).
+        let kf_interval_s = CFNumber::new_f64(2.0);
         set_cf(
             session,
             kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration,
@@ -138,10 +150,12 @@ fn configure_properties(
             kVTCompressionPropertyKey_AllowFrameReordering,
             CFBoolean::new(false),
         )?;
+        // CABAC: ~10-15% bitrate efficiency win vs CAVLC at equal quality.
+        // Requires Main+ profile; allowed here because we use High above.
         set_cf(
             session,
             kVTCompressionPropertyKey_H264EntropyMode,
-            kVTH264EntropyMode_CAVLC,
+            kVTH264EntropyMode_CABAC,
         )?;
     }
     Ok(())
@@ -198,6 +212,23 @@ unsafe extern "C-unwind" fn compression_output_callback(
         Ok((frame, maybe_params)) => {
             let mut guard = state.lock().unwrap_or_else(|p| p.into_inner());
             if let Some(params) = maybe_params {
+                // First-IDR-only log: gated on `guard.params.is_none()` so a
+                // 1 s GOP doesn't spam one info! per second. Verifies the
+                // bitstream matches the SDP `profile-level-id` negotiation —
+                // expected after the 2026-05-13 High profile bump:
+                // profile_idc=100, level_idc per AutoLevel. SPS byte layout
+                // (ITU-T H.264 §7.3.2.1): byte 0 = NAL header (0x67),
+                // byte 1 = profile_idc, byte 2 = constraint_set flags,
+                // byte 3 = level_idc.
+                if guard.params.is_none() && params.sps.len() >= 4 {
+                    info!(
+                        profile_idc = params.sps[1],
+                        level_idc = params.sps[3],
+                        sps_len = params.sps.len(),
+                        pps_len = params.pps.len(),
+                        "VT first IDR: SPS extracted",
+                    );
+                }
                 guard.params.get_or_insert(params);
             }
             guard.completed.push_back(frame);
@@ -249,6 +280,7 @@ fn extract_frame(
     } else {
         None
     };
+
 
     let block_buf = unsafe { sample.data_buffer() }
         .context("CMSampleBuffer missing data buffer (H.264 sample expected)")?;

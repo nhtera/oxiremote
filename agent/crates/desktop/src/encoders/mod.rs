@@ -45,15 +45,18 @@ pub struct ParameterSets {
 
 /// Bitrate targets by quality tier, in bits per second.
 ///
-/// Tuned for **screen content** (mostly UI + text), not natural video. Screen
-/// captures push H.264 outside its sweet spot: Constrained Baseline + CAVLC
-/// (no B-frames, no CABAC) costs ~25 % more bits than Main+CABAC for the same
-/// visual quality, and text edges are unforgiving — sub-3 bpp on a 1 MP frame
-/// produces visible macroblocking around glyphs and panel borders.
+/// Tuned for **screen content** (mostly UI + text), not natural video. As of
+/// the 2026-05-13 quality uplift (`260513-0009-h264-quality-uplift-vt-high-profile`)
+/// the VideoToolbox encoder uses **H.264 High profile + CABAC**, so these
+/// presets now buy noticeably sharper text per Mbps than phase-01's
+/// Baseline + CAVLC configuration. HiDPI sessions double each preset and
+/// clamp at **30 Mbps** (raised from 20 Mbps) — see `tier_bitrate` in
+/// `desktop_ws.rs`.
 ///
 /// Reference points (per industry remote-desktop tools at ~1 MP):
 /// - Parsec "Conservative" preset: ~8 Mbps
 /// - Moonlight default 1080p60: ~10–15 Mbps
+/// - Sunshine NVENC 1440p60: ~30 Mbps (matches our HiDPI cap)
 /// - AnyDesk Med tier: ~6–8 Mbps
 ///
 /// Picked so Med stays comfortable on broadband and High targets LAN/wifi-5
