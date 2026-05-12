@@ -14,22 +14,24 @@ type Tab = 'touch' | 'trackpad'
 
 const TOUCH_GESTURES = [
   { gesture: '1-finger tap', action: 'Left click' },
-  { gesture: 'Long press (0.5 s)', action: 'Right click' },
   { gesture: 'Double tap', action: 'Double click' },
+  { gesture: '1-finger drag (no zoom)', action: 'Click and drag' },
+  { gesture: 'Long press (0.5 s)', action: 'Right click' },
   { gesture: '2-finger tap', action: 'Right click' },
-  { gesture: '2-finger double-tap', action: 'Double click' },
+  { gesture: '3-finger tap', action: 'Middle click' },
   { gesture: '2-finger swipe', action: 'Scroll' },
   { gesture: '2-finger pinch', action: 'Zoom canvas' },
   { gesture: '1-finger drag (zoomed in)', action: 'Pan view' },
-  { gesture: '1-finger drag (no zoom)', action: 'Click and drag' },
   { gesture: 'Rectangle mode (▢) + drag', action: 'Marquee select on remote' },
 ]
 
 const TRACKPAD_GESTURES = [
   { gesture: 'Move', action: 'Move cursor' },
-  { gesture: 'Click', action: 'Left click' },
-  { gesture: 'Right-click', action: 'Right click' },
-  { gesture: '2-finger scroll', action: 'Scroll' },
+  { gesture: 'Tap', action: 'Left click' },
+  { gesture: 'Long press (0.5 s)', action: 'Right click' },
+  { gesture: '2-finger swipe', action: 'Scroll' },
+  { gesture: '2-finger pinch', action: 'Zoom canvas' },
+  { gesture: 'Edge of viewport (zoomed)', action: 'Auto-pan to follow cursor' },
 ]
 
 const TOOLBAR_LEGEND = [
