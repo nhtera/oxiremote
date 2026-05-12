@@ -33,13 +33,12 @@ use std::sync::{Arc, Mutex};
 use anyhow::Context;
 use bytes::Bytes;
 use objc2_core_foundation::{
-    CFBoolean, CFDictionary, CFNumber, CFRetained, CFString, CFType,
+    CFBoolean, CFDictionary, CFNumber, CFRetained, CFString,
 };
 use objc2_core_media::{
     kCMVideoCodecType_H264, CMSampleBuffer, CMTime, CMTimeFlags,
     CMVideoFormatDescriptionGetH264ParameterSetAtIndex,
 };
-use objc2_core_video::{kCVPixelFormatType_32BGRA, CVPixelBuffer, CVPixelBufferCreateWithBytes};
 use objc2_video_toolbox::{
     kVTCompressionPropertyKey_AllowFrameReordering, kVTCompressionPropertyKey_AverageBitRate,
     kVTCompressionPropertyKey_H264EntropyMode, kVTCompressionPropertyKey_MaxAllowedFrameQP,
@@ -49,10 +48,14 @@ use objc2_video_toolbox::{
     kVTCompressionPropertyKey_RealTime, kVTH264EntropyMode_CABAC,
     kVTProfileLevel_H264_High_AutoLevel,
     kVTVideoEncoderSpecification_EnableLowLatencyRateControl, VTCompressionSession,
-    VTEncodeInfoFlags, VTSessionSetProperty,
+    VTEncodeInfoFlags,
 };
 use tracing::{debug, info, warn};
 
+use super::vt_common::{
+    build_force_idr_dict, set_cf, try_set_cf, wrap_bgra_as_pixel_buffer,
+    DEFAULT_FRAME_DURATION_US, TIMESCALE_HZ,
+};
 use super::{BitrateBps, EncodedFrame, H264Encoder, ParameterSets};
 use crate::h264_format::{avcc_to_annexb, build_avcc};
 
@@ -91,14 +94,6 @@ pub struct VideoToolboxEncoder {
 // runtime can't prove it for arbitrary types.
 unsafe impl Send for VideoToolboxEncoder {}
 unsafe impl Sync for VideoToolboxEncoder {}
-
-/// Timescale for our PTS/duration CMTimes. 1_000_000 → µs granularity, which
-/// fits comfortably in a CMTimeValue (i64). Apple's examples typically use
-/// 600 or 90_000; µs works because VT only requires strictly-monotonic PTS.
-const TIMESCALE_HZ: i32 = 1_000_000;
-/// Microseconds per frame at 60 FPS. Real capture cadence may vary; VT's
-/// rate control uses this only as a hint.
-const DEFAULT_FRAME_DURATION_US: i64 = 16_666;
 
 // ─── Session construction + properties ──────────────────────────────────────
 
@@ -204,49 +199,6 @@ fn configure_properties(
         }
     }
     Ok(())
-}
-
-unsafe fn set_cf<V>(
-    session: &VTCompressionSession,
-    key: &CFString,
-    value: &V,
-) -> anyhow::Result<()>
-where
-    V: AsRef<CFType> + ?Sized,
-{
-    let status = unsafe { VTSessionSetProperty(session, key, Some(value.as_ref())) };
-    if status != 0 {
-        anyhow::bail!("VTSessionSetProperty failed, OSStatus={}", status);
-    }
-    Ok(())
-}
-
-/// Like [`set_cf`] but tolerates `kVTPropertyNotSupportedErr` (-12900).
-/// Use for *optional* encoder properties that may not be implemented by
-/// every VideoToolbox encoder variant (older macOS releases, software
-/// fallback paths, etc.) — the property is skipped instead of failing
-/// session init. `desc` is included in the log/error message so the
-/// caller doesn't have to plumb a separate context string.
-unsafe fn try_set_cf<V>(
-    session: &VTCompressionSession,
-    key: &CFString,
-    value: &V,
-    desc: &'static str,
-) -> anyhow::Result<()>
-where
-    V: AsRef<CFType> + ?Sized,
-{
-    let status = unsafe { VTSessionSetProperty(session, key, Some(value.as_ref())) };
-    match status {
-        0 => Ok(()),
-        // kVTPropertyNotSupportedErr — encoder doesn't implement this
-        // knob; not fatal, just continue without it.
-        -12900 => {
-            debug!(property = desc, "VT property not supported by encoder, skipping");
-            Ok(())
-        }
-        other => anyhow::bail!("VTSessionSetProperty({desc}) failed, OSStatus={other}"),
-    }
 }
 
 // ─── Compression output callback ────────────────────────────────────────────
@@ -429,63 +381,6 @@ fn read_param_set(
     Ok(slice.to_vec())
 }
 
-// ─── CVPixelBuffer construction for BGRA input ──────────────────────────────
-
-/// VT's release callback signature: `(refcon: *mut c_void, base: *const c_void)`.
-/// We pass a `Box<Vec<u8>>` as refcon so the BGRA copy is freed when VT is
-/// done with the pixel buffer.
-unsafe extern "C-unwind" fn bgra_release_cb(refcon: *mut c_void, _base: *const c_void) {
-    if refcon.is_null() {
-        return;
-    }
-    // SAFETY: refcon was Box<Vec<u8>>::into_raw at create time.
-    drop(unsafe { Box::from_raw(refcon as *mut Vec<u8>) });
-}
-
-fn wrap_bgra_as_pixel_buffer(
-    bgra: &[u8],
-    width: u32,
-    height: u32,
-) -> anyhow::Result<CFRetained<CVPixelBuffer>> {
-    let bytes_per_row = (width as usize) * 4;
-    anyhow::ensure!(
-        bgra.len() >= bytes_per_row * (height as usize),
-        "BGRA buffer too short: got {} bytes, need {}",
-        bgra.len(),
-        bytes_per_row * (height as usize)
-    );
-
-    // Copy — VT may hold the pixel buffer past encode_frame's return. The
-    // copy is freed via `bgra_release_cb` when CV releases the wrapping
-    // pixel buffer.
-    let owned: Box<Vec<u8>> = Box::new(bgra[..bytes_per_row * height as usize].to_vec());
-    let base_addr = owned.as_ptr() as *mut c_void;
-    let refcon = Box::into_raw(owned) as *mut c_void;
-
-    let mut pb_ptr: *mut CVPixelBuffer = ptr::null_mut();
-    let ret = unsafe {
-        CVPixelBufferCreateWithBytes(
-            None,
-            width as usize,
-            height as usize,
-            kCVPixelFormatType_32BGRA,
-            NonNull::new_unchecked(base_addr),
-            bytes_per_row,
-            Some(bgra_release_cb),
-            refcon,
-            None,
-            NonNull::new_unchecked(&mut pb_ptr),
-        )
-    };
-    if ret != 0 {
-        // Release our Box since CV won't call the release_cb on failure.
-        unsafe { drop(Box::from_raw(refcon as *mut Vec<u8>)) };
-        anyhow::bail!("CVPixelBufferCreateWithBytes failed, CVReturn={}", ret);
-    }
-    let nn = NonNull::new(pb_ptr).context("null CVPixelBuffer after successful create")?;
-    Ok(unsafe { CFRetained::from_raw(nn) })
-}
-
 // ─── Public encoder API ─────────────────────────────────────────────────────
 
 impl VideoToolboxEncoder {
@@ -666,13 +561,3 @@ impl VideoToolboxEncoder {
     }
 }
 
-/// Build the `frame_properties` dict that asks VT to emit the next frame as
-/// an IDR. Keyed by `kVTEncodeFrameOptionKey_ForceKeyFrame = true`.
-fn build_force_idr_dict() -> CFRetained<CFDictionary> {
-    let key: &'static CFString =
-        unsafe { objc2_video_toolbox::kVTEncodeFrameOptionKey_ForceKeyFrame };
-    let val: &'static CFBoolean = CFBoolean::new(true);
-    let typed: CFRetained<CFDictionary<CFString, CFBoolean>> =
-        CFDictionary::from_slices(&[key], &[val]);
-    unsafe { CFRetained::cast_unchecked::<CFDictionary>(typed) }
-}

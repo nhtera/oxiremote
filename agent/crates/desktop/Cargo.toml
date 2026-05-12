@@ -17,6 +17,14 @@ h264 = [
     "dep:objc2-core-media",
     "dep:objc2-core-foundation",
 ]
+# HEVC pipeline (VideoToolbox on macOS). Reuses the same objc2-* optional
+# deps as h264 — no new crate additions needed.
+hevc = [
+    "dep:objc2-video-toolbox",
+    "dep:objc2-core-media",
+    "dep:objc2-core-video",
+    "dep:objc2-core-foundation",
+]
 # Phase-02 audio (system-loopback → Opus → WebRTC). Off by default — pulls
 # vendored libopus (audiopus) + rubato resampler. `dep:cpal` resolves only
 # under the Windows target dependency table below, so macOS / Linux builds
