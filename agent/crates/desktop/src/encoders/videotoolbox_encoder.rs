@@ -131,18 +131,22 @@ fn configure_properties(
         )?;
         let bitrate_num = CFNumber::new_i32(bitrate.0 as i32);
         set_cf(session, kVTCompressionPropertyKey_AverageBitRate, &*bitrate_num)?;
-        // 60 frames = 1 s @ 60 fps between forced IDRs. Shorter GOP than
-        // phase-01's 120 frames halves the P-frame drift window — important
-        // for crisp text on UI motion (scrolling, cursor). VT may emit
-        // sooner on scene cuts or on client PLI. ~3% bitrate overhead trade.
-        let kf_interval = CFNumber::new_i32(60);
+        // Long GOP: 600 frames = 20 s @ 30 fps, or 10 s @ 60 fps.
+        // For live screen-content streaming, rely on client PLI for
+        // IDRs rather than periodic refreshes. Screen content is
+        // mostly static — periodic IDRs spend ~50-100 KB each on
+        // content that hasn't changed, wasting budget that's better
+        // spent on P-frame quality. Drift between PLI-driven IDRs is
+        // minimal on static UI (P-frames are mostly skip / identical
+        // blocks). A shorter GOP only pays off on heavy-motion content
+        // (gaming, sports video) where every frame is different.
+        let kf_interval = CFNumber::new_i32(600);
         set_cf(session, kVTCompressionPropertyKey_MaxKeyFrameInterval, &*kf_interval)?;
-        // Belt-and-braces: also cap the time-based interval. Without this,
-        // VT's RC may insert IDRs on detected scene changes — which fires
-        // every frame in a same-machine recursive view, blowing the
-        // bitrate budget on all-keyframe output. 2 s pairs cleanly with
-        // the 60-frame cap above (whichever fires first wins).
-        let kf_interval_s = CFNumber::new_f64(2.0);
+        // Time-based cap as safety net. 30 s pairs with the 600-frame
+        // cap above (whichever fires first wins). Bounded interval —
+        // not truly infinite — so a session running unattended for
+        // hours doesn't accumulate visible drift without any refresh.
+        let kf_interval_s = CFNumber::new_f64(30.0);
         set_cf(
             session,
             kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration,
