@@ -113,28 +113,44 @@ pub struct VideoPipelineConfig {
     pub frames_encoded_err: Option<Arc<AtomicU64>>,
 }
 
-/// Build the `RTCRtpCodecCapability` we expose in the SDP offer — H.264
-/// **High** profile, Level 5.0, 90 kHz clock, packetization-mode=1.
+/// SDP `fmtp` line for the H.264 codec we expose to the browser. Must match
+/// what the compiled-in encoder will actually emit at the wire level — the
+/// receiver (Chrome on Windows uses Media Foundation; Safari/Chrome on macOS
+/// use VideoToolbox) validates the in-stream SPS against this envelope.
 ///
-/// `profile-level-id=640032` decodes as: profile_idc=0x64 (100, High),
-/// profile-iop=0x00 (no constraint flags — High doesn't carry the
-/// baseline-compatibility bits), level_idc=0x32 (Level 5.0,
-/// max ~2560×1920 / 36 Mbps). Bumped from `42e032` (Constrained Baseline)
-/// on 2026-05-13 — plan `260513-0009-h264-quality-uplift-vt-high-profile`.
-/// All target browsers (iPad Safari 17+, Chrome desktop/Android,
-/// Firefox 130+) hardware-decode H.264 High 4:2:0 over WebRTC in 2026.
+/// macOS: VideoToolbox emits real High profile + CABAC bitstreams, so we
+/// advertise `profile-level-id=640032` (profile_idc=0x64=High, profile-iop=
+/// 0x00, level_idc=0x32=5.0) — set up by the 2026-05-13 quality uplift in
+/// commit 7fed601.
 ///
-/// The encoder runs at `AutoLevel` so VT emits the minimum level the
-/// actual resolution requires; advertising 5.0 here lets the SDP
-/// negotiate that envelope without false-rejection from browsers that
-/// strictly check `profile-level-id`.
+/// Non-macOS (Windows / Linux): OpenH264 0.9 has no public surface to enable
+/// `iEntropyCodingModeFlag`, so it emits Baseline-tooling bitstreams (CAVLC,
+/// 4×4 transform only). Advertising High here is a lie — Chrome's Media
+/// Foundation H.264 decoder on Windows strictly checks the SDP envelope
+/// against the in-stream SPS (profile, constraint flags, level_idc) and
+/// silently produces black frames when they disagree. We therefore advertise
+/// `42e032` (profile_idc=0x42=Baseline, profile-iop=0xe0 → constraint_set0/
+/// 1/2 = 1 = Constrained Baseline, level_idc=0x32=5.0) on non-macOS hosts —
+/// the same string used pre-7fed601 when Windows H.264 worked.
+///
+/// Keep the openh264 encoder config in
+/// `agent/crates/desktop/src/encoders/openh264_encoder.rs::build_config` in
+/// sync with the non-macOS branch here.
+#[cfg(target_os = "macos")]
+const H264_SDP_FMTP_LINE: &str =
+    "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=640032";
+#[cfg(not(target_os = "macos"))]
+const H264_SDP_FMTP_LINE: &str =
+    "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e032";
+
+/// Build the `RTCRtpCodecCapability` we expose in the SDP offer — 90 kHz
+/// clock, packetization-mode=1, profile per `H264_SDP_FMTP_LINE`.
 pub fn h264_codec_capability() -> RTCRtpCodecCapability {
     RTCRtpCodecCapability {
         mime_type: MIME_TYPE_H264.to_string(),
         clock_rate: 90_000,
         channels: 0,
-        sdp_fmtp_line:
-            "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=640032".to_string(),
+        sdp_fmtp_line: H264_SDP_FMTP_LINE.to_string(),
         rtcp_feedback: vec![],
     }
 }
@@ -731,19 +747,37 @@ pub fn build_hvcc(params: &desktop::encoders::HevcParameterSets) -> Vec<u8> {
 mod tests {
     use super::*;
 
+    #[cfg(target_os = "macos")]
     #[test]
-    fn h264_capability_has_high_5_0_fmtp() {
-        // Post 2026-05-13 quality uplift: High profile (`profile_idc=100`),
-        // Level 5.0 (`level_idc=0x32`). High enables 8×8 transform + CABAC
-        // for sharp text on screen content. Browsers in 2026 universally
-        // hardware-decode H.264 High 4:2:0 over WebRTC.
+    fn h264_capability_fmtp_macos_high() {
+        // macOS uses VideoToolbox, which emits real High+CABAC streams. SDP
+        // must advertise `profile-level-id=640032` (High 5.0) so Safari /
+        // Chrome on macOS configure their decoder for High.
         let cap = h264_codec_capability();
         assert_eq!(cap.mime_type, "video/H264");
         assert_eq!(cap.clock_rate, 90_000);
         assert!(cap.sdp_fmtp_line.contains("profile-level-id=640032"));
         assert!(cap.sdp_fmtp_line.contains("packetization-mode=1"));
-        // Regression guard: the prior Baseline fmtp must NOT reappear.
         assert!(!cap.sdp_fmtp_line.contains("42e032"));
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn h264_capability_fmtp_non_macos_constrained_baseline() {
+        // Non-macOS hosts use OpenH264, which emits Constrained Baseline
+        // (CAVLC, 4×4 transform). SDP must advertise `profile-level-id=42e032`
+        // so Chrome on Windows (Media Foundation H.264 decoder) configures a
+        // Baseline-compatible decode path — claiming High here produces
+        // black frames because the SPS profile / constraint / level bytes
+        // disagree with the SDP envelope.
+        let cap = h264_codec_capability();
+        assert_eq!(cap.mime_type, "video/H264");
+        assert_eq!(cap.clock_rate, 90_000);
+        assert!(cap.sdp_fmtp_line.contains("profile-level-id=42e032"));
+        assert!(cap.sdp_fmtp_line.contains("packetization-mode=1"));
+        // Regression guard: the universal-High fmtp from commit 7fed601
+        // must NOT reappear on non-macOS targets.
+        assert!(!cap.sdp_fmtp_line.contains("640032"));
     }
 
     #[test]

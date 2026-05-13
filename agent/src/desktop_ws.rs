@@ -1795,15 +1795,16 @@ mod inner {
                         let b64 = B64_STD.encode(&avcc);
                         // `codec` is the *bitstream descriptor* the client
                         // sees post-negotiation (the SPA renders it in the
-                        // status pill / telemetry). The capability handshake
-                        // token (`h264-baseline-3.1`) is a separate opaque
-                        // string used only by `pipeline_selection::choose()`.
-                        // Updated 2026-05-13 to reflect the actual High
-                        // profile bitstream so downstream telemetry / UI
-                        // doesn't lie about the encoded stream.
+                        // status pill / telemetry). Derive from the SPS
+                        // profile_idc so the label always matches what the
+                        // encoder actually emits — macOS / VideoToolbox
+                        // produces real High (0x64) while OpenH264 on the
+                        // other targets stays Constrained Baseline (0x42).
+                        let profile_idc = params.sps.get(1).copied().unwrap_or(0);
+                        let codec_label = h264_codec_label_from_sps(profile_idc);
                         let msg = SignalOut::Pipeline {
                             mode: "h264",
-                            codec: Some("h264-high-5.0"),
+                            codec: Some(codec_label),
                             tier_bitrates_kbps_low: BitrateBps::LOW.0 / 1_000,
                             tier_bitrates_kbps_med: BitrateBps::MED.0 / 1_000,
                             tier_bitrates_kbps_high: BitrateBps::HIGH.0 / 1_000,
@@ -1993,6 +1994,20 @@ mod inner {
             }
         }
         Ok(())
+    }
+
+    /// Map the SPS `profile_idc` byte (SPS[1] — byte 0 is the NAL header) to
+    /// the human-readable codec label the SPA renders in its telemetry pill.
+    /// Derived at runtime rather than hardcoded so a per-platform SDP fmtp
+    /// split (VT on macOS = High, OpenH264 elsewhere = Constrained Baseline)
+    /// stays in sync with the actual bitstream without `#[cfg]` here.
+    #[cfg(feature = "h264")]
+    fn h264_codec_label_from_sps(profile_idc: u8) -> &'static str {
+        match profile_idc {
+            0x64 => "h264-high-5.0",
+            0x42 => "h264-baseline-3.1",
+            _ => "h264-unknown",
+        }
     }
 
     /// Poll the first-IDR oneshot. Returns `None` if the pipeline exits
@@ -2536,6 +2551,23 @@ mod inner {
                 Some(InputEvent::Text { s }) => assert_eq!(s, "Hello!@#"),
                 other => panic!("expected InputEvent::Text, got {other:?}"),
             }
+        }
+    }
+
+    #[cfg(all(test, feature = "h264"))]
+    mod h264_codec_label_tests {
+        use super::*;
+
+        /// SPS `profile_idc` → telemetry codec string. macOS VT emits 0x64
+        /// (High); OpenH264 emits 0x42 (Baseline); anything else gets the
+        /// defensive `h264-unknown` fall-through so a future encoder can't
+        /// silently mislabel without surfacing in telemetry.
+        #[test]
+        fn label_maps_known_profiles() {
+            assert_eq!(h264_codec_label_from_sps(0x64), "h264-high-5.0");
+            assert_eq!(h264_codec_label_from_sps(0x42), "h264-baseline-3.1");
+            assert_eq!(h264_codec_label_from_sps(0x4d), "h264-unknown"); // Main
+            assert_eq!(h264_codec_label_from_sps(0x00), "h264-unknown");
         }
     }
 
