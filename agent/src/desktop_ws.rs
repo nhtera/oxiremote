@@ -999,6 +999,7 @@ mod inner {
                     hidpi,
                     Some(cap_iframe_rx),
                     None, // no audio on HEVC path for now
+                    None, // HEVC is macOS-only (VT-HEVC); diag counters not plumbed
                 )
             });
 
@@ -1409,10 +1410,19 @@ mod inner {
         use desktop::capture::CaptureLoop;
         use desktop::encoders::BitrateBps;
         use desktop::resize_dims;
+        use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
         let initial_tier = *quality_rx.borrow();
         let hidpi = initial_hidpi;
         let (out_w, out_h) = resize_dims(screen_w, screen_h, initial_tier, scale_factor, hidpi);
+
+        // Phase-01 watchdog observability — these atomics let the fallback
+        // path log a richer reason than "no-idr-5s" so Windows reports tell
+        // us whether capture stalled, encoder rejected every frame, or
+        // encoder produced frames but no IDR within the budget.
+        let frames_captured = Arc::new(AtomicU64::new(0));
+        let frames_encoded_ok = Arc::new(AtomicU64::new(0));
+        let frames_encoded_err = Arc::new(AtomicU64::new(0));
 
         // Emit Capabilities so the client can size its <video> backing canvas.
         if let Ok(msg) = serde_json::to_string(&SignalOut::Capabilities {
@@ -1487,6 +1497,7 @@ mod inner {
         let capture_audio_tx = audio_tx.clone();
         #[cfg(not(feature = "audio"))]
         let capture_audio_tx: Option<mpsc::Sender<Vec<i16>>> = None;
+        let cap_frames_counter = Some(Arc::clone(&frames_captured));
         tokio::task::spawn_blocking(move || {
             CaptureLoop::run_bgra(
                 initial_tier,
@@ -1496,6 +1507,7 @@ mod inner {
                 hidpi,
                 Some(cap_iframe_rx),
                 capture_audio_tx,
+                cap_frames_counter,
             )
         });
 
@@ -1616,6 +1628,8 @@ mod inner {
             pli_rx,
             params_tx,
             abr_tx: abr_tx.clone(),
+            frames_encoded_ok: Some(Arc::clone(&frames_encoded_ok)),
+            frames_encoded_err: Some(Arc::clone(&frames_encoded_err)),
         });
 
         crate::video_pipeline::spawn_rtcp_reader(
@@ -1815,12 +1829,31 @@ mod inner {
                 // and emit a `PipelineChosen` event tagging the JPEG
                 // fallback so dashboards count it as a fallback session.
                 _ = &mut watchdog, if params_rx.is_some() => {
+                    let cap_n = frames_captured.load(AtomicOrdering::Relaxed);
+                    let enc_ok = frames_encoded_ok.load(AtomicOrdering::Relaxed);
+                    let enc_err = frames_encoded_err.load(AtomicOrdering::Relaxed);
+                    // Classify the failure so Windows logs name a cause rather
+                    // than just "no IDR". Wire reason stays short for telemetry
+                    // stability; the warn log carries full counter values.
+                    let wire_reason: &'static str = if cap_n == 0 {
+                        "no-idr-5s-capture-stalled"
+                    } else if enc_ok == 0 && enc_err > 0 {
+                        "no-idr-5s-encode-errors"
+                    } else if enc_ok == 0 {
+                        "no-idr-5s-encode-skipped"
+                    } else {
+                        "no-idr-5s-no-keyframe"
+                    };
                     warn!(
                         device = %device_id,
+                        frames_captured = cap_n,
+                        frames_encoded_ok = enc_ok,
+                        frames_encoded_err = enc_err,
+                        wire_reason,
                         "h264: session-start IDR watchdog tripped — signaling FallbackPending"
                     );
                     if let Ok(txt) = serde_json::to_string(&SignalOut::FallbackPending {
-                        reason: "no-idr-5s",
+                        reason: wire_reason,
                     }) {
                         let _ = socket.send(Message::Text(txt.into())).await;
                     }

@@ -1,4 +1,5 @@
 /// Screen capture abstraction and FPS-capped capture loop.
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -296,6 +297,7 @@ impl CaptureLoop {
     /// `hidpi_mode` is also captured ONCE — like resolution it changes the
     /// encoder dims and so requires a session-level restart to flip. The
     /// caller (`desktop_ws.rs`) handles that path.
+    #[allow(clippy::too_many_arguments)]
     pub fn run_bgra(
         resolution_tier: QualityTier,
         fps_rx: tokio::sync::watch::Receiver<QualityTier>,
@@ -309,6 +311,12 @@ impl CaptureLoop {
         // (Linux + older macOS deferred per phase-02c plan). Passing
         // `None` preserves the pre-phase-02 video-only behaviour exactly.
         audio_tx: Option<Sender<Vec<i16>>>,
+        // Observability counter — when Some, incremented per successful
+        // `tx.try_send`. The H.264/HEVC session watchdog reads this at
+        // fallback time to distinguish "capture never delivered a frame"
+        // from "encoder rejected every frame". Pass None for callers that
+        // don't need diagnostics.
+        frames_sent: Option<Arc<AtomicU64>>,
     ) {
         // ── Pick a capture backend ────────────────────────────────────────
         // Prefer ScreenCaptureKit on macOS 12.3+: GPU-resized BGRA arrives
@@ -363,7 +371,7 @@ impl CaptureLoop {
                                  audio forwarder not started"
                             );
                         }
-                        return run_bgra_sck(sck, fps_rx, tx, force_iframe_rx);
+                        return run_bgra_sck(sck, fps_rx, tx, force_iframe_rx, frames_sent);
                     }
                     Err(err) => warn!(
                         error = %err,
@@ -379,7 +387,7 @@ impl CaptureLoop {
                         target_w, target_h, target_fps, hidpi_mode,
                         "CaptureLoop::run_bgra started (ScreenCaptureKit)"
                     );
-                    return run_bgra_sck(sck, fps_rx, tx, force_iframe_rx);
+                    return run_bgra_sck(sck, fps_rx, tx, force_iframe_rx, frames_sent);
                 }
                 Err(err) => warn!(error = %err, "ScreenCaptureKit init failed, falling back to xcap"),
             }
@@ -411,6 +419,7 @@ impl CaptureLoop {
             scale_factor,
             hidpi_mode,
             force_iframe_rx,
+            frames_sent,
         );
     }
 }
@@ -428,6 +437,7 @@ fn run_bgra_xcap(
     scale_factor: f32,
     hidpi_mode: bool,
     mut force_iframe_rx: Option<oneshot::Receiver<()>>,
+    frames_sent: Option<Arc<AtomicU64>>,
 ) {
     let mut frame_count: u64 = 0;
     let mut dropped_count: u64 = 0;
@@ -467,7 +477,15 @@ fn run_bgra_xcap(
             height,
             force_idr,
         }) {
-            Ok(()) => frame_count += 1,
+            Ok(()) => {
+                frame_count += 1;
+                if let Some(c) = &frames_sent {
+                    c.fetch_add(1, Ordering::Relaxed);
+                }
+                if frame_count == 1 {
+                    info!(width, height, "CaptureLoop::run_bgra (xcap) first frame delivered");
+                }
+            }
             Err(TrySendError::Full(_)) => {
                 dropped_count += 1;
                 tracing::debug!(dropped = dropped_count, "run_bgra: backpressure drop");
@@ -501,6 +519,7 @@ fn run_bgra_sck(
     fps_rx: tokio::sync::watch::Receiver<QualityTier>,
     tx: Sender<RawBgraFrame>,
     mut force_iframe_rx: Option<oneshot::Receiver<()>>,
+    frames_sent: Option<Arc<AtomicU64>>,
 ) {
     let mut frame_count: u64 = 0;
     let mut dropped_count: u64 = 0;
@@ -546,7 +565,15 @@ fn run_bgra_sck(
             height: frame.height,
             force_idr,
         }) {
-            Ok(()) => frame_count += 1,
+            Ok(()) => {
+                frame_count += 1;
+                if let Some(c) = &frames_sent {
+                    c.fetch_add(1, Ordering::Relaxed);
+                }
+                if frame_count == 1 {
+                    info!("CaptureLoop::run_bgra (sck) first frame delivered");
+                }
+            }
             Err(TrySendError::Full(_)) => {
                 dropped_count += 1;
                 tracing::debug!(dropped = dropped_count, "run_bgra: backpressure drop");

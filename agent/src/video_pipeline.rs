@@ -17,6 +17,7 @@
 
 #![cfg(feature = "h264")]
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -103,6 +104,13 @@ pub struct VideoPipelineConfig {
     /// controller + stats SSE subscribe via `tx.subscribe()`. Slow
     /// consumers see `Lagged` and skip ahead — never block producers.
     pub abr_tx: broadcast::Sender<AbrObservation>,
+    /// Observability counters read by the session-start IDR watchdog so
+    /// fallback warnings can name which side broke (capture vs encoder).
+    /// `frames_encoded_ok` increments per successful encode that yields a
+    /// non-empty bitstream; `frames_encoded_err` increments on
+    /// `encoder.encode` errors. None for callers that don't need diagnostics.
+    pub frames_encoded_ok: Option<Arc<AtomicU64>>,
+    pub frames_encoded_err: Option<Arc<AtomicU64>>,
 }
 
 /// Build the `RTCRtpCodecCapability` we expose in the SDP offer — H.264
@@ -275,11 +283,25 @@ pub fn spawn_video_pipeline(mut cfg: VideoPipelineConfig) {
                     if pli_honored {
                         pli_pending = false;
                     }
+                    if let Some(c) = &cfg.frames_encoded_ok {
+                        let n = c.fetch_add(1, Ordering::Relaxed) + 1;
+                        if n == 1 {
+                            info!(
+                                width = frame.width,
+                                height = frame.height,
+                                is_keyframe = f.is_keyframe,
+                                "video_pipeline: first frame encoded"
+                            );
+                        }
+                    }
                     f
                 }
                 Ok(None) => continue, // encoder chose to skip this frame
                 Err(e) => {
                     warn!(error = %e, "encoder.encode failed");
+                    if let Some(c) = &cfg.frames_encoded_err {
+                        c.fetch_add(1, Ordering::Relaxed);
+                    }
                     continue;
                 }
             };
