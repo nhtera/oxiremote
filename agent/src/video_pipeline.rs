@@ -214,8 +214,22 @@ pub fn spawn_video_pipeline(mut cfg: VideoPipelineConfig) {
     tokio::spawn(writer_task(track, sample_rx, writer_fps_rx));
 
     // Encoder task — blocking, owns the encoder + params_tx oneshot.
+    let initial_max_qp = cfg.initial_max_qp;
     std::thread::spawn(move || {
-        let mut encoder = match build_encoder(cfg.width, cfg.height, cfg.initial_bitrate, cfg.initial_max_qp) {
+        // Track configured dims so we can detect a capture-side resolution
+        // change and rebuild. xcap on Windows reports physical pixels from
+        // `Monitor::width()` even at fractional DPI scaling, while the
+        // capture pipeline's `quality_resize` normalizes captured frames to
+        // logical via 1/scale_factor — so `cfg.width/height` (derived from
+        // the former) can disagree with the actual frame dims (derived from
+        // the latter). Without a rebuild, every encode fails with
+        // "OpenH264Encoder dim mismatch" and zero frames reach the browser
+        // — which the user sees as a black H.264 stream. Rebuilding is also
+        // resilient to legitimate dim changes (display reconfig, multi-mon
+        // switches, mid-session DPI changes on Windows).
+        let mut encoder_w = cfg.width;
+        let mut encoder_h = cfg.height;
+        let mut encoder = match build_encoder(encoder_w, encoder_h, cfg.initial_bitrate, initial_max_qp) {
             Ok(e) => e,
             Err(e) => {
                 warn!(error = %e, "video_pipeline: encoder build failed, pipeline stopping");
@@ -277,6 +291,42 @@ pub fn spawn_video_pipeline(mut cfg: VideoPipelineConfig) {
             // backlog left after the drain loop above (so a sustained
             // non-zero indicates capture out-pacing the encoder).
             let bgra_queue_depth = cfg.bgra_rx.len();
+
+            // Rebuild the encoder if the capture pipeline's frame dims
+            // diverge from what the encoder was built for. See the
+            // encoder_w/encoder_h block at the top of this task for the
+            // physical-vs-logical pixel rationale. Rebuild emits a fresh
+            // IDR naturally on the next encode, so we don't need to
+            // re-trigger force_idr — but we DO reset the cached params
+            // so the new SPS/PPS gets surfaced to the session layer.
+            if frame.width != encoder_w || frame.height != encoder_h {
+                info!(
+                    old_width = encoder_w,
+                    old_height = encoder_h,
+                    new_width = frame.width,
+                    new_height = frame.height,
+                    "video_pipeline: capture dim changed, rebuilding encoder"
+                );
+                match build_encoder(
+                    frame.width,
+                    frame.height,
+                    BitrateBps(last_bitrate),
+                    initial_max_qp,
+                ) {
+                    Ok(e) => {
+                        encoder = e;
+                        encoder_w = frame.width;
+                        encoder_h = frame.height;
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "encoder rebuild on dim change failed");
+                        if let Some(c) = &cfg.frames_encoded_err {
+                            c.fetch_add(1, Ordering::Relaxed);
+                        }
+                        continue;
+                    }
+                }
+            }
 
             // Decide whether to honor a pending PLI. `drained_force_idr`
             // comes from the capture loop's session-start `force_iframe_rx`

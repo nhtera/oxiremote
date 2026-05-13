@@ -1816,8 +1816,20 @@ mod inner {
                         if let Ok(txt) = serde_json::to_string(&msg) {
                             let _ = ws_out_tx.send(txt).await;
                         }
+                        // SPS bytes 1-3 are profile_idc, constraint flags,
+                        // level_idc — the same envelope that must match the
+                        // SDP `profile-level-id`. Logging level_idc on first
+                        // IDR makes the Windows black-frame diagnosis
+                        // unambiguous: 0x32 = Level 5.0 (matches the
+                        // `42e032` SDP fmtp), anything lower means the
+                        // encoder is still emitting Cisco's auto-level.
+                        let level_idc = params.sps.get(3).copied().unwrap_or(0);
+                        let constraint = params.sps.get(2).copied().unwrap_or(0);
                         info!(
                             hardware_accel = hw_accel,
+                            profile_idc = format_args!("0x{:02x}", profile_idc),
+                            constraint_flags = format_args!("0x{:02x}", constraint),
+                            level_idc = format_args!("0x{:02x}", level_idc),
                             "h264: avcC description sent, decoder can configure"
                         );
                     }
@@ -2303,6 +2315,19 @@ mod inner {
             .await?;
         let answer = pc.create_answer(None).await?;
         let sdp_out = answer.sdp.clone();
+        // Log every H.264 fmtp line in the answer so the SDP envelope
+        // negotiated for this session is visible without running tcpdump or
+        // chrome://webrtc-internals. Crucial for verifying that
+        // `profile-level-id` matches what the encoder actually emits — a
+        // mismatch is what makes Chrome MF on Windows render black frames.
+        for line in sdp_out.lines() {
+            let lower = line.to_ascii_lowercase();
+            if lower.starts_with("a=fmtp:")
+                && lower.contains("profile-level-id")
+            {
+                info!(fmtp = line, "answer SDP fmtp");
+            }
+        }
         pc.set_local_description(answer).await?;
         let msg = serde_json::to_string(&SignalOut::Answer { sdp: &sdp_out })?;
         ws_out_tx.send(msg).await?;

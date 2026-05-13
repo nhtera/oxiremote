@@ -21,7 +21,7 @@
 use bytes::Bytes;
 use openh264::{
     OpenH264API,
-    encoder::{BitRate, Encoder, EncoderConfig, FrameRate, Profile},
+    encoder::{BitRate, Encoder, EncoderConfig, FrameRate, Level, Profile},
     formats::YUVSource,
 };
 use tracing::debug;
@@ -65,6 +65,22 @@ fn build_config(bitrate: BitrateBps) -> EncoderConfig {
         // Foundation H.264 decoder on Windows renders black frames. Stay
         // Baseline + honest, downgrade the SDP, let the decoder be happy.
         .profile(Profile::Baseline)
+        // Force `level_idc=0x32` (Level 5.0) so the SPS declares a level
+        // whose H.264 spec MB-rate envelope actually covers screen-share
+        // resolutions. Without this setter Cisco's level picker is
+        // bitrate-driven, not macroblock-rate driven: at 1920×1080@60 with a
+        // 4-12 Mbps target it stamps `level_idc=31` (Level 3.1), violating
+        // the spec's MB/s table for that resolution (522,240 MB/s vs L3.1's
+        // 27,600 cap). Chrome's Media Foundation H.264 decoder on Windows
+        // validates the SPS against the spec table and silently renders
+        // black when the bitstream is internally inconsistent. The browser's
+        // offer determines what level it advertises in its SDP, and
+        // `level-asymmetry-allowed=1` permits the sender to emit at a
+        // different level than the receiver declared (RFC 6184 §8.2.2) —
+        // we rely on that so an honest Level 5.0 SPS is accepted even when
+        // Chrome offers Level 3.1. L5.0 covers HiDPI captures up to
+        // ~2560×1920 / 36 Mbps.
+        .level(Level::Level_5_0)
 }
 
 impl OpenH264Encoder {
@@ -328,7 +344,11 @@ mod tests {
     ///   SDP's `e0` byte advertises Extended-compatible too, but Chrome MFT
     ///   only inspects set0/set1 when selecting the Baseline decoder path,
     ///   so the extra advertise is harmless. Accept either 0xC0 or 0xE0.
-    /// - SPS byte 3 = `level_idc` ≤ 0x32 (Level 5.0 envelope from SDP).
+    /// - SPS byte 3 = `level_idc` == 0x32 (Level 5.0). Forced via
+    ///   `.level(Level::Level_5_0)` so the SPS declares a level whose
+    ///   MB-rate envelope actually covers 1080p+ captures; without the
+    ///   explicit setter Cisco's bitrate-driven auto-level stamps Level
+    ///   3.1 and Chrome MF on Windows renders black.
     #[test]
     fn sps_advertises_constrained_baseline() {
         let width = 64u32;
@@ -353,10 +373,47 @@ mod tests {
             "SPS constraint_set0_flag + constraint_set1_flag must both be set for Constrained Baseline, got byte 0x{:02x}",
             params.sps[2]
         );
-        assert!(
-            params.sps[3] <= 0x32,
-            "SPS level_idc must be ≤ 0x32 (Level 5.0 envelope), got 0x{:02x}",
+        assert_eq!(
+            params.sps[3], 0x32,
+            "SPS level_idc must be exactly 0x32 (Level 5.0) — forced via .level(Level::Level_5_0); got 0x{:02x}",
             params.sps[3]
+        );
+    }
+
+    /// 1080p regression guard. At native screen-share resolution Cisco's
+    /// auto-level stamps `level_idc = 31` (Level 3.1) because its level
+    /// picker is bitrate-driven, not macroblock-rate driven; the
+    /// `.level(Level::Level_5_0)` setter in `build_config` forces the SPS
+    /// to declare a level whose H.264 spec MB-rate envelope (983,040 MB/s
+    /// for L5.0) actually covers 1920×1080@60 (522,240 MB/s). Without the
+    /// forced level the bitstream is internally inconsistent at this
+    /// resolution and Chrome's Media Foundation H.264 decoder on Windows
+    /// silently renders black. 64×64 tests don't surface this because
+    /// the auto-level happens to pick a low value that's still spec-valid
+    /// for that tiny content.
+    #[test]
+    fn sps_level_correct_at_1080p() {
+        let width = 1920u32;
+        let height = 1080u32;
+        let mut enc = OpenH264Encoder::new(width, height, BitrateBps::MED)
+            .expect("1080p encoder construction must succeed");
+        let bgra = vec![128u8; (width * height * 4) as usize];
+        let _ = enc
+            .encode(&bgra, width, height, false)
+            .expect("encode must succeed")
+            .expect("first frame must not be skipped");
+        let params = enc.parameter_sets().expect("SPS must be cached");
+        assert_eq!(
+            params.sps[3], 0x32,
+            "1080p stream must declare level_idc=0x32 (Level 5.0); without the explicit \
+             `.level(Level::Level_5_0)` call, Cisco's bitrate-driven auto-level \
+             stamps 0x1f (Level 3.1) which is invalid for 1920×1080. Got 0x{:02x}",
+            params.sps[3]
+        );
+        assert_eq!(
+            params.sps[1], 0x42,
+            "1080p stream must declare profile_idc=0x42 (Baseline). Got 0x{:02x}",
+            params.sps[1]
         );
     }
 
