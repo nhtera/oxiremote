@@ -21,7 +21,7 @@
 use bytes::Bytes;
 use openh264::{
     OpenH264API,
-    encoder::{BitRate, Encoder, EncoderConfig, FrameRate},
+    encoder::{BitRate, Encoder, EncoderConfig, FrameRate, Level, Profile},
     formats::YUVSource,
 };
 use tracing::debug;
@@ -55,6 +55,20 @@ fn build_config(bitrate: BitrateBps) -> EncoderConfig {
         .skip_frames(true)
         // Hint — 60 FPS cap; the encoder also accepts lower per-frame rates.
         .max_frame_rate(FrameRate::from_hz(60.0))
+        // Match the SDP fmtp `profile-level-id=640032` advertised by
+        // `h264_codec_capability()`. OpenH264's default is Constrained
+        // Baseline (profile_idc=66), but the SDP claims High (profile_idc=100)
+        // since the 2026-05-13 VT quality uplift. Without this override the
+        // SPS NAL units emitted on Windows/Linux disagree with the negotiated
+        // profile — Chrome's D3D11VA hardware decoder (configured per the
+        // SDP) then renders Baseline streams as black frames.
+        //
+        // OpenH264's "High" profile is CAVLC-only (no CABAC / 8×8 transform);
+        // VT's High profile uses CABAC. Both emit profile_idc=100 SPS so the
+        // browser decoder is happy. Level 5.0 matches `level_idc=0x32` in
+        // the fmtp.
+        .profile(Profile::High)
+        .level(Level::Level_5_0)
 }
 
 impl OpenH264Encoder {
@@ -301,6 +315,42 @@ mod tests {
         // SPS first byte is the NAL header; low 5 bits = 7.
         assert_eq!(params.sps[0] & 0x1F, NAL_TYPE_SPS);
         assert_eq!(params.pps[0] & 0x1F, NAL_TYPE_PPS);
+    }
+
+    /// Regression guard for the Windows / Linux H.264 black-screen bug
+    /// fixed alongside the 2026-05-13 VT quality uplift (commit 7fed601):
+    /// the SDP fmtp advertises `profile-level-id=640032` (High 5.0); without
+    /// `build_config()` setting `Profile::High` the encoder defaulted to
+    /// Constrained Baseline (profile_idc=66) and browsers' D3D11VA decoders
+    /// rendered the stream as black frames. The SPS profile_idc lives at
+    /// byte index 1 (byte 0 is the NAL header); 0x64 = 100 = High profile.
+    #[test]
+    fn sps_advertises_high_profile() {
+        let width = 64u32;
+        let height = 64u32;
+        let mut enc =
+            OpenH264Encoder::new(width, height, BitrateBps::LOW).expect("encoder");
+        let bgra = vec![128u8; (width * height * 4) as usize];
+        let _ = enc
+            .encode(&bgra, width, height, false)
+            .expect("encode must succeed")
+            .expect("first frame must not be skipped");
+        let params = enc.parameter_sets().expect("SPS must be cached");
+        assert!(params.sps.len() >= 4, "SPS too short: {} bytes", params.sps.len());
+        assert_eq!(
+            params.sps[1], 0x64,
+            "SPS profile_idc must be 100 (High) to match SDP profile-level-id=640032, got 0x{:02x}",
+            params.sps[1]
+        );
+        // Level 5.0 = level_idc 0x32 lives at SPS byte 3 (after profile_idc
+        // + constraint_set bits). OpenH264 may emit a lower level if the
+        // resolution allows it; assert it does not exceed 5.0 so the
+        // negotiated level envelope is respected.
+        assert!(
+            params.sps[3] <= 0x32,
+            "SPS level_idc must be ≤ 0x32 (Level 5.0), got 0x{:02x}",
+            params.sps[3]
+        );
     }
 
     #[test]
