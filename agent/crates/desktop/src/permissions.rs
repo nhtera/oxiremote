@@ -70,18 +70,56 @@ pub struct MonitorInfo {
 
 /// List all available monitors as plain `MonitorInfo` structs.
 /// Returns an empty vec if xcap cannot enumerate monitors.
+///
+/// `width` / `height` are LOGICAL pixels on every platform. xcap's
+/// `Monitor::width()` returns logical points on macOS but physical pixels
+/// on Windows at fractional DPI (e.g. 1920×1080 at 125%) — we normalize
+/// here so the rest of the pipeline (`encode::quality_resize` output,
+/// enigo's DPI-unaware `SendInput`, the SPA's `Capabilities` canvas
+/// sizing) all speak the same coordinate space.
 pub fn list_monitors() -> Vec<MonitorInfo> {
     xcap::Monitor::all()
         .unwrap_or_default()
         .iter()
         .enumerate()
-        .map(|(i, m)| MonitorInfo {
-            id: i,
-            label: if i == 0 { "Primary".into() } else { "Monitor".into() },
-            width: m.width().unwrap_or(0),
-            height: m.height().unwrap_or(0),
+        .map(|(i, m)| {
+            let raw_w = m.width().unwrap_or(0);
+            let raw_h = m.height().unwrap_or(0);
+            let scale = m.scale_factor().unwrap_or(1.0).max(1.0);
+            let (width, height) = normalize_to_logical(raw_w, raw_h, scale);
+            MonitorInfo {
+                id: i,
+                label: if i == 0 { "Primary".into() } else { "Monitor".into() },
+                width,
+                height,
+            }
         })
         .collect()
+}
+
+/// Convert xcap's `Monitor::width()/height()` return to LOGICAL pixels.
+///
+/// macOS / Linux: xcap already reports logical → pass through (no-op).
+/// Windows: xcap reports physical at fractional DPI → divide by scale_factor.
+///
+/// The result is what enigo's DPI-unaware `GetSystemMetrics`-based mapping
+/// expects, what `encode::quality_resize` produces, and what the SPA needs
+/// to size its `<canvas>` to match the actual encoded frame. Without this
+/// normalization, `Capabilities` advertises physical (1920×1080) while the
+/// encoded frame is logical (1536×864) — JPEG renders into 80% of the
+/// canvas (small-screen symptom) and H.264 mouse coords overshoot host by
+/// `scale_factor` (cursor lands in the wrong place).
+#[cfg_attr(not(target_os = "windows"), allow(unused_variables))]
+fn normalize_to_logical(raw_w: u32, raw_h: u32, scale: f32) -> (u32, u32) {
+    #[cfg(target_os = "windows")]
+    {
+        if scale > 1.0 + f32::EPSILON {
+            let lw = ((raw_w as f32) / scale).round() as u32;
+            let lh = ((raw_h as f32) / scale).round() as u32;
+            return (lw.max(1), lh.max(1));
+        }
+    }
+    (raw_w, raw_h)
 }
 
 /// Availability status of desktop features on the current system.
@@ -216,5 +254,37 @@ fn probe_accessibility() -> bool {
     #[cfg(not(target_os = "macos"))]
     {
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Windows: 1920x1080 physical at 125% DPI must normalize to 1536x864
+    // logical. The downstream contract is:
+    //   • SPA Capabilities width/height match the encoded-frame dims
+    //     produced by encode::quality_resize (which divides by scale_factor).
+    //   • enigo's DPI-unaware SendInput interprets coords against
+    //     GetSystemMetrics, which returns logical for non-DPI-aware procs.
+    // Mismatch causes JPEG "small screen" (canvas > frame) and H.264 cursor
+    // overshoot (input_px * scale = host_px) — both addressed here.
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn normalize_windows_125_dpi() {
+        assert_eq!(normalize_to_logical(1920, 1080, 1.25), (1536, 864));
+        assert_eq!(normalize_to_logical(2560, 1440, 1.5), (1707, 960));
+        // 100% scale is a no-op on the conversion branch.
+        assert_eq!(normalize_to_logical(1920, 1080, 1.0), (1920, 1080));
+    }
+
+    // Non-Windows: pass-through regardless of scale (xcap already returns
+    // logical on macOS / Linux). Guards against accidental cascade if the
+    // cfg gate is ever removed.
+    #[test]
+    #[cfg(not(target_os = "windows"))]
+    fn normalize_passthrough_off_windows() {
+        assert_eq!(normalize_to_logical(1512, 982, 2.0), (1512, 982));
+        assert_eq!(normalize_to_logical(1920, 1080, 1.25), (1920, 1080));
     }
 }
