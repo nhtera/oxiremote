@@ -21,7 +21,7 @@
 use bytes::Bytes;
 use openh264::{
     OpenH264API,
-    encoder::{BitRate, Encoder, EncoderConfig, FrameRate, Level, Profile},
+    encoder::{BitRate, Encoder, EncoderConfig, FrameRate, Profile},
     formats::YUVSource,
 };
 use tracing::debug;
@@ -55,20 +55,16 @@ fn build_config(bitrate: BitrateBps) -> EncoderConfig {
         .skip_frames(true)
         // Hint — 60 FPS cap; the encoder also accepts lower per-frame rates.
         .max_frame_rate(FrameRate::from_hz(60.0))
-        // Match the SDP fmtp `profile-level-id=640032` advertised by
-        // `h264_codec_capability()`. OpenH264's default is Constrained
-        // Baseline (profile_idc=66), but the SDP claims High (profile_idc=100)
-        // since the 2026-05-13 VT quality uplift. Without this override the
-        // SPS NAL units emitted on Windows/Linux disagree with the negotiated
-        // profile — Chrome's D3D11VA hardware decoder (configured per the
-        // SDP) then renders Baseline streams as black frames.
-        //
-        // OpenH264's "High" profile is CAVLC-only (no CABAC / 8×8 transform);
-        // VT's High profile uses CABAC. Both emit profile_idc=100 SPS so the
-        // browser decoder is happy. Level 5.0 matches `level_idc=0x32` in
-        // the fmtp.
-        .profile(Profile::High)
-        .level(Level::Level_5_0)
+        // Constrained Baseline. The non-macOS branch of
+        // `agent/src/video_pipeline.rs::H264_SDP_FMTP_LINE` advertises
+        // `profile-level-id=42e032`; the encoder must match. An earlier
+        // attempt (commit bdc563d) set this to `Profile::High` to chase the
+        // universal `640032` SDP, but OpenH264 0.9 has no public surface for
+        // `iEntropyCodingModeFlag=1` — the bitstream still uses Baseline
+        // tooling, the SPS lies about being High, and Chrome's Media
+        // Foundation H.264 decoder on Windows renders black frames. Stay
+        // Baseline + honest, downgrade the SDP, let the decoder be happy.
+        .profile(Profile::Baseline)
 }
 
 impl OpenH264Encoder {
@@ -317,15 +313,24 @@ mod tests {
         assert_eq!(params.pps[0] & 0x1F, NAL_TYPE_PPS);
     }
 
-    /// Regression guard for the Windows / Linux H.264 black-screen bug
-    /// fixed alongside the 2026-05-13 VT quality uplift (commit 7fed601):
-    /// the SDP fmtp advertises `profile-level-id=640032` (High 5.0); without
-    /// `build_config()` setting `Profile::High` the encoder defaulted to
-    /// Constrained Baseline (profile_idc=66) and browsers' D3D11VA decoders
-    /// rendered the stream as black frames. The SPS profile_idc lives at
-    /// byte index 1 (byte 0 is the NAL header); 0x64 = 100 = High profile.
+    /// Regression guard: the non-macOS H.264 SDP fmtp is
+    /// `profile-level-id=42e032` (Constrained Baseline 5.0). The OpenH264
+    /// SPS must match that envelope, otherwise Chrome's Media Foundation
+    /// H.264 decoder on Windows renders the stream as black frames.
+    ///
+    /// - SPS byte 1 = `profile_idc` (0x42 = 66 = Baseline).
+    /// - SPS byte 2 = `constraint_set` flags packed in the top 6 bits.
+    ///   `constraint_set0_flag` (bit 7) + `constraint_set1_flag` (bit 6)
+    ///   must both be set — together they mark the bitstream as decodable
+    ///   by both Baseline and Main conforming decoders (the H.264 §A.2.1.1
+    ///   "Constrained Baseline" subset). `constraint_set2_flag`
+    ///   (Extended-compatible) is optional and OpenH264 leaves it 0 — the
+    ///   SDP's `e0` byte advertises Extended-compatible too, but Chrome MFT
+    ///   only inspects set0/set1 when selecting the Baseline decoder path,
+    ///   so the extra advertise is harmless. Accept either 0xC0 or 0xE0.
+    /// - SPS byte 3 = `level_idc` ≤ 0x32 (Level 5.0 envelope from SDP).
     #[test]
-    fn sps_advertises_high_profile() {
+    fn sps_advertises_constrained_baseline() {
         let width = 64u32;
         let height = 64u32;
         let mut enc =
@@ -338,17 +343,19 @@ mod tests {
         let params = enc.parameter_sets().expect("SPS must be cached");
         assert!(params.sps.len() >= 4, "SPS too short: {} bytes", params.sps.len());
         assert_eq!(
-            params.sps[1], 0x64,
-            "SPS profile_idc must be 100 (High) to match SDP profile-level-id=640032, got 0x{:02x}",
+            params.sps[1], 0x42,
+            "SPS profile_idc must be 66 (Baseline) to match SDP profile-level-id=42e032, got 0x{:02x}",
             params.sps[1]
         );
-        // Level 5.0 = level_idc 0x32 lives at SPS byte 3 (after profile_idc
-        // + constraint_set bits). OpenH264 may emit a lower level if the
-        // resolution allows it; assert it does not exceed 5.0 so the
-        // negotiated level envelope is respected.
+        assert_eq!(
+            params.sps[2] & 0xC0,
+            0xC0,
+            "SPS constraint_set0_flag + constraint_set1_flag must both be set for Constrained Baseline, got byte 0x{:02x}",
+            params.sps[2]
+        );
         assert!(
             params.sps[3] <= 0x32,
-            "SPS level_idc must be ≤ 0x32 (Level 5.0), got 0x{:02x}",
+            "SPS level_idc must be ≤ 0x32 (Level 5.0 envelope), got 0x{:02x}",
             params.sps[3]
         );
     }
