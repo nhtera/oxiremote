@@ -191,15 +191,13 @@ export function useCanvasGestures({
   // Chrome Remote Desktop / Parsec and avoids the 300 ms click-defer
   // pessimisation that early mobile-web apps suffered from.
   const lastTapRef = useRef<{ time: number; x: number; y: number } | null>(null)
-  // Long-press timer for the touch-mode "drag arm" gesture.
+  // Long-press timer (touch + trackpad). When the user holds a single finger
+  // still for LONG_PRESS_MS it fires a right-click — touch mode at the
+  // finger position, trackpad mode at the virtual cursor.
   const longPressRef = useRef<ReturnType<typeof setTimeout> | null>(null)
-  // True after a successful long-press: the next 1-finger move emits a remote
-  // mousedown and the eventual pointerup emits mouseup.
-  const dragArmedRef = useRef(false)
   // True once a 1-finger drag at scale==1 has crossed the pan threshold and
   // we've emitted an implicit mousedown for click-and-drag. Held for the
-  // duration of the gesture; cleared on pointerup. Distinct from
-  // dragArmedRef (which requires a long-press first) — this is the default
+  // duration of the gesture; cleared on pointerup. This is the default
   // behaviour at no-zoom: drag = click-and-drag, no long-press needed.
   const implicitDragRef = useRef(false)
   // Trackpad-mode flag: while a single pointer is down, finger delta moves
@@ -212,6 +210,19 @@ export function useCanvasGestures({
   // doesn't slide as fingers leave at slightly different moments. The
   // `fired` flag suppresses the tap-on-last-finger-lift fallthrough.
   const threeFingerRef = useRef<{
+    startTime: number
+    midX: number
+    midY: number
+    fired: boolean
+  } | null>(null)
+  // 2-finger tap detection (CRD parity → right click at midpoint). Captured
+  // on the second pointerdown alongside `pinchRef`; cancelled when pinch
+  // engages, any finger moves past PAN_THRESHOLD_PX, or a third finger
+  // lands. The `fired` flag suppresses the tap-on-last-finger-lift
+  // fallthrough (the remaining finger after the first lift has its `moved`
+  // bumped to true by the size===1 branch below, but the size===0 branch
+  // still needs an explicit short-circuit to avoid running fling logic).
+  const twoFingerRef = useRef<{
     startTime: number
     midX: number
     midY: number
@@ -363,25 +374,36 @@ export function useCanvasGestures({
 
       if (pointersRef.current.size === 2) {
         // Two fingers down → pinch state initialised. Cancel any pending
-        // long-press from the first finger.
+        // long-press from the first finger. Arm a 2-finger tap candidate
+        // in parallel — pinch/scroll cancel it once a finger moves, but
+        // a quick lift with no movement fires a right-click at midpoint.
         clearLongPress()
         const [a, b] = Array.from(pointersRef.current.values())
+        const midX = (a.clientX + b.clientX) / 2
+        const midY = (a.clientY + b.clientY) / 2
         pinchRef.current = {
           startDist: dist(a, b),
           startScale: scaleRef.current,
-          midX: (a.clientX + b.clientX) / 2,
-          midY: (a.clientY + b.clientY) / 2,
+          midX,
+          midY,
           pinching: false,
+        }
+        twoFingerRef.current = {
+          startTime: performance.now(),
+          midX,
+          midY,
+          fired: false,
         }
         return
       }
 
       if (pointersRef.current.size === 3) {
         // Three fingers down → arm a 3-finger tap. Cancel any pinch we
-        // were tracking so the third finger doesn't get treated as the
-        // tail end of a 2-finger gesture.
+        // were tracking and the 2-finger tap candidate so the third
+        // finger doesn't get treated as the tail end of a 2-finger gesture.
         clearLongPress()
         pinchRef.current = null
+        twoFingerRef.current = null
         const pts = Array.from(pointersRef.current.values())
         threeFingerRef.current = {
           startTime: performance.now(),
@@ -393,25 +415,27 @@ export function useCanvasGestures({
       }
 
       if (pointersRef.current.size > 3) {
-        // 4+ fingers — abort the 3-finger tap; user is doing something else.
+        // 4+ fingers — abort gesture taps; user is doing something else.
         threeFingerRef.current = null
+        twoFingerRef.current = null
         return
       }
 
       // Single finger:
       if (modeRef.current === 'touch') {
-        // Arm the long-press timer; if the finger doesn't move past
-        // PAN_THRESHOLD_PX before LONG_PRESS_MS, switch to drag-armed mode.
+        // Arm long-press → right-click at the finger position (CRD parity,
+        // matches the on-screen gesture-help promise + file-header contract).
+        // Movement past PAN_THRESHOLD_PX in onPointerMove cancels the timer
+        // so the user can still pan / click-and-drag without triggering a
+        // stray right-click.
         const startClientX = e.clientX
         const startClientY = e.clientY
         clearLongPress()
         longPressRef.current = setTimeout(() => {
-          dragArmedRef.current = true
-          // Optional haptic — exposes a tactile cue on supporting devices.
+          sendMouse('down', 'right', startClientX, startClientY)
+          sendMouse('up', 'right', startClientX, startClientY)
+          // Optional haptic — tactile cue on supporting devices.
           navigator.vibrate?.(15)
-          // Fire the initial mousedown at the current finger pos so subsequent
-          // moves drag naturally.
-          sendMouse('down', 'left', startClientX, startClientY)
         }, LONG_PRESS_MS)
       } else {
         // Trackpad mode: 1-finger drag drives the virtual cursor (which in
@@ -444,11 +468,14 @@ export function useCanvasGestures({
       if (Math.hypot(totalDx, totalDy) > PAN_THRESHOLD_PX) {
         p.moved = true
         clearLongPress()
-        // Any movement past the pan threshold cancels a pending 3-finger
-        // tap — the user is panning / pinching / something other than
-        // tapping with three fingers.
+        // Any movement past the pan threshold cancels a pending multi-finger
+        // tap — the user is panning / pinching / scrolling rather than
+        // tapping.
         if (threeFingerRef.current && !threeFingerRef.current.fired) {
           threeFingerRef.current = null
+        }
+        if (twoFingerRef.current && !twoFingerRef.current.fired) {
+          twoFingerRef.current = null
         }
       }
 
@@ -480,6 +507,9 @@ export function useCanvasGestures({
           pinchRef.current.pinching = true
           pinchRef.current.startDist = newDist
           pinchRef.current.startScale = scaleRef.current
+          // Engaging pinch cancels the 2-finger tap candidate — the user
+          // is intentionally zooming, not tapping.
+          twoFingerRef.current = null
         }
 
         if (pinchRef.current.pinching) {
@@ -519,12 +549,6 @@ export function useCanvasGestures({
       if (pointersRef.current.size !== 1) return
 
       if (modeRef.current === 'touch') {
-        if (dragArmedRef.current) {
-          // User explicitly armed a drag via long-press → forward as
-          // mousemove with the button held. The remote sees a real drag.
-          sendMouse('move', 'left', e.clientX, e.clientY)
-          return
-        }
         if (scaleRef.current === MIN_SCALE) {
           // No-zoom 1-finger drag = click-and-drag on the remote. Fire an
           // implicit mousedown the first time the finger crosses the pan
@@ -682,6 +706,30 @@ export function useCanvasGestures({
         }
       }
 
+      // 2-finger tap detection: fire the right click on the FIRST lift
+      // when only one other finger remains down. Same reasoning as the
+      // 3-finger path — the size===1 branch below marks the remaining
+      // finger as moved to suppress its single-tap fallthrough, but the
+      // right-click itself has to be emitted here before that bookkeeping.
+      // Guarded on `pointersRef.current.size === 1` so the final 1→0 lift
+      // doesn't re-trigger (twoFingerRef is already null then, but the
+      // explicit gate documents intent).
+      if (
+        twoFingerRef.current &&
+        !twoFingerRef.current.fired &&
+        pointersRef.current.size === 1
+      ) {
+        const elapsed = performance.now() - twoFingerRef.current.startTime
+        if (elapsed < TAP_MAX_MS) {
+          const { midX, midY } = twoFingerRef.current
+          sendMouse('down', 'right', midX, midY)
+          sendMouse('up', 'right', midX, midY)
+          twoFingerRef.current.fired = true
+        } else {
+          twoFingerRef.current = null
+        }
+      }
+
       if (pointersRef.current.size === 1) {
         // Just dropped from 2 fingers to 1 — clear pinch state but DON'T
         // treat the remaining finger as a fresh tap. Same suppression for
@@ -705,10 +753,16 @@ export function useCanvasGestures({
       }
 
       if (pointersRef.current.size === 0 && p) {
-        // Final-finger lift. If a 3-finger tap fired, suppress the
-        // single-tap fallthrough — the gesture's intent was middle-click.
+        // Final-finger lift. If a 2- or 3-finger tap fired earlier in
+        // the chain, suppress the single-tap / pan-fling fallthrough —
+        // the gesture's intent was right/middle-click, not anything the
+        // remaining finger's lift would otherwise produce.
         if (threeFingerRef.current?.fired) {
           threeFingerRef.current = null
+          return
+        }
+        if (twoFingerRef.current?.fired) {
+          twoFingerRef.current = null
           return
         }
         const elapsed = performance.now() - p.startTime
@@ -717,12 +771,6 @@ export function useCanvasGestures({
         pinchRef.current = null
 
         if (modeRef.current === 'touch') {
-          if (dragArmedRef.current) {
-            // End the armed drag — release the left button.
-            sendMouse('up', 'left', p.clientX, p.clientY)
-            dragArmedRef.current = false
-            return
-          }
           if (implicitDragRef.current) {
             // End the implicit click-and-drag — release the left button.
             // No fling here: click-and-drag is a remote intent, not a
@@ -754,7 +802,7 @@ export function useCanvasGestures({
             } else {
               lastTapRef.current = { time: now, x: p.clientX, y: p.clientY }
             }
-          } else if (!wasPinch && moved && !dragArmedRef.current) {
+          } else if (!wasPinch && moved) {
             // Pan-gesture release — fling if velocity ≥ launch threshold.
             // Compute average velocity over the trailing window so a
             // pre-flick pause doesn't kill the launch.
@@ -832,10 +880,10 @@ export function useCanvasGestures({
       // equivalent to draining the array.
       velocityBufferRef.current = []
       lastTapRef.current = null
-      dragArmedRef.current = false
       implicitDragRef.current = false
       trackpadDraggingRef.current = false
       threeFingerRef.current = null
+      twoFingerRef.current = null
     }
   }, [layer, viewport, target, applyTransform, sendMouse, sendMove, disabled])
 
