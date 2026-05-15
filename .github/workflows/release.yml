@@ -121,14 +121,25 @@ jobs:
       # windows-2022 runners under C:\Program Files\LLVM\bin). We export
       # LIBCLANG_PATH and BINDGEN_EXTRA_CLANG_ARGS so bindgen picks up the
       # vcpkg include dirs.
+      #
+      # `pkgconfiglite` is required by build.rs (pkg-config crate probes for
+      # libvpx + libaom). Windows-latest does not ship pkg-config preinstalled.
+      # PKG_CONFIG_ALLOW_SYSTEM_LIBS / _CFLAGS bypass pkg-config's "system
+      # path" filter on Windows, where vcpkg outputs land under non-prefix
+      # dirs that pkg-config would otherwise reject.
       - name: Install Windows video codec deps
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
+          choco install pkgconfiglite --no-progress --yes
           vcpkg install libvpx:x64-windows-static aom:x64-windows-static
           echo "LIBCLANG_PATH=C:\Program Files\LLVM\bin" >> $env:GITHUB_ENV
           echo "VCPKG_ROOT=$env:VCPKG_INSTALLATION_ROOT" >> $env:GITHUB_ENV
           echo "PKG_CONFIG_PATH=$env:VCPKG_INSTALLATION_ROOT\installed\x64-windows-static\lib\pkgconfig" >> $env:GITHUB_ENV
+          echo "PKG_CONFIG_ALLOW_SYSTEM_LIBS=1" >> $env:GITHUB_ENV
+          echo "PKG_CONFIG_ALLOW_SYSTEM_CFLAGS=1" >> $env:GITHUB_ENV
+          echo "VPX_STATIC=1" >> $env:GITHUB_ENV
+          echo "AOM_STATIC=1" >> $env:GITHUB_ENV
           echo "BINDGEN_EXTRA_CLANG_ARGS=-I$env:VCPKG_INSTALLATION_ROOT\installed\x64-windows-static\include" >> $env:GITHUB_ENV
 
       # macOS: audiopus_sys 0.1.8 builds vendored libopus from source via
