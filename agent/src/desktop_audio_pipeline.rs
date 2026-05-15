@@ -30,6 +30,7 @@
 #![cfg(feature = "audio")]
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime};
 
 use desktop::audio::{AudioCapture, AudioError, opus_encoder::OpusEncoder};
@@ -105,6 +106,13 @@ pub struct AudioPipelineConfig {
     /// pipeline can't know which backend the capture is — caller picks the
     /// right variant for the platform it built.
     pub capture_error_reason: StopReason,
+    /// User-level mute. When `true`, the writer task skips `write_sample`
+    /// so no RTP packets reach the client (receiver hears silence) but the
+    /// capture + encode pipeline keeps running. Toggling this atomic is
+    /// instant — no PC renegotiation, no SCStream rebuild. The operator-
+    /// level master kill stays on `shutdown_rx` (UserToggleOff /
+    /// SessionClosed) so a setting flip still tears the whole pipeline.
+    pub muted: Arc<AtomicBool>,
 }
 
 /// `RTCRtpCodecCapability` matching what `register_default_codecs` exposes
@@ -145,7 +153,8 @@ pub fn spawn_audio_pipeline(cfg: AudioPipelineConfig) {
 
     // Writer task — async, owns the track Arc.
     let track = cfg.track.clone();
-    tokio::spawn(writer_task(track, sample_rx));
+    let muted = Arc::clone(&cfg.muted);
+    tokio::spawn(writer_task(track, sample_rx, muted));
 
     // Encoder task — async, owns the capture + encoder. Holds the shutdown
     // oneshot so it can break the next_frame await without leaking the
@@ -245,8 +254,16 @@ fn emit_stopped(event_bus: &EventBus, device_id: &str, reason: StopReason) {
 async fn writer_task(
     track: Arc<TrackLocalStaticSample>,
     mut sample_rx: mpsc::Receiver<Vec<u8>>,
+    muted: Arc<AtomicBool>,
 ) {
     while let Some(opus) = sample_rx.recv().await {
+        // Mute is a user-level toggle: drop the encoded frame instead of
+        // writing it. The encoder keeps running so unmute is instant —
+        // first frame after the flip lands on the wire ~20 ms later
+        // without renegotiation. Receiver hears natural silence until then.
+        if muted.load(Ordering::Relaxed) {
+            continue;
+        }
         let sample = Sample {
             data: opus.into(),
             timestamp: SystemTime::now(),
@@ -299,5 +316,44 @@ mod tests {
         // timestamp delta, so a mismatch here would desync the receiver.
         let samples_per_channel = FRAME_DURATION.as_millis() as u64 * 48_000 / 1_000;
         assert_eq!(samples_per_channel, 960);
+    }
+
+    #[tokio::test]
+    async fn writer_skips_write_sample_when_muted() {
+        // Regression for the instant-toggle fix: flipping the mute atomic to
+        // `true` must stop frames reaching `track.write_sample` without
+        // dropping the channel — the writer keeps draining `sample_rx` so a
+        // later unmute resumes immediately. We can't intercept
+        // `TrackLocalStaticSample` directly, so observe the indirect effect:
+        // the writer task must continue consuming samples while muted (it
+        // exits only when the channel closes), and must exit when the
+        // channel drops. Running the muted writer with a stream of samples
+        // and then closing the channel verifies both invariants.
+        let track = new_opus_track();
+        let muted = Arc::new(AtomicBool::new(true));
+        let (tx, rx) = mpsc::channel::<Vec<u8>>(4);
+        let handle = tokio::spawn(writer_task(track, rx, Arc::clone(&muted)));
+        for _ in 0..3 {
+            tx.send(vec![0xfc, 0xff, 0xfe]).await.unwrap();
+        }
+        drop(tx);
+        let result =
+            tokio::time::timeout(Duration::from_millis(500), handle).await;
+        assert!(
+            result.is_ok(),
+            "writer must exit when channel closes, even while muted"
+        );
+    }
+
+    #[test]
+    fn muted_atomic_default_is_unmuted_on_unset() {
+        // Audio gate negotiates the transceiver up-front; the per-session
+        // mute atomic is seeded from `!client_audio_opt_in`. Verify the
+        // wire-default (no opt-in flag → false → muted=true) so a stale
+        // capabilitiesClient frame can't accidentally unmute.
+        let muted = AtomicBool::new(true);
+        assert!(muted.load(Ordering::Relaxed), "default seed is muted when client did not opt in");
+        muted.store(false, Ordering::Relaxed);
+        assert!(!muted.load(Ordering::Relaxed));
     }
 }

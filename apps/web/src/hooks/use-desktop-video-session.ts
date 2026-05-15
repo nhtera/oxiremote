@@ -109,8 +109,19 @@ export function useDesktopVideoSession(
   onFrame: FrameCallback,
   tier: QualityTier = 'med',
   hidpi: boolean = false,
+  // `audio` = user's session-start intent (start unmuted vs muted). Sent in
+  // `capabilitiesClient.audio` so the agent can pick the initial mute state
+  // for its writer task. Mid-session toggles never re-run this — the WS
+  // `audioToggle` message flips a server-side atomic with no renegotiation.
   audio: boolean = false,
   forcePipeline?: 'h264' | 'vp9' | 'av1' | 'jpeg' | 'auto',
+  // `audioInfra` = operator allows audio on this session (probe + DB +
+  // pipeline). When true we ALWAYS add the recvonly audio transceiver to the
+  // offer so the agent has a sendonly counterpart bound and can unmute mid-
+  // session. Decoupled from `audio` so a user who opens muted can still
+  // unmute instantly. When false, the transceiver is elided entirely
+  // (matches the no-audio agent gate).
+  audioInfra: boolean = false,
 ): VideoSessionApi {
   const [status, setStatus] = useState<DesktopStatus>('idle')
   const [attempt, setAttempt] = useState(0)
@@ -151,14 +162,24 @@ export function useDesktopVideoSession(
     hidpiRef.current = hidpi
   }, [hidpi])
 
-  // Phase-02a audio opt-in. Sent inside `capabilitiesClient` so the agent
-  // can AND-merge with its own settings + probe and add the audio
-  // transceiver BEFORE `set_remote_description`. A change after session-start
-  // does NOT renegotiate (matches H.264 fallback policy — applies next session).
+  // User's session-start audio intent (start unmuted vs muted). Sent inside
+  // `capabilitiesClient.audio` so the agent picks the writer task's initial
+  // mute state. Mid-session toggles never re-run this — the WS `audioToggle`
+  // message flips a server-side atomic with no renegotiation.
   const audioRefBool = useRef<boolean>(audio)
   useEffect(() => {
     audioRefBool.current = audio
   }, [audio])
+
+  // Infrastructure gate (operator setting + probe + pipeline). When true we
+  // always add the recvonly audio transceiver to the offer so the agent has
+  // a sendonly counterpart bound and can unmute mid-session by flipping its
+  // writer atomic. Decoupled from `audioRefBool` so a user who opens muted
+  // can still unmute instantly. Read once at session-start.
+  const audioInfraRef = useRef<boolean>(audioInfra)
+  useEffect(() => {
+    audioInfraRef.current = audioInfra
+  }, [audioInfra])
 
   // ── Hidden <video> element lifecycle ────────────────────────────────────
   //
@@ -274,15 +295,15 @@ export function useDesktopVideoSession(
     // offer so it can add its TrackLocalStaticSample without renegotiation.
     pc.addTransceiver('video', { direction: 'recvonly' })
 
-    // Phase-02a: recvonly audio transceiver when the operator + probe + client
-    // agree on audio. Must be declared on the client offer so the server's
-    // sendonly Opus transceiver (added BEFORE set_remote_description on the
-    // agent side) has a matching m-line to pair with. Without this, the
-    // agent's audio transceiver becomes orphaned — the answer carries an
-    // unpaired m-section and zero RTP packets flow despite the audio
-    // pipeline running server-side. `audioRefBool` is read at session-start
-    // (mid-session toggle does not renegotiate, matches H.264 policy).
-    if (audioRefBool.current) {
+    // Recvonly audio transceiver. Added whenever the operator-side audio
+    // infrastructure is ready (probe + DB setting + video pipeline), even
+    // when the user opens this session muted. The agent's sendonly Opus
+    // transceiver (added BEFORE set_remote_description) needs a matching
+    // m-line; without it the agent's transceiver becomes orphaned and zero
+    // RTP packets flow. Pre-binding the transceiver lets mid-session
+    // `audioToggle` flip a server-side atomic instead of forcing a session
+    // reconnect to renegotiate audio onto the PC.
+    if (audioInfraRef.current) {
       pc.addTransceiver('audio', { direction: 'recvonly' })
     }
 
@@ -585,11 +606,15 @@ export function useDesktopVideoSession(
     (next: { hidpi: boolean }) => sendCtrl({ t: 'settings', hidpi: next.hidpi }),
     [],
   )
-  // Phase-02a: audio toggle goes over the signaling WS only (not ctrl DC).
-  // The ctrl DC parses WireInput (t-tagged); the signaling WS parses SignalIn
-  // (type-tagged), and only the latter knows `audioToggle`. Sending via DC
-  // would be silently dropped by the WireInput parser.
+  // Audio toggle. Goes over the signaling WS only (not ctrl DC) — the WS
+  // parses SignalIn (type-tagged) and knows `audioToggle`; the ctrl DC
+  // parses WireInput (t-tagged) and would silently drop it. Bidirectional
+  // and instant: the agent flips a shared `audio_muted` atomic the writer
+  // task reads, with no PC renegotiation and no audio-pipeline teardown.
+  // Track the latest intent locally so a flip that races a ws reconnect
+  // gets re-applied on the next session via `capabilitiesClient.audio`.
   const toggleAudio = useCallback((enabled: boolean) => {
+    audioRefBool.current = enabled
     if (wsRef.current?.readyState === WebSocket.OPEN) {
       wsRef.current.send(JSON.stringify({ type: 'audioToggle', enabled }))
     }

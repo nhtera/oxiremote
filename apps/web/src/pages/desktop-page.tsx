@@ -280,29 +280,24 @@ export default function DesktopPage() {
     })
   }, [])
 
-  // Phase-02a: user audio intent. `null` = follow gate default (audio on when
-  // the gate passes); `true` = user explicitly on; `false` = user explicitly
-  // off (sticky across reconnects). The actual `audioActive` flag is derived
-  // below from intent ∧ live gate so a pipeline switch doesn't clobber the
-  // operator's mute choice.
+  // User audio intent. `null` = follow gate default (unmuted when the gate
+  // passes); `true` = user explicitly unmuted; `false` = user explicitly
+  // muted (sticky across reconnects). The actual `audioActive` flag is
+  // derived below from intent ∧ live gate so a pipeline switch doesn't
+  // clobber the user's mute choice.
   const [audioPref, setAudioPref] = useState<boolean | null>(null)
-  // Bidirectional. On→Off: send `audioToggle=false` over the WS, server
-  // tears the audio pipeline down via `UserToggleOff` (no video disruption).
-  // Off→On: trigger a session reconnect — the SCK audio capture + Opus
-  // transceiver are bound at session-start and webrtc-rs has no clean
-  // mid-session "re-add audio" path, so we recycle the session.
+  // Bidirectional + instant. The SPA always negotiates the audio
+  // transceiver when the operator-side audio gate passes, so the agent's
+  // sendonly Opus track has a paired m-line at session-start regardless of
+  // the user's initial intent. Toggling just sends `audioToggle` over the
+  // signaling WS — the agent flips a shared `audio_muted` atomic that its
+  // writer task reads, with no PC renegotiation, no SCStream rebuild, no
+  // pipeline teardown.
   const handleToggleAudio = useCallback(() => {
     setAudioPref((cur) => {
-      if (cur === false) {
-        // Off → On: needs reconnect to add the audio transceiver back.
-        sessionApiRef.current.disconnect()
-        setForceJpegSession(false)
-        setReloadNonce((n) => n + 1)
-        return true
-      }
-      // On → Off: instant mute via WS — server tears audio without renegotiating.
-      sessionApiRef.current.toggleAudio?.(false)
-      return false
+      const next = cur === false
+      sessionApiRef.current.toggleAudio?.(next)
+      return next
     })
   }, [])
 
@@ -796,6 +791,7 @@ export default function DesktopPage() {
             onGestureApi={handleGestureApi}
             bottomAnchor={keyboardOpen}
             audio={audioActive}
+            audioInfra={audioGatePass}
             forcePipeline={forcePipelineWire}
           />
         ) : (

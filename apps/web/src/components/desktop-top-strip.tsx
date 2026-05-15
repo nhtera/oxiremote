@@ -148,11 +148,7 @@ export default function DesktopTopStrip({
             type="button"
             onClick={onToggleAudio}
             aria-pressed={audioActive}
-            title={
-              audioActive
-                ? 'Mute audio for this session'
-                : 'Re-enable audio (triggers a session reconnect)'
-            }
+            title={audioActive ? 'Mute audio for this session' : 'Enable audio output'}
             className={[
               'inline-flex items-center gap-1 h-6 px-2 rounded-full text-[11px] font-medium border transition-colors',
               audioActive

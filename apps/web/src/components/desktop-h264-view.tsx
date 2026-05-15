@@ -33,9 +33,9 @@ interface SessionApi {
   sendInput: (ev: DesktopInputEvent) => void
   setQuality: (tier: QualityTier) => void
   setSettings: (next: { hidpi: boolean }) => void
-  /** Phase-02a: client-driven audio mute. Sends `audioToggle` over the
-   *  signaling WS. `false` tears down the audio pipeline server-side via
-   *  `UserToggleOff`; `true` requires reconnect (server logs + ignores). */
+  /** Bidirectional client-driven audio mute. Sends `audioToggle` over the
+   *  signaling WS — the agent flips a shared `audio_muted` atomic so
+   *  toggling is instant in both directions without PC renegotiation. */
   toggleAudio?: (enabled: boolean) => void
   disconnect: () => void
   screenshot?: () => Promise<void>
@@ -62,12 +62,17 @@ interface Props {
   onGestureApi?: (api: DesktopGestureApi) => void
   /** See JPEG view: bottom-anchor only while the soft keyboard is open. */
   bottomAnchor?: boolean
-  /** Phase-02a: operator toggle ON + build-side probe true. SPA advertises
-   *  `audio: true` in the WS `capabilitiesClient` only when this is true,
-   *  and the agent independently AND-merges it with its own settings + probe
-   *  before adding an audio transceiver. Defaults to false so a missing prop
-   *  never silently activates audio. */
+  /** User's session-start audio intent. Sent in `capabilitiesClient.audio`
+   *  so the agent picks the writer task's initial mute state (false = start
+   *  muted; true = start unmuted). Mid-session changes don't reach the
+   *  agent through this prop — the `toggleAudio` WS message does. */
   audio?: boolean
+  /** Operator-side audio infrastructure ready (DB setting + probe). When
+   *  true, the SPA always negotiates the recvonly audio transceiver in the
+   *  SDP offer so the agent's sendonly Opus track has a paired m-line and
+   *  mid-session unmute is just an atomic flip. Decoupled from `audio` so
+   *  a user opening muted can still unmute instantly. */
+  audioInfra?: boolean
   /** User-driven pipeline override. Sent to the agent via `?force_pipeline=`
    *  on the WS upgrade so the choice survives mid-session reconnects without
    *  touching the operator-side env preference. */
@@ -90,6 +95,7 @@ export default function DesktopH264View({
   onGestureApi,
   bottomAnchor = false,
   audio = false,
+  audioInfra = false,
   forcePipeline,
 }: Props) {
   const canvasRef = useRef<HTMLCanvasElement>(null)
@@ -145,7 +151,16 @@ export default function DesktopH264View({
     pipelineInfo,
     hostLockState,
     accessibilityMissing,
-  } = useDesktopVideoSession(hostId, deviceId, onFrame, quality, hidpi, audio, forcePipeline)
+  } = useDesktopVideoSession(
+    hostId,
+    deviceId,
+    onFrame,
+    quality,
+    hidpi,
+    audio,
+    forcePipeline,
+    audioInfra,
+  )
 
   useEffect(() => {
     onSessionChange({

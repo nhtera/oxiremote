@@ -868,15 +868,21 @@ mod inner {
             (None, existing)
         };
 
-        // Phase-02a: audio gate AND-merges three sources of truth — operator
-        // settings (`desktop_audio_enabled`), client opt-in (`client_caps.audio`,
-        // already validated by serde default-false), and the build-side probe
-        // (`desktop::audio::probe_supported`). All three must agree before we
-        // build the Opus track + add the audio transceiver. Privacy posture:
+        // Audio infrastructure gate. Three operator-level sources of truth
+        // must agree before we add the Opus transceiver: pipeline is a
+        // video-RTP one (H.264/VP9/AV1), the DB setting
+        // `desktop_audio_enabled` is on, and the build-side probe
+        // (`desktop::audio::probe_supported`) succeeds. Privacy posture:
         // default-OFF wins on any disagreement, no silent activation.
-        // Audio gate. Audio is valid on every WebRTC video session
-        // (H.264 / VP9 / AV1) — they all add a video transceiver to the
-        // same PeerConnection, so the audio transceiver rides alongside.
+        //
+        // `client_audio_opt_in` is intentionally NOT part of this gate any
+        // more — the client toggle is a per-listener mute, not an
+        // infrastructure decision. When the client opens muted we still
+        // negotiate the transceiver + run the pipeline, then drop frames at
+        // the writer via `audio_muted`. That makes "Enable audio" instant
+        // (flip the atomic) instead of requiring a session reconnect to
+        // re-add a previously-absent transceiver.
+        //
         // JPEG sessions ride a DataChannel for tiles and have no PC to
         // attach audio to. The codec-arm `matches!` blocks resolve to
         // `false` when the feature isn't compiled, so the gate only opens
@@ -898,21 +904,33 @@ mod inner {
             Option<Arc<webrtc::track::track_local::track_local_static_sample::TrackLocalStaticSample>>,
             Option<Arc<dyn TrackLocal + Send + Sync>>,
         ) = if pipeline_supports_audio
-            && client_audio_opt_in
             && crate::settings::get_desktop_audio_enabled(&state.db_path)
             && desktop::audio::probe_supported()
         {
             let t = crate::desktop_audio_pipeline::new_opus_track();
             let as_trait: Arc<dyn TrackLocal + Send + Sync> = t.clone();
-            info!(pipeline = ?pipeline, "audio gate passed: opus transceiver will be added before SRD");
+            info!(
+                pipeline = ?pipeline,
+                initial_muted = !client_audio_opt_in,
+                "audio gate passed: opus transceiver will be added before SRD"
+            );
             (Some(t), Some(as_trait))
         } else {
             tracing::debug!(
                 client_audio = client_audio_opt_in,
-                "audio gate did not pass (any of: pipeline is JPEG, client opt-out, setting off, probe failed)"
+                "audio gate did not pass (any of: pipeline is JPEG, setting off, probe failed)"
             );
             (None, None)
         };
+        // User-level mute. Initialised from the client's session-start
+        // opt-in: if the client opened with audio toggled off, we start
+        // muted (transceiver still present, just dropping samples at the
+        // writer). Mid-session `audioToggle` flips this atomic — both
+        // directions, no teardown, no renegotiation.
+        #[cfg(feature = "audio")]
+        let audio_muted: Arc<std::sync::atomic::AtomicBool> = Arc::new(
+            std::sync::atomic::AtomicBool::new(!client_audio_opt_in),
+        );
         #[cfg(not(feature = "audio"))]
         let audio_sending_track: Option<Arc<dyn TrackLocal + Send + Sync>> = None;
         // Silence the unused-binding warning when feature="audio" is on but
@@ -954,6 +972,8 @@ mod inner {
                 &state,
                 #[cfg(feature = "audio")]
                 opus_track.clone(),
+                #[cfg(feature = "audio")]
+                Arc::clone(&audio_muted),
             )
             .await;
             let _ = pc.close().await;
@@ -1046,6 +1066,7 @@ mod inner {
                     vp9_audio_rx_opt,
                     vp9_ap_shutdown_rx,
                     &mut vp9_ap_shutdown_tx,
+                    Arc::clone(&audio_muted),
                     &state,
                     device_id,
                 );
@@ -1236,6 +1257,19 @@ mod inner {
                     msg = socket.recv() => {
                         match msg {
                             Some(Ok(Message::Text(text))) => {
+                                #[cfg(feature = "audio")]
+                                if text.contains("audioToggle")
+                                    && let Ok(SignalIn::AudioToggle { enabled }) =
+                                        serde_json::from_str::<SignalIn>(&text)
+                                {
+                                    handle_client_audio_toggle(
+                                        enabled,
+                                        &audio_muted,
+                                        opus_track.is_some(),
+                                        device_id,
+                                    );
+                                    continue;
+                                }
                                 on_incoming_text(
                                     &text,
                                     &pc,
@@ -1352,6 +1386,7 @@ mod inner {
                     av1_audio_rx_opt,
                     av1_ap_shutdown_rx,
                     &mut av1_ap_shutdown_tx,
+                    Arc::clone(&audio_muted),
                     &state,
                     device_id,
                 );
@@ -1536,6 +1571,19 @@ mod inner {
                     msg = socket.recv() => {
                         match msg {
                             Some(Ok(Message::Text(text))) => {
+                                #[cfg(feature = "audio")]
+                                if text.contains("audioToggle")
+                                    && let Ok(SignalIn::AudioToggle { enabled }) =
+                                        serde_json::from_str::<SignalIn>(&text)
+                                {
+                                    handle_client_audio_toggle(
+                                        enabled,
+                                        &audio_muted,
+                                        opus_track.is_some(),
+                                        device_id,
+                                    );
+                                    continue;
+                                }
                                 on_incoming_text(
                                     &text,
                                     &pc,
@@ -1798,6 +1846,12 @@ mod inner {
         #[cfg(feature = "audio")] audio_track: Option<
             Arc<webrtc::track::track_local::track_local_static_sample::TrackLocalStaticSample>,
         >,
+        // User-level mute atomic. Flipped by mid-session `audioToggle` WS
+        // messages from the client. Read by the audio writer task to drop
+        // encoded frames instead of writing them to the track. Decoupled
+        // from the operator master kill (`ap_shutdown_tx`) so user mute
+        // never tears the pipeline down.
+        #[cfg(feature = "audio")] audio_muted: Arc<std::sync::atomic::AtomicBool>,
     ) -> anyhow::Result<()> {
         use base64::{engine::general_purpose::STANDARD as B64_STD, Engine as _};
         use desktop::capture::CaptureLoop;
@@ -1913,6 +1967,7 @@ mod inner {
                 audio_rx_opt,
                 ap_shutdown_rx,
                 &mut ap_shutdown_tx,
+                Arc::clone(&audio_muted),
                 state,
                 device_id,
             );
@@ -2262,32 +2317,24 @@ mod inner {
                 msg = socket.recv() => {
                     match msg {
                         Some(Ok(Message::Text(text))) => {
-                            // Phase-02a: client-driven audio mute is handled
-                            // here (not in `on_incoming_text`) because the
-                            // shutdown sender is owned by this session and
-                            // is feature-gated. Cheap substring pre-check
-                            // avoids a JSON parse on every input/quality msg.
+                            // Client-driven audio mute (both directions —
+                            // instant, no teardown, no renegotiation). Cheap
+                            // substring pre-check avoids JSON parse on every
+                            // input/quality/ICE msg. Flips the shared
+                            // `audio_muted` atomic the writer task reads.
+                            // The operator master-kill stays on
+                            // `ap_shutdown_tx` via `toggle_off_detector`.
                             #[cfg(feature = "audio")]
                             if text.contains("audioToggle")
                                 && let Ok(SignalIn::AudioToggle { enabled }) =
                                     serde_json::from_str::<SignalIn>(&text)
                             {
-                                if !enabled {
-                                    if let Some(tx) = ap_shutdown_tx.take() {
-                                        info!(
-                                            device = %device_id,
-                                            "client requested audio mute mid-session"
-                                        );
-                                        let _ = tx.send(
-                                            crate::desktop_audio_pipeline::StopReason::UserToggleOff,
-                                        );
-                                    }
-                                } else {
-                                    info!(
-                                        device = %device_id,
-                                        "client audioToggle=true ignored (reconnect required)"
-                                    );
-                                }
+                                handle_client_audio_toggle(
+                                    enabled,
+                                    &audio_muted,
+                                    audio_track.is_some(),
+                                    device_id,
+                                );
                                 continue;
                             }
                             on_incoming_text(
@@ -2437,6 +2484,38 @@ mod inner {
         scale_hidpi_bitrate(base, scale_factor, hidpi)
     }
 
+    /// Handle a client `audioToggle` signal mid-session. Flips the shared
+    /// mute atomic the audio writer task reads — instant in both
+    /// directions, no PC renegotiation, no SCStream rebuild, no audio
+    /// pipeline teardown. Operator-level master kill (settings flip) stays
+    /// on `ap_shutdown_tx` via `toggle_off_detector`. No-op when the audio
+    /// gate didn't pass at session-start (no transceiver to unmute into);
+    /// the SPA never shows the toggle in that case, but defensive logging
+    /// helps diagnose stale clients.
+    #[cfg(feature = "audio")]
+    fn handle_client_audio_toggle(
+        enabled: bool,
+        audio_muted: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+        audio_gate_passed: bool,
+        device_id: &str,
+    ) {
+        if !audio_gate_passed {
+            tracing::debug!(
+                device = %device_id,
+                requested_enabled = enabled,
+                "audioToggle ignored: audio gate did not pass at session-start"
+            );
+            return;
+        }
+        let muted = !enabled;
+        audio_muted.store(muted, std::sync::atomic::Ordering::Relaxed);
+        info!(
+            device = %device_id,
+            muted,
+            "client audioToggle applied (atomic flip, no teardown)"
+        );
+    }
+
     /// Spawn the audio capture + Opus encoder pipeline for the current
     /// session. Pipeline-agnostic — used by all video-track sessions
     /// (H.264 / VP9 / AV1). Caller has already passed the audio
@@ -2461,6 +2540,7 @@ mod inner {
         ap_shutdown_tx: &mut Option<
             tokio::sync::oneshot::Sender<crate::desktop_audio_pipeline::StopReason>,
         >,
+        muted: std::sync::Arc<std::sync::atomic::AtomicBool>,
         state: &std::sync::Arc<AppState>,
         device_id: &str,
     ) {
@@ -2508,6 +2588,7 @@ mod inner {
                         event_bus: std::sync::Arc::clone(&state.event_bus),
                         device_id: device_id.to_string(),
                         capture_error_reason,
+                        muted,
                     },
                 );
                 state

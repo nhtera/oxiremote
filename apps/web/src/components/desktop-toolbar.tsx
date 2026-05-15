@@ -378,14 +378,11 @@ export default function DesktopToolbar({
         ))}
       </div>
 
-      {/* Phase-02a audio toggle — visible only when the gate passed at
-          session-start (operator setting + probe + H.264 path).
-          On → Off: instant client-driven mute via `audioToggle` over the WS;
-          server tears the audio pipeline down with `UserToggleOff`, video
-          continues uninterrupted.
-          Off → On: triggers a session reconnect (same UX as Reload), since
-          the SCK audio capture + Opus transceiver are bound at session start
-          and webrtc-rs has no clean mid-session re-add path. ~1–2 s blip. */}
+      {/* Audio toggle — visible only when the operator-side audio gate
+          passed at session-start (DB setting + probe + video pipeline).
+          Bidirectional and instant: the SPA always negotiates the audio
+          transceiver under the gate, so unmute is a server-side atomic
+          flip — no session reconnect, no video blip. */}
       {audioGated && (
         <div className="hidden lg:flex items-center justify-between gap-2 pt-1">
           <span className="text-[10px] uppercase tracking-[0.12em] text-text-muted">
@@ -394,11 +391,7 @@ export default function DesktopToolbar({
           <button
             type="button"
             onClick={() => onToggleAudio?.()}
-            title={
-              audioActive
-                ? 'Mute audio for this session'
-                : 'Re-enable audio (triggers a session reconnect)'
-            }
+            title={audioActive ? 'Mute audio for this session' : 'Enable audio output'}
             className={
               'inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full text-[11px] border transition-colors ' +
               (audioActive
