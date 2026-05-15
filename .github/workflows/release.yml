@@ -105,7 +105,31 @@ jobs:
             libxcb-shape0-dev libxcb-xkb-dev libxkbcommon-dev libxcb-cursor-dev \
             libglib2.0-dev libgtk-3-dev libayatana-appindicator3-dev \
             libxdo-dev libwayland-dev libgbm-dev libpipewire-0.3-dev \
-            pkg-config nasm
+            pkg-config nasm \
+            libvpx-dev libaom-dev libclang-dev clang
+
+      # macOS: VP9/AV1 software encoders need libvpx + libaom system libs
+      # and llvm/libclang for bindgen. brew is pre-installed on the runner;
+      # `clang` ships with Xcode so we only fetch the codec libs and llvm
+      # (which provides libclang for bindgen).
+      - name: Install macOS video codec deps
+        if: runner.os == 'macOS'
+        run: brew install libvpx aom llvm
+
+      # Windows: vcpkg installs libvpx + libaom static libs. bindgen finds
+      # libclang via the LLVM Chocolatey package (already pre-installed on
+      # windows-2022 runners under C:\Program Files\LLVM\bin). We export
+      # LIBCLANG_PATH and BINDGEN_EXTRA_CLANG_ARGS so bindgen picks up the
+      # vcpkg include dirs.
+      - name: Install Windows video codec deps
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          vcpkg install libvpx:x64-windows-static aom:x64-windows-static
+          echo "LIBCLANG_PATH=C:\Program Files\LLVM\bin" >> $env:GITHUB_ENV
+          echo "VCPKG_ROOT=$env:VCPKG_INSTALLATION_ROOT" >> $env:GITHUB_ENV
+          echo "PKG_CONFIG_PATH=$env:VCPKG_INSTALLATION_ROOT\installed\x64-windows-static\lib\pkgconfig" >> $env:GITHUB_ENV
+          echo "BINDGEN_EXTRA_CLANG_ARGS=-I$env:VCPKG_INSTALLATION_ROOT\installed\x64-windows-static\include" >> $env:GITHUB_ENV
 
       # macOS: audiopus_sys 0.1.8 builds vendored libopus from source via
       # autotools when pkg-config can't find a system Opus. The GitHub-hosted

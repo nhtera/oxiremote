@@ -1,34 +1,38 @@
 //! Pipeline selection.
 //!
-//! Decides whether a desktop-streaming session runs over the legacy JPEG
-//! DataChannel pipeline, the H.264 WebRTC-track pipeline, or the HEVC
-//! WebRTC-track pipeline. Inputs:
+//! Decides which encoder transport carries a desktop-streaming session:
+//! AV1 → VP9 → H.264 → JPEG. Inputs:
 //!
 //! 1. **Operator preference** via the `OXI_VIDEO_PIPELINE` env var:
-//!    - `auto` — HEVC → H.264 → JPEG in priority order, gated by feature
-//!      compilation and client-advertised codec support.
+//!    - `auto` — AV1 → VP9 → H.264 → JPEG in priority order, gated
+//!      by feature compilation and client-advertised codec support.
 //!      **The new default when the env var is unset.**
-//!    - `hevc` — force HEVC; fail-closed if the client lacks decode (no
-//!      silent fallback when the operator is explicit).
-//!    - `h264` — force H.264; fail-closed if the client lacks decode (no
-//!      silent JPEG fallback when the operator is explicit).
+//!    - `av1` — force AV1; fail-closed if the client lacks decode (no
+//!      silent fallback when the operator is explicit). Safari ≤ 18 has
+//!      no AV1 WebRTC support and will hit this branch.
+//!    - `vp9` — force VP9; fail-closed if the client lacks decode.
+//!    - `h264` — force H.264; fail-closed if the client lacks decode.
 //!    - `jpeg` — force JPEG.
 //!    - any other value or absent → `Auto`.
 //!
 //! 2. **Client capability** announced via `SignalIn::CapabilitiesClient`:
 //!    - `webcodecs: true` OR the `codecs` list contains a baseline-3.1 H.264
 //!      entry → client can decode H.264.
-//!    - `codecs` list contains a string starting with `"h265"` or `"hevc"`
-//!      (case-insensitive) → client can decode HEVC.
+//!    - `codecs` list contains a string starting with `"vp9"`
+//!      (case-insensitive) → client can decode VP9.
+//!    - `codecs` list contains a string starting with `"av1"` or `"av01"`
+//!      (case-insensitive) → client can decode AV1. Browsers expose both
+//!      forms; Chrome canonical is `"AV1"` from `RTCRtpReceiver`, while
+//!      WebCodecs and Media Capabilities use the `"av01.*"` MIME suffix.
 //!
-//! 3. **Build-time features** `h264` and `hevc`: if the binary was built
-//!    without either, `choose()` resolves to the next capable pipeline or
-//!    JPEG. Forced selection of a missing feature returns an error rather
-//!    than a silent fallback — operator intent is fail-closed.
+//! 3. **Build-time features** `h264`, `vp9`, `av1`: if the binary was built
+//!    without one, `choose()` resolves to the next capable pipeline or JPEG.
+//!    Forced selection of a missing feature returns an error rather than a
+//!    silent fallback — operator intent is fail-closed.
 //!
-//! The resulting `(Pipeline, reason)` flows through the negotiation loop so
-//! the server can attach the right track type before SDP exchange and ship
-//! the reason in `SignalOut::Pipeline` for the SPA status pill tooltip.
+//! The resulting `(Pipeline, reason)` flows through the negotiation loop
+//! so the server can attach the right track type before SDP exchange and
+//! ship the reason in `SignalOut::Pipeline` for the SPA status pill.
 
 #![cfg(feature = "desktop")]
 
@@ -44,9 +48,12 @@ pub enum Pipeline {
     /// H.264 via VideoToolbox / OpenH264 → RTP video track (phase 03).
     #[cfg(feature = "h264")]
     H264,
-    /// HEVC / H.265 via VideoToolbox (macOS) or platform encoder → RTP video track.
-    #[cfg(feature = "hevc")]
-    Hevc,
+    /// VP9 via libvpx (screen-content tuned, active-map driven) → RTP video track.
+    #[cfg(feature = "vp9")]
+    Vp9,
+    /// AV1 via libaom (AOM_CONTENT_SCREEN + palette + IBC) → RTP video track.
+    #[cfg(feature = "av1")]
+    Av1,
 }
 
 impl Pipeline {
@@ -55,26 +62,27 @@ impl Pipeline {
             Pipeline::Jpeg => "jpeg",
             #[cfg(feature = "h264")]
             Pipeline::H264 => "h264",
-            // Wire name is "h265" to align with the SDP codec string family
-            // and the SPA stats overlay label.
-            #[cfg(feature = "hevc")]
-            Pipeline::Hevc => "h265",
+            #[cfg(feature = "vp9")]
+            Pipeline::Vp9 => "vp9",
+            #[cfg(feature = "av1")]
+            Pipeline::Av1 => "av1",
         }
     }
 }
 
 /// Operator's stated preference, distinct from the final `Pipeline` because
 /// `Auto` resolves at session time using client capabilities. Forced values
-/// (`H264`, `Hevc`, `Jpeg`) override client capability checks — a forced
-/// pipeline with a client that can't decode is an explicit error, not a
-/// silent fallback.
+/// override client capability checks — a forced pipeline with a client that
+/// can't decode is an explicit error, not a silent fallback.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OperatorPref {
     Auto,
     #[cfg(feature = "h264")]
     H264,
-    #[cfg(feature = "hevc")]
-    Hevc,
+    #[cfg(feature = "vp9")]
+    Vp9,
+    #[cfg(feature = "av1")]
+    Av1,
     Jpeg,
 }
 
@@ -99,19 +107,32 @@ impl std::fmt::Display for ForcedH264Unavailable {
 }
 impl std::error::Error for ForcedH264Unavailable {}
 
-/// Error: operator forced HEVC but the client lacks decode. Parallel to
-/// `ForcedH264Unavailable` — no silent fallback to H.264 or JPEG.
-#[cfg(feature = "hevc")]
+/// Error: operator forced VP9 but the client lacks decode.
+#[cfg(feature = "vp9")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ForcedHevcUnavailable {
+pub struct ForcedVp9Unavailable {
     pub reason: &'static str,
 }
-#[cfg(feature = "hevc")]
-impl std::fmt::Display for ForcedHevcUnavailable {
+#[cfg(feature = "vp9")]
+impl std::fmt::Display for ForcedVp9Unavailable {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str(self.reason) }
 }
-#[cfg(feature = "hevc")]
-impl std::error::Error for ForcedHevcUnavailable {}
+#[cfg(feature = "vp9")]
+impl std::error::Error for ForcedVp9Unavailable {}
+
+/// Error: operator forced AV1 but the client lacks decode. Safari ≤ 18
+/// hits this branch — Apple has stated no plans for AV1 WebRTC.
+#[cfg(feature = "av1")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ForcedAv1Unavailable {
+    pub reason: &'static str,
+}
+#[cfg(feature = "av1")]
+impl std::fmt::Display for ForcedAv1Unavailable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str(self.reason) }
+}
+#[cfg(feature = "av1")]
+impl std::error::Error for ForcedAv1Unavailable {}
 
 /// Read operator preference from `OXI_VIDEO_PIPELINE`. Unknown/absent → `Auto`.
 /// Per-session override via `?force_pipeline=` uses `parse_force_pipeline`.
@@ -128,10 +149,14 @@ pub fn parse_force_pipeline(value: &str) -> Option<OperatorPref> {
         "h264" => Some(OperatorPref::H264),
         #[cfg(not(feature = "h264"))]
         "h264" => None, // no encoder compiled
-        #[cfg(feature = "hevc")]
-        "hevc" => Some(OperatorPref::Hevc),
-        #[cfg(not(feature = "hevc"))]
-        "hevc" => None, // no encoder compiled
+        #[cfg(feature = "vp9")]
+        "vp9" => Some(OperatorPref::Vp9),
+        #[cfg(not(feature = "vp9"))]
+        "vp9" => None, // no encoder compiled
+        #[cfg(feature = "av1")]
+        "av1" => Some(OperatorPref::Av1),
+        #[cfg(not(feature = "av1"))]
+        "av1" => None, // no encoder compiled
         "jpeg" => Some(OperatorPref::Jpeg),
         _ => None,
     }
@@ -144,8 +169,10 @@ fn parse_preference(input: Option<&str>) -> OperatorPref {
         Some("auto") => OperatorPref::Auto,
         #[cfg(feature = "h264")]
         Some("h264") => OperatorPref::H264,
-        #[cfg(feature = "hevc")]
-        Some("hevc") => OperatorPref::Hevc,
+        #[cfg(feature = "vp9")]
+        Some("vp9") => OperatorPref::Vp9,
+        #[cfg(feature = "av1")]
+        Some("av1") => OperatorPref::Av1,
         Some("jpeg") => OperatorPref::Jpeg,
         _ => OperatorPref::Auto,
     }
@@ -172,42 +199,68 @@ impl ClientCapabilities {
         self.codecs.iter().any(|c| c.eq_ignore_ascii_case("h264-baseline-3.1") || c.starts_with("h264"))
     }
 
-    /// HEVC / H.265: codec starts with `"h265"` or `"hevc"` (case-insensitive).
-    /// No `webcodecs` shortcut — WebCodecs ≠ WebRTC HEVC; SPA must advertise
-    /// explicitly.
-    #[cfg_attr(not(feature = "hevc"), allow(dead_code))]
-    pub fn supports_hevc(&self) -> bool {
+    /// VP9: codec starts with `"vp9"` (case-insensitive). Includes
+    /// profile-specific strings like `"vp9-profile0"` that future phases
+    /// may emit. No `webcodecs` shortcut — VP9 must be explicitly
+    /// advertised because Safari ≤ 16 lacks VP9 WebRTC support.
+    #[cfg_attr(not(feature = "vp9"), allow(dead_code))]
+    pub fn supports_vp9(&self) -> bool {
+        self.codecs.iter().any(|c| c.to_ascii_lowercase().starts_with("vp9"))
+    }
+
+    /// AV1: codec starts with `"av1"` (canonical from `RTCRtpReceiver`) or
+    /// `"av01"` (MIME-style from Media Capabilities). Both forms accepted
+    /// case-insensitive. No `webcodecs` shortcut — Safari WebCodecs may
+    /// expose AV1 decode while WebRTC does not.
+    #[cfg_attr(not(feature = "av1"), allow(dead_code))]
+    pub fn supports_av1(&self) -> bool {
         self.codecs.iter().any(|c| {
             let l = c.to_ascii_lowercase();
-            l.starts_with("h265") || l.starts_with("hevc")
+            l.starts_with("av1") || l.starts_with("av01")
         })
     }
 }
 
 /// `true` when the binary includes the `h264` encoder.
 pub const H264_COMPILED: bool = cfg!(feature = "h264");
-/// `true` when the binary includes the `hevc` encoder.
+/// `true` when the binary includes the `vp9` encoder.
 #[allow(dead_code)]
-pub const HEVC_COMPILED: bool = cfg!(feature = "hevc");
+pub const VP9_COMPILED: bool = cfg!(feature = "vp9");
+/// `true` when the binary includes the `av1` encoder.
+#[allow(dead_code)]
+pub const AV1_COMPILED: bool = cfg!(feature = "av1");
 
 /// Select the pipeline for this session.
 ///
 /// `Ok(Decision)` on success; `Err(boxed)` only when the operator forced a
 /// pipeline (`OXI_VIDEO_PIPELINE` or `?force_pipeline=`) but the client lacks
 /// decode support. The session layer converts the error into a WS close reason.
+///
+/// Auto priority chain: **AV1 → VP9 → H.264 → JPEG**. Matches Chrome
+/// Remote Desktop's default (best quality-per-bit first). Each arm compiles
+/// only when the matching feature is present, so a JPEG-only build collapses
+/// the chain to `Pipeline::Jpeg`.
 pub fn choose(
     operator: OperatorPref,
     client: &ClientCapabilities,
 ) -> Result<Decision, Box<dyn std::error::Error + Send + Sync>> {
-    let _ = client; // unused on non-h264/non-hevc builds
+    let _ = client; // unused on non-codec builds
     match operator {
         OperatorPref::Jpeg => Ok(Decision { pipeline: Pipeline::Jpeg, reason: "forced-jpeg" }),
-        #[cfg(feature = "hevc")]
-        OperatorPref::Hevc => {
-            if client.supports_hevc() {
-                Ok(Decision { pipeline: Pipeline::Hevc, reason: "forced-hevc" })
+        #[cfg(feature = "av1")]
+        OperatorPref::Av1 => {
+            if client.supports_av1() {
+                Ok(Decision { pipeline: Pipeline::Av1, reason: "forced-av1" })
             } else {
-                Err(Box::new(ForcedHevcUnavailable { reason: "forced-hevc-no-client" }))
+                Err(Box::new(ForcedAv1Unavailable { reason: "forced-av1-no-client" }))
+            }
+        }
+        #[cfg(feature = "vp9")]
+        OperatorPref::Vp9 => {
+            if client.supports_vp9() {
+                Ok(Decision { pipeline: Pipeline::Vp9, reason: "forced-vp9" })
+            } else {
+                Err(Box::new(ForcedVp9Unavailable { reason: "forced-vp9-no-client" }))
             }
         }
         #[cfg(feature = "h264")]
@@ -219,11 +272,15 @@ pub fn choose(
             }
         }
         OperatorPref::Auto => {
-            // Priority: HEVC → H.264 → JPEG. Each arm compiles only when the
-            // matching feature is present.
-            #[cfg(feature = "hevc")]
-            if client.supports_hevc() {
-                return Ok(Decision { pipeline: Pipeline::Hevc, reason: "auto-hevc" });
+            // Priority: AV1 → VP9 → H.264 → JPEG. Each arm compiles only
+            // when the matching feature is present.
+            #[cfg(feature = "av1")]
+            if client.supports_av1() {
+                return Ok(Decision { pipeline: Pipeline::Av1, reason: "auto-av1" });
+            }
+            #[cfg(feature = "vp9")]
+            if client.supports_vp9() {
+                return Ok(Decision { pipeline: Pipeline::Vp9, reason: "auto-vp9" });
             }
             #[cfg(feature = "h264")]
             {
@@ -256,7 +313,11 @@ mod tests {
         assert_eq!(parse_force_pipeline("jpeg"), Some(OperatorPref::Jpeg));
         #[cfg(feature = "h264")]
         assert_eq!(parse_force_pipeline("h264"), Some(OperatorPref::H264));
-        assert_eq!(parse_force_pipeline("HEVC"), None);
+        #[cfg(feature = "vp9")]
+        assert_eq!(parse_force_pipeline("vp9"), Some(OperatorPref::Vp9));
+        #[cfg(feature = "av1")]
+        assert_eq!(parse_force_pipeline("av1"), Some(OperatorPref::Av1));
+        assert_eq!(parse_force_pipeline("hevc"), None);
         assert_eq!(parse_force_pipeline(""), None);
     }
 
@@ -268,12 +329,17 @@ mod tests {
         assert_eq!(parse_preference(Some("jpeg")), OperatorPref::Jpeg);
         #[cfg(feature = "h264")]
         assert_eq!(parse_preference(Some("h264")), OperatorPref::H264);
+        #[cfg(feature = "vp9")]
+        assert_eq!(parse_preference(Some("vp9")), OperatorPref::Vp9);
+        #[cfg(feature = "av1")]
+        assert_eq!(parse_preference(Some("av1")), OperatorPref::Av1);
     }
 
     #[test]
-    fn auto_with_capable_client_picks_h264_when_compiled() {
+    fn auto_with_capable_client_picks_highest_priority() {
         let d = choose(OperatorPref::Auto, &caps(&[], true)).expect("auto never errors");
-        #[cfg(all(feature = "h264", not(feature = "hevc")))]
+        // Highest-priority compiled codec wins for the H.264-only baseline case.
+        #[cfg(all(feature = "h264", not(feature = "vp9"), not(feature = "av1")))]
         { assert_eq!(d.pipeline, Pipeline::H264); assert_eq!(d.reason, "auto-h264"); }
         #[cfg(not(feature = "h264"))]
         { assert_eq!(d.pipeline, Pipeline::Jpeg); assert_eq!(d.reason, "auto-jpeg-no-feature"); }
@@ -320,71 +386,141 @@ mod tests {
     fn wire_name_matches_protocol() {
         assert_eq!(Pipeline::Jpeg.wire_name(), "jpeg");
         #[cfg(feature = "h264")] assert_eq!(Pipeline::H264.wire_name(), "h264");
-        #[cfg(feature = "hevc")] assert_eq!(Pipeline::Hevc.wire_name(), "h265");
+        #[cfg(feature = "vp9")] assert_eq!(Pipeline::Vp9.wire_name(), "vp9");
+        #[cfg(feature = "av1")] assert_eq!(Pipeline::Av1.wire_name(), "av1");
     }
 
-    // HEVC tests — compiled only when hevc feature is active.
+    // VP9 tests — compiled only when vp9 feature is active.
 
-    #[cfg(feature = "hevc")]
+    #[cfg(feature = "vp9")]
     #[test]
-    fn forced_hevc_with_capable_client_picks_hevc() {
-        let d = choose(OperatorPref::Hevc, &caps(&["h265-main-5.0"], false)).unwrap();
-        assert_eq!(d.pipeline, Pipeline::Hevc);
-        assert_eq!(d.reason, "forced-hevc");
+    fn forced_vp9_with_capable_client_picks_vp9() {
+        let d = choose(OperatorPref::Vp9, &caps(&["vp9"], false)).unwrap();
+        assert_eq!(d.pipeline, Pipeline::Vp9);
+        assert_eq!(d.reason, "forced-vp9");
     }
 
-    #[cfg(feature = "hevc")]
+    #[cfg(feature = "vp9")]
     #[test]
-    fn forced_hevc_with_incapable_client_errors() {
-        let e = choose(OperatorPref::Hevc, &caps(&[], false))
-            .expect_err("fail-closed on forced hevc + incapable client");
-        assert_eq!(e.to_string(), "forced-hevc-no-client");
+    fn forced_vp9_without_client_returns_error() {
+        let e = choose(OperatorPref::Vp9, &caps(&[], false))
+            .expect_err("fail-closed on forced vp9 + incapable client");
+        assert_eq!(e.to_string(), "forced-vp9-no-client");
     }
 
-    #[cfg(feature = "hevc")]
+    #[cfg(feature = "vp9")]
     #[test]
-    fn auto_with_hevc_capable_client_picks_hevc() {
-        let d = choose(OperatorPref::Auto, &caps(&["h265-main-5.0"], false))
+    fn auto_with_vp9_capable_client_picks_vp9_when_no_av1() {
+        // Client advertises VP9 but not AV1 — VP9 must win the auto chain.
+        let d = choose(OperatorPref::Auto, &caps(&["vp9"], false))
             .expect("auto never errors");
-        assert_eq!(d.pipeline, Pipeline::Hevc);
-        assert_eq!(d.reason, "auto-hevc");
+        assert_eq!(d.pipeline, Pipeline::Vp9);
+        assert_eq!(d.reason, "auto-vp9");
     }
 
-    #[cfg(feature = "hevc")]
+    #[cfg(feature = "vp9")]
     #[test]
-    fn auto_with_h264_only_client_picks_h264() {
-        // Client advertises h264 but not hevc; HEVC must not be picked.
-        let d = choose(OperatorPref::Auto, &caps(&["h264-baseline-3.1"], false))
+    fn parse_force_pipeline_vp9_returns_some_when_feature() {
+        assert_eq!(parse_force_pipeline("vp9"), Some(OperatorPref::Vp9));
+    }
+
+    #[cfg(not(feature = "vp9"))]
+    #[test]
+    fn parse_force_pipeline_vp9_returns_none_when_no_feature() {
+        assert_eq!(parse_force_pipeline("vp9"), None);
+    }
+
+    #[cfg(feature = "vp9")]
+    #[test]
+    fn wire_name_vp9() {
+        assert_eq!(Pipeline::Vp9.wire_name(), "vp9");
+    }
+
+    #[test]
+    fn supports_vp9_case_insensitive() {
+        let mk = |codec: &str| ClientCapabilities {
+            codecs: vec![codec.into()],
+            ..Default::default()
+        };
+        assert!(mk("vp9").supports_vp9(), "vp9 must match");
+        assert!(mk("VP9-profile0").supports_vp9(), "VP9-profile0 must match case-insensitively");
+        assert!(!mk("h264-baseline-3.1").supports_vp9(), "h264 must not match vp9 check");
+    }
+
+    // AV1 tests — compiled only when av1 feature is active.
+
+    #[cfg(feature = "av1")]
+    #[test]
+    fn forced_av1_with_capable_client_picks_av1() {
+        let d = choose(OperatorPref::Av1, &caps(&["av1"], false)).unwrap();
+        assert_eq!(d.pipeline, Pipeline::Av1);
+        assert_eq!(d.reason, "forced-av1");
+    }
+
+    #[cfg(feature = "av1")]
+    #[test]
+    fn forced_av1_with_av01_form_works() {
+        // Browsers may expose AV1 via the av01.* MIME family.
+        let d = choose(OperatorPref::Av1, &caps(&["av01.0.08M.08"], false)).unwrap();
+        assert_eq!(d.pipeline, Pipeline::Av1);
+    }
+
+    #[cfg(feature = "av1")]
+    #[test]
+    fn forced_av1_without_client_returns_error() {
+        let e = choose(OperatorPref::Av1, &caps(&[], false))
+            .expect_err("fail-closed on forced av1 + incapable client (Safari hits this)");
+        assert_eq!(e.to_string(), "forced-av1-no-client");
+    }
+
+    #[cfg(feature = "av1")]
+    #[test]
+    fn auto_with_av1_capable_client_picks_av1() {
+        // AV1 sits at the top of the auto chain — must beat VP9, H.264.
+        let d = choose(OperatorPref::Auto, &caps(&["av1", "vp9", "h264-baseline-3.1"], true))
             .expect("auto never errors");
-        #[cfg(feature = "h264")]
-        { assert_eq!(d.pipeline, Pipeline::H264); assert_eq!(d.reason, "auto-h264"); }
-        #[cfg(not(feature = "h264"))]
-        assert_eq!(d.pipeline, Pipeline::Jpeg);
-        let _ = d;
+        assert_eq!(d.pipeline, Pipeline::Av1);
+        assert_eq!(d.reason, "auto-av1");
     }
 
-    #[cfg(feature = "hevc")]
+    #[cfg(feature = "av1")]
     #[test]
-    fn parse_force_pipeline_hevc_returns_some_when_feature() {
-        assert_eq!(parse_force_pipeline("hevc"), Some(OperatorPref::Hevc));
+    fn parse_force_pipeline_av1_returns_some_when_feature() {
+        assert_eq!(parse_force_pipeline("av1"), Some(OperatorPref::Av1));
     }
 
-    #[cfg(not(feature = "hevc"))]
+    #[cfg(not(feature = "av1"))]
     #[test]
-    fn parse_force_pipeline_hevc_returns_none_when_no_feature() {
-        assert_eq!(parse_force_pipeline("hevc"), None);
+    fn parse_force_pipeline_av1_returns_none_when_no_feature() {
+        assert_eq!(parse_force_pipeline("av1"), None);
     }
 
-    #[cfg(feature = "hevc")]
+    #[cfg(feature = "av1")]
     #[test]
-    fn wire_name_hevc() {
-        assert_eq!(Pipeline::Hevc.wire_name(), "h265");
+    fn wire_name_av1() {
+        assert_eq!(Pipeline::Av1.wire_name(), "av1");
     }
 
     #[test]
-    fn supports_hevc_case_insensitive() {
-        assert!(caps(&["h265-main-5.0"], false).supports_hevc(), "h265-main-5.0 must match");
-        assert!(caps(&["HEVC"], false).supports_hevc(), "HEVC must match case-insensitively");
-        assert!(!caps(&["h264"], false).supports_hevc(), "h264 must not match hevc check");
+    fn supports_av1_case_insensitive() {
+        let mk = |codec: &str| ClientCapabilities {
+            codecs: vec![codec.into()],
+            ..Default::default()
+        };
+        assert!(mk("av1").supports_av1(), "av1 must match");
+        assert!(mk("AV1").supports_av1(), "AV1 must match case-insensitively");
+        assert!(mk("av01.0.08M.08").supports_av1(), "av01.* MIME family must match");
+        assert!(!mk("vp9").supports_av1(), "vp9 must not match av1 check");
+    }
+
+    // Priority-chain integration — needs both vp9 and av1 features.
+
+    #[cfg(all(feature = "av1", feature = "vp9"))]
+    #[test]
+    fn auto_av1_beats_vp9_when_both_advertised() {
+        let d = choose(OperatorPref::Auto, &caps(&["av1", "vp9"], false))
+            .expect("auto never errors");
+        assert_eq!(d.pipeline, Pipeline::Av1);
+        assert_eq!(d.reason, "auto-av1");
     }
 }

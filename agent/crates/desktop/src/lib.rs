@@ -8,7 +8,10 @@
 pub mod audio;
 pub mod capture;
 pub mod encode;
-#[cfg(feature = "h264")]
+// `encoders` module hosts H.264 (h264), VP9 (vp9), and AV1 (av1) backends.
+// Each backend submodule is itself feature-gated, so a build that enables
+// only one encoder still compiles cleanly.
+#[cfg(any(feature = "h264", feature = "vp9", feature = "av1"))]
 pub mod encoders;
 pub mod h264_format;
 pub mod input;
@@ -19,7 +22,7 @@ pub mod permissions;
 pub mod sck;
 
 // Flat re-exports used by the agent crate and Phase 04 transport layer.
-pub use capture::{frame_interval, primary_scale_factor, RawBgraFrame};
+pub use capture::{frame_interval, primary_scale_factor, DirtyRect, RawBgraFrame};
 pub use encode::{resize_dims, EncodedTile, FrameOutput, QualityTier, TILE_SIZE};
 pub use h264_format::{annexb_to_avcc, avcc_to_annexb, build_avcc, split_annexb};
 pub use input::InputEvent;

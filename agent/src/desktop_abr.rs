@@ -16,11 +16,11 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::broadcast;
 
-#[cfg(feature = "h264")]
+#[cfg(any(feature = "h264", feature = "vp9", feature = "av1"))]
 use std::sync::Arc;
-#[cfg(feature = "h264")]
+#[cfg(any(feature = "h264", feature = "vp9", feature = "av1"))]
 use tokio::sync::{oneshot, watch};
-#[cfg(feature = "h264")]
+#[cfg(any(feature = "h264", feature = "vp9", feature = "av1"))]
 use tracing::{debug, info};
 
 /// Capacity tuned for an encoder producing ≤60 events/s plus an RTCP reader
@@ -469,7 +469,7 @@ impl AbrController {
 /// Gated on `h264` because the controller's only output is the encoder
 /// `bitrate_tx`, which exists only when the H.264 pipeline is compiled in.
 /// JPEG-only builds have no encoder-side bitrate knob to drive.
-#[cfg(feature = "h264")]
+#[cfg(any(feature = "h264", feature = "vp9", feature = "av1"))]
 pub struct ControllerConfig {
     pub abr_rx: broadcast::Receiver<AbrObservation>,
     pub bitrate_tx: watch::Sender<desktop::encoders::BitrateBps>,
@@ -481,7 +481,7 @@ pub struct ControllerConfig {
     pub shutdown_rx: oneshot::Receiver<()>,
 }
 
-#[cfg(feature = "h264")]
+#[cfg(any(feature = "h264", feature = "vp9", feature = "av1"))]
 pub fn spawn_controller(cfg: ControllerConfig) {
     use desktop::encoders::BitrateBps;
     use tokio::time::{interval, MissedTickBehavior};

@@ -38,9 +38,9 @@ interface Props {
   quality: QualityTier
   onQualityChange: (tier: QualityTier) => void
   onSettingsChange: (next: { hidpi: boolean; smoothScaling: boolean }) => void
-  pipeline: 'h264' | 'jpeg'
+  pipeline: 'h264' | 'vp9' | 'av1' | 'jpeg'
   /** Phase-02a: whether the audio gate passed at session-start (operator
-   *  setting + probe + H.264 path). Drives chip visibility — hidden entirely
+   *  setting + probe + video path). Drives chip visibility — hidden entirely
    *  when no audio path exists for this session. */
   audioGated?: boolean
   /** True when the audio pipeline is alive on the wire right now. */
@@ -48,8 +48,10 @@ interface Props {
   /** Tap-to-toggle. On→Off mutes via WS (instant); Off→On reconnects. */
   onToggleAudio?: () => void
   /** User-driven pipeline preference — forwarded to the overflow menu picker. */
-  pipelinePref?: 'auto' | 'h264' | 'jpeg'
-  onPipelinePrefChange?: (p: 'auto' | 'h264' | 'jpeg') => void
+  pipelinePref?: 'auto' | 'av1' | 'vp9' | 'h264' | 'jpeg'
+  onPipelinePrefChange?: (
+    p: 'auto' | 'av1' | 'vp9' | 'h264' | 'jpeg',
+  ) => void
   /** Phase-03 step 7: persisted "Show stream stats" toggle, forwarded to
    *  the overflow menu's Display section. */
   showStats?: boolean

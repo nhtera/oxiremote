@@ -46,25 +46,31 @@ mod pipeline_selection;
 // VT/OpenH264 toolchain.
 #[cfg(feature = "h264")]
 mod video_pipeline;
-// Adaptive-bitrate observation channel — wire format only (phase-03 step 2);
-// state machine + stats SSE consumers land in later steps. Currently only
-// the h264 pipeline produces; widen the cfg gate when phase-03 extends to
-// the JPEG path (`desktop_ws_capture.rs` same emit pattern).
-#[cfg(feature = "h264")]
+// Adaptive-bitrate observation channel — wire format only. Pipeline-agnostic,
+// so the gate matches the union of every video-codec feature. Without this
+// widening, VP9/AV1 sessions drop their `_abr_rx_dropped` receivers and
+// the ABR controller never spawns, leaving REMB-driven bitrate adaptation
+// dead for non-H.264 codecs.
+#[cfg(any(feature = "h264", feature = "vp9", feature = "av1"))]
 mod desktop_abr;
-// Phase-03 step 5: 1 Hz stats SSE aggregator. Subscribes to the per-session
-// `AbrObservation` broadcast, folds it into a rolling `StatsSnapshot`, and
-// streams JSON over Server-Sent Events on `/api/hosts/{id}/desktop/stats`.
-#[cfg(feature = "h264")]
+// 1 Hz stats SSE aggregator. Subscribes to the per-session `AbrObservation`
+// broadcast and streams JSON over `/api/hosts/{id}/desktop/stats`. Widened
+// alongside `desktop_abr` so the stats overlay works on every video codec
+// (previously H.264-only, leaving VP9/AV1 users without encode_ms / bitrate
+// visibility).
+#[cfg(any(feature = "h264", feature = "vp9", feature = "av1"))]
 mod desktop_stats_sse;
-// HEVC RTP payloader — RFC 7798 FU/AP packetizer used by the HEVC pipeline.
-// Gated independently so the h264-only build does not pull this module.
-#[cfg(feature = "hevc")]
-mod hevc_payloader;
-// HEVC pipeline — HevcTrack, HevcPipelineConfig, spawn_hevc_pipeline,
-// build_hevc_encoder. macOS VideoToolbox only; no software HEVC fallback.
-#[cfg(feature = "hevc")]
-mod hevc_pipeline;
+// VP9 pipeline — libvpx software encoder (screen-content tuned, matches
+// Chrome Remote Desktop's `webrtc_video_encoder_vpx.cc`). Uses webrtc-rs's
+// built-in VP9 RTP payloader (PT 98).
+#[cfg(feature = "vp9")]
+mod vp9_pipeline;
+// AV1 pipeline — libaom software encoder with AOM_CONTENT_SCREEN (palette
+// + IBC), matching Chrome Remote Desktop's `webrtc_video_encoder_av1.cc`.
+// Uses webrtc-rs's built-in AV1 RTP payloader (PT 41) via
+// `TrackLocalStaticSample` — no custom payloader needed.
+#[cfg(feature = "av1")]
+mod av1_pipeline;
 // Audio pipeline — gated on the agent's `audio` feature (forwards to
 // desktop/audio). Off by default until phase-02a + 02b both ship.
 #[cfg(feature = "audio")]

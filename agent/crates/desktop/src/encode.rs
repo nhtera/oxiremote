@@ -139,12 +139,20 @@ pub fn quality_resize(
     let tier_f = tier.scale_num() as f32 / 4.0;
     let effective = hidpi_norm * tier_f;
 
-    if (effective - 1.0).abs() < 0.01 {
+    let src_w = img.width();
+    let src_h = img.height();
+    let raw_w = ((src_w as f32 * effective) as u32).max(1);
+    let raw_h = ((src_h as f32 * effective) as u32).max(1);
+    let w = make_even(raw_w);
+    let h = make_even(raw_h);
+
+    // Fast path: skip resize only when the input already matches the
+    // even-clamped target. effective ≈ 1.0 + even source dims short-circuits;
+    // odd source dims fall through to a 1-pixel trim via fir_resize_rgba8 so
+    // 4:2:0 encoders never see odd inputs.
+    if w == src_w && h == src_h {
         return img;
     }
-
-    let w = ((img.width() as f32 * effective) as u32).max(1);
-    let h = ((img.height() as f32 * effective) as u32).max(1);
     fir_resize_rgba8(&img, w, h)
 }
 
@@ -202,9 +210,21 @@ pub fn resize_dims(
     } else {
         (logical_w, logical_h)
     };
-    let w = (base_w * num / 4).max(1);
-    let h = (base_h * num / 4).max(1);
+    // 4:2:0 chroma encoders (libvpx/libaom, VideoToolbox H.264) require
+    // even dimensions. Common retina + Med-tier captures (e.g. 1964×3/4=1473)
+    // land on odd values; round down to the nearest even (min 2) so every
+    // downstream pipeline sees compatible dims.
+    let w = make_even(base_w * num / 4);
+    let h = make_even(base_h * num / 4);
     (w, h)
+}
+
+/// Round `n` down to the nearest even integer, clamped to a minimum of 2.
+/// Encoders downstream (libvpx, libaom, VideoToolbox H.264) reject odd
+/// dimensions because YUV 4:2:0 needs even rows/cols to subsample chroma.
+#[inline]
+fn make_even(n: u32) -> u32 {
+    (n & !1).max(2)
 }
 
 /// Hash a thumbnail of `img` for the global short-circuit. Resized via
@@ -656,6 +676,56 @@ mod tests {
         assert_eq!(resize_dims(100, 100, QualityTier::High, 2.0, true), (200, 200));
         assert_eq!(resize_dims(100, 100, QualityTier::Med, 2.0, true), (150, 150));
         assert_eq!(resize_dims(100, 100, QualityTier::Low, 2.0, true), (100, 100));
+    }
+
+    /// Regression: 14" MBP retina (logical 1512×982, sf=2.0) at Med + HiDPI
+    /// used to return (2268, 1473) — height 1473 is odd, so AV1/VP9 encoders
+    /// rejected init with `dims must be even`. Both resize_dims and
+    /// quality_resize must now clamp to even dims so every downstream
+    /// 4:2:0 encoder accepts the buffer.
+    #[test]
+    fn resize_dims_clamps_odd_height_on_retina_med() {
+        let (w, h) = resize_dims(1512, 982, QualityTier::Med, 2.0, true);
+        assert_eq!(w % 2, 0, "width must be even, got {w}");
+        assert_eq!(h % 2, 0, "height must be even, got {h}");
+        // Concretely: 1964 * 3 / 4 = 1473 → rounded down to 1472.
+        assert_eq!((w, h), (2268, 1472));
+
+        // quality_resize on the matching physical input must agree.
+        let physical = solid_rgba(3024, 1964, Rgba([0, 0, 0, 255]));
+        let out = quality_resize(physical, QualityTier::Med, 2.0, true);
+        assert_eq!((out.width(), out.height()), (2268, 1472));
+    }
+
+    /// Every (tier, hidpi, scale_factor) combination must yield even
+    /// dimensions regardless of input. Covers the matrix the SCK output
+    /// stream is configured with on real macOS hosts.
+    #[test]
+    fn resize_dims_always_returns_even_dims() {
+        let cases = [
+            // (logical_w, logical_h, scale_factor) — covers 14"/16" MBP retina
+            // (1.5x scaled-default and 2x native), iPad sf=1.5, plain 1x.
+            (1512, 982, 2.0),
+            (1728, 1117, 2.0),
+            (1920, 1080, 1.0),
+            (2048, 1280, 1.5),
+        ];
+        for (lw, lh, sf) in cases {
+            for tier in [QualityTier::High, QualityTier::Med, QualityTier::Low] {
+                for hidpi in [false, true] {
+                    let (w, h) = resize_dims(lw, lh, tier, sf, hidpi);
+                    assert_eq!(
+                        w % 2, 0,
+                        "width odd for logical=({lw},{lh}) sf={sf} tier={tier:?} hidpi={hidpi} → ({w},{h})"
+                    );
+                    assert_eq!(
+                        h % 2, 0,
+                        "height odd for logical=({lw},{lh}) sf={sf} tier={tier:?} hidpi={hidpi} → ({w},{h})"
+                    );
+                    assert!(w >= 2 && h >= 2, "dims must be ≥ 2");
+                }
+            }
+        }
     }
 
     /// Parallel encode preserves input ordering (rayon docs contract).

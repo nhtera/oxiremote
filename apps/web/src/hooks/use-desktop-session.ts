@@ -36,7 +36,7 @@ export type QualityTier = 'low' | 'med' | 'high'
  * its first IDR (~33ms after stream-up).
  */
 export interface DesktopPipelineInfo {
-  mode: 'h264' | 'jpeg'
+  mode: 'h264' | 'vp9' | 'av1' | 'jpeg'
   reason: string
   hardwareAccel?: boolean
 }

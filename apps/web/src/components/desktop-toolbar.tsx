@@ -9,6 +9,21 @@ import type { InputMode, GestureMode } from '../hooks/use-desktop-input'
 import DesktopSettingsPopover from './desktop-settings-popover'
 import TransportPill from './transport-pill'
 
+type PipelineMode = 'h264' | 'vp9' | 'av1' | 'jpeg'
+
+function pipelineLabel(mode: PipelineMode): string {
+  switch (mode) {
+    case 'h264':
+      return 'H.264'
+    case 'vp9':
+      return 'VP9'
+    case 'av1':
+      return 'AV1'
+    case 'jpeg':
+      return 'JPEG'
+  }
+}
+
 interface Props {
   quality: QualityTier
   onQualityChange: (tier: QualityTier) => void
@@ -25,7 +40,7 @@ interface Props {
   smoothScaling: boolean
   onSettingsChange: (next: { hidpi: boolean; smoothScaling: boolean }) => void
   /** Active video pipeline. Surfaced as a chip so the user knows which path is in use. */
-  pipeline: 'h264' | 'jpeg'
+  pipeline: 'h264' | 'vp9' | 'av1' | 'jpeg'
   /** Operator-initiated session end. Triggers a confirm dialog up in the page. */
   onExit?: () => void
   /** Whether the text-batch sheet is currently open. */
@@ -43,8 +58,10 @@ interface Props {
    *  reconnect (matches hidpi-flip / H.264 fallback policy). */
   onToggleAudio?: () => void
   /** User-driven pipeline preference — forwarded into the Display popover. */
-  pipelinePref?: 'auto' | 'h264' | 'jpeg'
-  onPipelinePrefChange?: (p: 'auto' | 'h264' | 'jpeg') => void
+  pipelinePref?: 'auto' | 'av1' | 'vp9' | 'h264' | 'jpeg'
+  onPipelinePrefChange?: (
+    p: 'auto' | 'av1' | 'vp9' | 'h264' | 'jpeg',
+  ) => void
   /** Phase-03 step 7: persisted "Show stream stats" checkbox in the Display
    *  popover. Drives the lazy-loaded stats overlay in `desktop-page.tsx`. */
   showStats?: boolean
@@ -300,19 +317,19 @@ export default function DesktopToolbar({
             aria-expanded={settingsOpen}
             aria-haspopup="dialog"
             title={
-              pipeline === 'h264'
-                ? 'Display — H.264 (WebRTC video track). Click to change quality and scaling.'
-                : 'Display — JPEG (tile frames over DataChannel). Click to change quality and scaling.'
+              pipeline === 'jpeg'
+                ? 'Display — JPEG (tile frames over DataChannel). Click to change codec, quality and scaling.'
+                : `Display — ${pipelineLabel(pipeline)} (WebRTC video track). Click to change codec, quality and scaling.`
             }
             className={`inline-flex items-center gap-1 h-8 px-2 border rounded-md transition-colors text-[10px] font-semibold ${
               settingsOpen
                 ? 'bg-accent/15 text-accent border-accent/40'
-                : pipeline === 'h264'
-                  ? 'bg-accent/10 text-accent border-accent/30 hover:bg-accent/20'
-                  : 'bg-surface-alt text-text-muted border-border hover:text-text-primary hover:bg-surface-hover'
+                : pipeline === 'jpeg'
+                  ? 'bg-surface-alt text-text-muted border-border hover:text-text-primary hover:bg-surface-hover'
+                  : 'bg-accent/10 text-accent border-accent/30 hover:bg-accent/20'
             }`}
           >
-            {pipeline === 'h264' ? 'H.264' : 'JPEG'}
+            {pipelineLabel(pipeline)}
             <svg
               viewBox="0 0 16 16"
               width="10"

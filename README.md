@@ -57,15 +57,23 @@ On first launch the agent downloads `cloudflared`, opens a Quick Tunnel, and pri
 - `OXI_SECURE_COOKIES=1` — mark auth cookies as `Secure` (recommended over HTTPS / tunnel)
 - `OXI_WORKSPACE=/path/to/project` — set the workspace root (defaults to CWD)
 - `OXI_HEADLESS=1` — force headless server mode even when a TTY is attached
-- `OXI_VIDEO_PIPELINE=auto|h264|jpeg` — pick the remote-desktop transport. **Default `auto`** (H.264 when the client supports it, JPEG otherwise). Force `h264` to fail-closed on incapable clients; force `jpeg` to disable H.264 entirely.
+- `OXI_VIDEO_PIPELINE=auto|av1|vp9|h264|jpeg` — pick the remote-desktop transport. **Default `auto`** resolves in priority order **AV1 → VP9 → H.264 → JPEG**, AND-merged with the client's advertised codec list. Force a specific codec to fail-closed on incapable clients; force `jpeg` to disable WebRTC video entirely. AV1 + VP9 use libaom / libvpx with screen-content tuning (`AOM_CONTENT_SCREEN` + `VP9E_CONTENT_SCREEN`) to match Chrome Remote Desktop's bitrate-quality tradeoff.
 - `OXIREMOTE_INSTALL_DIR=...` — install script target directory
 - `OXIREMOTE_BINARY_URL=...` — npm wrapper download base URL (corp proxies / mirrors)
 
 ## Remote desktop
 
-H.264 over a WebRTC video track is the default for clients that support it (iPad Safari ≥17, Chrome desktop, recent Android Chrome). Older browsers fall back to JPEG tile streaming over a DataChannel. The chosen pipeline is shown in the desktop toolbar as `H.264 (HW)` / `H.264 (SW)` / `JPEG` — hover the pill for the reason.
+Auto-negotiated WebRTC video at session start: **AV1 → VP9 → H.264 → JPEG** in priority order, picking the highest codec both server and client agree on. AV1 + VP9 use screen-content tuning (`AOM_CONTENT_SCREEN`, `VP9E_CONTENT_SCREEN`) and 16×16 dirty-rect active-map to match Chrome Remote Desktop's quality + speed. The chosen pipeline is shown in the desktop toolbar — hover the pill for the reason.
 
-Operators who need to opt out: `OXI_VIDEO_PIPELINE=jpeg`. Headless builds without H.264: `cargo build --no-default-features --features desktop`.
+Browser support matrix (WebRTC receive):
+
+| Codec | Chrome | Safari | Firefox |
+|---|---|---|---|
+| AV1 | 116+ | — (no plans 2026) | 130+ |
+| VP9 | all | iPad ≥ 17 | all |
+| H.264 | all | all | all |
+
+Operators who need to opt out of WebRTC: `OXI_VIDEO_PIPELINE=jpeg`. Headless builds without video: `cargo build --no-default-features --features desktop`. Build-time system deps: `libvpx` (VP9) and `libaom ≥ 3.0` (AV1) — `brew install libvpx aom` on macOS, `apt install libvpx-dev libaom-dev` on Linux, vcpkg `libvpx aom` on Windows.
 
 ## Mobile usage
 

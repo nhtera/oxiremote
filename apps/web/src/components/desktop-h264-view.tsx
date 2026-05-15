@@ -71,7 +71,7 @@ interface Props {
   /** User-driven pipeline override. Sent to the agent via `?force_pipeline=`
    *  on the WS upgrade so the choice survives mid-session reconnects without
    *  touching the operator-side env preference. */
-  forcePipeline?: 'h264' | 'jpeg' | 'auto'
+  forcePipeline?: 'h264' | 'vp9' | 'av1' | 'jpeg' | 'auto'
 }
 
 export default function DesktopH264View({

@@ -1,10 +1,8 @@
-//! Shared VideoToolbox helpers used by both H.264 and HEVC encoders.
-//!
-//! Extracted verbatim from `videotoolbox_encoder.rs` so the two encoder
-//! backends can share pixel-buffer wrapping, force-IDR dict, and
-//! property-set helpers without duplication.
+//! Shared VideoToolbox helpers used by the H.264 encoder. Extracted from
+//! `videotoolbox_encoder.rs` to keep pixel-buffer wrapping, force-IDR dict,
+//! and property-set helpers reusable.
 
-#![cfg(all(any(feature = "h264", feature = "hevc"), target_os = "macos"))]
+#![cfg(all(feature = "h264", target_os = "macos"))]
 
 use std::ffi::c_void;
 use std::ptr::{self, NonNull};
@@ -130,21 +128,3 @@ pub(crate) fn build_force_idr_dict() -> CFRetained<CFDictionary> {
     unsafe { CFRetained::cast_unchecked::<CFDictionary>(typed) }
 }
 
-/// Convert AVCC (4-byte length-prefix) NALUs to Annex-B (start-code prefix).
-///
-/// The H.264 path uses `crate::h264_format::avcc_to_annexb` instead.
-/// This copy is only needed by the HEVC path so it doesn't depend on `h264`.
-#[cfg(feature = "hevc")]
-pub(crate) fn avcc_to_annexb(avcc: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(avcc.len() + avcc.len() / 8);
-    let mut pos = 0;
-    while pos + 4 <= avcc.len() {
-        let n = u32::from_be_bytes([avcc[pos], avcc[pos+1], avcc[pos+2], avcc[pos+3]]) as usize;
-        pos += 4;
-        if n == 0 || pos + n > avcc.len() { break; }
-        out.extend_from_slice(&[0, 0, 0, 1]);
-        out.extend_from_slice(&avcc[pos..pos + n]);
-        pos += n;
-    }
-    out
-}

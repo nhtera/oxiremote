@@ -16,6 +16,15 @@ export default defineConfig({
     {
       name: 'iphone-14',
       use: { ...devices['iPhone 14'] },
+      testIgnore: ['**/vp9-av1-render.spec.ts'],
+    },
+    {
+      // VP9 + AV1 e2e need a Chromium-class browser (Safari has no AV1
+      // WebRTC and stricter WebRTC API surface). Scoped to just the
+      // codec-render specs so mobile-focused specs keep running on iPhone.
+      name: 'desktop-chromium',
+      use: { ...devices['Desktop Chrome'] },
+      testMatch: ['**/vp9-av1-render.spec.ts'],
     },
   ],
   // CI sets OXI_BASE_URL against a live agent; locally, we expect the dev

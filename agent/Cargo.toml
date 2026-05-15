@@ -158,19 +158,24 @@ quick-xml = { version = "0.37", features = ["serialize"] }
 tokio = { version = "1", features = ["test-util"] }
 
 [features]
-# H.264 is now the default video pipeline. The auto-select path in
-# `pipeline_selection::choose()` still resolves to JPEG when the client
-# can't decode H.264, so the JPEG transport stays a first-class fallback.
-# Headless / CI builds that don't need video: `--no-default-features`.
-default = ["desktop", "h264"]
+# Default features include all software video codecs (H.264, VP9, AV1).
+# `pipeline_selection::choose()` resolves Auto in priority order
+# AV1 → VP9 → H.264 → JPEG, AND-merged with client capability.
+# Headless / CI builds without video: `--no-default-features`.
+default = ["desktop", "h264", "vp9", "av1"]
 desktop = ["dep:desktop", "dep:webrtc"]
 # H.264 pipeline (VT on macOS, OpenH264 fallback). The default JPEG build
 # (`--no-default-features --features desktop`) still compiles cleanly so the
 # transport split survives a feature-flag rollback.
 h264 = ["desktop", "desktop/h264", "dep:rtcp"]
-# HEVC pipeline (VideoToolbox on macOS). Phase 01 encoder only; payloader
-# and negotiation land in subsequent phases.
-hevc = ["desktop", "desktop/hevc"]
+# VP9 pipeline (libvpx via in-tree vpx-sys bindgen). Phase-01 foundation
+# only — encoder + RTP pipeline land in phases 02-03. Off by default
+# until phase-09 promotes once CI release matrix is green.
+vp9 = ["desktop", "desktop/vp9", "dep:rtcp"]
+# AV1 pipeline (libaom via in-tree aom-sys bindgen, screen-content tuned).
+# Phase-01 foundation only — encoder + custom RTP payloader land in phases
+# 05-06. Off by default until phase-09.
+av1 = ["desktop", "desktop/av1", "dep:rtcp"]
 # Audio pipeline (Opus over WebRTC). Forwards to the desktop subcrate's
 # `audio` feature so the OpusEncoder + per-platform AudioCapture compile.
 # NOT in default — opt-in until phase-02a (macOS) + 02b (Windows) both ship.

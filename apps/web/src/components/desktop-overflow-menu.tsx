@@ -31,10 +31,12 @@ interface Props {
   quality: QualityTier
   onQualityChange: (tier: QualityTier) => void
   onSettingsChange: (next: { hidpi: boolean; smoothScaling: boolean }) => void
-  pipeline: 'h264' | 'jpeg'
+  pipeline: 'h264' | 'vp9' | 'av1' | 'jpeg'
   /** User-driven pipeline preference. `auto` defers to agent default. */
-  pipelinePref?: 'auto' | 'h264' | 'jpeg'
-  onPipelinePrefChange?: (p: 'auto' | 'h264' | 'jpeg') => void
+  pipelinePref?: 'auto' | 'av1' | 'vp9' | 'h264' | 'jpeg'
+  onPipelinePrefChange?: (
+    p: 'auto' | 'av1' | 'vp9' | 'h264' | 'jpeg',
+  ) => void
   /** Phase-03 step 7: persisted "Show stream stats" toggle. */
   showStats?: boolean
   onShowStatsChange?: (v: boolean) => void
@@ -181,27 +183,30 @@ export default function DesktopOverflowMenu({
             picks ride on `?force_pipeline=` over the WS upgrade. The
             currently-active pipeline is shown in the bottom-row text. */}
         {onPipelinePrefChange && (
-          <div className="px-3 py-2 flex items-center gap-2">
-            <span className="text-[11px] uppercase tracking-widest text-text-muted">Pipeline</span>
-            <div className="flex-1 grid grid-cols-3 gap-1">
-              {(['auto', 'h264', 'jpeg'] as const).map((p) => {
-                const active = pipelinePref === p
-                return (
-                  <button
-                    key={p}
-                    onClick={() => onPipelinePrefChange(p)}
-                    className={[
-                      'h-7 text-[11px] font-medium rounded border transition-colors',
-                      active
-                        ? 'bg-[hsl(var(--accent-primary)/0.2)] text-[hsl(var(--accent-primary))] border-[hsl(var(--accent-primary)/0.4)]'
-                        : 'bg-surface-alt text-text-muted border-border hover:text-text-primary',
-                    ].join(' ')}
-                  >
-                    {p === 'auto' ? 'Auto' : p === 'h264' ? 'H.264' : 'JPEG'}
-                  </button>
+          <div className="px-3 py-2 flex flex-col gap-1">
+            <span className="text-[11px] uppercase tracking-widest text-text-muted">
+              Video codec
+            </span>
+            <select
+              value={pipelinePref}
+              onChange={(e) =>
+                onPipelinePrefChange(
+                  e.target.value as
+                    | 'auto'
+                    | 'av1'
+                    | 'vp9'
+                    | 'h264'
+                    | 'jpeg',
                 )
-              })}
-            </div>
+              }
+              className="text-xs bg-surface-alt border border-border rounded-md px-2 py-1 text-text-primary outline-none focus:border-accent/50"
+            >
+              <option value="auto">Auto (recommended)</option>
+              <option value="av1">AV1</option>
+              <option value="vp9">VP9</option>
+              <option value="h264">H.264</option>
+              <option value="jpeg">JPEG (fallback)</option>
+            </select>
           </div>
         )}
         <div className="px-3 pb-2 text-[10px] text-text-muted">

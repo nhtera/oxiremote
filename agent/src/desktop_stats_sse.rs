@@ -17,7 +17,7 @@
 //! No SPA bundle delta — overlay lands in step 6. Until then this is
 //! useful by itself for dev tools / curl debugging.
 
-#![cfg(feature = "h264")]
+#![cfg(any(feature = "h264", feature = "vp9", feature = "av1"))]
 
 use std::convert::Infallible;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};

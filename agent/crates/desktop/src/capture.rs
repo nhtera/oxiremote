@@ -312,7 +312,7 @@ impl CaptureLoop {
         // `None` preserves the pre-phase-02 video-only behaviour exactly.
         audio_tx: Option<Sender<Vec<i16>>>,
         // Observability counter — when Some, incremented per successful
-        // `tx.try_send`. The H.264/HEVC session watchdog reads this at
+        // `tx.try_send`. The H.264 session watchdog reads this at
         // fallback time to distinguish "capture never delivered a frame"
         // from "encoder rejected every frame". Pass None for callers that
         // don't need diagnostics.
@@ -476,6 +476,10 @@ fn run_bgra_xcap(
             width,
             height,
             force_idr,
+            // xcap doesn't surface dirty rects — full-frame active-map
+            // every tick (no encode speed-up vs status quo on Linux/Windows
+            // until phase-03c plumbs DXGI dirty rects).
+            dirty_rects: Vec::new(),
         }) {
             Ok(()) => {
                 frame_count += 1;
@@ -564,6 +568,7 @@ fn run_bgra_sck(
             width: frame.width,
             height: frame.height,
             force_idr,
+            dirty_rects: frame.dirty_rects,
         }) {
             Ok(()) => {
                 frame_count += 1;
@@ -708,9 +713,21 @@ fn max_tier_fps_hz() -> u32 {
 }
 
 
+/// Pixel-space rectangle. Used to surface SCK / DXGI dirty rects so the
+/// VP9 / AV1 encoders can drive their active-map and skip unchanged
+/// 16×16 blocks (the #1 speed gap vs Chrome Remote Desktop). Coordinates
+/// are in the same logical/tier pixel space as `RawBgraFrame.bytes`.
+#[derive(Debug, Clone, Copy)]
+pub struct DirtyRect {
+    pub x: u32,
+    pub y: u32,
+    pub width: u32,
+    pub height: u32,
+}
+
 /// One captured frame already resized to the logical/tier dimensions, ready
-/// for H.264 encode. Byte order is BGRA (matches `kCVPixelFormatType_32BGRA`
-/// and the `yuvutils-rs` BGRA→I420 path used by OpenH264).
+/// for H.264/VP9/AV1 encode. Byte order is BGRA (matches
+/// `kCVPixelFormatType_32BGRA` and the `yuvutils-rs` BGRA→I420 path).
 #[derive(Debug)]
 pub struct RawBgraFrame {
     pub bytes: Vec<u8>,
@@ -719,6 +736,11 @@ pub struct RawBgraFrame {
     /// Set when the pipeline must mark the next encoded frame as an IDR.
     /// Driven by client PLI over RTCP or by session-open cold-start.
     pub force_idr: bool,
+    /// Phase-03b: 16×16-block active-map driver. Empty `Vec` means "every
+    /// block is dirty" (capture backend doesn't expose dirty rects, or the
+    /// frame is the session's cold-start full frame). VP9 + AV1 encoders
+    /// consume this; H.264 + JPEG ignore it.
+    pub dirty_rects: Vec<DirtyRect>,
 }
 
 /// Convert an RGBA8 byte slice in-place-style to a BGRA8 Vec. xcap delivers

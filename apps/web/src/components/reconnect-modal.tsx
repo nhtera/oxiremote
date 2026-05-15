@@ -31,6 +31,11 @@ interface Props {
   onCancel: () => void
   /** Optional: trigger a manual retry now. When unset, only Cancel is shown. */
   onRetry?: () => void
+  /** Optional recovery action: switch the session to JPEG safe-mode and
+   *  reconnect. Use when the current video codec keeps failing (codec RTP not
+   *  in offer SDP, H.264 profile mismatch, etc.) so the user is not stuck on
+   *  Exit. Exposed in the exhausted state as the primary recovery action. */
+  onSafeMode?: () => void
   /** Real fast-phase backoff (ms) the hook will wait before the next attempt.
    *  Drives both the seconds label and the progress bar in fast phase. */
   countdownMs?: number
@@ -44,6 +49,7 @@ export default function ReconnectModal({
   exhausted = false,
   onCancel,
   onRetry,
+  onSafeMode,
   countdownMs = 3000,
 }: Props) {
   const isSlow = phase === 'slow' && !exhausted
@@ -83,7 +89,16 @@ export default function ReconnectModal({
       </div>
       <div id="reconnect-desc" className="text-text-secondary text-[length:var(--text-body)] mt-2 leading-relaxed">
         {exhausted ? (
-          `Could not reconnect after ${maxAttempts} attempts. Your session is still preserved on the host — try opening the page again to resume.`
+          <>
+            Could not reconnect after {maxAttempts} attempts.
+            {onSafeMode && (
+              <>
+                {' '}If the current codec is the cause, try{' '}
+                <span className="text-text-primary font-medium">safe mode (JPEG)</span> —
+                widely compatible and works without WebRTC video.
+              </>
+            )}
+          </>
         ) : isSlow ? (
           `We'll keep trying — your session is preserved on the host. This usually clears within a minute of the host waking up.`
         ) : (
@@ -113,10 +128,27 @@ export default function ReconnectModal({
         </div>
       )}
 
-      <div className="mt-4 flex justify-end gap-2">
+      <div className="mt-4 flex flex-wrap justify-end gap-2">
+        {exhausted && onSafeMode && (
+          // Primary recovery in exhausted state: switch codec to JPEG. The
+          // most common cause of repeated reconnect failures is a codec the
+          // browser advertises but can't actually negotiate over RTP (Chrome
+          // AV1 in older builds). JPEG bypasses RTP entirely.
+          <Button variant="primary" size="sm" onClick={onSafeMode}>
+            Try safe mode (JPEG)
+          </Button>
+        )}
         {!exhausted && onRetry && (
           <Button variant="primary" size="sm" onClick={onRetry}>
             Retry now
+          </Button>
+        )}
+        {exhausted && onRetry && (
+          // Even when exhausted, let the user manually retry the current
+          // codec. Useful when the failure was transient (sleep/wake, brief
+          // network blip) rather than codec-related.
+          <Button variant="ghost" size="sm" onClick={onRetry}>
+            Retry current codec
           </Button>
         )}
         <Button variant={exhausted ? 'danger' : 'ghost'} size="sm" onClick={onCancel}>

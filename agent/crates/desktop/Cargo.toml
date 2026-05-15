@@ -17,14 +17,16 @@ h264 = [
     "dep:objc2-core-media",
     "dep:objc2-core-foundation",
 ]
-# HEVC pipeline (VideoToolbox on macOS). Reuses the same objc2-* optional
-# deps as h264 — no new crate additions needed.
-hevc = [
-    "dep:objc2-video-toolbox",
-    "dep:objc2-core-media",
-    "dep:objc2-core-video",
-    "dep:objc2-core-foundation",
-]
+# VP9 pipeline (Phase-02 — libvpx via in-tree bindgen + screen-content
+# tuning matching Chrome Remote Desktop). Pulls yuvutils-rs for BGRA→I420
+# and triggers build.rs to generate libvpx bindings. libvpx itself is a
+# system dep (Homebrew `libvpx`, `apt install libvpx-dev`, vcpkg).
+vp9 = ["dep:yuvutils-rs"]
+# AV1 pipeline (Phase-05 — libaom via in-tree aom-sys bindgen with
+# AOM_CONTENT_SCREEN + IBC + palette coding matching Chrome Remote
+# Desktop). libaom ≥ 3.0 required (Homebrew, Ubuntu 22.04+, vcpkg).
+# yuvutils-rs is the BGRA→I420 path (same one VP9 uses).
+av1 = ["dep:yuvutils-rs"]
 # Phase-02 audio (system-loopback → Opus → WebRTC). Off by default — pulls
 # vendored libopus (audiopus) + rubato resampler. `dep:cpal` resolves only
 # under the Windows target dependency table below, so macOS / Linux builds
@@ -116,3 +118,14 @@ objc2-foundation = { version = "0.3", features = [
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+
+# Phase-02: bindgen runs at build time when the `vp9` (and later `av1`)
+# feature is enabled, producing raw FFI bindings against the system
+# libvpx headers. `pkg-config` resolves the include + link search paths
+# from `vpx.pc` so the build works identically across Homebrew, apt-get,
+# and vcpkg. Both crates are tiny (< 1s compile each) and only land on
+# `cargo:rerun-if-changed=build.rs` — non-vp9 builds skip the
+# bindgen invocation entirely (build.rs reads `CARGO_FEATURE_VP9`).
+[build-dependencies]
+bindgen = "0.72"
+pkg-config = "0.3"

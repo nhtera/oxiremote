@@ -20,7 +20,10 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/api/host", get(api_host_info))
         .route("/api/hosts/{id}/desktop/capabilities", get(api_desktop_capabilities))
         .route("/api/devices/{id}", patch(api_device_rename));
-    #[cfg(feature = "h264")]
+    // Stats SSE — produced by the ABR pipeline which is now wired into
+    // H.264 + VP9 + AV1 sessions. JPEG-only builds (no video codec)
+    // don't expose the route.
+    #[cfg(any(feature = "h264", feature = "vp9", feature = "av1"))]
     let r = r.route("/api/hosts/{id}/desktop/stats", get(api_desktop_stats));
     r
 }
@@ -143,10 +146,15 @@ pub async fn api_desktop_capabilities(
         // pre-handshake hint.
         let optimistic_caps = ClientCapabilities {
             codecs: {
-                #[cfg_attr(not(feature = "hevc"), allow(unused_mut))]
+                #[cfg_attr(
+                    not(any(feature = "vp9", feature = "av1")),
+                    allow(unused_mut)
+                )]
                 let mut v = vec!["h264-baseline-3.1".to_string()];
-                #[cfg(feature = "hevc")]
-                v.push("h265-main-5.0".to_string());
+                #[cfg(feature = "vp9")]
+                v.push("vp9".to_string());
+                #[cfg(feature = "av1")]
+                v.push("av1".to_string());
                 v
             },
             webcodecs: true,
@@ -168,16 +176,21 @@ pub async fn api_desktop_capabilities(
         if crate::pipeline_selection::H264_COMPILED {
             available_pipelines.push("h264".to_string());
         }
-        if crate::pipeline_selection::HEVC_COMPILED {
-            available_pipelines.push("h265".to_string());
+        if crate::pipeline_selection::VP9_COMPILED {
+            available_pipelines.push("vp9".to_string());
+        }
+        if crate::pipeline_selection::AV1_COMPILED {
+            available_pipelines.push("av1".to_string());
         }
         let preferred_pipeline = match op {
             OperatorPref::Jpeg => "jpeg",
             OperatorPref::Auto => "auto",
             #[cfg(feature = "h264")]
             OperatorPref::H264 => "h264",
-            #[cfg(feature = "hevc")]
-            OperatorPref::Hevc => "hevc",
+            #[cfg(feature = "vp9")]
+            OperatorPref::Vp9 => "vp9",
+            #[cfg(feature = "av1")]
+            OperatorPref::Av1 => "av1",
         };
 
         // Phase-02: `audio_supported` is the single-source-of-truth probe
@@ -239,7 +252,7 @@ pub async fn api_desktop_capabilities(
 ///
 /// Auth: same as `/desktop/capabilities` — Bearer + cookie session.
 /// `host_id` must match this agent's own id.
-#[cfg(feature = "h264")]
+#[cfg(any(feature = "h264", feature = "vp9", feature = "av1"))]
 async fn api_desktop_stats(
     State(state): State<Arc<AppState>>,
     jar: CookieJar,

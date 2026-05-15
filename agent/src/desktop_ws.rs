@@ -151,25 +151,21 @@ mod inner {
         /// Server tells client which pipeline was selected and the per-tier
         /// bitrate presets. On H.264 mode `avcc_description_b64` carries the
         /// base64-encoded `avcC` box built from the first IDR's SPS+PPS,
-        /// ready for `VideoDecoder.configure({ description })`.
-        /// On H.265 mode `hvcc_description_b64` carries the base64-encoded
-        /// `hvcC` box (ISO 14496-15 §8.3.3.1). The SPA matches on `mode` to
-        /// decide which field to decode. Both are `None` on JPEG.
+        /// ready for `VideoDecoder.configure({ description })`. VP9 and AV1
+        /// carry their config inline (no equivalent box); `avcc_description_b64`
+        /// stays `None` for those modes and on JPEG.
         ///
         /// Phase-01 additions: `reason` mirrors `PipelineChosen.reason` so a
         /// client that missed the first message can still self-describe;
         /// `hardware_accel` is authoritative once this message lands (the
         /// encoder backend is locked at that point).
         Pipeline {
-            mode: &'a str, // "h264" | "h265" | "jpeg"
+            mode: &'a str, // "h264" | "vp9" | "av1" | "jpeg"
             codec: Option<&'a str>,
             tier_bitrates_kbps_low: u32,
             tier_bitrates_kbps_med: u32,
             tier_bitrates_kbps_high: u32,
             avcc_description_b64: Option<String>,
-            /// Phase-04: `hvcC` config blob for HEVC sessions.
-            /// `Some(base64)` when mode="h265"; `None` otherwise.
-            hvcc_description_b64: Option<String>,
             reason: &'a str,
             hardware_accel: bool,
         },
@@ -475,7 +471,7 @@ mod inner {
         // ── Offer / answer exchange ───────────────────────────────────────────
         // Two-phase: read the offer + capabilities FIRST (without a PC),
         // then build the MediaEngine with the correct codec set (registering
-        // HEVC only when `Pipeline::Hevc` is chosen), then build the PC and
+        // pipeline is chosen), then build the PC and
         // create DataChannels.
         //
         // This ordering is required because webrtc-rs `MediaEngine::register_codec`
@@ -518,7 +514,7 @@ mod inner {
                     // hides the fail-closed denominator.
                     // `e` is an anyhow error whose Display string is the
                     // stable reason identifier (e.g. "forced-h264-no-client",
-                    // "forced-hevc-no-client", or "WS closed during negotiation").
+                    // "forced-av1-no-client", or "WS closed during negotiation").
                     // Extract it directly; no concrete type downcast needed.
                     let reason = e.to_string();
                     state.event_bus.send(AgentEvent::PipelineChosen {
@@ -533,28 +529,9 @@ mod inner {
         let pipeline = decision_pipeline;
 
         // ── Peer connection ───────────────────────────────────────────────────
-        // Build MediaEngine with the codec set determined by the pipeline
-        // decision above. HEVC requires explicit `register_codec` because
-        // webrtc-rs has no built-in H.265 payloader; H.264 and audio codecs
-        // come from `register_default_codecs`. The MediaEngine must be fully
-        // configured before `APIBuilder::build()` + `new_peer_connection`.
+        // Build MediaEngine with default codecs (H.264, VP9, AV1, Opus).
         let mut media_engine = MediaEngine::default();
         media_engine.register_default_codecs()?;
-        #[cfg(feature = "hevc")]
-        if matches!(pipeline, Pipeline::Hevc) {
-            use webrtc::rtp_transceiver::rtp_codec::{RTCRtpCodecParameters, RTPCodecType};
-            media_engine.register_codec(
-                RTCRtpCodecParameters {
-                    capability: crate::video_pipeline::hevc_codec_capability(),
-                    // PT 99 — `register_default_codecs` already claims 98 for VP9
-                    // (webrtc-rs media_engine/mod.rs). Doubling up there would
-                    // emit a malformed SDP answer and break HEVC negotiation.
-                    payload_type: 99,
-                    ..Default::default()
-                },
-                RTPCodecType::Video,
-            )?;
-        }
         let api = APIBuilder::new().with_media_engine(media_engine).build();
         let pc = Arc::new(
             api.new_peer_connection(RTCConfiguration {
@@ -663,10 +640,13 @@ mod inner {
             Pipeline::Jpeg => Some(false),
             #[cfg(feature = "h264")]
             Pipeline::H264 => None,
-            // HEVC uses platform encoder (VideoToolbox on macOS); hardware
-            // acceleration status is determined after encoder init, not here.
-            #[cfg(feature = "hevc")]
-            Pipeline::Hevc => None,
+            // VP9 / AV1 ship software-only in the phase-01 foundation; encoder
+            // backends (and any future hardware AV1 path) land in phases 02 + 05
+            // / 11. Always-SW until then — hw_hint stays Some(false).
+            #[cfg(feature = "vp9")]
+            Pipeline::Vp9 => Some(false),
+            #[cfg(feature = "av1")]
+            Pipeline::Av1 => Some(false),
         };
         if let Ok(msg) = serde_json::to_string(&SignalOut::PipelineChosen {
             mode: pipeline.wire_name(),
@@ -831,7 +811,6 @@ mod inner {
 
         // Build the video sending track based on the chosen pipeline.
         // H.264: `TrackLocalStaticSample` with the built-in H264 payloader.
-        // HEVC: `HevcTrack` wrapping `TrackLocalStaticRTP` + our RFC 7798 payloader.
         // JPEG: no video track (DataChannel / WS binary tiles instead).
         // `sending_track` is None for JPEG; `complete_answer` skips `add_transceiver`.
         #[cfg(feature = "h264")]
@@ -848,26 +827,37 @@ mod inner {
         #[cfg(not(feature = "h264"))]
         let sending_track: Option<Arc<dyn TrackLocal + Send + Sync>> = None;
 
-        // HEVC track — only when pipeline=Hevc AND feature is compiled in.
-        // `HevcTrack::as_track_local()` returns `Arc<dyn TrackLocal + Send + Sync>`
-        // pointing at the inner `TrackLocalStaticRTP`, which webrtc-rs can bind.
-        // When not Hevc, preserve whatever `sending_track` the H.264 arm set.
-        #[cfg(feature = "hevc")]
-        let (hevc_track, sending_track): (
-            Option<Arc<crate::hevc_pipeline::HevcTrack>>,
+        // VP9 track — only when pipeline=Vp9 AND feature is compiled in.
+        // Uses webrtc-rs's built-in VP9 RTP payloader (PT 98 reserved by
+        // `register_default_codecs`), so `TrackLocalStaticSample` works the
+        // same way as the H.264 path. Preserves whatever `sending_track` the
+        // earlier H.264 arm set when VP9 isn't the chosen pipeline.
+        #[cfg(feature = "vp9")]
+        let (vp9_track, sending_track): (
+            Option<Arc<webrtc::track::track_local::track_local_static_sample::TrackLocalStaticSample>>,
             Option<Arc<dyn TrackLocal + Send + Sync>>,
-        ) = if matches!(pipeline, Pipeline::Hevc) {
-            let t = crate::video_pipeline::new_hevc_track();
-            let as_tl = t.as_track_local();
-            (Some(t), Some(as_tl))
+        ) = if matches!(pipeline, Pipeline::Vp9) {
+            let t = crate::vp9_pipeline::new_vp9_track();
+            let as_trait: Arc<dyn TrackLocal + Send + Sync> = t.clone();
+            (Some(t), Some(as_trait))
         } else {
-            // Preserve the sending_track already set by the H.264 path above.
-            // This block is compiled alongside h264 when both features are
-            // active — must not clobber the H.264 track assignment.
-            #[cfg(feature = "h264")]
             let existing = sending_track;
-            #[cfg(not(feature = "h264"))]
-            let existing = None::<Arc<dyn TrackLocal + Send + Sync>>;
+            (None, existing)
+        };
+
+        // AV1 track — same pattern as VP9: webrtc-rs ships a built-in AV1
+        // RTP payloader (PT 41 reserved by `register_default_codecs`) so
+        // `TrackLocalStaticSample` carries OBU fragmentation for us.
+        #[cfg(feature = "av1")]
+        let (av1_track, sending_track): (
+            Option<Arc<webrtc::track::track_local::track_local_static_sample::TrackLocalStaticSample>>,
+            Option<Arc<dyn TrackLocal + Send + Sync>>,
+        ) = if matches!(pipeline, Pipeline::Av1) {
+            let t = crate::av1_pipeline::new_av1_track();
+            let as_trait: Arc<dyn TrackLocal + Send + Sync> = t.clone();
+            (Some(t), Some(as_trait))
+        } else {
+            let existing = sending_track;
             (None, existing)
         };
 
@@ -877,23 +867,42 @@ mod inner {
         // (`desktop::audio::probe_supported`). All three must agree before we
         // build the Opus track + add the audio transceiver. Privacy posture:
         // default-OFF wins on any disagreement, no silent activation.
+        // Audio gate. Audio is valid on every WebRTC video session
+        // (H.264 / VP9 / AV1) — they all add a video transceiver to the
+        // same PeerConnection, so the audio transceiver rides alongside.
+        // JPEG sessions ride a DataChannel for tiles and have no PC to
+        // attach audio to. The codec-arm `matches!` blocks resolve to
+        // `false` when the feature isn't compiled, so the gate only opens
+        // for codecs the binary actually supports.
+        #[cfg(feature = "audio")]
+        let pipeline_supports_audio: bool = {
+            #[allow(unused_mut)]
+            let mut ok = false;
+            #[cfg(feature = "h264")]
+            { ok = ok || matches!(pipeline, Pipeline::H264); }
+            #[cfg(feature = "vp9")]
+            { ok = ok || matches!(pipeline, Pipeline::Vp9); }
+            #[cfg(feature = "av1")]
+            { ok = ok || matches!(pipeline, Pipeline::Av1); }
+            ok
+        };
         #[cfg(feature = "audio")]
         let (opus_track, audio_sending_track): (
             Option<Arc<webrtc::track::track_local::track_local_static_sample::TrackLocalStaticSample>>,
             Option<Arc<dyn TrackLocal + Send + Sync>>,
-        ) = if matches!(pipeline, Pipeline::H264)
+        ) = if pipeline_supports_audio
             && client_audio_opt_in
             && crate::settings::get_desktop_audio_enabled(&state.db_path)
             && desktop::audio::probe_supported()
         {
             let t = crate::desktop_audio_pipeline::new_opus_track();
             let as_trait: Arc<dyn TrackLocal + Send + Sync> = t.clone();
-            info!("audio gate passed: opus transceiver will be added before SRD");
+            info!(pipeline = ?pipeline, "audio gate passed: opus transceiver will be added before SRD");
             (Some(t), Some(as_trait))
         } else {
             tracing::debug!(
                 client_audio = client_audio_opt_in,
-                "audio gate did not pass (any of: pipeline!=h264, client opt-out, setting off, probe failed)"
+                "audio gate did not pass (any of: pipeline is JPEG, client opt-out, setting off, probe failed)"
             );
             (None, None)
         };
@@ -907,7 +916,7 @@ mod inner {
         let video_sender =
             complete_answer(&pc, offer_sdp, &ws_out_tx, sending_track, audio_sending_track)
                 .await?;
-        let _ = &video_sender; // silence unused when neither h264 nor hevc feature is on
+        let _ = &video_sender; // silence unused when neither h264 nor vp9 nor av1 is on
 
         // Branch the transport pipeline now that the answer is on the wire.
         // H.264 uses an RTP track — no DC-open race, no JPEG tile encoder.
@@ -944,11 +953,12 @@ mod inner {
             return result;
         }
 
-        // HEVC dispatch — mirrors the H.264 path but uses `spawn_hevc_pipeline`
-        // and `build_hvcc` to produce the `hvcC` config blob for the SPA.
-        #[cfg(feature = "hevc")]
-        if let (Pipeline::Hevc, Some(track)) = (pipeline, hevc_track.as_ref()) {
-            use base64::{engine::general_purpose::STANDARD as B64_STD, Engine as _};
+        // VP9 dispatch — uses `TrackLocalStaticSample` (no custom payloader;
+        // webrtc-rs has built-in VP9 RTP at PT 98) and `Vp9SequenceInfo` (no
+        // out-of-band config blob — VP9 keyframes carry the sequence header
+        // inline). Active-map (dirty-rect block skip) lands in phase-03b.
+        #[cfg(feature = "vp9")]
+        if let (Pipeline::Vp9, Some(track)) = (pipeline, vp9_track.as_ref()) {
             use desktop::capture::CaptureLoop;
             use desktop::encoders::BitrateBps;
             use desktop::resize_dims;
@@ -958,7 +968,6 @@ mod inner {
             let (out_w, out_h) =
                 resize_dims(screen_w, screen_h, initial_tier, scale_factor, hidpi);
 
-            // Emit Capabilities so the client can size its <video> backing canvas.
             if let Ok(msg) = serde_json::to_string(&SignalOut::Capabilities {
                 width: out_w,
                 height: out_h,
@@ -968,19 +977,19 @@ mod inner {
                 let _ = ws_out_tx.send(msg).await;
             }
 
-            // RTCRtpSender for RTCP feedback (PLI + REMB). `complete_answer`
-            // returns Some when a track was added (always true for HEVC here).
-            let Some(hevc_sender) = video_sender else {
-                warn!("hevc: complete_answer returned no sender — RTCP feedback unavailable");
+            let Some(vp9_sender) = video_sender else {
+                warn!("vp9: complete_answer returned no sender — RTCP feedback unavailable");
                 let _ = pc.close().await;
                 return Ok(());
             };
 
-            // Channels for the pipeline + RTCP reader lifecycle.
+            // Channels for pipeline + RTCP reader lifecycle.
             let (bgra_tx, bgra_rx) = mpsc::channel::<desktop::RawBgraFrame>(2);
-            let (bitrate_tx, bitrate_rx) = watch::channel(tier_bitrate_hevc(initial_tier, hidpi));
+            let (bitrate_tx, bitrate_rx) =
+                watch::channel(tier_bitrate_vp9(initial_tier, hidpi));
             let (pli_tx, pli_rx) = mpsc::channel::<()>(4);
-            let (params_tx, params_rx) = tokio::sync::oneshot::channel();
+            let (seq_info_tx, seq_info_rx) =
+                tokio::sync::oneshot::channel::<desktop::encoders::Vp9SequenceInfo>();
             let (vp_shutdown_tx, vp_shutdown_rx) = tokio::sync::oneshot::channel::<()>();
             let (rtcp_shutdown_tx, rtcp_shutdown_rx) = tokio::sync::oneshot::channel::<()>();
             let (cap_iframe_tx, cap_iframe_rx) = tokio::sync::oneshot::channel::<()>();
@@ -988,8 +997,28 @@ mod inner {
 
             let (abr_tx, _abr_rx_dropped) = crate::desktop_abr::channel();
 
-            // Capture: BGRA frames → bgra_tx.
+            // Audio channel pair + shutdown for the VP9 session.
+            #[cfg(feature = "audio")]
+            let (vp9_audio_tx, vp9_audio_rx_opt) = if opus_track.is_some() {
+                let (tx, rx) = mpsc::channel::<Vec<i16>>(8);
+                (Some(tx), Some(rx))
+            } else {
+                (None, None)
+            };
+            #[cfg(feature = "audio")]
+            let (vp9_ap_shutdown_tx, vp9_ap_shutdown_rx) = tokio::sync::oneshot::channel::<
+                crate::desktop_audio_pipeline::StopReason,
+            >();
+            #[cfg(feature = "audio")]
+            let mut vp9_ap_shutdown_tx = Some(vp9_ap_shutdown_tx);
+
+            // Capture: BGRA frames → bgra_tx (and PCM → vp9_audio_tx when
+            // audio is gated on).
             let cap_fps_rx = quality_tx.subscribe();
+            #[cfg(feature = "audio")]
+            let cap_audio_tx = vp9_audio_tx;
+            #[cfg(not(feature = "audio"))]
+            let cap_audio_tx: Option<mpsc::Sender<Vec<i16>>> = None;
             tokio::task::spawn_blocking(move || {
                 CaptureLoop::run_bgra(
                     initial_tier,
@@ -998,30 +1027,45 @@ mod inner {
                     scale_factor,
                     hidpi,
                     Some(cap_iframe_rx),
-                    None, // no audio on HEVC path for now
-                    None, // HEVC is macOS-only (VT-HEVC); diag counters not plumbed
+                    cap_audio_tx,
+                    None, // diag counters not plumbed for vp9 phase-03
                 )
             });
 
-            crate::hevc_pipeline::spawn_hevc_pipeline(
-                crate::hevc_pipeline::HevcPipelineConfig {
+            #[cfg(feature = "audio")]
+            if let Some(track) = opus_track.as_ref() {
+                try_spawn_session_audio_pipeline(
+                    track,
+                    vp9_audio_rx_opt,
+                    vp9_ap_shutdown_rx,
+                    &mut vp9_ap_shutdown_tx,
+                    &state,
+                    device_id,
+                );
+            } else {
+                let _ = vp9_audio_rx_opt;
+                drop(vp9_ap_shutdown_rx);
+            }
+
+            crate::vp9_pipeline::spawn_vp9_pipeline(
+                crate::vp9_pipeline::Vp9PipelineConfig {
                     width: out_w,
                     height: out_h,
-                    initial_bitrate: tier_bitrate_hevc(initial_tier, hidpi),
-                    initial_max_qp: tier_max_qp_hevc(initial_tier),
+                    initial_bitrate: tier_bitrate_vp9(initial_tier, hidpi),
                     track: Arc::clone(track),
                     bgra_rx,
                     bitrate_rx,
                     fps_rx: quality_tx.subscribe(),
                     shutdown_rx: vp_shutdown_rx,
                     pli_rx,
-                    params_tx,
-                    abr_tx: abr_tx.clone(),
+                    seq_info_tx,
+                    frames_encoded_ok: None,
+                    frames_encoded_err: None,
                 },
             );
 
             crate::video_pipeline::spawn_rtcp_reader(
-                hevc_sender,
+                vp9_sender,
                 pli_tx,
                 bitrate_tx.clone(),
                 abr_tx.clone(),
@@ -1029,9 +1073,34 @@ mod inner {
                 client_loopback,
             );
 
-            // Attach ABR publisher so the stats SSE endpoint can subscribe.
             if let Some(svc) = state.desktop_service.as_ref() {
                 svc.attach_abr_tx(device_id, abr_tx.clone());
+            }
+
+            // P1: ABR controller for VP9 sessions. Same shape as the H.264
+            // path — REMB observations drive `bitrate_tx`, which the encoder
+            // consumes via its `bitrate_rx` watch. Loopback origins skip the
+            // controller (no signal to act on; encoder rides operator tier).
+            let (vp9_abr_shutdown_tx, vp9_abr_shutdown_rx) =
+                tokio::sync::oneshot::channel::<()>();
+            let mut vp9_abr_shutdown_tx = Some(vp9_abr_shutdown_tx);
+            if !client_loopback {
+                let initial_kbps = tier_bitrate_vp9(initial_tier, hidpi).0 / 1_000;
+                let floor_kbps = BitrateBps::LOW.0 / 1_000;
+                crate::desktop_abr::spawn_controller(crate::desktop_abr::ControllerConfig {
+                    abr_rx: abr_tx.subscribe(),
+                    bitrate_tx: bitrate_tx.clone(),
+                    event_bus: Arc::clone(&state.event_bus),
+                    device_id: device_id.to_string(),
+                    floor_kbps,
+                    ceiling_kbps: initial_kbps,
+                    tunables: crate::desktop_abr::AbrTunables::from_env(),
+                    shutdown_rx: vp9_abr_shutdown_rx,
+                });
+            } else {
+                drop(vp9_abr_shutdown_rx);
+                vp9_abr_shutdown_tx = None;
+                info!(device = %device_id, "vp9: loopback origin — ABR controller skipped");
             }
 
             info!(
@@ -1039,11 +1108,11 @@ mod inner {
                 height = out_h,
                 tier = ?initial_tier,
                 hidpi,
-                "hevc pipeline spawned"
+                "vp9 pipeline spawned"
             );
 
             // Session-start IDR watchdog: same 5-second budget as H.264.
-            let mut params_rx = Some(params_rx);
+            let mut seq_info_rx = Some(seq_info_rx);
             let connected_notify = Arc::new(tokio::sync::Notify::new());
             {
                 let notify = Arc::clone(&connected_notify);
@@ -1069,7 +1138,6 @@ mod inner {
             };
             tokio::pin!(watchdog);
 
-            // Main WS event loop for HEVC session.
             let current_hidpi = hidpi;
             loop {
                 tokio::select! {
@@ -1077,36 +1145,38 @@ mod inner {
 
                     _ = &mut close_rx => break,
 
-                    // First IDR's VPS+SPS+PPS → build hvcC, send over signaling WS.
-                    res = wait_hevc_params(params_rx.as_mut()), if params_rx.is_some() => {
-                        params_rx = None;
-                        if let Some(params) = res {
-                            let hw_accel = params.is_hardware;
-                            let hvcc = crate::video_pipeline::build_hvcc(&params);
-                            let b64 = B64_STD.encode(&hvcc);
+                    // First IDR — emit pipeline signal with hw_accel flag.
+                    res = wait_vp9_seq_info(seq_info_rx.as_mut()), if seq_info_rx.is_some() => {
+                        seq_info_rx = None;
+                        if let Some(info) = res {
+                            // Phase-08: surface the VP9 codec-specific tier
+                            // bitrates so the SPA stats overlay reflects
+                            // the real targets (not H.264's presets).
+                            let low = tier_bitrate_vp9(QualityTier::Low, false).0 / 1_000;
+                            let med = tier_bitrate_vp9(QualityTier::Med, false).0 / 1_000;
+                            let high = tier_bitrate_vp9(QualityTier::High, false).0 / 1_000;
+                            let _ = BitrateBps::LOW; // silence unused-import
                             let msg = SignalOut::Pipeline {
-                                mode: "h265",
-                                codec: Some("h265-main-5.0"),
-                                tier_bitrates_kbps_low: BitrateBps::LOW.0 / 1_000,
-                                tier_bitrates_kbps_med: BitrateBps::MED.0 / 1_000,
-                                tier_bitrates_kbps_high: BitrateBps::HIGH.0 / 1_000,
+                                mode: "vp9",
+                                codec: Some("vp9-profile0"),
+                                tier_bitrates_kbps_low: low,
+                                tier_bitrates_kbps_med: med,
+                                tier_bitrates_kbps_high: high,
                                 avcc_description_b64: None,
-                                hvcc_description_b64: Some(b64),
                                 reason: decision_reason,
-                                hardware_accel: hw_accel,
+                                hardware_accel: info.is_hardware,
                             };
                             if let Ok(txt) = serde_json::to_string(&msg) {
                                 let _ = ws_out_tx.send(txt).await;
                             }
-                            info!(hardware_accel = hw_accel, "hevc: hvcC description sent");
+                            info!(hardware_accel = info.is_hardware, "vp9: pipeline signal sent");
                         }
                     }
 
-                    // Session-start IDR watchdog.
-                    _ = &mut watchdog, if params_rx.is_some() => {
+                    _ = &mut watchdog, if seq_info_rx.is_some() => {
                         warn!(
                             device = %device_id,
-                            "hevc: session-start IDR watchdog tripped — signaling FallbackPending"
+                            "vp9: session-start IDR watchdog tripped — signaling FallbackPending"
                         );
                         if let Ok(txt) = serde_json::to_string(&SignalOut::FallbackPending {
                             reason: "no-idr-5s",
@@ -1127,7 +1197,7 @@ mod inner {
 
                     Ok(_) = quality_rx.changed() => {
                         let new_tier = *quality_rx.borrow();
-                        let _ = bitrate_tx.send(tier_bitrate_hevc(new_tier, current_hidpi));
+                        let _ = bitrate_tx.send(tier_bitrate_vp9(new_tier, current_hidpi));
                         let (w, h) = resize_dims(
                             screen_w, screen_h, new_tier, scale_factor, current_hidpi,
                         );
@@ -1142,7 +1212,7 @@ mod inner {
                         let new_hidpi = *settings_rx.borrow();
                         if new_hidpi != current_hidpi {
                             info!(old = current_hidpi, new = new_hidpi,
-                                "hevc: hidpi change → session restart");
+                                "vp9: hidpi change → session restart");
                             break;
                         }
                     }
@@ -1172,6 +1242,306 @@ mod inner {
 
             let _ = vp_shutdown_tx.send(());
             let _ = rtcp_shutdown_tx.send(());
+            if let Some(tx) = vp9_abr_shutdown_tx.take() {
+                let _ = tx.send(());
+            }
+            #[cfg(feature = "audio")]
+            if let Some(tx) = vp9_ap_shutdown_tx.take() {
+                let _ = tx.send(crate::desktop_audio_pipeline::StopReason::SessionClosed);
+            }
+            let _ = pc.close().await;
+            return Ok(());
+        }
+
+        // AV1 dispatch — same shape as VP9; uses libaom encoder with
+        // AOM_CONTENT_SCREEN (palette + IBC matching Chrome Remote Desktop).
+        // webrtc-rs's built-in AV1 RTP payloader (PT 41) handles OBU
+        // fragmentation per RFC 9606 via TrackLocalStaticSample.
+        #[cfg(feature = "av1")]
+        if let (Pipeline::Av1, Some(track)) = (pipeline, av1_track.as_ref()) {
+            use desktop::capture::CaptureLoop;
+            use desktop::encoders::BitrateBps;
+            use desktop::resize_dims;
+
+            let initial_tier = *quality_rx.borrow();
+            let hidpi = initial_hidpi;
+            let (out_w, out_h) =
+                resize_dims(screen_w, screen_h, initial_tier, scale_factor, hidpi);
+
+            if let Ok(msg) = serde_json::to_string(&SignalOut::Capabilities {
+                width: out_w,
+                height: out_h,
+                scale_factor,
+                tile_size: desktop::TILE_SIZE,
+            }) {
+                let _ = ws_out_tx.send(msg).await;
+            }
+
+            let Some(av1_sender) = video_sender else {
+                warn!("av1: complete_answer returned no sender — RTCP feedback unavailable");
+                let _ = pc.close().await;
+                return Ok(());
+            };
+
+            let (bgra_tx, bgra_rx) = mpsc::channel::<desktop::RawBgraFrame>(2);
+            let (bitrate_tx, bitrate_rx) =
+                watch::channel(tier_bitrate_av1(initial_tier, hidpi));
+            let (pli_tx, pli_rx) = mpsc::channel::<()>(4);
+            let (seq_info_tx, seq_info_rx) =
+                tokio::sync::oneshot::channel::<desktop::encoders::Av1SequenceInfo>();
+            let (vp_shutdown_tx, vp_shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+            let (rtcp_shutdown_tx, rtcp_shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+            let (cap_iframe_tx, cap_iframe_rx) = tokio::sync::oneshot::channel::<()>();
+            let _ = cap_iframe_tx.send(());
+
+            let (abr_tx, _abr_rx_dropped) = crate::desktop_abr::channel();
+
+            // Audio channel pair + shutdown for the AV1 session.
+            #[cfg(feature = "audio")]
+            let (av1_audio_tx, av1_audio_rx_opt) = if opus_track.is_some() {
+                let (tx, rx) = mpsc::channel::<Vec<i16>>(8);
+                (Some(tx), Some(rx))
+            } else {
+                (None, None)
+            };
+            #[cfg(feature = "audio")]
+            let (av1_ap_shutdown_tx, av1_ap_shutdown_rx) = tokio::sync::oneshot::channel::<
+                crate::desktop_audio_pipeline::StopReason,
+            >();
+            #[cfg(feature = "audio")]
+            let mut av1_ap_shutdown_tx = Some(av1_ap_shutdown_tx);
+
+            let cap_fps_rx = quality_tx.subscribe();
+            #[cfg(feature = "audio")]
+            let cap_audio_tx = av1_audio_tx;
+            #[cfg(not(feature = "audio"))]
+            let cap_audio_tx: Option<mpsc::Sender<Vec<i16>>> = None;
+            tokio::task::spawn_blocking(move || {
+                CaptureLoop::run_bgra(
+                    initial_tier,
+                    cap_fps_rx,
+                    bgra_tx,
+                    scale_factor,
+                    hidpi,
+                    Some(cap_iframe_rx),
+                    cap_audio_tx,
+                    None,
+                )
+            });
+
+            #[cfg(feature = "audio")]
+            if let Some(track) = opus_track.as_ref() {
+                try_spawn_session_audio_pipeline(
+                    track,
+                    av1_audio_rx_opt,
+                    av1_ap_shutdown_rx,
+                    &mut av1_ap_shutdown_tx,
+                    &state,
+                    device_id,
+                );
+            } else {
+                let _ = av1_audio_rx_opt;
+                drop(av1_ap_shutdown_rx);
+            }
+
+            crate::av1_pipeline::spawn_av1_pipeline(
+                crate::av1_pipeline::Av1PipelineConfig {
+                    width: out_w,
+                    height: out_h,
+                    initial_bitrate: tier_bitrate_av1(initial_tier, hidpi),
+                    track: Arc::clone(track),
+                    bgra_rx,
+                    bitrate_rx,
+                    fps_rx: quality_tx.subscribe(),
+                    shutdown_rx: vp_shutdown_rx,
+                    pli_rx,
+                    seq_info_tx,
+                    frames_encoded_ok: None,
+                    frames_encoded_err: None,
+                },
+            );
+
+            crate::video_pipeline::spawn_rtcp_reader(
+                av1_sender,
+                pli_tx,
+                bitrate_tx.clone(),
+                abr_tx.clone(),
+                rtcp_shutdown_rx,
+                client_loopback,
+            );
+
+            if let Some(svc) = state.desktop_service.as_ref() {
+                svc.attach_abr_tx(device_id, abr_tx.clone());
+            }
+
+            // P1: ABR controller for AV1 (mirrors VP9). Loopback origins
+            // skip the controller since GCC collapses on same-machine paths.
+            let (av1_abr_shutdown_tx, av1_abr_shutdown_rx) =
+                tokio::sync::oneshot::channel::<()>();
+            let mut av1_abr_shutdown_tx = Some(av1_abr_shutdown_tx);
+            if !client_loopback {
+                let initial_kbps = tier_bitrate_av1(initial_tier, hidpi).0 / 1_000;
+                let floor_kbps = BitrateBps::LOW.0 / 1_000;
+                crate::desktop_abr::spawn_controller(crate::desktop_abr::ControllerConfig {
+                    abr_rx: abr_tx.subscribe(),
+                    bitrate_tx: bitrate_tx.clone(),
+                    event_bus: Arc::clone(&state.event_bus),
+                    device_id: device_id.to_string(),
+                    floor_kbps,
+                    ceiling_kbps: initial_kbps,
+                    tunables: crate::desktop_abr::AbrTunables::from_env(),
+                    shutdown_rx: av1_abr_shutdown_rx,
+                });
+            } else {
+                drop(av1_abr_shutdown_rx);
+                av1_abr_shutdown_tx = None;
+                info!(device = %device_id, "av1: loopback origin — ABR controller skipped");
+            }
+
+            info!(
+                width = out_w,
+                height = out_h,
+                tier = ?initial_tier,
+                hidpi,
+                "av1 pipeline spawned"
+            );
+
+            let mut seq_info_rx = Some(seq_info_rx);
+            let connected_notify = Arc::new(tokio::sync::Notify::new());
+            {
+                let notify = Arc::clone(&connected_notify);
+                let fired = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                pc.on_peer_connection_state_change(Box::new(move |state| {
+                    let notify = Arc::clone(&notify);
+                    let fired = Arc::clone(&fired);
+                    Box::pin(async move {
+                        use std::sync::atomic::Ordering;
+                        use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
+                        if matches!(state, RTCPeerConnectionState::Connected)
+                            && !fired.swap(true, Ordering::SeqCst)
+                        {
+                            notify.notify_waiters();
+                        }
+                    })
+                }));
+            }
+            let watchdog_notify = Arc::clone(&connected_notify);
+            let watchdog = async move {
+                watchdog_notify.notified().await;
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            };
+            tokio::pin!(watchdog);
+
+            let current_hidpi = hidpi;
+            loop {
+                tokio::select! {
+                    biased;
+
+                    _ = &mut close_rx => break,
+
+                    res = wait_av1_seq_info(seq_info_rx.as_mut()), if seq_info_rx.is_some() => {
+                        seq_info_rx = None;
+                        if let Some(info) = res {
+                            // Phase-08: surface AV1's codec-specific tier
+                            // bitrates (lower than VP9 — AV1 + screen tools
+                            // hit equivalent quality at ~70% of VP9).
+                            let low = tier_bitrate_av1(QualityTier::Low, false).0 / 1_000;
+                            let med = tier_bitrate_av1(QualityTier::Med, false).0 / 1_000;
+                            let high = tier_bitrate_av1(QualityTier::High, false).0 / 1_000;
+                            let _ = BitrateBps::LOW;
+                            let msg = SignalOut::Pipeline {
+                                mode: "av1",
+                                codec: Some("av1-main"),
+                                tier_bitrates_kbps_low: low,
+                                tier_bitrates_kbps_med: med,
+                                tier_bitrates_kbps_high: high,
+                                avcc_description_b64: None,
+                                reason: decision_reason,
+                                hardware_accel: info.is_hardware,
+                            };
+                            if let Ok(txt) = serde_json::to_string(&msg) {
+                                let _ = ws_out_tx.send(txt).await;
+                            }
+                            info!(hardware_accel = info.is_hardware, "av1: pipeline signal sent");
+                        }
+                    }
+
+                    _ = &mut watchdog, if seq_info_rx.is_some() => {
+                        warn!(
+                            device = %device_id,
+                            "av1: session-start IDR watchdog tripped — signaling FallbackPending"
+                        );
+                        if let Ok(txt) = serde_json::to_string(&SignalOut::FallbackPending {
+                            reason: "no-idr-5s",
+                        }) {
+                            let _ = socket.send(Message::Text(txt.into())).await;
+                        }
+                        state.event_bus.send(AgentEvent::PipelineChosen {
+                            device_id: device_id.to_string(),
+                            pipeline: "jpeg".to_string(),
+                            reason: "fallback-idr-watchdog".to_string(),
+                        });
+                        break;
+                    }
+
+                    Some(text) = ws_out_rx.recv() => {
+                        if socket.send(Message::Text(text.into())).await.is_err() { break; }
+                    }
+
+                    Ok(_) = quality_rx.changed() => {
+                        let new_tier = *quality_rx.borrow();
+                        let _ = bitrate_tx.send(tier_bitrate_av1(new_tier, current_hidpi));
+                        let (w, h) = resize_dims(
+                            screen_w, screen_h, new_tier, scale_factor, current_hidpi,
+                        );
+                        if let Ok(msg) = serde_json::to_string(&SignalOut::Capabilities {
+                            width: w, height: h, scale_factor, tile_size: desktop::TILE_SIZE,
+                        }) {
+                            let _ = ws_out_tx.send(msg).await;
+                        }
+                    }
+
+                    Ok(_) = settings_rx.changed() => {
+                        let new_hidpi = *settings_rx.borrow();
+                        if new_hidpi != current_hidpi {
+                            info!(old = current_hidpi, new = new_hidpi,
+                                "av1: hidpi change → session restart");
+                            break;
+                        }
+                    }
+
+                    msg = socket.recv() => {
+                        match msg {
+                            Some(Ok(Message::Text(text))) => {
+                                on_incoming_text(
+                                    &text,
+                                    &pc,
+                                    &injector,
+                                    screen_w,
+                                    screen_h,
+                                    &quality_tx,
+                                    &settings_tx,
+                                    scale_factor,
+                                    &ws_out_tx,
+                                    None,
+                                ).await;
+                            }
+                            Some(Ok(Message::Close(_))) | None => break,
+                            _ => {}
+                        }
+                    }
+                }
+            }
+
+            let _ = vp_shutdown_tx.send(());
+            let _ = rtcp_shutdown_tx.send(());
+            if let Some(tx) = av1_abr_shutdown_tx.take() {
+                let _ = tx.send(());
+            }
+            #[cfg(feature = "audio")]
+            if let Some(tx) = av1_ap_shutdown_tx.take() {
+                let _ = tx.send(crate::desktop_audio_pipeline::StopReason::SessionClosed);
+            }
             let _ = pc.close().await;
             return Ok(());
         }
@@ -1511,95 +1881,21 @@ mod inner {
             )
         });
 
-        // Audio pipeline: only spawned when the gate passed (audio_track is
-        // Some). Capture construction is platform-specific — macOS bridges
-        // the SCStream's audio mpsc (the capture loop already opened the
-        // SCStream in audio mode and is forwarding PCM into `audio_rx_opt`),
-        // Windows opens an independent cpal WASAPI loopback stream via
-        // `desktop::audio::make_default()` (the mpsc pair is vestigial there).
+        // Audio pipeline: spawned when the gate passed (audio_track Some).
+        // The helper is pipeline-agnostic — VP9 / AV1 dispatches reuse it.
         #[cfg(feature = "audio")]
-        {
-            #[cfg(target_os = "windows")]
-            let capture_error_reason =
-                crate::desktop_audio_pipeline::StopReason::WasapiError;
-            #[cfg(not(target_os = "windows"))]
-            let capture_error_reason =
-                crate::desktop_audio_pipeline::StopReason::SckError;
-
-            let capture_init: Option<
-                Result<Box<dyn desktop::audio::AudioCapture>, desktop::audio::AudioError>,
-            > = if audio_track.is_some() {
-                #[cfg(target_os = "macos")]
-                {
-                    Some(match audio_rx_opt {
-                        Some(rx) => Ok(Box::new(
-                            desktop::audio::sck_audio::SckAudioCapture::from_receiver(rx),
-                        )),
-                        None => Err(desktop::audio::AudioError::CaptureFailed(
-                            "sck audio rx absent".into(),
-                        )),
-                    })
-                }
-                #[cfg(target_os = "windows")]
-                {
-                    let _ = audio_rx_opt;
-                    Some(desktop::audio::make_default())
-                }
-                #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-                {
-                    let _ = audio_rx_opt;
-                    Some(Err(desktop::audio::AudioError::Unsupported(
-                        "audio.platform.unsupported",
-                    )))
-                }
-            } else {
-                let _ = audio_rx_opt;
-                None
-            };
-
-            if let (Some(track), Some(init)) = (audio_track.as_ref(), capture_init) {
-                match init {
-                    Ok(capture) => {
-                        crate::desktop_audio_pipeline::spawn_audio_pipeline(
-                            crate::desktop_audio_pipeline::AudioPipelineConfig {
-                                track: track.clone(),
-                                capture,
-                                shutdown_rx: ap_shutdown_rx,
-                                event_bus: Arc::clone(&state.event_bus),
-                                device_id: device_id.to_string(),
-                                capture_error_reason,
-                            },
-                        );
-                        state
-                            .event_bus
-                            .send(crate::events::AgentEvent::AudioStarted {
-                                device_id: device_id.to_string(),
-                            });
-                        state.telemetry.record_audio_session_started();
-                        info!("audio pipeline spawned (Opus → RTP)");
-                    }
-                    Err(err) => {
-                        // Gate passed but the capture backend wouldn't open
-                        // (e.g. WASAPI device gone). The audio transceiver is
-                        // already on the PC so the client sees a dormant
-                        // receiver — surface that via AudioStopped so
-                        // dashboards reflect reality. Consume the shutdown
-                        // sender so the later teardown path doesn't try to
-                        // fire SessionClosed into a pipeline that never
-                        // started.
-                        warn!(
-                            error = %err,
-                            "audio capture init failed; pipeline not spawned"
-                        );
-                        state.event_bus.send(crate::events::AgentEvent::AudioStopped {
-                            device_id: device_id.to_string(),
-                            reason: capture_error_reason.as_wire().to_string(),
-                        });
-                        let _ = ap_shutdown_tx.take();
-                        drop(ap_shutdown_rx);
-                    }
-                }
-            }
+        if let Some(track) = audio_track.as_ref() {
+            try_spawn_session_audio_pipeline(
+                track,
+                audio_rx_opt,
+                ap_shutdown_rx,
+                &mut ap_shutdown_tx,
+                state,
+                device_id,
+            );
+        } else {
+            let _ = audio_rx_opt;
+            drop(ap_shutdown_rx);
         }
         // Drop the audio_tx clone we held only to thread into capture; the
         // capture loop owns its own clone now.
@@ -1809,7 +2105,6 @@ mod inner {
                             tier_bitrates_kbps_med: BitrateBps::MED.0 / 1_000,
                             tier_bitrates_kbps_high: BitrateBps::HIGH.0 / 1_000,
                             avcc_description_b64: Some(b64),
-                            hvcc_description_b64: None,
                             reason: decision_reason,
                             hardware_accel: hw_accel,
                         };
@@ -2034,29 +2329,33 @@ mod inner {
         }
     }
 
-    /// Poll the HEVC first-IDR oneshot for VPS+SPS+PPS.
-    #[cfg(feature = "hevc")]
-    async fn wait_hevc_params(
-        rx: Option<&mut tokio::sync::oneshot::Receiver<desktop::encoders::HevcParameterSets>>,
-    ) -> Option<desktop::encoders::HevcParameterSets> {
+    /// Poll the VP9 first-IDR oneshot for sequence info. VP9 has no
+    /// out-of-band parameter sets — the keyframe carries the sequence
+    /// header inline — so this only surfaces `is_hardware` so the SPA pill
+    /// can render `VP9 (HW)` vs `VP9 (SW)`.
+    #[cfg(feature = "vp9")]
+    async fn wait_vp9_seq_info(
+        rx: Option<&mut tokio::sync::oneshot::Receiver<desktop::encoders::Vp9SequenceInfo>>,
+    ) -> Option<desktop::encoders::Vp9SequenceInfo> {
         match rx {
             Some(r) => r.await.ok(),
             None => std::future::pending().await,
         }
     }
 
-    /// Map quality tier + HiDPI flag to HEVC bitrate. Mirrors the H.264
-    /// `tier_bitrate` function — same presets, same 2× HiDPI multiplier,
-    /// same 30 Mbps cap. HEVC compresses screen content better than H.264
-    /// at equal bitrate but we start at the same presets so operators get
-    /// consistent behaviour when toggling between codecs.
-    #[cfg(feature = "hevc")]
-    fn tier_bitrate_hevc(tier: QualityTier, hidpi: bool) -> desktop::encoders::BitrateBps {
+    /// Map quality tier + HiDPI flag to VP9 bitrate. **Phase-08 retune:**
+    /// VP9 hits equivalent screen-content quality at ~40-50 % of H.264's
+    /// bitrate per CRD measurements, so the presets drop accordingly —
+    /// `LOW=1.0 Mbps`, `MED=2.5 Mbps`, `HIGH=5 Mbps` (vs H.264's
+    /// `LOW=2.5 / MED=6 / HIGH=12 Mbps`). HiDPI still doubles and the
+    /// 30 Mbps cap is preserved as a safety ceiling.
+    #[cfg(feature = "vp9")]
+    fn tier_bitrate_vp9(tier: QualityTier, hidpi: bool) -> desktop::encoders::BitrateBps {
         use desktop::encoders::BitrateBps;
         let base = match tier {
-            QualityTier::High => BitrateBps::HIGH,
-            QualityTier::Med => BitrateBps::MED,
-            QualityTier::Low => BitrateBps::LOW,
+            QualityTier::High => BitrateBps(5_000_000),
+            QualityTier::Med => BitrateBps(2_500_000),
+            QualityTier::Low => BitrateBps(1_000_000),
         };
         if hidpi {
             BitrateBps((base.0.saturating_mul(2)).min(30_000_000))
@@ -2065,14 +2364,131 @@ mod inner {
         }
     }
 
-    /// Map quality tier to HEVC `MaxAllowedFrameQP` cap. Mirrors the H.264
-    /// `tier_max_qp` function — same thresholds (HIGH=23, MED=28, LOW=None).
-    #[cfg(feature = "hevc")]
-    fn tier_max_qp_hevc(tier: QualityTier) -> Option<u32> {
-        match tier {
-            QualityTier::High => Some(23),
-            QualityTier::Med => Some(28),
-            QualityTier::Low => None,
+    /// Poll the AV1 first-IDR oneshot for sequence info. AV1 has no
+    /// out-of-band parameter sets (the sequence OBU is the first OBU in the
+    /// keyframe and rides inline through the RTP payloader).
+    #[cfg(feature = "av1")]
+    async fn wait_av1_seq_info(
+        rx: Option<&mut tokio::sync::oneshot::Receiver<desktop::encoders::Av1SequenceInfo>>,
+    ) -> Option<desktop::encoders::Av1SequenceInfo> {
+        match rx {
+            Some(r) => r.await.ok(),
+            None => std::future::pending().await,
+        }
+    }
+
+    /// Map quality tier + HiDPI flag to AV1 bitrate. **Phase-08 retune:**
+    /// AV1 with `AOM_CONTENT_SCREEN` (palette + IBC) hits equivalent
+    /// screen-content quality at ~30 % below VP9's bitrate. Presets
+    /// drop to `LOW=0.7 Mbps`, `MED=1.5 Mbps`, `HIGH=3 Mbps`. Matches the
+    /// bitrate footprint Chrome Remote Desktop uses for AV1 sessions.
+    #[cfg(feature = "av1")]
+    fn tier_bitrate_av1(tier: QualityTier, hidpi: bool) -> desktop::encoders::BitrateBps {
+        use desktop::encoders::BitrateBps;
+        let base = match tier {
+            QualityTier::High => BitrateBps(3_000_000),
+            QualityTier::Med => BitrateBps(1_500_000),
+            QualityTier::Low => BitrateBps(700_000),
+        };
+        if hidpi {
+            BitrateBps((base.0.saturating_mul(2)).min(30_000_000))
+        } else {
+            base
+        }
+    }
+
+    /// Spawn the audio capture + Opus encoder pipeline for the current
+    /// session. Pipeline-agnostic — used by all video-track sessions
+    /// (H.264 / VP9 / AV1). Caller has already passed the audio
+    /// mpsc tx side into the capture loop; this helper picks up the rx
+    /// side (macOS SCK bridge) or opens an independent WASAPI loopback
+    /// (Windows) and hands the result to `spawn_audio_pipeline`.
+    ///
+    /// On capture-init failure the audio transceiver stays on the PC but
+    /// receives no frames. We emit `AudioStopped` so dashboards reflect
+    /// reality and consume the shutdown sender slot so the later teardown
+    /// path doesn't try to fire `SessionClosed` into a pipeline that never
+    /// started.
+    #[cfg(feature = "audio")]
+    fn try_spawn_session_audio_pipeline(
+        audio_track: &std::sync::Arc<
+            webrtc::track::track_local::track_local_static_sample::TrackLocalStaticSample,
+        >,
+        audio_rx_opt: Option<tokio::sync::mpsc::Receiver<Vec<i16>>>,
+        ap_shutdown_rx: tokio::sync::oneshot::Receiver<
+            crate::desktop_audio_pipeline::StopReason,
+        >,
+        ap_shutdown_tx: &mut Option<
+            tokio::sync::oneshot::Sender<crate::desktop_audio_pipeline::StopReason>,
+        >,
+        state: &std::sync::Arc<AppState>,
+        device_id: &str,
+    ) {
+        #[cfg(target_os = "windows")]
+        let capture_error_reason = crate::desktop_audio_pipeline::StopReason::WasapiError;
+        #[cfg(not(target_os = "windows"))]
+        let capture_error_reason = crate::desktop_audio_pipeline::StopReason::SckError;
+
+        let capture_init: Result<
+            Box<dyn desktop::audio::AudioCapture>,
+            desktop::audio::AudioError,
+        > = {
+            #[cfg(target_os = "macos")]
+            {
+                match audio_rx_opt {
+                    Some(rx) => Ok(Box::new(
+                        desktop::audio::sck_audio::SckAudioCapture::from_receiver(rx),
+                    )),
+                    None => Err(desktop::audio::AudioError::CaptureFailed(
+                        "sck audio rx absent".into(),
+                    )),
+                }
+            }
+            #[cfg(target_os = "windows")]
+            {
+                let _ = audio_rx_opt;
+                desktop::audio::make_default()
+            }
+            #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+            {
+                let _ = audio_rx_opt;
+                Err(desktop::audio::AudioError::Unsupported(
+                    "audio.platform.unsupported",
+                ))
+            }
+        };
+
+        match capture_init {
+            Ok(capture) => {
+                crate::desktop_audio_pipeline::spawn_audio_pipeline(
+                    crate::desktop_audio_pipeline::AudioPipelineConfig {
+                        track: audio_track.clone(),
+                        capture,
+                        shutdown_rx: ap_shutdown_rx,
+                        event_bus: std::sync::Arc::clone(&state.event_bus),
+                        device_id: device_id.to_string(),
+                        capture_error_reason,
+                    },
+                );
+                state
+                    .event_bus
+                    .send(crate::events::AgentEvent::AudioStarted {
+                        device_id: device_id.to_string(),
+                    });
+                state.telemetry.record_audio_session_started();
+                info!("audio pipeline spawned (Opus → RTP)");
+            }
+            Err(err) => {
+                warn!(error = %err, "audio capture init failed; pipeline not spawned");
+                state
+                    .event_bus
+                    .send(crate::events::AgentEvent::AudioStopped {
+                        device_id: device_id.to_string(),
+                        reason: capture_error_reason.as_wire().to_string(),
+                    });
+                let _ = ap_shutdown_tx.take();
+                drop(ap_shutdown_rx);
+            }
         }
     }
 
@@ -2134,10 +2550,9 @@ mod inner {
     /// `MediaEngine` codec set AFTER learning the pipeline choice.
     ///
     /// Pre-offer ICE candidates are buffered and returned so the caller can
-    /// apply them to the freshly-built PC after construction. This is
-    /// necessary because HEVC codec registration must happen before
-    /// `APIBuilder::build()` + `new_peer_connection`, which in turn must
-    /// happen after we know the pipeline (from `CapabilitiesClient`+`Offer`).
+    /// apply them to the freshly-built PC after construction. This matters
+    /// because PC construction happens after we know the pipeline (from
+    /// `CapabilitiesClient`+`Offer`), and ICE may arrive before then.
     ///
     /// Also collects any pre-offer `Settings` so the encoder starts with
     /// the user's persisted HiDPI preference without a reconnect round-trip.
@@ -2149,6 +2564,42 @@ mod inner {
     /// by `?force_pipeline=` on the WS upgrade). When the operator forces a
     /// pipeline the client can't decode, ships `CaptureEnded` and returns
     /// `Err` (fail-closed, no silent JPEG fallback).
+    /// Case-insensitive scan of an offer SDP's `a=rtpmap:` lines for a codec
+    /// name. The browser-side `RTCRtpReceiver.getCapabilities('video')` and
+    /// the actual codecs it lists in `pc.createOffer()` can disagree on
+    /// some codecs (notably AV1 in older Chrome builds). Calling
+    /// `set_local_description` then fails inside `TrackLocalStaticSample::bind`
+    /// with `ErrUnsupportedCodec`, and the session error-closes with no
+    /// graceful fallback. Validate before we commit.
+    fn offer_advertises_codec(sdp: &str, codec_name: &str) -> bool {
+        // SDP rtpmap line: `a=rtpmap:<PT> <NAME>/<CLOCK>[/<CHANNELS>]`.
+        // We only need a fuzzy substring check — `VP9/90000`, `AV1/90000`,
+        // `H264/90000`. Uppercase normalise both sides.
+        let needle = format!("{}/90000", codec_name.to_ascii_uppercase());
+        sdp.lines().any(|line| {
+            let l = line.trim();
+            if !l.to_ascii_lowercase().starts_with("a=rtpmap:") {
+                return false;
+            }
+            l.to_ascii_uppercase().contains(&needle)
+        })
+    }
+
+    /// Map a `Pipeline` to the SDP codec name browsers use in their offer's
+    /// `a=rtpmap:` line. JPEG has no SDP codec (uses DataChannel transport).
+    #[allow(unused_variables, unreachable_patterns)] // codec arms are cfg-gated
+    fn pipeline_sdp_codec(pipeline: Pipeline) -> Option<&'static str> {
+        match pipeline {
+            #[cfg(feature = "h264")]
+            Pipeline::H264 => Some("H264"),
+            #[cfg(feature = "vp9")]
+            Pipeline::Vp9 => Some("VP9"),
+            #[cfg(feature = "av1")]
+            Pipeline::Av1 => Some("AV1"),
+            Pipeline::Jpeg => None,
+        }
+    }
+
     async fn await_offer_with_caps(
         socket: &mut WebSocket,
         close_rx: &mut tokio::sync::oneshot::Receiver<()>,
@@ -2182,6 +2633,43 @@ mod inner {
                         Ok(SignalIn::Offer { sdp }) => {
                             match choose_pipeline(operator, &client_caps) {
                                 Ok(decision) => {
+                                    // Second-stage validation: the client's
+                                    // capabilitiesClient.codecs list reflects
+                                    // RTCRtpReceiver.getCapabilities, which can
+                                    // overstate WebRTC RTP support. Confirm the
+                                    // chosen codec is actually in the offer's
+                                    // m=video rtpmap — otherwise webrtc-rs's
+                                    // TrackLocalStaticSample bind fails with
+                                    // ErrUnsupportedCodec mid-negotiation and
+                                    // the WS error-closes with no graceful
+                                    // fallback. FallbackPending
+                                    // lets the SPA mount JPEG instead.
+                                    if let Some(codec_name) = pipeline_sdp_codec(decision.pipeline)
+                                        && !offer_advertises_codec(&sdp, codec_name)
+                                    {
+                                        warn!(
+                                            pipeline = decision.pipeline.wire_name(),
+                                            codec_name,
+                                            "offer SDP missing chosen codec's rtpmap — client overadvertised; falling back"
+                                        );
+                                        let reason: String = format!(
+                                            "{}-not-in-offer-sdp",
+                                            decision.pipeline.wire_name()
+                                        );
+                                        if let Ok(msg) = serde_json::to_string(
+                                            &SignalOut::FallbackPending {
+                                                reason: reason.as_str(),
+                                            },
+                                        ) {
+                                            let _ = socket
+                                                .send(Message::Text(msg.into()))
+                                                .await;
+                                        }
+                                        return Err(anyhow::anyhow!(
+                                            "{} not in offer SDP",
+                                            codec_name
+                                        ));
+                                    }
                                     info!(
                                         operator = ?operator,
                                         client_webcodecs = client_caps.webcodecs,
@@ -2229,9 +2717,8 @@ mod inner {
                         }
                         Ok(SignalIn::Ice { candidate }) => {
                             // Buffer pre-offer ICE candidates. The PC is built
-                            // AFTER capability negotiation (so HEVC codec can
-                            // be registered before `new_peer_connection`);
-                            // the caller applies them once the PC exists.
+                            // AFTER capability negotiation; the caller applies
+                            // them once the PC exists.
                             buffered_ice.push(candidate);
                         }
                         Ok(SignalIn::CapabilitiesClient { codecs, webcodecs, audio, loopback }) => {
@@ -2593,6 +3080,85 @@ mod inner {
             assert_eq!(h264_codec_label_from_sps(0x42), "h264-baseline-3.1");
             assert_eq!(h264_codec_label_from_sps(0x4d), "h264-unknown"); // Main
             assert_eq!(h264_codec_label_from_sps(0x00), "h264-unknown");
+        }
+    }
+
+    #[cfg(test)]
+    mod offer_codec_scan_tests {
+        use super::*;
+
+        const MINIMAL_OFFER_H264_ONLY: &str = "\
+v=0\r\n\
+m=video 9 UDP/TLS/RTP/SAVPF 96\r\n\
+a=rtpmap:96 H264/90000\r\n\
+a=fmtp:96 profile-level-id=42e01f\r\n";
+
+        const MINIMAL_OFFER_H264_VP9: &str = "\
+v=0\r\n\
+m=video 9 UDP/TLS/RTP/SAVPF 96 98\r\n\
+a=rtpmap:96 H264/90000\r\n\
+a=rtpmap:98 VP9/90000\r\n";
+
+        const OFFER_WITH_AV1: &str = "\
+v=0\r\n\
+m=video 9 UDP/TLS/RTP/SAVPF 96 41\r\n\
+a=rtpmap:96 H264/90000\r\n\
+a=rtpmap:41 AV1/90000\r\n";
+
+        #[test]
+        fn detects_codec_present() {
+            assert!(offer_advertises_codec(MINIMAL_OFFER_H264_ONLY, "H264"));
+            assert!(offer_advertises_codec(MINIMAL_OFFER_H264_VP9, "VP9"));
+            assert!(offer_advertises_codec(OFFER_WITH_AV1, "AV1"));
+        }
+
+        #[test]
+        fn rejects_codec_absent() {
+            assert!(!offer_advertises_codec(MINIMAL_OFFER_H264_ONLY, "AV1"));
+            assert!(!offer_advertises_codec(MINIMAL_OFFER_H264_VP9, "AV1"));
+            assert!(!offer_advertises_codec(MINIMAL_OFFER_H264_ONLY, "VP9"));
+        }
+
+        #[test]
+        fn case_insensitive_match() {
+            let lower = "a=rtpmap:41 av1/90000\r\n";
+            let upper = "a=rtpmap:41 AV1/90000\r\n";
+            assert!(offer_advertises_codec(lower, "AV1"));
+            assert!(offer_advertises_codec(upper, "av1"));
+        }
+
+        /// rtpmap is the only place the codec name appears canonically — a=fmtp
+        /// payload-level params or a stray comment must not false-positive.
+        #[test]
+        fn ignores_non_rtpmap_lines() {
+            let sdp = "\
+m=video 9 UDP/TLS/RTP/SAVPF 96\r\n\
+a=rtpmap:96 H264/90000\r\n\
+a=fmtp:96 profile-level-id=42e01f AV1-MENTION-IN-FMTP\r\n";
+            assert!(!offer_advertises_codec(sdp, "AV1"));
+        }
+
+        #[test]
+        fn jpeg_pipeline_has_no_sdp_codec() {
+            assert_eq!(pipeline_sdp_codec(Pipeline::Jpeg), None);
+        }
+
+        #[cfg(feature = "h264")]
+        #[test]
+        fn h264_pipeline_maps_to_h264_codec_name() {
+            assert_eq!(pipeline_sdp_codec(Pipeline::H264), Some("H264"));
+        }
+
+        #[cfg(feature = "vp9")]
+        #[test]
+        fn vp9_pipeline_maps_to_vp9_codec_name() {
+            assert_eq!(pipeline_sdp_codec(Pipeline::Vp9), Some("VP9"));
+        }
+
+        #[cfg(feature = "av1")]
+        #[test]
+        fn av1_pipeline_maps_to_av1_codec_name() {
+            assert_eq!(pipeline_sdp_codec(Pipeline::Av1), Some("AV1"));
         }
     }
 

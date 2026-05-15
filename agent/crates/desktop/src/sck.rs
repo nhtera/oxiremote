@@ -51,6 +51,12 @@ pub struct SckFrame {
     pub bytes: Vec<u8>,
     pub width: u32,
     pub height: u32,
+    /// Phase-03b: SCK-reported changed regions for this frame, mapped from
+    /// `SCStreamFrameInfo.dirtyRects` via `screencapturekit 1.5`'s
+    /// `CMSampleBuffer::dirty_rects()`. Coordinates are in the SCK stream's
+    /// pixel space, which matches `width × height` above. Empty when SCK
+    /// returned no dirty-rect attachment (rare; treat as full-frame).
+    pub dirty_rects: Vec<crate::capture::DirtyRect>,
 }
 
 /// Stereo PCM samples ready for `OpusEncoder::encode_frame`. Interleaved
@@ -138,10 +144,33 @@ impl Handler {
             }
             out
         };
+        // Phase-03b: extract dirty rects from SCStreamFrameInfo so the
+        // active-map encoders can skip unchanged 16×16 blocks. SCK returns
+        // CGRect in pixel space (same coordinate basis as `bytes`); cast
+        // through clamping into u32. None / empty falls back to full-frame.
+        let dirty_rects: Vec<crate::capture::DirtyRect> = sample
+            .dirty_rects()
+            .map(|rects| {
+                rects
+                    .into_iter()
+                    .filter_map(|r| {
+                        let x = r.x.max(0.0) as u32;
+                        let y = r.y.max(0.0) as u32;
+                        let width = r.width.max(0.0) as u32;
+                        let height = r.height.max(0.0) as u32;
+                        if width == 0 || height == 0 {
+                            None
+                        } else {
+                            Some(crate::capture::DirtyRect { x, y, width, height })
+                        }
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
         // Cap=1 + try_send: drop frames that can't be delivered, never block
         // SCK's internal dispatch queue. Backpressure here means the consumer
         // is slow; landing the freshest frame later is better than queueing.
-        let _ = self.video_tx.try_send(SckFrame { bytes, width: w, height: h });
+        let _ = self.video_tx.try_send(SckFrame { bytes, width: w, height: h, dirty_rects });
     }
 }
 
