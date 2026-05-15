@@ -58,9 +58,35 @@ fn asset_extension() -> &'static str {
     }
 }
 
+/// Parse a `MAJOR.MINOR.PATCH` tag into a comparable tuple. Trailing
+/// non-numeric components (pre-release / build metadata after `-` or `+`) are
+/// stripped before parsing; segments that fail to parse fall back to `0` so a
+/// malformed remote tag never masks a real upgrade. Returns `None` only when
+/// the input has fewer than three dot-separated segments.
+fn parse_version(v: &str) -> Option<(u64, u64, u64)> {
+    let core = v.split(['-', '+']).next().unwrap_or(v);
+    let mut it = core.split('.');
+    let major = it.next()?.parse().unwrap_or(0);
+    let minor = it.next()?.parse().unwrap_or(0);
+    let patch = it.next()?.parse().unwrap_or(0);
+    Some((major, minor, patch))
+}
+
+/// Strictly-greater comparison. Returns `false` if either side fails to parse
+/// — better to under-prompt than to flag a phantom upgrade.
+fn is_newer(latest: &str, current: &str) -> bool {
+    match (parse_version(latest), parse_version(current)) {
+        (Some(l), Some(c)) => l > c,
+        _ => false,
+    }
+}
+
 /// Check whether a newer release is available. Returns the latest version tag
-/// (without `v` prefix) if it differs from the compiled-in version, or `None`
-/// if already up-to-date or the check fails (network unavailable, etc.).
+/// (without `v` prefix) only when it is **strictly greater** than the
+/// compiled-in version. Returns `None` when already up-to-date, when the
+/// upstream `releases/latest` is *older* than the running binary (happens
+/// between a local `Cargo.toml` bump and the matching GitHub release), or when
+/// the check fails (network unavailable, etc.).
 ///
 /// Intentionally non-async and synchronous so it can be called from the TUI
 /// startup path before the tokio runtime is running on the server thread.
@@ -95,7 +121,11 @@ pub fn check_latest() -> Option<String> {
             .unwrap_or(&release.tag_name)
             .to_string();
         let current = env!("CARGO_PKG_VERSION");
-        if latest != current { Some(latest) } else { None }
+        if is_newer(&latest, current) {
+            Some(latest)
+        } else {
+            None
+        }
     })
 }
 
@@ -160,6 +190,15 @@ async fn run_async() -> Result<UpdateOutcome> {
     let latest_version = release.tag_name.strip_prefix('v').unwrap_or(&release.tag_name);
     if latest_version == current_version {
         println!("Already on latest ({latest_version}).");
+        return Ok(UpdateOutcome::NotNeeded);
+    }
+    // Guard against the window where Cargo.toml has been bumped locally but the
+    // matching GitHub release hasn't been published — without this, a manual
+    // `oxiremote update` would silently downgrade the running binary.
+    if !is_newer(latest_version, current_version) {
+        println!(
+            "Local build ({current_version}) is ahead of latest published release ({latest_version}). Nothing to do."
+        );
         return Ok(UpdateOutcome::NotNeeded);
     }
     println!("Latest version:  {latest_version}");
@@ -354,5 +393,37 @@ pub fn cleanup_stale_bak() {
         if let Ok(exe) = std::env::current_exe() {
             let _ = std::fs::remove_file(exe.with_extension("exe.bak"));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{is_newer, parse_version};
+
+    #[test]
+    fn parse_version_extracts_triplet() {
+        assert_eq!(parse_version("0.1.64"), Some((0, 1, 64)));
+        assert_eq!(parse_version("1.2.3"), Some((1, 2, 3)));
+        // Pre-release / build metadata is stripped.
+        assert_eq!(parse_version("0.2.0-rc1"), Some((0, 2, 0)));
+        assert_eq!(parse_version("0.2.0+build.5"), Some((0, 2, 0)));
+        // Too few segments → None (treated as unparseable).
+        assert_eq!(parse_version("0.1"), None);
+    }
+
+    #[test]
+    fn is_newer_strict_greater_only() {
+        // Real-world regression: GitHub `releases/latest` is older than the
+        // running Cargo.toml version. Must NOT flag as an upgrade.
+        assert!(!is_newer("0.1.62", "0.1.64"));
+        // Equal versions are not newer.
+        assert!(!is_newer("0.1.64", "0.1.64"));
+        // Real upgrades.
+        assert!(is_newer("0.1.65", "0.1.64"));
+        assert!(is_newer("0.2.0", "0.1.99"));
+        assert!(is_newer("1.0.0", "0.99.99"));
+        // Malformed input fails closed — better to under-prompt than to flag a
+        // phantom upgrade.
+        assert!(!is_newer("nightly", "0.1.64"));
     }
 }
