@@ -341,7 +341,10 @@ impl Vp9Encoder for VpxVp9Encoder {
                 pts_ms,
                 33 as c_ulong, // ~30 fps duration in ms
                 flags,
-                vpx::VPX_DL_REALTIME as vpx::vpx_enc_deadline_t,
+                // Deadline param: libvpx ≥1.15 typedefs this as `vpx_enc_deadline_t`,
+                // older releases (Ubuntu 24.04 ships 1.13) only expose the raw c_ulong.
+                // Cast to c_ulong directly so both work.
+                vpx::VPX_DL_REALTIME as c_ulong,
             )
         };
         if rv != vpx::vpx_codec_err_t::VPX_CODEC_OK {
