@@ -5,9 +5,11 @@
   "scripts": {
     "dev": "bun run --parallel dev:agent dev:web",
     "dev:h264": "bun run --parallel dev:agent:h264 dev:web",
+    "dev:audio": "bun run --parallel dev:agent:audio dev:web",
     "dev:web": "bun --cwd apps/web dev",
     "dev:agent": "cargo run --manifest-path agent/Cargo.toml",
     "dev:agent:h264": "OXI_VIDEO_PIPELINE=h264 cargo run --manifest-path agent/Cargo.toml --features h264",
+    "dev:agent:audio": "cargo run --manifest-path agent/Cargo.toml --features audio",
     "dev:landing": "bun --cwd apps/landing dev",
     "dev:discovery": "bun --cwd apps/discovery-worker dev",
     "build": "bun run build:web && cargo build --manifest-path agent/Cargo.toml",
