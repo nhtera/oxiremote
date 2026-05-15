@@ -49,6 +49,12 @@ function jsonResponse(body: unknown, status: number, origin: string | null): Res
     status,
     headers: {
       'Content-Type': 'application/json',
+      // Control-plane responses are never safe to cache: lookups race against
+      // a fire-and-forget agent registration, and any cached 404 (browser
+      // heuristic-freshness or Cloudflare edge) strands users behind a stale
+      // "expired/unknown" error until they wipe site data. `no-store` is the
+      // only directive that bypasses both caches in every browser.
+      'Cache-Control': 'no-store',
       ...corsHeaders(origin),
     },
   })

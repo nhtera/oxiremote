@@ -197,9 +197,15 @@ async function rawLookup(key: string): Promise<LookupResult | null> {
   const base = discoveryBaseUrl()
   if (!base) return null
   try {
+    // `cache: 'no-store'` bypasses the HTTP cache on both read and write. The
+    // worker emits 404 during the brief race between OTK generation and the
+    // agent's spawn_register_code POST landing — without no-store the browser
+    // can apply heuristic freshness to that 404 and serve it back on every
+    // retry, locking the user out until they clear site data.
     const res = await fetch(`${base}/api/session/lookup?k=${encodeURIComponent(key)}`, {
       method: 'GET',
       credentials: 'omit',
+      cache: 'no-store',
     })
     if (!res.ok) return null
     const body = (await res.json()) as { tunnelUrl?: unknown; localIp?: unknown; discoveryId?: unknown }
