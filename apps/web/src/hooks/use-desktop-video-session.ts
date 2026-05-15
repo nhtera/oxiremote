@@ -395,6 +395,11 @@ export function useDesktopVideoSession(
           // Skipping this would force a reconnect every time the user has
           // HiDPI on.
           ws.send(JSON.stringify({ type: 'settings', hidpi: hidpiRef.current }))
+          // Push the quality tier too so the encoder picks up the user's
+          // resolution scaling on first frame instead of building at the
+          // default Med, only to be restarted by the first ctrl-DC tier
+          // message. Mirrors the hidpi pre-offer hand-off.
+          ws.send(JSON.stringify({ type: 'quality', tier: tierRef.current }))
           return pc.createOffer()
         })
         .then((offer) => {

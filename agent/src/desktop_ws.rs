@@ -103,6 +103,13 @@ mod inner {
             #[serde(default)]
             hidpi: bool,
         },
+        /// Pre-offer quality tier hint. Lets the encoder build at the user's
+        /// chosen resolution on session-start instead of defaulting to Med
+        /// then restarting on first ctrl-DC tier message. Mid-session tier
+        /// changes still come via the DC `quality` WireInput.
+        Quality {
+            tier: String,
+        },
         /// Phase-02a: client-driven audio mute mid-session. `enabled=false`
         /// fires the audio pipeline shutdown with `UserToggleOff`; video
         /// continues. `enabled=true` is logged + ignored (re-enabling needs
@@ -504,7 +511,7 @@ mod inner {
             client_audio_opt_in,
             client_loopback,
             buffered_ice,
-        ) = match await_offer_with_caps(&mut socket, &mut close_rx, operator_pref).await {
+        ) = match await_offer_with_caps(&mut socket, &mut close_rx, operator_pref, &quality_tx).await {
                 Ok(v) => v,
                 Err(e) => {
                     // Emit a telemetry event for the failure path so dashboards
@@ -986,7 +993,7 @@ mod inner {
             // Channels for pipeline + RTCP reader lifecycle.
             let (bgra_tx, bgra_rx) = mpsc::channel::<desktop::RawBgraFrame>(2);
             let (bitrate_tx, bitrate_rx) =
-                watch::channel(tier_bitrate_vp9(initial_tier, hidpi));
+                watch::channel(tier_bitrate_vp9(initial_tier, scale_factor, hidpi));
             let (pli_tx, pli_rx) = mpsc::channel::<()>(4);
             let (seq_info_tx, seq_info_rx) =
                 tokio::sync::oneshot::channel::<desktop::encoders::Vp9SequenceInfo>();
@@ -1051,7 +1058,7 @@ mod inner {
                 crate::vp9_pipeline::Vp9PipelineConfig {
                     width: out_w,
                     height: out_h,
-                    initial_bitrate: tier_bitrate_vp9(initial_tier, hidpi),
+                    initial_bitrate: tier_bitrate_vp9(initial_tier, scale_factor, hidpi),
                     track: Arc::clone(track),
                     bgra_rx,
                     bitrate_rx,
@@ -1085,7 +1092,7 @@ mod inner {
                 tokio::sync::oneshot::channel::<()>();
             let mut vp9_abr_shutdown_tx = Some(vp9_abr_shutdown_tx);
             if !client_loopback {
-                let initial_kbps = tier_bitrate_vp9(initial_tier, hidpi).0 / 1_000;
+                let initial_kbps = tier_bitrate_vp9(initial_tier, scale_factor, hidpi).0 / 1_000;
                 let floor_kbps = BitrateBps::LOW.0 / 1_000;
                 crate::desktop_abr::spawn_controller(crate::desktop_abr::ControllerConfig {
                     abr_rx: abr_tx.subscribe(),
@@ -1152,9 +1159,9 @@ mod inner {
                             // Phase-08: surface the VP9 codec-specific tier
                             // bitrates so the SPA stats overlay reflects
                             // the real targets (not H.264's presets).
-                            let low = tier_bitrate_vp9(QualityTier::Low, false).0 / 1_000;
-                            let med = tier_bitrate_vp9(QualityTier::Med, false).0 / 1_000;
-                            let high = tier_bitrate_vp9(QualityTier::High, false).0 / 1_000;
+                            let low = tier_bitrate_vp9(QualityTier::Low, 1.0, false).0 / 1_000;
+                            let med = tier_bitrate_vp9(QualityTier::Med, 1.0, false).0 / 1_000;
+                            let high = tier_bitrate_vp9(QualityTier::High, 1.0, false).0 / 1_000;
                             let _ = BitrateBps::LOW; // silence unused-import
                             let msg = SignalOut::Pipeline {
                                 mode: "vp9",
@@ -1197,10 +1204,19 @@ mod inner {
 
                     Ok(_) = quality_rx.changed() => {
                         let new_tier = *quality_rx.borrow();
-                        let _ = bitrate_tx.send(tier_bitrate_vp9(new_tier, current_hidpi));
                         let (w, h) = resize_dims(
                             screen_w, screen_h, new_tier, scale_factor, current_hidpi,
                         );
+                        // Encoder dims are locked at init. If the new tier
+                        // resizes capture, break out so the SPA reconnect
+                        // rebuilds the session at the new dims (same path
+                        // hidpi-flip uses). Otherwise just push bitrate live.
+                        if (w, h) != (out_w, out_h) {
+                            info!(old = ?(out_w, out_h), new = ?(w, h), new_tier = ?new_tier,
+                                "vp9: tier change resizes capture → session restart");
+                            break;
+                        }
+                        let _ = bitrate_tx.send(tier_bitrate_vp9(new_tier, scale_factor, current_hidpi));
                         if let Ok(msg) = serde_json::to_string(&SignalOut::Capabilities {
                             width: w, height: h, scale_factor, tile_size: desktop::TILE_SIZE,
                         }) {
@@ -1285,7 +1301,7 @@ mod inner {
 
             let (bgra_tx, bgra_rx) = mpsc::channel::<desktop::RawBgraFrame>(2);
             let (bitrate_tx, bitrate_rx) =
-                watch::channel(tier_bitrate_av1(initial_tier, hidpi));
+                watch::channel(tier_bitrate_av1(initial_tier, scale_factor, hidpi));
             let (pli_tx, pli_rx) = mpsc::channel::<()>(4);
             let (seq_info_tx, seq_info_rx) =
                 tokio::sync::oneshot::channel::<desktop::encoders::Av1SequenceInfo>();
@@ -1348,7 +1364,7 @@ mod inner {
                 crate::av1_pipeline::Av1PipelineConfig {
                     width: out_w,
                     height: out_h,
-                    initial_bitrate: tier_bitrate_av1(initial_tier, hidpi),
+                    initial_bitrate: tier_bitrate_av1(initial_tier, scale_factor, hidpi),
                     track: Arc::clone(track),
                     bgra_rx,
                     bitrate_rx,
@@ -1380,7 +1396,7 @@ mod inner {
                 tokio::sync::oneshot::channel::<()>();
             let mut av1_abr_shutdown_tx = Some(av1_abr_shutdown_tx);
             if !client_loopback {
-                let initial_kbps = tier_bitrate_av1(initial_tier, hidpi).0 / 1_000;
+                let initial_kbps = tier_bitrate_av1(initial_tier, scale_factor, hidpi).0 / 1_000;
                 let floor_kbps = BitrateBps::LOW.0 / 1_000;
                 crate::desktop_abr::spawn_controller(crate::desktop_abr::ControllerConfig {
                     abr_rx: abr_tx.subscribe(),
@@ -1445,9 +1461,9 @@ mod inner {
                             // Phase-08: surface AV1's codec-specific tier
                             // bitrates (lower than VP9 — AV1 + screen tools
                             // hit equivalent quality at ~70% of VP9).
-                            let low = tier_bitrate_av1(QualityTier::Low, false).0 / 1_000;
-                            let med = tier_bitrate_av1(QualityTier::Med, false).0 / 1_000;
-                            let high = tier_bitrate_av1(QualityTier::High, false).0 / 1_000;
+                            let low = tier_bitrate_av1(QualityTier::Low, 1.0, false).0 / 1_000;
+                            let med = tier_bitrate_av1(QualityTier::Med, 1.0, false).0 / 1_000;
+                            let high = tier_bitrate_av1(QualityTier::High, 1.0, false).0 / 1_000;
                             let _ = BitrateBps::LOW;
                             let msg = SignalOut::Pipeline {
                                 mode: "av1",
@@ -1490,10 +1506,17 @@ mod inner {
 
                     Ok(_) = quality_rx.changed() => {
                         let new_tier = *quality_rx.borrow();
-                        let _ = bitrate_tx.send(tier_bitrate_av1(new_tier, current_hidpi));
                         let (w, h) = resize_dims(
                             screen_w, screen_h, new_tier, scale_factor, current_hidpi,
                         );
+                        // Encoder dims are locked at init — break on resize.
+                        // See vp9 dispatcher for full rationale.
+                        if (w, h) != (out_w, out_h) {
+                            info!(old = ?(out_w, out_h), new = ?(w, h), new_tier = ?new_tier,
+                                "av1: tier change resizes capture → session restart");
+                            break;
+                        }
+                        let _ = bitrate_tx.send(tier_bitrate_av1(new_tier, scale_factor, current_hidpi));
                         if let Ok(msg) = serde_json::to_string(&SignalOut::Capabilities {
                             width: w, height: h, scale_factor, tile_size: desktop::TILE_SIZE,
                         }) {
@@ -1806,7 +1829,7 @@ mod inner {
 
         // ── Channels ──────────────────────────────────────────────────────────
         let (bgra_tx, bgra_rx) = mpsc::channel::<desktop::RawBgraFrame>(2);
-        let (bitrate_tx, bitrate_rx) = watch::channel(tier_bitrate(initial_tier, hidpi));
+        let (bitrate_tx, bitrate_rx) = watch::channel(tier_bitrate(initial_tier, scale_factor, hidpi));
         let (pli_tx, pli_rx) = mpsc::channel::<()>(4);
         // Force an IDR after the host unlocks so the first frame after the
         // lock-screen overlay clears is clean (no decoder green-block from a
@@ -1911,7 +1934,7 @@ mod inner {
         crate::video_pipeline::spawn_video_pipeline(crate::video_pipeline::VideoPipelineConfig {
             width: out_w,
             height: out_h,
-            initial_bitrate: tier_bitrate(initial_tier, hidpi),
+            initial_bitrate: tier_bitrate(initial_tier, scale_factor, hidpi),
             initial_max_qp: tier_max_qp(initial_tier),
             track,
             bgra_rx,
@@ -1964,7 +1987,7 @@ mod inner {
         let (abr_shutdown_tx, abr_shutdown_rx) = tokio::sync::oneshot::channel::<()>();
         let mut abr_shutdown_tx = Some(abr_shutdown_tx);
         if !client_loopback {
-            let initial_kbps = tier_bitrate(initial_tier, hidpi).0 / 1_000;
+            let initial_kbps = tier_bitrate(initial_tier, scale_factor, hidpi).0 / 1_000;
             // Floor = Low-tier preset (no HiDPI scaling) — controller can
             // cut bitrate aggressively in Recovery but never drops below a
             // value where the encoder produces visible artifacts. Ceiling =
@@ -2178,16 +2201,22 @@ mod inner {
                     if socket.send(Message::Text(text.into())).await.is_err() { break; }
                 }
 
-                // Tier change → new bitrate target. Dimensions cannot change
-                // mid-session in H.264 mode (encoder size is fixed at init);
-                // capabilities are re-emitted so the client stays in sync but
-                // the encoder keeps its locked resolution.
+                // Tier change → bitrate update if dims unchanged, full
+                // session restart if the new tier resizes capture. H.264
+                // encoder dims are locked at init (VT can't resize live);
+                // breaking lets the SPA reconnect rebuild at the new dims,
+                // matching the hidpi-flip path below.
                 Ok(_) = quality_rx.changed() => {
                     let new_tier = *quality_rx.borrow();
-                    let _ = bitrate_tx.send(tier_bitrate(new_tier, current_hidpi));
                     let (w, h) = resize_dims(
                         screen_w, screen_h, new_tier, scale_factor, current_hidpi,
                     );
+                    if (w, h) != (out_w, out_h) {
+                        info!(old = ?(out_w, out_h), new = ?(w, h), new_tier = ?new_tier,
+                            "h264: tier change resizes capture → session restart");
+                        break;
+                    }
+                    let _ = bitrate_tx.send(tier_bitrate(new_tier, scale_factor, current_hidpi));
                     if let Ok(msg) = serde_json::to_string(&SignalOut::Capabilities {
                         width: w, height: h, scale_factor, tile_size: desktop::TILE_SIZE,
                     }) {
@@ -2347,21 +2376,30 @@ mod inner {
     /// VP9 hits equivalent screen-content quality at ~40-50 % of H.264's
     /// bitrate per CRD measurements, so the presets drop accordingly —
     /// `LOW=1.0 Mbps`, `MED=2.5 Mbps`, `HIGH=5 Mbps` (vs H.264's
-    /// `LOW=2.5 / MED=6 / HIGH=12 Mbps`). HiDPI still doubles and the
-    /// 30 Mbps cap is preserved as a safety ceiling.
+    /// `LOW=2.5 / MED=6 / HIGH=12 Mbps`). The 30 Mbps cap is preserved
+    /// as a safety ceiling.
+    ///
+    /// **HiDPI area-scaling (2026-05-16):** in HiDPI mode the encoder
+    /// receives physical pixels, so output pixel area grows as
+    /// `scale_factor²` (e.g. 4× on a 2× Retina, 2.25× on Windows 1.5×).
+    /// The bitrate budget tracks the area so bits-per-pixel stays
+    /// constant across HiDPI on/off at the same tier. Previously a flat
+    /// `× 2` left HiDPI sessions on Retina with half the budget per
+    /// pixel — visibly smeared on motion and the in-video cursor lagged
+    /// the SPA overlay sprite.
     #[cfg(feature = "vp9")]
-    fn tier_bitrate_vp9(tier: QualityTier, hidpi: bool) -> desktop::encoders::BitrateBps {
+    fn tier_bitrate_vp9(
+        tier: QualityTier,
+        scale_factor: f32,
+        hidpi: bool,
+    ) -> desktop::encoders::BitrateBps {
         use desktop::encoders::BitrateBps;
         let base = match tier {
             QualityTier::High => BitrateBps(5_000_000),
             QualityTier::Med => BitrateBps(2_500_000),
             QualityTier::Low => BitrateBps(1_000_000),
         };
-        if hidpi {
-            BitrateBps((base.0.saturating_mul(2)).min(30_000_000))
-        } else {
-            base
-        }
+        scale_hidpi_bitrate(base, scale_factor, hidpi)
     }
 
     /// Poll the AV1 first-IDR oneshot for sequence info. AV1 has no
@@ -2382,19 +2420,21 @@ mod inner {
     /// screen-content quality at ~30 % below VP9's bitrate. Presets
     /// drop to `LOW=0.7 Mbps`, `MED=1.5 Mbps`, `HIGH=3 Mbps`. Matches the
     /// bitrate footprint Chrome Remote Desktop uses for AV1 sessions.
+    ///
+    /// HiDPI scales by `scale_factor²` — see `tier_bitrate_vp9` for rationale.
     #[cfg(feature = "av1")]
-    fn tier_bitrate_av1(tier: QualityTier, hidpi: bool) -> desktop::encoders::BitrateBps {
+    fn tier_bitrate_av1(
+        tier: QualityTier,
+        scale_factor: f32,
+        hidpi: bool,
+    ) -> desktop::encoders::BitrateBps {
         use desktop::encoders::BitrateBps;
         let base = match tier {
             QualityTier::High => BitrateBps(3_000_000),
             QualityTier::Med => BitrateBps(1_500_000),
             QualityTier::Low => BitrateBps(700_000),
         };
-        if hidpi {
-            BitrateBps((base.0.saturating_mul(2)).min(30_000_000))
-        } else {
-            base
-        }
+        scale_hidpi_bitrate(base, scale_factor, hidpi)
     }
 
     /// Spawn the audio capture + Opus encoder pipeline for the current
@@ -2529,18 +2569,41 @@ mod inner {
     /// zone still cuts 30% on loss; floor stays at LOW tier (2.5 Mbps) so
     /// cellular sessions converge to a sane bitrate even at the new cap.
     #[cfg(feature = "h264")]
-    fn tier_bitrate(tier: QualityTier, hidpi: bool) -> desktop::encoders::BitrateBps {
+    fn tier_bitrate(
+        tier: QualityTier,
+        scale_factor: f32,
+        hidpi: bool,
+    ) -> desktop::encoders::BitrateBps {
         use desktop::encoders::BitrateBps;
         let base = match tier {
             QualityTier::High => BitrateBps::HIGH,
             QualityTier::Med => BitrateBps::MED,
             QualityTier::Low => BitrateBps::LOW,
         };
-        if hidpi {
-            BitrateBps((base.0.saturating_mul(2)).min(30_000_000))
-        } else {
-            base
+        scale_hidpi_bitrate(base, scale_factor, hidpi)
+    }
+
+    /// Shared HiDPI bitrate scaling for H.264/VP9/AV1. In HiDPI mode the
+    /// encoder receives physical pixels, so output area grows as
+    /// `scale_factor²`. We track that to keep bits-per-pixel constant
+    /// across HiDPI on/off at the same tier, capped at 30 Mbps.
+    /// `scale_factor` is clamped to `>= 1.0` defensively — values below
+    /// 1.0 don't make physical sense for HiDPI but would otherwise
+    /// shrink the budget.
+    #[cfg(any(feature = "h264", feature = "vp9", feature = "av1"))]
+    fn scale_hidpi_bitrate(
+        base: desktop::encoders::BitrateBps,
+        scale_factor: f32,
+        hidpi: bool,
+    ) -> desktop::encoders::BitrateBps {
+        use desktop::encoders::BitrateBps;
+        const CAP_BPS: f64 = 30_000_000.0;
+        if !hidpi {
+            return base;
         }
+        let sf = (scale_factor as f64).max(1.0);
+        let scaled = (base.0 as f64 * sf * sf).min(CAP_BPS).round();
+        BitrateBps(scaled as u32)
     }
 
     // ── Signaling: offer → answer ─────────────────────────────────────────────
@@ -2604,6 +2667,7 @@ mod inner {
         socket: &mut WebSocket,
         close_rx: &mut tokio::sync::oneshot::Receiver<()>,
         operator: OperatorPref,
+        quality_tx: &watch::Sender<QualityTier>,
     ) -> anyhow::Result<(
         Pipeline,
         &'static str,
@@ -2729,6 +2793,17 @@ mod inner {
                         }
                         Ok(SignalIn::Settings { hidpi }) => {
                             initial_hidpi = hidpi;
+                        }
+                        Ok(SignalIn::Quality { tier }) => {
+                            // Pre-offer tier hint — write straight into the
+                            // session-wide `quality_tx` so the H.264/VP9/AV1
+                            // dispatchers read it as `initial_tier`. Unknown
+                            // values are ignored (channel stays at default
+                            // Med); the post-offer ctrl-DC `quality` message
+                            // still corrects it via the live-update path.
+                            if let Some(t) = parse_quality_tier(&tier) {
+                                let _ = quality_tx.send(t);
+                            }
                         }
                         Ok(SignalIn::AudioToggle { .. }) => {
                             // Pre-offer phase: the audio pipeline isn't
@@ -3167,35 +3242,62 @@ a=fmtp:96 profile-level-id=42e01f AV1-MENTION-IN-FMTP\r\n";
         use super::*;
         use desktop::encoders::BitrateBps;
 
-        /// HiDPI on doubles the per-tier bitrate, capped at 30 Mbps so REMB
-        /// clamping doesn't fight us under cellular bandwidth. Cap was 20 Mbps
-        /// before the 2026-05-13 quality uplift; raised to land in
-        /// Sunshine/Moonlight territory for Retina captures.
+        /// HiDPI on scales the per-tier bitrate by `scale_factor²` to track
+        /// the pixel area growth (the encoder sees physical pixels in HiDPI
+        /// mode). Result is capped at 30 Mbps so REMB clamping doesn't fight
+        /// us under cellular bandwidth. Cap was 20 Mbps before the 2026-05-13
+        /// quality uplift; raised to land in Sunshine/Moonlight territory for
+        /// Retina captures. Area-scaling replaced a flat 2× on 2026-05-16
+        /// after Retina/HiDPI motion was visibly smeared with the cursor
+        /// trailing — see `260516-0136-hidpi-bitrate-area-scale` notes.
         #[test]
-        fn tier_bitrate_doubles_when_hidpi_on() {
-            // Off → matches base preset.
-            assert_eq!(tier_bitrate(QualityTier::Low, false).0, BitrateBps::LOW.0);
-            assert_eq!(tier_bitrate(QualityTier::Med, false).0, BitrateBps::MED.0);
-            assert_eq!(tier_bitrate(QualityTier::High, false).0, BitrateBps::HIGH.0);
+        fn tier_bitrate_off_matches_base_preset() {
+            for sf in [1.0_f32, 1.5, 2.0] {
+                assert_eq!(tier_bitrate(QualityTier::Low, sf, false).0, BitrateBps::LOW.0);
+                assert_eq!(tier_bitrate(QualityTier::Med, sf, false).0, BitrateBps::MED.0);
+                assert_eq!(tier_bitrate(QualityTier::High, sf, false).0, BitrateBps::HIGH.0);
+            }
+        }
 
-            // On → 2× until the 30 Mbps cap.
+        #[test]
+        fn tier_bitrate_scales_by_area_on_hidpi() {
+            // 2× Retina → 4× area → bitrate ×4 (capped at 30 Mbps).
             assert_eq!(
-                tier_bitrate(QualityTier::Low, true).0,
-                BitrateBps::LOW.0 * 2
+                tier_bitrate(QualityTier::Low, 2.0, true).0,
+                (BitrateBps::LOW.0 as f64 * 4.0) as u32
             );
             assert_eq!(
-                tier_bitrate(QualityTier::Med, true).0,
-                BitrateBps::MED.0 * 2
+                tier_bitrate(QualityTier::Med, 2.0, true).0,
+                (BitrateBps::MED.0 as f64 * 4.0).min(30_000_000.0) as u32
             );
-            // High = 12 Mbps × 2 = 24 Mbps → under 30 Mbps cap, unclamped.
+            // 12 Mbps × 4 = 48 Mbps → cap at 30 Mbps.
+            assert_eq!(tier_bitrate(QualityTier::High, 2.0, true).0, 30_000_000);
+        }
+
+        #[test]
+        fn tier_bitrate_scales_for_windows_fractional_dpi() {
+            // Windows 125 % → scale_factor 1.25 → area 1.5625× the logical.
+            let med_125 = tier_bitrate(QualityTier::Med, 1.25, true).0;
             assert_eq!(
-                tier_bitrate(QualityTier::High, true).0,
-                BitrateBps::HIGH.0 * 2
+                med_125,
+                (BitrateBps::MED.0 as f64 * 1.5625).round() as u32
             );
-            // Sanity: cap is 30 Mbps, not 20 Mbps. Synthesize a hypothetical
-            // 20 Mbps base to prove clamping still engages above the new cap.
-            // (Cannot mutate BitrateBps::HIGH; this regression test stays
-            // structural — see the cap constant in tier_bitrate above.)
+            // Windows 150 % → 2.25×.
+            let high_150 = tier_bitrate(QualityTier::High, 1.5, true).0;
+            assert_eq!(
+                high_150,
+                (BitrateBps::HIGH.0 as f64 * 2.25).min(30_000_000.0).round() as u32
+            );
+        }
+
+        #[test]
+        fn tier_bitrate_clamps_scale_factor_below_one() {
+            // Defensive: a stale or unset scale_factor mustn't shrink the
+            // budget below the non-HiDPI preset.
+            assert_eq!(
+                tier_bitrate(QualityTier::Med, 0.5, true).0,
+                BitrateBps::MED.0
+            );
         }
     }
 }
