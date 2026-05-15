@@ -1377,7 +1377,7 @@ dependencies = [
 
 [[package]]
 name = "desktop"
-version = "0.1.64"
+version = "0.1.65"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3977,7 +3977,7 @@ dependencies = [
 
 [[package]]
 name = "oxiremote"
-version = "0.1.64"
+version = "0.1.65"
 dependencies = [
  "aes-gcm",
  "anyhow",
