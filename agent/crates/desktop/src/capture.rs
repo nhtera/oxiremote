@@ -563,12 +563,32 @@ fn run_bgra_sck(
         }
         last_emit = now;
 
+        // 2026-05-16: discard SCK's dirty_rects at the pipeline boundary.
+        //
+        // `CMSampleBuffer.dirty_rects()` reports framebuffer redraws, but the
+        // macOS cursor is composited AFTER framebuffer dirty tracking — so a
+        // pure cursor move (no underlying window redraw) yields dirty rects
+        // that exclude both the cursor's old and new bounding box. The
+        // cursor pixels ARE in the BGRA output (SCK composites them on
+        // output), but downstream active-map encoders (VP9 `VP8E_SET_ACTIVEMAP`,
+        // AV1 `AOME_SET_ACTIVEMAP`) then mark those tiles INACTIVE → encoder
+        // SKIPs them → decoder reuses the previous frame's cursor pixels →
+        // visible cursor history trail across the screen.
+        //
+        // `encoders::Vp9Encoder::apply_dirty_rects` doc-contract: "empty rects
+        // with force_full=false means 'no info — assume full'", so passing
+        // `Vec::new()` makes the encoder mark every block active. Matches the
+        // xcap path which has never had this bug. Trades the active-map CPU
+        // optimization on idle SCK frames for correctness — the optimization
+        // helped libvpx/libaom but didn't apply to VideoToolbox H.264 anyway
+        // (the dominant pipeline on macOS).
+        let _ = frame.dirty_rects;
         match tx.try_send(RawBgraFrame {
             bytes: frame.bytes,
             width: frame.width,
             height: frame.height,
             force_idr,
-            dirty_rects: frame.dirty_rects,
+            dirty_rects: Vec::new(),
         }) {
             Ok(()) => {
                 frame_count += 1;
