@@ -223,6 +223,15 @@ pub fn make_stream(
     pipeline: &'static str,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
     let stream = stream! {
+        // Primer event: an SSE comment line emitted before the 1 s aggregator
+        // tick fires. Forces hyper to flush the response headers + first body
+        // bytes immediately. Without this the response sits buffered inside
+        // cloudflared's edge proxy until the first real `data:` frame arrives
+        // ~1 s later — Cloudflare Quick Tunnels never flushed it through and
+        // the SPA's `await fetch(...)` stayed pending forever, leaving the
+        // stats overlay stuck on "connecting".
+        yield Ok(Event::default().comment("ok"));
+
         let mut state = AggregatorState::new(pipeline);
         let mut tick = time::interval(TICK_INTERVAL);
         // Skip the immediate-fire on the first tick — wait one full

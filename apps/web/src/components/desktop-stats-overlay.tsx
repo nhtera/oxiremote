@@ -1,13 +1,18 @@
-// Phase-03 step 6: live stats overlay for the active H.264 desktop session.
+// Phase-03 step 6: live stats overlay for the active webrtc desktop session.
 // Lazy-loaded — main bundle stays under the 250 KB cap.
 //
 // Auth note: EventSource can't send Authorization headers, but the global
 // fetch interceptor in api-client.ts attaches Bearer + CSRF, so we use
 // fetch + ReadableStream and parse `data:` lines ourselves (~30 LOC).
 //
-// Termination: abort on unmount, on stream end (server emits one final
-// snapshot when the desktop session closes), or on transient fetch error
-// (component renders a single-line "stats: connecting…" / "stats: closed").
+// Reconnect strategy: the discovery worker's reverse proxy enforces a 25 s
+// AbortSignal.timeout on every upstream fetch (CF Workers cap subrequest
+// duration around 30 s) — so any SSE that crosses the worker is forcibly
+// torn down after ~25 s. We transparently reconnect on `done`/error so the
+// overlay stays live across the worker's roll. `snap` is preserved across
+// reconnects, so the displayed numbers don't blank out during the gap.
+// 404 (no active webrtc session) still terminates cleanly so JPEG sessions
+// don't busy-loop.
 //
 // Visual: fixed bottom-right, semi-transparent, monospace, pointer-events
 // off so taps fall through to the canvas.
@@ -42,18 +47,38 @@ export default function DesktopStatsOverlay({ hostId }: Props) {
   const abortRef = useRef<AbortController | null>(null)
 
   useEffect(() => {
-    const ac = new AbortController()
-    abortRef.current = ac
     let cancelled = false
+    let retryTimer: ReturnType<typeof setTimeout> | null = null
 
-    void (async () => {
+    const scheduleReconnect = (delayMs: number) => {
+      if (cancelled || retryTimer) return
+      retryTimer = setTimeout(() => {
+        retryTimer = null
+        void connect()
+      }, delayMs)
+    }
+
+    const connect = async () => {
+      if (cancelled) return
+      const ac = new AbortController()
+      abortRef.current = ac
       try {
         const res = await fetch(
           `/api/hosts/${encodeURIComponent(hostId)}/desktop/stats`,
           { signal: ac.signal, credentials: 'include' },
         )
         if (!res.ok || !res.body) {
-          if (!cancelled) setState(res.status === 404 ? 'closed' : 'error')
+          if (cancelled) return
+          if (res.status === 404) {
+            // No active webrtc session — JPEG path or pre-handshake. Retry
+            // less aggressively; if the user starts a webrtc session it'll
+            // come online within seconds.
+            setState('closed')
+            scheduleReconnect(5_000)
+          } else {
+            setState('error')
+            scheduleReconnect(1_000)
+          }
           return
         }
         if (!cancelled) setState('open')
@@ -63,12 +88,16 @@ export default function DesktopStatsOverlay({ hostId }: Props) {
         while (!cancelled) {
           const { value, done } = await reader.read()
           if (done) {
-            if (!cancelled) setState('closed')
+            // Stream ended cleanly (worker 25 s timeout or agent close) —
+            // reconnect quickly. Don't clear `snap`; keep last numbers
+            // visible across the ~1 s gap.
+            if (!cancelled) scheduleReconnect(500)
             break
           }
           buf += decoder.decode(value, { stream: true })
           // SSE frames are separated by blank lines; each frame is one
-          // or more `field: value` lines. We only emit `data:` lines.
+          // or more `field: value` lines. We only emit `data:` lines —
+          // the agent's startup `:ok` primer comment is silently skipped.
           let nl: number
           while ((nl = buf.indexOf('\n\n')) >= 0) {
             const frame = buf.slice(0, nl)
@@ -86,14 +115,25 @@ export default function DesktopStatsOverlay({ hostId }: Props) {
           }
         }
       } catch (err) {
-        if (!cancelled && (err as Error).name !== 'AbortError') setState('error')
+        if (cancelled || (err as Error).name === 'AbortError') return
+        // Mid-stream abort (worker AbortSignal.timeout, network blip, etc.).
+        // Don't flicker the state if we already have a snapshot to render.
+        if (!snap) setState('error')
+        scheduleReconnect(1_000)
       }
-    })()
+    }
+
+    void connect()
 
     return () => {
       cancelled = true
-      ac.abort()
+      if (abortRef.current) abortRef.current.abort()
+      if (retryTimer) clearTimeout(retryTimer)
     }
+    // `snap` is read inside the catch to skip the visual error flash when
+    // we already have data; intentionally NOT in the deps list — we don't
+    // want a snap update to re-run the whole effect.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [hostId])
 
   return (
