@@ -307,6 +307,7 @@ function CanvasWithInput({
         canvas={canvasRef}
         viewport={viewportRef}
         snapshot={cursorSnapshot}
+        screenDims={screenDims}
       />
     </div>
   )

@@ -28,12 +28,20 @@ interface Props {
   viewport: RefObject<HTMLElement | null>
   /** Latest pose + matching sprite. Null until the first pose lands. */
   snapshot: CursorSnapshot | null
+  /** Host monitor dimensions in LOGICAL pixels (from the agent's
+   *  `capabilities`). Used to scale the cursor sprite by the same
+   *  factor the host's UI is scaled — without this the sprite is
+   *  sized against the encoded frame width and grows proportionally
+   *  larger at Med/Low quality where the encoded frame is downscaled
+   *  from the monitor but the sprite is not. */
+  screenDims?: { width: number; height: number }
 }
 
 export default function DesktopCursorTrackOverlay({
   canvas,
   viewport,
   snapshot,
+  screenDims,
 }: Props) {
   const canvasEl = useRef<HTMLCanvasElement | null>(null)
   // Re-upload the sprite RGBA only when the id changes — pose ticks
@@ -64,11 +72,15 @@ export default function DesktopCursorTrackOverlay({
   if (!c || !v) return null
   const pr = paintedRect(c)
   const vr = v.getBoundingClientRect()
-  // The canvas's pixel width is the encoded-frame width; `pr.width` is
-  // the painted size in CSS pixels. Ratio gives us the screen scale we
-  // apply to both position offset and sprite size.
-  const canvasW = c.width || pr.width
-  const scale = canvasW > 0 ? pr.width / canvasW : 1
+  // The sprite is in host LOGICAL pixels (cursor bitmap on a 1920×1080
+  // monitor is 32px regardless of quality tier). The painted rect is in
+  // viewport CSS pixels. Scale by the host's logical width — not
+  // canvas.width (encoded-frame width), which shrinks at Med/Low quality
+  // and would make the cursor visually grow as quality drops.
+  // Fallback to canvas.width on the rare frames where capabilities have
+  // not arrived yet.
+  const monitorW = screenDims?.width ?? c.width
+  const scale = monitorW > 0 ? pr.width / monitorW : 1
   const { pose, sprite } = snapshot
   const x = pr.left - vr.left + pose.x * pr.width - sprite.hotspotX * scale
   const y = pr.top - vr.top + pose.y * pr.height - sprite.hotspotY * scale
