@@ -1089,6 +1089,7 @@ mod inner {
                     seq_info_tx,
                     frames_encoded_ok: None,
                     frames_encoded_err: None,
+                    abr_tx: abr_tx.clone(),
                 },
             );
 
@@ -1102,7 +1103,7 @@ mod inner {
             );
 
             if let Some(svc) = state.desktop_service.as_ref() {
-                svc.attach_abr_tx(device_id, abr_tx.clone());
+                svc.attach_abr_tx(device_id, abr_tx.clone(), "vp9");
             }
 
             // P1: ABR controller for VP9 sessions. Same shape as the H.264
@@ -1409,6 +1410,7 @@ mod inner {
                     seq_info_tx,
                     frames_encoded_ok: None,
                     frames_encoded_err: None,
+                    abr_tx: abr_tx.clone(),
                 },
             );
 
@@ -1422,7 +1424,7 @@ mod inner {
             );
 
             if let Some(svc) = state.desktop_service.as_ref() {
-                svc.attach_abr_tx(device_id, abr_tx.clone());
+                svc.attach_abr_tx(device_id, abr_tx.clone(), "av1");
             }
 
             // P1: ABR controller for AV1 (mirrors VP9). Loopback origins
@@ -2030,7 +2032,7 @@ mod inner {
         // device_id without reaching into pipeline internals. Optional
         // because non-desktop builds carry `Option<Arc<DesktopService>>`.
         if let Some(svc) = state.desktop_service.as_ref() {
-            svc.attach_abr_tx(device_id, abr_tx.clone());
+            svc.attach_abr_tx(device_id, abr_tx.clone(), "h264");
         }
 
         // Phase-03 step 3: spawn the ABR controller. Skipped entirely on

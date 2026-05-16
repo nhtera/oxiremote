@@ -276,10 +276,10 @@ async fn api_desktop_stats(
     let Some(svc) = state.desktop_service.as_ref() else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    let Some(rx) = svc.subscribe_abr(&device_id) else {
-        // No active h264 session for this device — JPEG sessions don't
+    let Some((rx, pipeline)) = svc.subscribe_abr(&device_id) else {
+        // No active webrtc session for this device — JPEG sessions don't
         // produce observations yet. SPA renders an empty overlay state.
         return StatusCode::NOT_FOUND.into_response();
     };
-    crate::desktop_stats_sse::make_stream(rx).into_response()
+    crate::desktop_stats_sse::make_stream(rx, pipeline).into_response()
 }

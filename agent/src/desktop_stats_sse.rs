@@ -45,9 +45,9 @@ const TICK_INTERVAL: Duration = Duration::from_secs(1);
 pub struct StatsSnapshot {
     /// UNIX epoch ms at the moment the snapshot was assembled.
     pub ts_ms: u64,
-    /// Active video pipeline label — currently always `"h264"` because
-    /// only the h264 path emits observations. JPEG path lands in a
-    /// later step; keep the field so the schema doesn't churn.
+    /// Active video pipeline label — populated from `SessionHandle` so it
+    /// reflects the codec actually negotiated for the session
+    /// (`"h264"` | `"vp9"` | `"av1"`).
     pub pipeline: &'static str,
     /// REMB target the receiver is signaling (kbps, unclamped).
     pub remb_kbps: Option<u32>,
@@ -81,8 +81,13 @@ pub struct StatsSnapshot {
 /// Mutable state the aggregator carries across ticks. Snapshots are
 /// derived from this on every emit; per-window counters reset after
 /// emit, persistent network values (REMB/loss/RTT) carry over.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct AggregatorState {
+    // Codec label sourced from the session handle. Sticky for the life
+    // of the SSE connection — pipeline switches re-register the session
+    // and tear the stream down anyway.
+    pipeline: &'static str,
+
     // Persistent: latest known per-session network observations.
     last_remb_kbps: Option<u32>,
     last_loss_pct: Option<f32>,
@@ -98,6 +103,20 @@ struct AggregatorState {
 }
 
 impl AggregatorState {
+    fn new(pipeline: &'static str) -> Self {
+        Self {
+            pipeline,
+            last_remb_kbps: None,
+            last_loss_pct: None,
+            last_rtt_ms: None,
+            last_jitter_ms: None,
+            last_bitrate_kbps: None,
+            encode_ms_window: Vec::new(),
+            keyframes_window: 0,
+            bgra_queue_peak_window: 0,
+            sample_queue_peak_window: 0,
+        }
+    }
     fn fold(&mut self, obs: AbrObservation) {
         match obs {
             AbrObservation::Network {
@@ -150,7 +169,7 @@ impl AggregatorState {
                 .duration_since(UNIX_EPOCH)
                 .map(|d| d.as_millis().min(u64::MAX as u128) as u64)
                 .unwrap_or(0),
-            pipeline: "h264",
+            pipeline: self.pipeline,
             remb_kbps: self.last_remb_kbps,
             bitrate_kbps: self.last_bitrate_kbps,
             loss_pct: self.last_loss_pct,
@@ -201,9 +220,10 @@ fn percentiles(samples: &mut [u32]) -> (Option<u32>, Option<u32>) {
 ///   reconcile.
 pub fn make_stream(
     mut rx: broadcast::Receiver<AbrObservation>,
+    pipeline: &'static str,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
     let stream = stream! {
-        let mut state = AggregatorState::default();
+        let mut state = AggregatorState::new(pipeline);
         let mut tick = time::interval(TICK_INTERVAL);
         // Skip the immediate-fire on the first tick — wait one full
         // window so the first emit isn't a near-empty snapshot.
@@ -276,7 +296,7 @@ mod tests {
 
     #[test]
     fn fold_network_then_emit_carries_persistent_state() {
-        let mut s = AggregatorState::default();
+        let mut s = AggregatorState::new("h264");
         s.fold(AbrObservation::Network {
             remb_kbps: Some(5_000),
             loss_pct: None,
@@ -298,7 +318,7 @@ mod tests {
 
     #[test]
     fn fold_encode_then_emit_resets_window_counters() {
-        let mut s = AggregatorState::default();
+        let mut s = AggregatorState::new("h264");
         for ms in [10, 20, 30, 40, 50] {
             s.fold(AbrObservation::Encode {
                 encode_ms: ms,

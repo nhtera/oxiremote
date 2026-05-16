@@ -15,12 +15,14 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 use desktop::encoders::{Av1Encoder, Av1SequenceInfo, BitrateBps, EncodedFrame};
 use desktop::{QualityTier, RawBgraFrame};
-use tokio::sync::{mpsc, oneshot, watch};
+use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use tracing::{info, warn};
 use webrtc::api::media_engine::MIME_TYPE_AV1;
 use webrtc::media::Sample;
 use webrtc::rtp_transceiver::rtp_codec::RTCRtpCodecCapability;
 use webrtc::track::track_local::track_local_static_sample::TrackLocalStaticSample;
+
+use crate::desktop_abr::AbrObservation;
 
 const FIRST_FRAME_DURATION_MS: u64 = 33;
 const PLI_MIN_INTERVAL: Duration = Duration::from_secs(1);
@@ -70,6 +72,9 @@ pub struct Av1PipelineConfig {
     pub seq_info_tx: oneshot::Sender<Av1SequenceInfo>,
     pub frames_encoded_ok: Option<Arc<AtomicU64>>,
     pub frames_encoded_err: Option<Arc<AtomicU64>>,
+    /// Per-frame ABR observation publisher; see `vp9_pipeline::Vp9PipelineConfig`
+    /// for the rationale.
+    pub abr_tx: broadcast::Sender<AbrObservation>,
 }
 
 fn build_encoder(
@@ -131,6 +136,9 @@ pub fn spawn_av1_pipeline(mut cfg: Av1PipelineConfig) {
                 frame = newer;
             }
 
+            // Snapshot bgra queue depth AFTER drain — mirrors h264/vp9 path.
+            let bgra_queue_depth = cfg.bgra_rx.len();
+
             if frame.width != encoder_w || frame.height != encoder_h {
                 info!(
                     old_width = encoder_w, old_height = encoder_h,
@@ -170,6 +178,7 @@ pub fn spawn_av1_pipeline(mut cfg: Av1PipelineConfig) {
                 warn!(error = %e, "av1 encoder.apply_dirty_rects failed");
             }
 
+            let encode_started = Instant::now();
             match encoder.encode(&frame.bytes, frame.width, frame.height, force_idr) {
                 Ok(Some(encoded)) => {
                     if pli_honored { pli_pending = false; }
@@ -193,6 +202,19 @@ pub fn spawn_av1_pipeline(mut cfg: Av1PipelineConfig) {
                             );
                         }
                     }
+                    let encode_ms =
+                        encode_started.elapsed().as_millis().min(u32::MAX as u128) as u32;
+                    let is_keyframe = encoded.is_keyframe;
+                    let sample_queue_depth = sample_tx
+                        .max_capacity()
+                        .saturating_sub(sample_tx.capacity());
+                    let _ = cfg.abr_tx.send(AbrObservation::Encode {
+                        encode_ms,
+                        is_keyframe,
+                        bgra_queue_depth,
+                        sample_queue_depth,
+                        current_bitrate_kbps: last_bitrate / 1_000,
+                    });
                     let _ = sample_tx.try_send(encoded);
                 }
                 Ok(None) => continue,
