@@ -287,7 +287,17 @@ function CanvasWithInput({
           // keyboard is open; centred otherwise so the image sits
           // balanced when the operator isn't typing.
           className={`w-full h-full object-contain outline-none ${bottomAnchor ? 'object-bottom' : ''}`}
-          style={{ display: 'block' }}
+          // Hide the local browser cursor only when the cursor sideband
+          // (`DesktopCursorTrackOverlay`) is actively rendering the host
+          // pointer — without this the user sees two stacked arrows
+          // (local browser cursor + sideband sprite). Matches CRD /
+          // RustDesk / TightVNC. Gated on `cursorSnapshot != null` so
+          // macOS sessions (no sideband, in-frame cursor) keep their
+          // local cursor as before.
+          style={{
+            display: 'block',
+            cursor: cursorSnapshot ? 'none' : undefined,
+          }}
           aria-label="Remote desktop canvas"
         />
       </div>

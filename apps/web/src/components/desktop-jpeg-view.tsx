@@ -329,7 +329,15 @@ function CanvasWithInput({
           // closed we fall back to centred so the desktop sits balanced
           // in the available space (no oddly-empty top half).
           className={`w-full h-full object-contain outline-none ${bottomAnchor ? 'object-bottom' : ''}`}
-          style={{ display: 'block' }}
+          // Hide the local browser cursor only when the cursor sideband
+          // (`DesktopCursorTrackOverlay`) is actively rendering the host
+          // pointer. Without this the user sees two stacked arrows on
+          // Windows hosts. Gated so macOS sessions (no sideband) retain
+          // the local cursor over the in-frame captured cursor.
+          style={{
+            display: 'block',
+            cursor: cursorSnapshot ? 'none' : undefined,
+          }}
           aria-label="Remote desktop canvas"
         />
       </div>
