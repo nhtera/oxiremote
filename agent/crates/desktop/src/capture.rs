@@ -54,7 +54,7 @@ impl ScreenCapture {
         #[allow(unused_mut)]
         let mut img = self.monitor.capture_image().context("capture_image")?;
         #[cfg(target_os = "windows")]
-        crate::cursor_overlay_windows::compose(&mut img, self.origin);
+        crate::cursor_overlay_windows::compose(&mut img, self.origin, self.scale_factor);
         Ok(img)
     }
 

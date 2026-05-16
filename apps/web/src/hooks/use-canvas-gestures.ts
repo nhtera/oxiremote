@@ -237,16 +237,31 @@ export function useCanvasGestures({
       setCursor((c) => ({ ...c, visible: false }))
       return
     }
-    // Park the cursor over the painted-image centre on every entry. The
-    // canvas is `object-contain`-letterboxed inside the viewport; landing
-    // in the bars would feel broken. Defer one rAF so layout has settled
-    // (refs can return 0×0 on synchronous read after a route remount).
+    // The SPA virtual cursor only earns its keep on coarse-pointer (touch)
+    // devices, where it indicates "tap-to-click lands here". On desktop
+    // browsers with a real mouse, the host OS cursor is already streamed
+    // (composited by `cursor_overlay_windows` on Win; SCK on macOS) and the
+    // mouse drives the remote directly via `use-desktop-input.onMouseMove`
+    // — rendering a parked SPA sprite there is dead weight and confuses
+    // operators who can see their real cursor in the frame already.
+    const hasFinePointer =
+      typeof window !== 'undefined' &&
+      window.matchMedia?.('(any-pointer: fine)')?.matches === true
+    if (hasFinePointer) {
+      cursorRef.current = { ...cursorRef.current, visible: false }
+      setCursor((c) => ({ ...c, visible: false }))
+      return
+    }
+
+    // Touch device, trackpad mode. Park the cursor over the painted-image
+    // centre on every entry — the canvas is `object-contain`-letterboxed
+    // inside the viewport; landing in the bars would feel broken. Defer
+    // one rAF so layout has settled (refs can return 0×0 on synchronous
+    // read after a route remount).
     //
-    // We also send a remote mouse-move to the parked coord so the host
-    // OS cursor (now composited into the captured stream on Windows; SCK
-    // composites natively on macOS) lands at the same spot as the SPA
-    // virtual cursor. Without this nudge, the two cursors render at
-    // different positions on first entry until the user drags.
+    // We also send a remote mouse-move to the parked coord so the host OS
+    // cursor (now visible in the stream) anchors under the SPA sprite —
+    // both cursors render at the same spot from frame one.
     const raf = requestAnimationFrame(() => {
       const c = target.current
       const v = viewport.current

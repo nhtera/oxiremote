@@ -43,12 +43,20 @@ fn cache() -> &'static Mutex<HashMap<isize, Sprite>> {
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// Composite the current OS cursor onto `rgba`. `monitor_origin` is the
-/// captured monitor's top-left in virtual-screen coords; cursor's screen
-/// position is translated into image-local coords by subtracting it.
+/// Composite the current OS cursor onto `rgba`.
+///
+/// `monitor_origin` is the captured monitor's top-left in virtual-screen
+/// coords. `scale_factor` is the physical/logical pixel ratio. The agent
+/// process is DPI-unaware (see `permissions.rs::normalize_to_logical`), so
+/// `GetCursorInfo` and `monitor.x/y` both return LOGICAL coords — but
+/// `xcap` captures the framebuffer at PHYSICAL pixels. Multiplying the
+/// logical-local cursor position by `scale_factor` lands the sprite in
+/// the right place on the physical-pixel buffer. At 125% scale the offset
+/// without this fix is 20%; at 200% the cursor would land at half the
+/// correct distance.
 ///
 /// No-op when the cursor is hidden, off-monitor, or any GDI call fails.
-pub fn compose(rgba: &mut RgbaImage, monitor_origin: (i32, i32)) {
+pub fn compose(rgba: &mut RgbaImage, monitor_origin: (i32, i32), scale_factor: f32) {
     let info = unsafe {
         let mut ci: CURSORINFO = std::mem::zeroed();
         ci.cbSize = std::mem::size_of::<CURSORINFO>() as u32;
@@ -65,8 +73,11 @@ pub fn compose(rgba: &mut RgbaImage, monitor_origin: (i32, i32)) {
     };
 
     let key = info.hCursor as isize;
-    let pt_x = info.ptScreenPos.x - monitor_origin.0;
-    let pt_y = info.ptScreenPos.y - monitor_origin.1;
+    let scale = scale_factor.max(1.0);
+    let logical_x = info.ptScreenPos.x - monitor_origin.0;
+    let logical_y = info.ptScreenPos.y - monitor_origin.1;
+    let pt_x = (logical_x as f32 * scale).round() as i32;
+    let pt_y = (logical_y as f32 * scale).round() as i32;
 
     let mut guard = cache().lock().unwrap_or_else(|e| e.into_inner());
     if !guard.contains_key(&key) {
