@@ -20,6 +20,8 @@ pub mod macos_stay_awake;
 pub mod permissions;
 #[cfg(target_os = "macos")]
 pub mod sck;
+#[cfg(target_os = "windows")]
+pub mod cursor_overlay_windows;
 
 // Flat re-exports used by the agent crate and Phase 04 transport layer.
 pub use capture::{frame_interval, primary_scale_factor, DirtyRect, RawBgraFrame};

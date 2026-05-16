@@ -79,8 +79,19 @@ yuvutils-rs = { version = "0.8", optional = true }
 # ScreenCaptureKit instead (see `audio/sck_audio.rs`) and Linux is
 # deferred, so cpal is gated on the Windows target to keep non-Windows
 # builds from pulling Core Audio / ALSA backends they don't use.
+#
+# windows-sys: GDI + cursor APIs for `cursor_overlay_windows.rs`. xcap
+# disables cursor capture on Windows (SetIsCursorCaptureEnabled(false)),
+# so we read the live OS cursor with GetCursorInfo + GetIconInfo and
+# alpha-blend the decoded bitmap onto every captured RGBA frame. Pinned
+# to 0.59 to match the agent crate so the dep tree stays single-version.
 [target.'cfg(target_os = "windows")'.dependencies]
 cpal = { version = "0.15", optional = true }
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_UI_WindowsAndMessaging",
+] }
 
 # Phase 03 macOS hardware encoder. Raw FFI to VideoToolbox/CoreMedia via the
 # madsmtm/objc2 ecosystem — auto-generated from Apple SDK headers. All four

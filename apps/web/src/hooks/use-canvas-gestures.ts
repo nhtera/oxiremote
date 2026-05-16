@@ -241,6 +241,12 @@ export function useCanvasGestures({
     // canvas is `object-contain`-letterboxed inside the viewport; landing
     // in the bars would feel broken. Defer one rAF so layout has settled
     // (refs can return 0×0 on synchronous read after a route remount).
+    //
+    // We also send a remote mouse-move to the parked coord so the host
+    // OS cursor (now composited into the captured stream on Windows; SCK
+    // composites natively on macOS) lands at the same spot as the SPA
+    // virtual cursor. Without this nudge, the two cursors render at
+    // different positions on first entry until the user drags.
     const raf = requestAnimationFrame(() => {
       const c = target.current
       const v = viewport.current
@@ -258,9 +264,10 @@ export function useCanvasGestures({
       }
       cursorRef.current = next
       setCursor(next)
+      sendInput({ t: 'mouse', action: 'move', x: 0.5, y: 0.5 })
     })
     return () => cancelAnimationFrame(raf)
-  }, [mode, target, viewport])
+  }, [mode, target, viewport, sendInput])
 
   const sendInputRef = useRef(sendInput)
   useEffect(() => {

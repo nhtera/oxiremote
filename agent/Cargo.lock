@@ -1402,6 +1402,7 @@ dependencies = [
  "tokio",
  "tracing",
  "turbojpeg",
+ "windows-sys 0.59.0",
  "xcap",
  "xxhash-rust",
  "yuvutils-rs",

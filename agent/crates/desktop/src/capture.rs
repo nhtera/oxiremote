@@ -24,6 +24,11 @@ pub type InputWake = Arc<Notify>;
 pub struct ScreenCapture {
     monitor: Monitor,
     scale_factor: f32,
+    /// Monitor's top-left in virtual-screen coords, cached at open time.
+    /// Windows cursor overlay uses this to map `GetCursorInfo`'s screen-space
+    /// `ptScreenPos` into image-local coords. Always (0, 0) on macOS/Linux.
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+    origin: (i32, i32),
 }
 
 impl ScreenCapture {
@@ -32,12 +37,25 @@ impl ScreenCapture {
         let monitors = Monitor::all().context("list monitors")?;
         let monitor = monitors.into_iter().next().context("no monitors found")?;
         let scale_factor = monitor.scale_factor().unwrap_or(1.0).max(1.0);
-        Ok(ScreenCapture { monitor, scale_factor })
+        let origin = (monitor.x().unwrap_or(0), monitor.y().unwrap_or(0));
+        Ok(ScreenCapture {
+            monitor,
+            scale_factor,
+            origin,
+        })
     }
 
     /// Capture a single full-resolution frame from the monitor.
+    ///
+    /// On Windows the OS cursor is composited onto the RGBA buffer here —
+    /// xcap's WGC backend disables cursor capture, so without this step the
+    /// stream never shows the host pointer. See `cursor_overlay_windows`.
     pub fn next_frame(&self) -> anyhow::Result<RgbaImage> {
-        self.monitor.capture_image().context("capture_image")
+        #[allow(unused_mut)]
+        let mut img = self.monitor.capture_image().context("capture_image")?;
+        #[cfg(target_os = "windows")]
+        crate::cursor_overlay_windows::compose(&mut img, self.origin);
+        Ok(img)
     }
 
     /// Width of this monitor in logical pixels.
