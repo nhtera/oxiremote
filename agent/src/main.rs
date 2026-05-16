@@ -34,6 +34,8 @@ mod tracing_setup;
 mod update;
 mod static_files;
 #[cfg(feature = "desktop")]
+mod cursor_sideband;
+#[cfg(feature = "desktop")]
 mod desktop_service;
 #[cfg(feature = "desktop")]
 mod desktop_ws;

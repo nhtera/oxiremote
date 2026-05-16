@@ -582,6 +582,38 @@ mod inner {
             )
             .await?;
 
+        // "cursor" (id=3): server→client cursor pose + shape sideband.
+        // Decouples cursor latency from the video frame rate — the client
+        // renders the sprite at network RTT instead of waiting for the
+        // next captured frame (~33-100 ms on H.264 High). Created in both
+        // JPEG and H.264 paths; the client always pre-binds id=3 too.
+        // Ordered so shape arrives before any pose using its id.
+        //
+        // Currently only Windows publishes — `cursor_sideband::spawn`
+        // is a no-op elsewhere. macOS keeps the SCK-composited cursor
+        // in the captured frame for now (matches the current default).
+        let cursor_dc = pc
+            .create_data_channel(
+                "cursor",
+                Some(RTCDataChannelInit {
+                    ordered: Some(true),
+                    negotiated: Some(3),
+                    ..Default::default()
+                }),
+            )
+            .await?;
+        {
+            let dc = Arc::clone(&cursor_dc);
+            let origin = desktop::primary_monitor_origin();
+            let (w, h) = (screen_w, screen_h);
+            cursor_dc.on_open(Box::new(move || {
+                let dc = Arc::clone(&dc);
+                Box::pin(async move {
+                    crate::cursor_sideband::spawn(dc, origin, w, h);
+                })
+            }));
+        }
+
         // ── Outgoing WS text channel (ICE candidates + answer) ────────────────
         // Callbacks cannot hold &mut socket, so we push through an mpsc.
         let (ws_out_tx, mut ws_out_rx) = mpsc::channel::<String>(32);

@@ -37,6 +37,10 @@ import {
 } from './codec-detect'
 import { isDiscoveryMode, getCurrentTunnelUrl } from '../lib/discovery-client'
 import { getActiveHost, loadApiKey, loadTunnelBase, storeTunnelBase } from '../lib/api-client'
+import {
+  attachCursorChannel,
+  type CursorSnapshot,
+} from '../lib/desktop-cursor-track'
 import { isAllowedTunnelHost, getNamedTunnelAllowlist } from '../lib/url-validation'
 import { shouldFastRetryOnHandshakeFailure } from '../lib/ws-fast-retry'
 import { TUNNEL_URL_CHANGED_EVENT } from './use-tunnel-url-sse'
@@ -66,6 +70,10 @@ interface VideoSessionApi {
   hostLockState: HostLockState
   /** True when the agent reports OS Accessibility permission is missing. */
   accessibilityMissing: boolean
+  /** Latest cursor pose + sprite from the `cursor` sideband DataChannel,
+   *  or `null` when the server hasn't sent one (no Windows host, or
+   *  before the DC opens). Drives `<DesktopCursorTrackOverlay>`. */
+  cursorSnapshot: CursorSnapshot | null
 }
 
 /** Callback invoked once per decoded video frame. Caller draws to canvas. */
@@ -133,6 +141,8 @@ export function useDesktopVideoSession(
   const wsRef = useRef<WebSocket | null>(null)
   const pcRef = useRef<RTCPeerConnection | null>(null)
   const ctrlDcRef = useRef<RTCDataChannel | null>(null)
+  const cursorDcRef = useRef<RTCDataChannel | null>(null)
+  const [cursorSnapshot, setCursorSnapshot] = useState<CursorSnapshot | null>(null)
   const videoRef = useRef<HTMLVideoElement | null>(null)
   // Phase-02 scaffold. Hidden <audio> sink for the BUNDLE'd Opus track once the
   // server adds it (gated on Windows kill-switch). Detached element — never
@@ -255,11 +265,14 @@ export function useDesktopVideoSession(
     if (reconnectTimerRef.current) clearTimeout(reconnectTimerRef.current)
     stopFrameLoop()
     ctrlDcRef.current?.close()
+    cursorDcRef.current?.close()
     pcRef.current?.close()
     if (wsRef.current && wsRef.current.readyState < WebSocket.CLOSING) {
       wsRef.current.close()
     }
     ctrlDcRef.current = null
+    cursorDcRef.current = null
+    setCursorSnapshot(null)
     pcRef.current = null
     wsRef.current = null
     if (videoRef.current) videoRef.current.srcObject = null
@@ -316,6 +329,14 @@ export function useDesktopVideoSession(
       id: 2,
     })
     ctrlDcRef.current = ctrlDc
+
+    // Cursor DC (id=3): server-pushed pose + shape sideband. The agent
+    // polls its OS cursor at 60 Hz and forwards updates over this DC so
+    // the SPA can render the host cursor at network RTT instead of being
+    // bound to the video frame rate. Pre-bound here so the agent's
+    // matching pre-bound DC (`cursor`, id=3) finds the same SCTP stream.
+    setCursorSnapshot(null)
+    cursorDcRef.current = attachCursorChannel(pc, setCursorSnapshot)
 
     pc.onicecandidate = (e) => {
       if (e.candidate && ws.readyState === WebSocket.OPEN) {
@@ -663,5 +684,6 @@ export function useDesktopVideoSession(
     pipelineInfo,
     hostLockState,
     accessibilityMissing,
+    cursorSnapshot,
   }
 }

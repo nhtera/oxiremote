@@ -19,6 +19,7 @@ import { useCanvasGestures } from '../hooks/use-canvas-gestures'
 import { captureCanvas } from '../lib/desktop-screenshot'
 import DesktopRectOverlay, { type DesktopRectOverlayHandle } from './desktop-rect-overlay'
 import DesktopCursorOverlay from './desktop-cursor-overlay'
+import DesktopCursorTrackOverlay from './desktop-cursor-track-overlay'
 
 interface SessionSnapshot {
   status: DesktopStatus
@@ -151,6 +152,7 @@ export default function DesktopH264View({
     pipelineInfo,
     hostLockState,
     accessibilityMissing,
+    cursorSnapshot,
   } = useDesktopVideoSession(
     hostId,
     deviceId,
@@ -204,6 +206,7 @@ export default function DesktopH264View({
       onGestureApi={onGestureApi}
       bottomAnchor={bottomAnchor}
       screenDims={screenDims}
+      cursorSnapshot={cursorSnapshot}
     />
   )
 }
@@ -217,6 +220,7 @@ function CanvasWithInput({
   onGestureApi,
   bottomAnchor,
   screenDims,
+  cursorSnapshot,
 }: {
   canvasRef: React.RefObject<HTMLCanvasElement | null>
   mode: InputMode
@@ -226,6 +230,7 @@ function CanvasWithInput({
   onGestureApi?: (api: DesktopGestureApi) => void
   bottomAnchor: boolean
   screenDims?: { width: number; height: number }
+  cursorSnapshot: import('../lib/desktop-cursor-track').CursorSnapshot | null
 }) {
   const overlayRef = useRef<DesktopRectOverlayHandle>(null)
   const layerRef = useRef<HTMLDivElement>(null)
@@ -288,6 +293,11 @@ function CanvasWithInput({
       </div>
       <DesktopRectOverlay ref={overlayRef} />
       <DesktopCursorOverlay x={cursor.x} y={cursor.y} visible={cursor.visible} />
+      <DesktopCursorTrackOverlay
+        canvas={canvasRef}
+        viewport={viewportRef}
+        snapshot={cursorSnapshot}
+      />
     </div>
   )
 }

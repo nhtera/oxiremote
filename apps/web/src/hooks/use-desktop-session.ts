@@ -9,6 +9,10 @@ import { isDiscoveryMode, getCurrentTunnelUrl } from '../lib/discovery-client'
 import { getActiveHost, loadApiKey, loadTunnelBase, storeTunnelBase } from '../lib/api-client'
 import { isAllowedTunnelHost, getNamedTunnelAllowlist } from '../lib/url-validation'
 import { shouldFastRetryOnHandshakeFailure } from '../lib/ws-fast-retry'
+import {
+  attachCursorChannel,
+  type CursorSnapshot,
+} from '../lib/desktop-cursor-track'
 import { TUNNEL_URL_CHANGED_EVENT } from './use-tunnel-url-sse'
 
 /// Subprotocol marker used to carry a Bearer api_key on WS upgrade in
@@ -83,6 +87,10 @@ interface SessionApi {
   /// True when the agent reports the OS Accessibility permission is missing.
   /// SPA shows an inline yellow banner with a deep link to System Settings.
   accessibilityMissing: boolean
+  /// Latest cursor pose + sprite from the `cursor` sideband DataChannel
+  /// (Windows agents emit; macOS/Linux currently keep the cursor in the
+  /// captured frame). `null` until the first pose lands.
+  cursorSnapshot: CursorSnapshot | null
 }
 
 // Callback invoked for every raw tile binary message (DC or WS fallback).
@@ -180,6 +188,8 @@ export function useDesktopSession(
   const pcRef = useRef<RTCPeerConnection | null>(null)
   const desktopDcRef = useRef<RTCDataChannel | null>(null)
   const ctrlDcRef = useRef<RTCDataChannel | null>(null)
+  const cursorDcRef = useRef<RTCDataChannel | null>(null)
+  const [cursorSnapshot, setCursorSnapshot] = useState<CursorSnapshot | null>(null)
   const dcOpenTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const fallbackRef = useRef(false)
   const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
@@ -220,12 +230,15 @@ export function useDesktopSession(
     if (reconnectTimerRef.current) clearTimeout(reconnectTimerRef.current)
     desktopDcRef.current?.close()
     ctrlDcRef.current?.close()
+    cursorDcRef.current?.close()
     pcRef.current?.close()
     if (wsRef.current && wsRef.current.readyState < WebSocket.CLOSING) {
       wsRef.current.close()
     }
     desktopDcRef.current = null
     ctrlDcRef.current = null
+    cursorDcRef.current = null
+    setCursorSnapshot(null)
     pcRef.current = null
     wsRef.current = null
     fallbackRef.current = false
@@ -276,6 +289,14 @@ export function useDesktopSession(
       id: 2,
     })
     ctrlDcRef.current = ctrlDc
+
+    // Cursor DC (id=3): server-pushed cursor pose + shape sideband. See
+    // `desktop-cursor-track.ts` + `agent/src/cursor_sideband.rs`. Always
+    // created so the agent's pre-bound DC has a matching SCTP stream;
+    // the agent only sends data on Windows hosts today, on other hosts
+    // the DC stays open and idle (cursor remains in the captured frame).
+    setCursorSnapshot(null)
+    cursorDcRef.current = attachCursorChannel(pc, setCursorSnapshot)
 
     // ICE candidates → forward over WS
     pc.onicecandidate = (e) => {
@@ -597,5 +618,6 @@ export function useDesktopSession(
     pipelineInfo,
     hostLockState,
     accessibilityMissing,
+    cursorSnapshot,
   }
 }

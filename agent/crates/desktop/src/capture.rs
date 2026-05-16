@@ -24,11 +24,6 @@ pub type InputWake = Arc<Notify>;
 pub struct ScreenCapture {
     monitor: Monitor,
     scale_factor: f32,
-    /// Monitor's top-left in virtual-screen coords, cached at open time.
-    /// Windows cursor overlay uses this to map `GetCursorInfo`'s screen-space
-    /// `ptScreenPos` into image-local coords. Always (0, 0) on macOS/Linux.
-    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
-    origin: (i32, i32),
 }
 
 impl ScreenCapture {
@@ -37,25 +32,18 @@ impl ScreenCapture {
         let monitors = Monitor::all().context("list monitors")?;
         let monitor = monitors.into_iter().next().context("no monitors found")?;
         let scale_factor = monitor.scale_factor().unwrap_or(1.0).max(1.0);
-        let origin = (monitor.x().unwrap_or(0), monitor.y().unwrap_or(0));
-        Ok(ScreenCapture {
-            monitor,
-            scale_factor,
-            origin,
-        })
+        Ok(ScreenCapture { monitor, scale_factor })
     }
 
     /// Capture a single full-resolution frame from the monitor.
     ///
-    /// On Windows the OS cursor is composited onto the RGBA buffer here —
-    /// xcap's WGC backend disables cursor capture, so without this step the
-    /// stream never shows the host pointer. See `cursor_overlay_windows`.
+    /// On Windows the OS cursor is intentionally NOT in the captured frame
+    /// — xcap's WGC backend disables cursor capture, and we now ship the
+    /// cursor pose + shape over the `cursor` WebRTC DataChannel so the
+    /// client can render it at network RTT instead of being bound to the
+    /// video frame rate. See `cursor_windows::poll_state` / `fetch_sprite`.
     pub fn next_frame(&self) -> anyhow::Result<RgbaImage> {
-        #[allow(unused_mut)]
-        let mut img = self.monitor.capture_image().context("capture_image")?;
-        #[cfg(target_os = "windows")]
-        crate::cursor_overlay_windows::compose(&mut img, self.origin, self.scale_factor);
-        Ok(img)
+        self.monitor.capture_image().context("capture_image")
     }
 
     /// Width of this monitor in logical pixels.
@@ -84,6 +72,19 @@ pub fn primary_scale_factor() -> f32 {
         .and_then(|m| m.scale_factor().ok())
         .unwrap_or(1.0)
         .max(1.0)
+}
+
+/// Top-left of the primary monitor in virtual-screen coords. (0, 0) on
+/// single-monitor setups; non-zero when an extended desktop puts the
+/// primary monitor to the right or below another. Used by the cursor
+/// sideband to map `GetCursorInfo.ptScreenPos` to monitor-local coords
+/// before normalising for the wire.
+pub fn primary_monitor_origin() -> (i32, i32) {
+    Monitor::all()
+        .ok()
+        .and_then(|ms| ms.into_iter().next())
+        .map(|m| (m.x().unwrap_or(0), m.y().unwrap_or(0)))
+        .unwrap_or((0, 0))
 }
 
 /// Frame-rate constants per quality tier (milliseconds per frame).
