@@ -195,6 +195,33 @@ export default function DesktopPage() {
       vp.removeEventListener('scroll', update)
     }
   }, [keyboardOpen])
+
+  // iOS Safari shifts the *layout* viewport upward when an input gains
+  // focus, to keep the focused element above the soft keyboard. Our
+  // accessory bar already lifts itself above the keyboard via the
+  // paddingBottom above, so iOS's compensating scroll just pushes the
+  // remote-screen canvas off the top of the viewport — the operator sees
+  // a black bar and the wrong part of the desktop. Clamp window.scrollY
+  // back to 0 while the keyboard is open. Listener is passive; the
+  // window only scrolls when iOS does its focus-into-view dance, and we
+  // immediately undo it.
+  useEffect(() => {
+    if (!keyboardOpen) return
+    const clamp = () => {
+      if (window.scrollY !== 0 || window.scrollX !== 0) {
+        window.scrollTo(0, 0)
+      }
+    }
+    // Burst-clamp through the focus animation window (iOS does its
+    // scroll over ~150 ms), then keep listening for any subsequent
+    // shifts (rotation, keyboard predictive-bar resize, etc.).
+    const ids = [0, 50, 150, 300, 500].map((ms) => setTimeout(clamp, ms))
+    window.addEventListener('scroll', clamp, { passive: true })
+    return () => {
+      ids.forEach(clearTimeout)
+      window.removeEventListener('scroll', clamp)
+    }
+  }, [keyboardOpen])
   const [showTextBatch, setShowTextBatch] = useState(false)
   const [showExitConfirm, setShowExitConfirm] = useState(false)
   // Forces a remount of the active video view — used by the mobile Reload
