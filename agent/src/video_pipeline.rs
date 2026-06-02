@@ -215,6 +215,10 @@ pub fn spawn_video_pipeline(mut cfg: VideoPipelineConfig) {
 
     // Encoder task — blocking, owns the encoder + params_tx oneshot.
     let initial_max_qp = cfg.initial_max_qp;
+    // Capture a runtime handle for the bounded frame wait inside the thread.
+    // Must be grabbed here (async context) — a raw `std::thread` has no
+    // ambient runtime to query later.
+    let rt = tokio::runtime::Handle::current();
     std::thread::spawn(move || {
         // Track configured dims so we can detect a capture-side resolution
         // change and rebuild. xcap on Windows reports physical pixels from
@@ -273,7 +277,22 @@ pub fn spawn_video_pipeline(mut cfg: VideoPipelineConfig) {
                 }
             }
 
-            let Some(mut frame) = cfg.bgra_rx.blocking_recv() else {
+            // Bounded wait so the loop returns to the `shutdown_rx` check above
+            // even when no frames are flowing. SCK delivers nothing while the
+            // host screen is static, so a plain `blocking_recv()` parks here
+            // forever — and since this thread owns `bgra_rx`, the capture loop
+            // can never see its sender close either. The result was a permanent
+            // leak of this thread *and* the VideoToolbox encoder session (tens
+            // of MB of reference-frame buffers) on every session that ended
+            // with an idle screen. The ~250 ms timeout caps teardown latency
+            // with zero impact on active streaming (a queued frame returns
+            // immediately).
+            let Some(mut frame) = (match rt.block_on(async {
+                tokio::time::timeout(Duration::from_millis(250), cfg.bgra_rx.recv()).await
+            }) {
+                Ok(opt) => opt,            // Some(frame), or None when closed
+                Err(_timeout) => continue, // re-check shutdown at loop top
+            }) else {
                 // bgra_rx closed — capture loop shut down.
                 break;
             };

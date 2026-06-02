@@ -129,6 +129,9 @@ pub fn spawn_vp9_pipeline(mut cfg: Vp9PipelineConfig) {
     let writer_fps_rx = cfg.fps_rx.clone();
     tokio::spawn(writer_task(track, sample_rx, writer_fps_rx));
 
+    // Runtime handle for the bounded frame wait inside the encoder thread —
+    // captured here because a raw `std::thread` has no ambient runtime.
+    let rt = tokio::runtime::Handle::current();
     std::thread::spawn(move || {
         let mut encoder_w = cfg.width;
         let mut encoder_h = cfg.height;
@@ -164,7 +167,18 @@ pub fn spawn_vp9_pipeline(mut cfg: Vp9PipelineConfig) {
                 }
             }
 
-            let Some(mut frame) = cfg.bgra_rx.blocking_recv() else {
+            // Bounded wait so `shutdown_rx` (checked at loop top) is observed
+            // even when no frames flow. SCK delivers nothing on a static
+            // screen; a plain `blocking_recv()` parks here forever, leaking
+            // this thread and stranding the capture loop (which can never see
+            // its `bgra_tx` close while we hold `bgra_rx`). See
+            // `video_pipeline.rs` for the full rationale.
+            let Some(mut frame) = (match rt.block_on(async {
+                tokio::time::timeout(Duration::from_millis(250), cfg.bgra_rx.recv()).await
+            }) {
+                Ok(opt) => opt,
+                Err(_timeout) => continue,
+            }) else {
                 break;
             };
             // Drain-to-latest: discard older frames the capture loop produced
