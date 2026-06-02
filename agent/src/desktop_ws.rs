@@ -1921,10 +1921,17 @@ mod inner {
         let (pli_tx, pli_rx) = mpsc::channel::<()>(4);
         // Force an IDR after the host unlocks so the first frame after the
         // lock-screen overlay clears is clean (no decoder green-block from a
-        // P-frame referencing pre-lock content). Spawns a tiny task that
-        // owns its own lock-observer subscription + a clone of pli_tx; the
-        // task exits naturally when pli_tx is dropped at session teardown.
-        {
+        // P-frame referencing pre-lock content). Spawns a tiny task that owns
+        // its own lock-observer subscription + a clone of pli_tx.
+        //
+        // The subscription is a process-global broadcast whose sender never
+        // closes, so `rx.recv()` never resolves to `None` — the task does NOT
+        // exit on its own (dropping `pli_tx` only makes `try_send` start
+        // failing; it does not wake the `rx.recv()` await). We therefore hold
+        // the JoinHandle and abort it explicitly at session teardown.
+        // Otherwise one of these tasks (plus its global subscriber entry)
+        // leaks on every H.264 session, accumulating over days of reconnects.
+        let lock_pli_task = {
             let pli_tx = pli_tx.clone();
             tokio::spawn(async move {
                 let mut rx = desktop::macos_lock_observer::subscribe();
@@ -1936,8 +1943,17 @@ mod inner {
                         let _ = pli_tx.try_send(());
                     }
                 }
-            });
+            })
+        };
+        // Abort the lock→PLI task whenever this function returns (any break
+        // out of the session loop, early `?`, or panic unwind).
+        struct AbortOnDrop(tokio::task::JoinHandle<()>);
+        impl Drop for AbortOnDrop {
+            fn drop(&mut self) {
+                self.0.abort();
+            }
         }
+        let _lock_pli_guard = AbortOnDrop(lock_pli_task);
         let (params_tx, params_rx) = tokio::sync::oneshot::channel();
         let (vp_shutdown_tx, vp_shutdown_rx) = tokio::sync::oneshot::channel::<()>();
         let (rtcp_shutdown_tx, rtcp_shutdown_rx) = tokio::sync::oneshot::channel::<()>();

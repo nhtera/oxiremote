@@ -551,12 +551,31 @@ fn run_bgra_sck(
     // currently-selected tier interval.
     let mut last_emit = Instant::now() - Duration::from_secs(1);
 
+    // Handle for the bounded async recv below. We run inside `spawn_blocking`,
+    // so the runtime context is available.
+    let rt = tokio::runtime::Handle::current();
+
     loop {
-        let frame = match sck.next_frame_blocking() {
-            Some(f) => f,
-            None => {
+        // Bounded wait: SCK delivers no frames while the host screen is
+        // static, so a plain `next_frame_blocking()` parks here forever. The
+        // ~250 ms timeout lets us notice when the downstream consumer
+        // (`bgra_rx`, held by the encoder thread) has been dropped at session
+        // teardown — otherwise this thread + its SCStream leak on every
+        // session that ends with an idle screen.
+        let frame = match rt.block_on(async {
+            tokio::time::timeout(Duration::from_millis(250), sck.recv()).await
+        }) {
+            Ok(Some(f)) => f,
+            Ok(None) => {
                 info!("CaptureLoop::run_bgra: SCK stream ended");
                 break;
+            }
+            Err(_timeout) => {
+                if tx.is_closed() {
+                    info!("CaptureLoop::run_bgra: consumer gone, stopping");
+                    break;
+                }
+                continue;
             }
         };
 
@@ -663,6 +682,9 @@ fn run_jpeg_sck(
     let mut frame_count: u64 = 0;
     let mut dropped_count: u64 = 0;
 
+    // Handle for the bounded async recv below. We run inside `spawn_blocking`.
+    let rt = tokio::runtime::Handle::current();
+
     loop {
         // Force-IDR poll mirrors the xcap path so a new viewer joining
         // mid-session always sees a complete frame.
@@ -677,11 +699,24 @@ fn run_jpeg_sck(
             }
         }
 
-        let frame = match sck.next_frame_blocking() {
-            Some(f) => f,
-            None => {
+        // Bounded wait — see `run_bgra_sck` for the rationale. SCK delivers no
+        // frames on a static screen, so we must poll `tx.is_closed()` to learn
+        // that the session was torn down; otherwise this thread + its SCStream
+        // leak whenever a session ends with an idle screen.
+        let frame = match rt.block_on(async {
+            tokio::time::timeout(Duration::from_millis(250), sck.recv()).await
+        }) {
+            Ok(Some(f)) => f,
+            Ok(None) => {
                 info!("run_jpeg_sck: SCK stream ended");
                 break;
+            }
+            Err(_timeout) => {
+                if tx.is_closed() {
+                    info!("run_jpeg_sck: consumer gone, stopping");
+                    break;
+                }
+                continue;
             }
         };
 

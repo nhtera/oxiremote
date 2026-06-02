@@ -275,8 +275,24 @@ impl SckCapture {
 
     /// Block the caller until the next BGRA frame arrives. Returns `None` if
     /// the stream has been torn down (handler-side `tx` was dropped).
+    ///
+    /// Superseded by the timeout-wrapped [`recv`](Self::recv) in the capture
+    /// loops (which can observe consumer-drop on a static screen); kept for
+    /// callers that want an unconditional block.
+    #[allow(dead_code)]
     pub fn next_frame_blocking(&mut self) -> Option<SckFrame> {
         self.rx.blocking_recv()
+    }
+
+    /// Async receive — await the next BGRA frame. Returns `None` when the
+    /// stream is torn down. Lets the capture loop wrap the wait in a
+    /// `tokio::time::timeout` so it can periodically check whether its
+    /// downstream consumer is gone. Without this the loop parks forever in
+    /// `next_frame_blocking` when SCK stops delivering frames on a static
+    /// screen, leaking the SCStream (and the whole encode pipeline behind it)
+    /// on every session that ends while the host screen is idle.
+    pub async fn recv(&mut self) -> Option<SckFrame> {
+        self.rx.recv().await
     }
 
     /// Non-blocking poll. Useful for periodic shutdown checks alongside a
