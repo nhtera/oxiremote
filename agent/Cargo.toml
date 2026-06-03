@@ -3,7 +3,7 @@ members = [".", "crates/desktop"]
 
 [package]
 name = "oxiremote"
-version = "0.1.66"
+version = "0.1.67"
 edition = "2024"
 description = "Self-hosted remote-access agent — terminal, files, preview, and remote desktop over a Cloudflare tunnel."
 repository = "https://github.com/nhtera/oxiremote"

@@ -1,8 +1,8 @@
 // Single source of truth for the version label shown across the landing site
 // (nav badge, hero pill, footer line). Update here when cutting a release —
 // don't sprinkle string literals through the sections.
-export const VERSION = 'v0.1.66'
+export const VERSION = 'v0.1.67'
 
 // Short tagline shown next to the hero version pill — typically the headline
 // feature or theme of the release. Empty string hides the secondary text.
-export const VERSION_TAGLINE = 'Native Windows cursor over sideband DataChannel (CRD parity) + instant audio toggle'
+export const VERSION_TAGLINE = 'Fix encode-pipeline leak when a session ends on the idle screen'
