@@ -81,10 +81,10 @@ async fn spawn_tunnel(
     bus: &Arc<EventBus>,
     shutdown: &Arc<Notify>,
     rate_limited: &Arc<AtomicBool>,
-) -> anyhow::Result<Option<String>> {
+) -> anyhow::Result<(Option<String>, crate::tunnel::TerminateHandle)> {
     match mode {
         TunnelMode::Quick(addr) => {
-            let url = crate::tunnel::ensure_quick_tunnel(
+            let (url, terminate) = crate::tunnel::ensure_quick_tunnel(
                 *addr,
                 cf_path.to_path_buf(),
                 bus.clone(),
@@ -92,7 +92,7 @@ async fn spawn_tunnel(
                 rate_limited.clone(),
             )
             .await?;
-            Ok(Some(url))
+            Ok((Some(url), terminate))
         }
         TunnelMode::Named(cfg) => {
             crate::tunnel::ensure_named_tunnel(
@@ -192,20 +192,42 @@ pub async fn run(
     // cool-down when our IP is throttled.
     let rate_limited = Arc::new(AtomicBool::new(false));
 
+    // Handle to terminate the currently-running cloudflared. Fired before every
+    // respawn so at most one cloudflared is ever alive. CRITICAL for the
+    // force_respawn path: on a natural TunnelDown the child has already exited
+    // (no-op), but a heartbeat/edge-health force_respawn fires while the child
+    // is still alive — without this it stayed reparented to its wait-task with
+    // its stdout/stderr pipes held open, leaking one cloudflared per respawn
+    // until the agent exited (FD/socket exhaustion → agent wedged at Preparing).
+    let mut prev_terminate: Option<crate::tunnel::TerminateHandle> = None;
+
     loop {
         if shutdown_flag.load(Ordering::SeqCst) {
             break;
         }
 
+        // Enforce the single-cloudflared invariant: kill the previous spawn's
+        // child before launching a new one.
+        if let Some(t) = prev_terminate.take() {
+            t.notify_one();
+        }
+
         let spawn_start = Instant::now();
         match spawn_tunnel(&mode, &cf_path, &bus, &shutdown, &rate_limited).await {
-            Ok(url_or_none) => {
+            Ok((url_or_none, terminate)) => {
+                prev_terminate = Some(terminate);
                 if let Some(url) = url_or_none {
                     bus.send(AgentEvent::TunnelUrlChanged { url });
                 }
                 // Tunnel is up; wait for it to die, a forced respawn, or shutdown.
                 let should_respawn = wait_for_tunnel_down_or_shutdown(&mut rx, &force_respawn, &shutdown).await;
                 if !should_respawn {
+                    // Shutdown — terminate the live child explicitly in case the
+                    // global shutdown Notify only woke this loop, not the child's
+                    // wait-task. No-op if the wait-task already reaped it.
+                    if let Some(t) = prev_terminate.take() {
+                        t.notify_one();
+                    }
                     break;
                 }
                 // record_success resets only the short-window backoff.

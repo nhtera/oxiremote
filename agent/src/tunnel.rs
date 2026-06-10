@@ -247,13 +247,21 @@ async fn fetch_latest_tag(client: &Client) -> anyhow::Result<String> {
     anyhow::bail!("could not determine latest cloudflared version (status {status}, no location header — corporate proxy may be stripping redirects)")
 }
 
+/// Per-spawn handle the supervisor fires to terminate THIS cloudflared before
+/// launching the next one. Without it, a `force_respawn` (heartbeat / edge
+/// health) respawns cloudflared while the previous child is still alive and
+/// reparented to the wait-task forever — leaking one process + its stdout/stderr
+/// pipes per respawn until the agent exits (observed: hundreds of orphaned
+/// cloudflared after a long session, exhausting FDs/sockets).
+pub type TerminateHandle = Arc<Notify>;
+
 pub async fn ensure_quick_tunnel(
     addr: std::net::SocketAddr,
     cloudflared: PathBuf,
     bus: Arc<EventBus>,
     shutdown: Arc<Notify>,
     rate_limited: Arc<std::sync::atomic::AtomicBool>,
-) -> anyhow::Result<String> {
+) -> anyhow::Result<(String, TerminateHandle)> {
     // Step 1 — process is about to spawn.
     bus.send(AgentEvent::TunnelStepChanged {
         step: TunnelStep::Preparing,
@@ -377,9 +385,14 @@ pub async fn ensure_quick_tunnel(
                     });
 
                     // Spawn a task that races child-exit against operator
-                    // disconnect. On natural exit: fire TunnelDown (no
-                    // auto-restart — quick-tunnel URLs rotate). On disconnect:
-                    // SIGTERM cloudflared, reap, emit TunnelDisconnected.
+                    // disconnect and a supervisor-driven terminate. On natural
+                    // exit: fire TunnelDown (no auto-restart — quick-tunnel URLs
+                    // rotate). On disconnect: SIGTERM cloudflared, reap, emit
+                    // TunnelDisconnected. On terminate: SIGTERM + reap silently
+                    // — the supervisor is intentionally respawning and owns the
+                    // lifecycle event, so emitting TunnelDown here would be a lie.
+                    let terminate: TerminateHandle = Arc::new(Notify::new());
+                    let terminate_for_wait = terminate.clone();
                     let bus_for_wait = bus.clone();
                     let shutdown_for_wait = shutdown.clone();
                     tokio::spawn(async move {
@@ -399,9 +412,13 @@ pub async fn ensure_quick_tunnel(
                                 let _ = child.wait().await;
                                 bus_for_wait.send(AgentEvent::TunnelDisconnected);
                             }
+                            _ = terminate_for_wait.notified() => {
+                                let _ = child.kill().await;
+                                let _ = child.wait().await;
+                            }
                         }
                     });
-                    Ok(u)
+                    Ok((u, terminate))
                 }
                 None => {
                     bus.send(AgentEvent::TunnelStepChanged {
@@ -457,7 +474,7 @@ pub async fn ensure_named_tunnel(
     bus: Arc<EventBus>,
     shutdown: Arc<Notify>,
     rate_limited: Arc<std::sync::atomic::AtomicBool>,
-) -> anyhow::Result<Option<String>> {
+) -> anyhow::Result<(Option<String>, TerminateHandle)> {
     bus.send(AgentEvent::TunnelStepChanged {
         step: TunnelStep::Preparing,
         attempt: 1,
@@ -602,8 +619,11 @@ pub async fn ensure_named_tunnel(
     }
 
     // Mirror the quick-tunnel path: race child-exit against operator
-    // disconnect so the same `tunnel/disconnect` endpoint works regardless
-    // of tunnel mode.
+    // disconnect and a supervisor-driven terminate so the same lifecycle
+    // works regardless of tunnel mode, and a force_respawn never leaks the
+    // previous cloudflared.
+    let terminate: TerminateHandle = Arc::new(Notify::new());
+    let terminate_for_wait = terminate.clone();
     let bus_for_wait = bus.clone();
     let shutdown_for_wait = shutdown.clone();
     tokio::spawn(async move {
@@ -623,6 +643,10 @@ pub async fn ensure_named_tunnel(
                 let _ = child.wait().await;
                 bus_for_wait.send(AgentEvent::TunnelDisconnected);
             }
+            _ = terminate_for_wait.notified() => {
+                let _ = child.kill().await;
+                let _ = child.wait().await;
+            }
         }
     });
 
@@ -631,7 +655,7 @@ pub async fn ensure_named_tunnel(
     // URL in the dashboard and nobody could open it. Returning Ok(None) lets
     // the caller render a clearer "Named tunnel active (no public hostname)"
     // state instead of dangling a non-clickable string.
-    Ok(cfg.hostname)
+    Ok((cfg.hostname, terminate))
 }
 
 /// Outcome of inspecting a cloudflared stderr line for a Quick Tunnel URL
@@ -877,6 +901,70 @@ mod tests {
         assert!(
             matches!(event, AgentEvent::TunnelDisconnected),
             "expected TunnelDisconnected, got {event:?}"
+        );
+    }
+
+    /// Mirrors the production wait-task's terminate arm: a still-alive child
+    /// must be SIGKILL'd + reaped when the supervisor fires the per-spawn
+    /// terminate handle (the force_respawn path), and NO TunnelDown/Disconnected
+    /// event is emitted — the supervisor owns the lifecycle event for an
+    /// intentional respawn. Regression guard for the orphaned-cloudflared leak
+    /// that exhausted FDs/sockets after a long session.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn terminate_kills_live_child_without_event() {
+        use crate::events::EventBus;
+
+        let bus = EventBus::new();
+        let mut rx = bus.subscribe();
+        let shutdown = Arc::new(Notify::new());
+        let terminate: TerminateHandle = Arc::new(Notify::new());
+
+        // Long-lived child stands in for a healthy cloudflared the supervisor
+        // wants to replace on force_respawn.
+        let mut child = tokio::process::Command::new("/bin/sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn /bin/sleep");
+        let pid = child.id().expect("child has pid");
+
+        let bus_clone = bus.clone();
+        let shutdown_clone = shutdown.clone();
+        let terminate_clone = terminate.clone();
+        let handle = tokio::spawn(async move {
+            tokio::select! {
+                status = child.wait() => {
+                    bus_clone.send(AgentEvent::TunnelDown { reason: format!("{status:?}"), recovery_hint: None });
+                }
+                _ = shutdown_clone.notified() => {
+                    let _ = child.kill().await;
+                    let _ = child.wait().await;
+                    bus_clone.send(AgentEvent::TunnelDisconnected);
+                }
+                _ = terminate_clone.notified() => {
+                    let _ = child.kill().await;
+                    let _ = child.wait().await;
+                }
+            }
+        });
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        terminate.notify_one();
+
+        // Wait-task must finish (child reaped) within the budget.
+        tokio::time::timeout(Duration::from_secs(2), handle)
+            .await
+            .expect("wait-task did not reap child after terminate")
+            .expect("wait-task panicked");
+
+        // The reaped process must no longer be killable (ESRCH) — proves no orphan.
+        let alive = unsafe { libc::kill(pid as libc::pid_t, 0) } == 0;
+        assert!(!alive, "child must be reaped, not orphaned, after terminate");
+
+        // No lifecycle event should have been emitted for an intentional respawn.
+        assert!(
+            rx.try_recv().is_err(),
+            "terminate must not emit TunnelDown/TunnelDisconnected"
         );
     }
 
