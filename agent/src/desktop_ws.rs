@@ -50,6 +50,22 @@ mod inner {
     };
     use crate::AppState;
 
+    /// Budget from session start (answer sent, ICE underway) to
+    /// `RTCPeerConnectionState::Connected` for the codec (RTP media)
+    /// pipelines. On UDP-blocked or strict-NAT networks — the common case
+    /// on guest Wi-Fi and some cellular carriers — STUN-only ICE never
+    /// completes, and without this watchdog the session pumps signaling
+    /// forever while the viewer stares at a black canvas: the IDR watchdog
+    /// only arms *after* Connected. The signaling WS rides the Cloudflare
+    /// tunnel (TCP/443) and stays alive in exactly this failure mode, so a
+    /// `FallbackPending` sent here reliably reaches the client, which
+    /// re-mounts the JPEG view whose DataChannel/WS-binary race works
+    /// wherever the WS does. 15 s clears slow-cellular ICE (observed
+    /// 3–5 s) with generous headroom.
+    const ICE_CONNECT_TIMEOUT_S: u64 = 15;
+    /// Stable wire reason for the ICE-connect watchdog (telemetry + SPA log).
+    const ICE_TIMEOUT_REASON: &str = "ice-timeout-15s";
+
     /// Optional per-session pipeline override, parsed from the WS upgrade
     /// query string. The SPA appends `?force_pipeline=jpeg` when honoring a
     /// `FallbackPending` so the reconnect session forces JPEG without
@@ -540,12 +556,22 @@ mod inner {
         let mut media_engine = MediaEngine::default();
         media_engine.register_default_codecs()?;
         let api = APIBuilder::new().with_media_engine(media_engine).build();
+        // ICE servers come from `OXI_STUN_URL` / `OXI_TURN_*` (default:
+        // Google STUN only). A configured TURN relay is what lets media
+        // flow on UDP-blocked networks — the SPA receives the same list via
+        // the desktop capabilities endpoint so both sides can relay.
+        let ice_servers = crate::ice_servers::from_env()
+            .into_iter()
+            .map(|s| RTCIceServer {
+                urls: s.urls,
+                username: s.username.unwrap_or_default(),
+                credential: s.credential.unwrap_or_default(),
+                ..Default::default()
+            })
+            .collect();
         let pc = Arc::new(
             api.new_peer_connection(RTCConfiguration {
-                ice_servers: vec![RTCIceServer {
-                    urls: vec!["stun:stun.l.google.com:19302".into()],
-                    ..Default::default()
-                }],
+                ice_servers,
                 ..Default::default()
             })
             .await?,
@@ -1128,10 +1154,8 @@ mod inner {
             crate::video_pipeline::spawn_rtcp_reader(
                 vp9_sender,
                 pli_tx,
-                bitrate_tx.clone(),
                 abr_tx.clone(),
                 rtcp_shutdown_rx,
-                client_loopback,
             );
 
             if let Some(svc) = state.desktop_service.as_ref() {
@@ -1147,7 +1171,7 @@ mod inner {
             let mut vp9_abr_shutdown_tx = Some(vp9_abr_shutdown_tx);
             if !client_loopback {
                 let initial_kbps = tier_bitrate_vp9(initial_tier, scale_factor, hidpi).0 / 1_000;
-                let floor_kbps = BitrateBps::LOW.0 / 1_000;
+                let floor_kbps = crate::desktop_abr::ABR_FLOOR_KBPS;
                 crate::desktop_abr::spawn_controller(crate::desktop_abr::ControllerConfig {
                     abr_rx: abr_tx.subscribe(),
                     bitrate_tx: bitrate_tx.clone(),
@@ -1175,9 +1199,10 @@ mod inner {
             // Session-start IDR watchdog: same 5-second budget as H.264.
             let mut seq_info_rx = Some(seq_info_rx);
             let connected_notify = Arc::new(tokio::sync::Notify::new());
+            let pc_connected = Arc::new(std::sync::atomic::AtomicBool::new(false));
             {
                 let notify = Arc::clone(&connected_notify);
-                let fired = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let fired = Arc::clone(&pc_connected);
                 pc.on_peer_connection_state_change(Box::new(move |state| {
                     let notify = Arc::clone(&notify);
                     let fired = Arc::clone(&fired);
@@ -1199,12 +1224,39 @@ mod inner {
             };
             tokio::pin!(watchdog);
 
+            // ICE-connect watchdog — see the H.264 session for rationale.
+            let ice_connect_timer =
+                tokio::time::sleep(std::time::Duration::from_secs(ICE_CONNECT_TIMEOUT_S));
+            tokio::pin!(ice_connect_timer);
+            let mut ice_watchdog_armed = true;
+
             let current_hidpi = hidpi;
             loop {
                 tokio::select! {
                     biased;
 
                     _ = &mut close_rx => break,
+
+                    _ = &mut ice_connect_timer, if ice_watchdog_armed => {
+                        ice_watchdog_armed = false;
+                        if !pc_connected.load(std::sync::atomic::Ordering::SeqCst) {
+                            warn!(
+                                device = %device_id,
+                                "vp9: PC never reached Connected — signaling FallbackPending"
+                            );
+                            if let Ok(txt) = serde_json::to_string(&SignalOut::FallbackPending {
+                                reason: ICE_TIMEOUT_REASON,
+                            }) {
+                                let _ = socket.send(Message::Text(txt.into())).await;
+                            }
+                            state.event_bus.send(AgentEvent::PipelineChosen {
+                                device_id: device_id.to_string(),
+                                pipeline: "jpeg".to_string(),
+                                reason: "fallback-ice-timeout".to_string(),
+                            });
+                            break;
+                        }
+                    }
 
                     // First IDR — emit pipeline signal with hw_accel flag.
                     res = wait_vp9_seq_info(seq_info_rx.as_mut()), if seq_info_rx.is_some() => {
@@ -1449,10 +1501,8 @@ mod inner {
             crate::video_pipeline::spawn_rtcp_reader(
                 av1_sender,
                 pli_tx,
-                bitrate_tx.clone(),
                 abr_tx.clone(),
                 rtcp_shutdown_rx,
-                client_loopback,
             );
 
             if let Some(svc) = state.desktop_service.as_ref() {
@@ -1466,7 +1516,7 @@ mod inner {
             let mut av1_abr_shutdown_tx = Some(av1_abr_shutdown_tx);
             if !client_loopback {
                 let initial_kbps = tier_bitrate_av1(initial_tier, scale_factor, hidpi).0 / 1_000;
-                let floor_kbps = BitrateBps::LOW.0 / 1_000;
+                let floor_kbps = crate::desktop_abr::ABR_FLOOR_KBPS;
                 crate::desktop_abr::spawn_controller(crate::desktop_abr::ControllerConfig {
                     abr_rx: abr_tx.subscribe(),
                     bitrate_tx: bitrate_tx.clone(),
@@ -1493,9 +1543,10 @@ mod inner {
 
             let mut seq_info_rx = Some(seq_info_rx);
             let connected_notify = Arc::new(tokio::sync::Notify::new());
+            let pc_connected = Arc::new(std::sync::atomic::AtomicBool::new(false));
             {
                 let notify = Arc::clone(&connected_notify);
-                let fired = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let fired = Arc::clone(&pc_connected);
                 pc.on_peer_connection_state_change(Box::new(move |state| {
                     let notify = Arc::clone(&notify);
                     let fired = Arc::clone(&fired);
@@ -1517,12 +1568,39 @@ mod inner {
             };
             tokio::pin!(watchdog);
 
+            // ICE-connect watchdog — see the H.264 session for rationale.
+            let ice_connect_timer =
+                tokio::time::sleep(std::time::Duration::from_secs(ICE_CONNECT_TIMEOUT_S));
+            tokio::pin!(ice_connect_timer);
+            let mut ice_watchdog_armed = true;
+
             let current_hidpi = hidpi;
             loop {
                 tokio::select! {
                     biased;
 
                     _ = &mut close_rx => break,
+
+                    _ = &mut ice_connect_timer, if ice_watchdog_armed => {
+                        ice_watchdog_armed = false;
+                        if !pc_connected.load(std::sync::atomic::Ordering::SeqCst) {
+                            warn!(
+                                device = %device_id,
+                                "av1: PC never reached Connected — signaling FallbackPending"
+                            );
+                            if let Ok(txt) = serde_json::to_string(&SignalOut::FallbackPending {
+                                reason: ICE_TIMEOUT_REASON,
+                            }) {
+                                let _ = socket.send(Message::Text(txt.into())).await;
+                            }
+                            state.event_bus.send(AgentEvent::PipelineChosen {
+                                device_id: device_id.to_string(),
+                                pipeline: "jpeg".to_string(),
+                                reason: "fallback-ice-timeout".to_string(),
+                            });
+                            break;
+                        }
+                    }
 
                     res = wait_av1_seq_info(seq_info_rx.as_mut()), if seq_info_rx.is_some() => {
                         seq_info_rx = None;
@@ -1841,7 +1919,7 @@ mod inner {
     /// Spawns three tasks:
     /// 1. `CaptureLoop::run_bgra` (blocking thread) — raw BGRA frames.
     /// 2. `video_pipeline::spawn_video_pipeline` — BGRA→H.264, writes RTP samples.
-    /// 3. `video_pipeline::spawn_rtcp_reader` — PLI → force-IDR, REMB → bitrate.
+    /// 3. `video_pipeline::spawn_rtcp_reader` — PLI → force-IDR, RTCP → ABR observations.
     ///
     /// Waits for the first IDR's SPS/PPS, ships an `avcC` description over
     /// the signaling WS so the client's `VideoDecoder` can configure before
@@ -2059,21 +2137,9 @@ mod inner {
         crate::video_pipeline::spawn_rtcp_reader(
             sender,
             pli_tx,
-            bitrate_tx.clone(),
             abr_tx.clone(),
             rtcp_shutdown_rx,
-            // Loopback bypass: when true the REMB handler still emits the
-            // observation (so stats SSE shows what Chrome thinks) but does
-            // NOT push to bitrate_tx. Encoder stays at the operator's tier
-            // bitrate, dodging GCC's loopback collapse.
-            client_loopback,
         );
-        if client_loopback {
-            info!(
-                device = %device_id,
-                "h264: client signalled loopback origin — REMB → encoder bitrate disabled"
-            );
-        }
 
         // Phase-03 step 5: register the broadcast publisher with the
         // session registry so the stats SSE endpoint can subscribe by
@@ -2099,7 +2165,7 @@ mod inner {
             // current operator tier bitrate; mid-session tier changes
             // briefly override via the existing `quality_rx.changed()` arm,
             // and the controller re-establishes over its next few ticks.
-            let floor_kbps = BitrateBps::LOW.0 / 1_000;
+            let floor_kbps = crate::desktop_abr::ABR_FLOOR_KBPS;
             crate::desktop_abr::spawn_controller(crate::desktop_abr::ControllerConfig {
                 abr_rx: abr_tx.subscribe(),
                 bitrate_tx: bitrate_tx.clone(),
@@ -2153,13 +2219,14 @@ mod inner {
         // bounded.
         let mut params_rx = Some(params_rx);
         let connected_notify = Arc::new(tokio::sync::Notify::new());
+        let pc_connected = Arc::new(std::sync::atomic::AtomicBool::new(false));
         {
             // Only the first transition to Connected counts; PCs can briefly
             // bounce through Disconnected→Connected after ICE-restart in the
             // future, but we don't want to re-arm the watchdog mid-session
             // (params_rx is already None at that point anyway).
             let notify = Arc::clone(&connected_notify);
-            let fired = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let fired = Arc::clone(&pc_connected);
             pc.on_peer_connection_state_change(Box::new(move |state| {
                 let notify = Arc::clone(&notify);
                 let fired = Arc::clone(&fired);
@@ -2180,6 +2247,20 @@ mod inner {
             tokio::time::sleep(std::time::Duration::from_secs(5)).await;
         };
         tokio::pin!(watchdog);
+
+        // ICE-connect watchdog: the IDR watchdog above only arms once the
+        // PC reaches Connected — on UDP-blocked networks (STUN-only ICE,
+        // no relay) that never happens, and pre-fix the session would pump
+        // signaling forever while the client showed a black canvas. Bound
+        // the wait: if the PC hasn't Connected within the budget, ship
+        // `FallbackPending` over the signaling WS (which rides the tunnel
+        // over TCP and is alive in exactly this failure mode) so the SPA
+        // re-mounts the JPEG view, whose WS-binary fallback works wherever
+        // the signaling WS does.
+        let ice_connect_timer =
+            tokio::time::sleep(std::time::Duration::from_secs(ICE_CONNECT_TIMEOUT_S));
+        tokio::pin!(ice_connect_timer);
+        let mut ice_watchdog_armed = true;
 
         // Phase-02a step 10b: detector future that resolves once when the
         // operator flips `desktop_audio_enabled` to false mid-session. Polls
@@ -2209,6 +2290,27 @@ mod inner {
                 biased;
 
                 _ = &mut *close_rx => break,
+
+                _ = &mut ice_connect_timer, if ice_watchdog_armed => {
+                    ice_watchdog_armed = false;
+                    if !pc_connected.load(AtomicOrdering::SeqCst) {
+                        warn!(
+                            device = %device_id,
+                            "h264: PC never reached Connected — signaling FallbackPending"
+                        );
+                        if let Ok(txt) = serde_json::to_string(&SignalOut::FallbackPending {
+                            reason: ICE_TIMEOUT_REASON,
+                        }) {
+                            let _ = socket.send(Message::Text(txt.into())).await;
+                        }
+                        state.event_bus.send(AgentEvent::PipelineChosen {
+                            device_id: device_id.to_string(),
+                            pipeline: "jpeg".to_string(),
+                            reason: "fallback-ice-timeout".to_string(),
+                        });
+                        break;
+                    }
+                }
 
                 // First IDR's SPS/PPS — ship the avcC description once.
                 res = wait_params(params_rx.as_mut()), if params_rx.is_some() => {

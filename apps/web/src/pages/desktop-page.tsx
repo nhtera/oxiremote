@@ -25,6 +25,7 @@ import {
   supportsVp9Video,
 } from '../hooks/use-desktop-video-session'
 import { probeCodecSdpSupport } from '../hooks/codec-detect'
+import { setSessionIceServers, type IceServerEntry } from '../lib/ice-config'
 import PipelineStatusPill from '../components/pipeline-status-pill'
 import DesktopJpegView from '../components/desktop-jpeg-view'
 import DesktopH264View from '../components/desktop-h264-view'
@@ -65,6 +66,11 @@ interface Capabilities {
    *  AND-merged with `audio_enabled` does the SPA advertise `audio: true` in
    *  the WS `capabilitiesClient`. */
   audio_supported?: boolean
+  /** ICE servers the agent's own PeerConnection uses (`OXI_STUN_URL` /
+   *  `OXI_TURN_*`). Stored via `setSessionIceServers` so both session hooks
+   *  build their RTCPeerConnection with the same list — a TURN relay here is
+   *  what keeps WebRTC media alive on UDP-blocked networks. */
+  ice_servers?: IceServerEntry[]
 }
 
 interface SessionApi {
@@ -360,7 +366,13 @@ export default function DesktopPage() {
         if (!r.ok) throw new Error(`${r.status}`)
         return r.json() as Promise<Capabilities>
       })
-      .then(setCaps)
+      .then((c) => {
+        // Must land before the session views mount (they only mount once
+        // `caps` is non-null) so the first PeerConnection already carries
+        // any operator-configured TURN relay.
+        setSessionIceServers(c.ice_servers)
+        setCaps(c)
+      })
       .catch((e: unknown) => setCapsError(String(e)))
   }, [hostId])
 

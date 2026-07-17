@@ -12,8 +12,9 @@
 //! `desktop::encoders::videotoolbox_encoder`.
 //!
 //! Feedback is bidirectional: PLI packets arriving on the RTCP read loop
-//! force the next encoded frame to be an IDR (recovery), and REMB packets
-//! drive a `watch<BitrateBps>` the encoder polls between frames.
+//! force the next encoded frame to be an IDR (recovery), and RTCP
+//! observations (REMB / loss / RTT) feed the `desktop_abr` controller,
+//! which drives the `watch<BitrateBps>` the encoder polls between frames.
 
 #![cfg(feature = "h264")]
 
@@ -504,29 +505,27 @@ async fn writer_task(
 // webrtc-rs 0.11 exposes no `on_pli` / `on_remb` callbacks — per research
 // memo A, both arrive via `sender.read_rtcp()` returning a `Vec<Box<dyn
 // rtcp::packet::Packet>>`. We own the read loop ourselves, downcast each
-// packet, and fan out to two channels:
+// packet, and fan out:
 // - `pli_tx`   — one empty signal per PLI; encoder task must force next IDR.
-// - `remb_tx`  — latest REMB bitrate estimate in bps; encoder task uses as
-//                the target for `set_bitrate`. We don't debounce; encoder
-//                applies the current value at its own cadence.
+// - `abr_tx`   — REMB / loss / RTT / jitter observations for the ABR
+//                controller and the stats SSE.
+//
+// The reader does NOT write encoder bitrate. It used to push REMB straight
+// into the encoder's `bitrate_tx` clamped to a 6 Mbps floor, which fought
+// the ABR controller (two writers on one watch channel) and pinned the
+// encoder above the capacity of any link slower than 6 Mbps — sustained
+// loss, no decodable frames, black canvas. All congestion response is now
+// consolidated in `desktop_abr::AbrController`, which weighs REMB against
+// loss/RTT evidence before acting (GCC underestimates on healthy tunneled
+// paths, so raw REMB alone is not a trustworthy down-signal).
 
 /// Spawn the RTCP read loop. The task terminates when `shutdown_rx` fires,
 /// when the sender closes, or when `read_rtcp` returns a persistent error.
-///
-/// `loopback_bypass=true` — emitted by the SPA when its origin is
-/// localhost / 127.* / ::1 — disables the REMB → encoder-bitrate path. The
-/// encoder stays at the tier bitrate; REMB observations still reach the
-/// stats SSE so the overlay shows the (broken) Chrome BWE estimate. This
-/// matches Parsec's BUD2 / Rustdesk's TLS-direct posture: skip generic
-/// BWE on local paths because GCC misreads CPU-contention scheduling
-/// jitter as network congestion and collapses to ~5 kbps.
 pub fn spawn_rtcp_reader(
     sender: Arc<RTCRtpSender>,
     pli_tx: mpsc::Sender<()>,
-    remb_tx: tokio::sync::watch::Sender<BitrateBps>,
     abr_tx: broadcast::Sender<AbrObservation>,
     mut shutdown_rx: oneshot::Receiver<()>,
-    loopback_bypass: bool,
 ) {
     tokio::spawn(async move {
         loop {
@@ -541,10 +540,8 @@ pub fn spawn_rtcp_reader(
                         Ok((packets, _attrs)) => handle_rtcp_batch(
                             &packets,
                             &pli_tx,
-                            &remb_tx,
                             &abr_tx,
-                            loopback_bypass,
-                        ).await,
+                        ),
                         Err(e) => {
                             warn!(error = ?e, "rtcp reader: read_rtcp failed; stopping");
                             return;
@@ -599,12 +596,10 @@ fn report_to_network_obs(
     }
 }
 
-async fn handle_rtcp_batch(
+fn handle_rtcp_batch(
     packets: &[Box<dyn rtcp::packet::Packet + Send + Sync>],
     pli_tx: &mpsc::Sender<()>,
-    remb_tx: &tokio::sync::watch::Sender<BitrateBps>,
     abr_tx: &broadcast::Sender<AbrObservation>,
-    loopback_bypass: bool,
 ) {
     for pkt in packets {
         let any = pkt.as_any();
@@ -621,36 +616,16 @@ async fn handle_rtcp_batch(
             .downcast_ref::<rtcp::payload_feedbacks::receiver_estimated_maximum_bitrate::ReceiverEstimatedMaximumBitrate>(
             )
         {
-            // Always emit the raw REMB observation so the stats SSE shows
-            // what Chrome's BWE thinks, even when we're not honoring it.
+            // Observation only. The ABR controller decides whether the
+            // estimate is trustworthy (it acts on REMB only when loss/RTT
+            // corroborate congestion); the stats SSE always shows what
+            // Chrome's BWE thinks.
             let _ = abr_tx.send(AbrObservation::Network {
                 remb_kbps: Some((remb.bitrate as u32) / 1_000),
                 loss_pct: None,
                 rtt_ms: None,
                 jitter_ms: None,
             });
-            // Loopback bypass: skip the encoder-bitrate update entirely.
-            // Chrome's GCC collapses to near-zero on same-machine paths;
-            // honoring it would starve the encoder. Operator's tier
-            // bitrate stays in effect via the initial `bitrate_tx` value.
-            if loopback_bypass {
-                continue;
-            }
-            // REMB's bitrate is f32 bps. Clamp to a safe range:
-            // - Floor 6 Mbps (= MED tier preset): below this, screen
-            //   content becomes unreadable regardless of any other
-            //   encoder knob. Raised from 1.5 Mbps on 2026-05-13 after
-            //   observing Chrome's GCC reporting REMB=3.9M on Cloudflared
-            //   tunnel traffic despite 0% packet loss and a sustainable
-            //   24 Mbps encoder target — Chrome's REMB is known to
-            //   underestimate over tunneled paths. The 1.5 Mbps floor
-            //   was originally chosen to "keep Low tier intact" but Low
-            //   tier is itself 2.5 Mbps; the gap was load-bearing for
-            //   nothing.
-            // - Ceiling 30 Mbps: matches the HiDPI High tier
-            //   (12 Mbps × 2 = 24 Mbps clamped at the tier_bitrate cap).
-            let bps = (remb.bitrate as u32).clamp(6_000_000, 30_000_000);
-            let _ = remb_tx.send(BitrateBps(bps));
             continue;
         }
         if let Some(rr) = any

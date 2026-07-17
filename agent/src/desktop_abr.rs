@@ -29,6 +29,17 @@ use tracing::{debug, info};
 /// pattern: slow consumers skip rather than block producers.
 pub const ABR_BROADCAST_CAPACITY: usize = 32;
 
+/// Absolute encoder-bitrate floor (kbps) for the ABR controller across all
+/// codec pipelines. Chrome Remote Desktop's congestion controller bottoms
+/// out in the low hundreds of kbps and keeps the stream *alive* (soft,
+/// but decodable) on constrained links; the previous floor of the Low-tier
+/// preset (2.5 Mbps) guaranteed sustained packet loss on any link slower
+/// than that, which the viewer experienced as a permanently black or
+/// frozen canvas while JPEG "worked". 250 kbps is enough for a readable
+/// 1080p screen-content stream between keyframes and lets Probe climb
+/// back the moment the link allows.
+pub const ABR_FLOOR_KBPS: u32 = 250;
+
 /// A single observation from somewhere in the video pipeline. Variants are
 /// `#[non_exhaustive]` so new fields don't break downstream consumers.
 ///
@@ -245,6 +256,16 @@ pub struct AbrController {
     window_loss_max: f32,
     window_rtt_max: u32,
     window_obs_count: u32,
+    // Lowest receiver-estimated bitrate (REMB, kbps) seen this window.
+    // Used only as a capacity hint when cutting in Recovery — Chrome's
+    // estimate converges on the real link rate much faster than repeated
+    // 30% cuts do, so honoring it while loss is present collapses a
+    // 6 Mbps → 1.5 Mbps mismatch in one tick instead of five. It is
+    // deliberately ignored outside Recovery: GCC is known to
+    // underestimate on healthy tunneled paths (see the 2026-05-13 note
+    // in video_pipeline.rs), so a low REMB with zero loss must not drag
+    // the bitrate down.
+    window_remb_min_kbps: Option<u32>,
 }
 
 impl AbrController {
@@ -268,13 +289,17 @@ impl AbrController {
             window_loss_max: 0.0,
             window_rtt_max: 0,
             window_obs_count: 0,
+            window_remb_min_kbps: None,
         }
     }
 
     /// Feed a single observation. Cheap — just folds into rolling window.
     pub fn observe(&mut self, obs: &AbrObservation) {
         if let AbrObservation::Network {
-            loss_pct, rtt_ms, ..
+            loss_pct,
+            rtt_ms,
+            remb_kbps,
+            ..
         } = obs
         {
             if let Some(l) = loss_pct
@@ -287,6 +312,14 @@ impl AbrController {
             {
                 self.window_rtt_max = *r;
             }
+            if let Some(remb) = remb_kbps
+                && *remb > 0
+            {
+                self.window_remb_min_kbps = Some(match self.window_remb_min_kbps {
+                    Some(cur) => cur.min(*remb),
+                    None => *remb,
+                });
+            }
             self.window_obs_count += 1;
         }
     }
@@ -298,18 +331,32 @@ impl AbrController {
         let observed = self.classify_window(now);
         let transition = self.apply_hysteresis(observed, now);
 
-        // Reset rolling window for next second.
-        self.window_loss_max = 0.0;
-        self.window_rtt_max = 0;
-        self.window_obs_count = 0;
-
-        if let Some(new_zone) = transition {
+        let decision = if let Some(new_zone) = transition {
             self.transition_to(new_zone, now)
+        } else if matches!(self.zone, AbrZone::Recovery)
+            && matches!(observed, AbrZone::Recovery)
+            && self.window_obs_count > 0
+            && self.current_kbps > self.floor_kbps
+        {
+            // Congestion persists past the entry cut — keep cutting every
+            // tick (multiplicative decrease) until the receiver reports a
+            // drained link or we hit the floor. A single entry cut is not
+            // adaptation: on a link at half the target rate, one 30% cut
+            // leaves the path saturated (and the decoder starved) forever.
+            let target = self.recovery_target();
+            self.current_kbps = target;
+            AbrDecision {
+                zone: AbrZone::Recovery,
+                zone_changed: false,
+                target_bitrate_kbps: target,
+                reason: "recovery_continued",
+            }
         } else {
             // No transition — but Probe zone keeps stepping bitrate up each
             // tick until we either hit the ceiling or fall back to Recovery.
             // This gives the controller a continuous "feel" rather than a
             // single one-shot bump per probe interval.
+            let mut probe_ceiling = false;
             if matches!(self.zone, AbrZone::Probe) {
                 let step = self
                     .current_kbps
@@ -324,21 +371,46 @@ impl AbrController {
                     self.zone = AbrZone::Comfort;
                     self.last_transition_at = now;
                     self.last_probe_at = now;
-                    return AbrDecision {
-                        zone: AbrZone::Comfort,
-                        zone_changed: true,
-                        target_bitrate_kbps: self.current_kbps,
-                        reason: "probe_ceiling",
-                    };
+                    probe_ceiling = true;
                 }
             }
             AbrDecision {
                 zone: self.zone,
-                zone_changed: false,
+                zone_changed: probe_ceiling,
                 target_bitrate_kbps: self.current_kbps,
-                reason: "steady",
+                reason: if probe_ceiling { "probe_ceiling" } else { "steady" },
             }
+        };
+
+        // Reset the rolling window for the next second AFTER the decision —
+        // Recovery targets and reasons must see this window's loss + REMB
+        // values (the pre-decision reset previously zeroed `window_loss_max`
+        // before `transition_to` read it, making the "loss_high" reason
+        // unreachable).
+        self.window_loss_max = 0.0;
+        self.window_rtt_max = 0;
+        self.window_obs_count = 0;
+        self.window_remb_min_kbps = None;
+
+        decision
+    }
+
+    /// Bitrate target for a Recovery cut: multiplicative decrease from the
+    /// current target, additionally bounded by the receiver's own bitrate
+    /// estimate (REMB) when one arrived this window. The REMB bound is what
+    /// lets a badly mismatched link (encoder 6 Mbps, link 1.5 Mbps)
+    /// converge in one tick instead of five — during real congestion the
+    /// receiver's estimate is the best capacity signal we have.
+    fn recovery_target(&self) -> u32 {
+        let cut = self
+            .current_kbps
+            .saturating_mul(self.tunables.recovery_cut_pct)
+            / 100;
+        let mut target = self.current_kbps.saturating_sub(cut);
+        if let Some(remb) = self.window_remb_min_kbps {
+            target = target.min(remb);
         }
+        target.clamp(self.floor_kbps, self.ceiling_kbps)
     }
 
     /// Classify the current rolling window into a zone (independent of the
@@ -417,11 +489,7 @@ impl AbrController {
     fn transition_to(&mut self, zone: AbrZone, now: Instant) -> AbrDecision {
         let (target_kbps, reason) = match zone {
             AbrZone::Recovery => {
-                let cut = self
-                    .current_kbps
-                    .saturating_mul(self.tunables.recovery_cut_pct)
-                    / 100;
-                let target = self.current_kbps.saturating_sub(cut);
+                let target = self.recovery_target();
                 let reason = if self.window_loss_max >= self.tunables.loss_pct_recovery {
                     "loss_high"
                 } else {
@@ -438,7 +506,14 @@ impl AbrController {
                 self.last_probe_at = now;
                 (target, "probe_interval")
             }
-            AbrZone::Comfort => (self.ceiling_kbps, "recovered"),
+            // Re-entering Comfort keeps the recovered bitrate — jumping
+            // straight back to the ceiling re-floods a link that just
+            // proved it can't carry the ceiling, producing a permanent
+            // loss→recover→loss oscillation on slow paths (the "black
+            // screen on slow networks" failure). Probe climbs back
+            // gradually (probe_step_pct per tick) with loss checks
+            // between steps, matching GCC/CRD's AIMD shape.
+            AbrZone::Comfort => (self.current_kbps, "recovered"),
         };
         let target_kbps = target_kbps.clamp(self.floor_kbps, self.ceiling_kbps);
         self.current_kbps = target_kbps;
@@ -667,13 +742,120 @@ mod tests {
         let d = ctrl.tick(now);
         assert!(!d.zone_changed, "first healthy tick is just hysteresis-pending");
 
-        // Second consecutive healthy tick — now transition.
+        // Second consecutive healthy tick — now transition. Comfort keeps
+        // the recovered bitrate (4200 after the single 30% cut) instead of
+        // jumping back to the 6000 ceiling; Probe climbs back gradually.
         ctrl.observe(&loss_obs(0.0, 50));
         now += Duration::from_secs(1);
         let d = ctrl.tick(now);
         assert!(d.zone_changed);
         assert_eq!(d.zone, AbrZone::Comfort);
+        assert_eq!(d.target_bitrate_kbps, 4_200);
+    }
+
+    #[test]
+    fn controller_keeps_cutting_while_recovery_persists() {
+        let mut now = Instant::now();
+        let mut ctrl = AbrController::new(fast_tunables(), 250, 6_000, now);
+
+        // Entry cut: 6000 → 4200.
+        ctrl.observe(&loss_obs(10.0, 50));
+        now += Duration::from_secs(1);
+        let d = ctrl.tick(now);
+        assert_eq!(d.zone, AbrZone::Recovery);
+        assert_eq!(d.target_bitrate_kbps, 4_200);
+
+        // Loss persists → multiplicative decrease continues every tick
+        // (4200 → 2940 → 2058) instead of parking at the entry cut.
+        ctrl.observe(&loss_obs(10.0, 50));
+        now += Duration::from_secs(1);
+        let d = ctrl.tick(now);
+        assert!(!d.zone_changed);
+        assert_eq!(d.reason, "recovery_continued");
+        assert_eq!(d.target_bitrate_kbps, 2_940);
+
+        ctrl.observe(&loss_obs(10.0, 50));
+        now += Duration::from_secs(1);
+        let d = ctrl.tick(now);
+        assert_eq!(d.target_bitrate_kbps, 2_058);
+    }
+
+    #[test]
+    fn controller_recovery_honors_remb_capacity_hint() {
+        let mut now = Instant::now();
+        let mut ctrl = AbrController::new(fast_tunables(), 250, 6_000, now);
+
+        // High loss + receiver estimates 1.5 Mbps of capacity → converge to
+        // the estimate in one tick instead of five successive 30% cuts.
+        ctrl.observe(&loss_obs(10.0, 50));
+        ctrl.observe(&AbrObservation::Network {
+            remb_kbps: Some(1_500),
+            loss_pct: None,
+            rtt_ms: None,
+            jitter_ms: None,
+        });
+        now += Duration::from_secs(1);
+        let d = ctrl.tick(now);
+        assert_eq!(d.zone, AbrZone::Recovery);
+        assert_eq!(d.target_bitrate_kbps, 1_500);
+    }
+
+    #[test]
+    fn controller_remb_ignored_when_healthy() {
+        let mut now = Instant::now();
+        let mut ctrl = AbrController::new(fast_tunables(), 250, 6_000, now);
+
+        // A low REMB with zero loss must NOT drag the bitrate down — GCC
+        // underestimates on healthy tunneled paths.
+        ctrl.observe(&loss_obs(0.0, 50));
+        ctrl.observe(&AbrObservation::Network {
+            remb_kbps: Some(1_000),
+            loss_pct: None,
+            rtt_ms: None,
+            jitter_ms: None,
+        });
+        now += Duration::from_secs(1);
+        let d = ctrl.tick(now);
+        assert_eq!(d.zone, AbrZone::Comfort);
         assert_eq!(d.target_bitrate_kbps, 6_000);
+    }
+
+    #[test]
+    fn controller_cuts_to_floor_and_climbs_back_via_probe() {
+        let mut now = Instant::now();
+        let mut ctrl = AbrController::new(fast_tunables(), 250, 6_000, now);
+
+        // Sustained heavy loss drives the bitrate all the way to the floor.
+        for _ in 0..12 {
+            ctrl.observe(&loss_obs(20.0, 50));
+            now += Duration::from_secs(1);
+            let _ = ctrl.tick(now);
+        }
+        assert_eq!(ctrl.current_kbps(), 250);
+
+        // Link drains: healthy ticks → Comfort at the floor (no ceiling
+        // jump), then Probe steps up gradually.
+        now += Duration::from_secs(3); // anti-thrash
+        for _ in 0..2 {
+            ctrl.observe(&loss_obs(0.0, 50));
+            now += Duration::from_secs(1);
+            let _ = ctrl.tick(now);
+        }
+        assert_eq!(ctrl.zone(), AbrZone::Comfort);
+        assert_eq!(ctrl.current_kbps(), 250);
+
+        // Drive healthy ticks until probing raises the bitrate.
+        for _ in 0..30 {
+            ctrl.observe(&loss_obs(0.0, 50));
+            now += Duration::from_secs(1);
+            let _ = ctrl.tick(now);
+        }
+        assert!(
+            ctrl.current_kbps() > 250,
+            "probe should climb off the floor on a healthy link, got {}",
+            ctrl.current_kbps()
+        );
+        assert!(ctrl.current_kbps() <= 6_000);
     }
 
     #[test]
@@ -708,10 +890,9 @@ mod tests {
             now += Duration::from_secs(1);
             let _ = ctrl.tick(now);
         }
-        // current_kbps jumped back to ceiling on recovered transition. Drop
-        // it artificially to test probe (real path: Recovery → smaller
-        // bitrate → recovered jumps back; probing only matters when
-        // last_probe_at is stale AND current < ceiling).
+        // Comfort keeps the recovered (reduced) bitrate; probing is now the
+        // only path back toward the ceiling.
+        assert!(ctrl.current_kbps() < 6_000);
     }
 
     #[test]

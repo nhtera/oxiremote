@@ -43,6 +43,7 @@ import {
 } from '../lib/desktop-cursor-track'
 import { isAllowedTunnelHost, getNamedTunnelAllowlist } from '../lib/url-validation'
 import { shouldFastRetryOnHandshakeFailure } from '../lib/ws-fast-retry'
+import { getRtcConfiguration } from '../lib/ice-config'
 import { TUNNEL_URL_CHANGED_EVENT } from './use-tunnel-url-sse'
 
 // Re-export for backwards compatibility — callers that imported supportsH264Video
@@ -79,11 +80,17 @@ interface VideoSessionApi {
 /** Callback invoked once per decoded video frame. Caller draws to canvas. */
 type FrameCallback = (bitmap: VideoFrame | HTMLVideoElement, video: HTMLVideoElement) => void
 
-const STUN_CONFIG: RTCConfiguration = {
-  iceServers: [{ urls: 'stun:stun.l.google.com:19302' }],
-}
 const RECONNECT_DELAY_MS = 1500
 const MAX_ATTEMPTS = 3
+// Budget from `ontrack` (SDP-level — fires before any media flows) to the
+// first actually-decoded frame. Covers ICE stuck in `checking` on
+// UDP-blocked networks, DTLS stalls, and decoders that accept the stream
+// but render nothing (e.g. SDP profile / bitstream mismatch black frames).
+// When it trips we fall back to JPEG, whose DataChannel + WS-binary race
+// works on any network the signaling WS itself works on. Chrome Remote
+// Desktop applies the same policy: never leave the user on a silent black
+// canvas when a degraded-but-working transport exists.
+const FIRST_FRAME_TIMEOUT_MS = 10_000
 
 function wsUrl(
   deviceId: string,
@@ -152,6 +159,13 @@ export function useDesktopVideoSession(
   const attemptRef = useRef(0)
   const destroyedRef = useRef(false)
   const rvfcHandleRef = useRef<number | null>(null)
+  // True once at least one decoded frame has been presented this session.
+  // Drives the truthful `streaming` status (set on first frame, not on
+  // `ontrack`, which fires at SDP time before any media flows) and the
+  // pre-first-frame failure policy (fall back to JPEG rather than retry a
+  // codec transport that never produced a pixel).
+  const firstFrameRef = useRef(false)
+  const frameWatchdogRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   // Distinguishes Cloudflare Quick Tunnel handshake transients (close/error
   // before onopen) from mid-session disconnects. Reset to false in connect();
   // flipped true once `ws.onopen` fires. Pairs with fastRetryUsedRef.
@@ -219,6 +233,21 @@ export function useDesktopVideoSession(
     }
   }, [])
 
+  // First decoded frame this session: cancel the no-frame watchdog and flip
+  // to the truthful `streaming` state. Reconnect attempts reset here — a
+  // session only counts as healthy once it has actually painted.
+  const markFirstFrame = useCallback(() => {
+    if (firstFrameRef.current) return
+    firstFrameRef.current = true
+    if (frameWatchdogRef.current) {
+      clearTimeout(frameWatchdogRef.current)
+      frameWatchdogRef.current = null
+    }
+    setStatus('streaming')
+    attemptRef.current = 0
+    setAttempt(0)
+  }, [])
+
   // ── rVFC draw loop ──────────────────────────────────────────────────────
   //
   // `requestVideoFrameCallback` fires only when a new decoded frame is
@@ -230,6 +259,9 @@ export function useDesktopVideoSession(
     if (typeof video.requestVideoFrameCallback !== 'function') {
       const loop = () => {
         if (destroyedRef.current) return
+        // rAF fires regardless of media flow — only count a first frame
+        // once the element actually has decodable data at real dimensions.
+        if (video.readyState >= 2 && video.videoWidth > 0) markFirstFrame()
         onFrame(video, video)
         rvfcHandleRef.current = requestAnimationFrame(loop) as unknown as number
       }
@@ -238,11 +270,14 @@ export function useDesktopVideoSession(
     }
     const step = () => {
       if (destroyedRef.current) return
+      // rVFC fires once per *presented* frame, so reaching here means the
+      // decoder produced real output.
+      markFirstFrame()
       onFrame(video, video)
       rvfcHandleRef.current = video.requestVideoFrameCallback(step) as unknown as number
     }
     rvfcHandleRef.current = video.requestVideoFrameCallback(step) as unknown as number
-  }, [onFrame])
+  }, [onFrame, markFirstFrame])
 
   const stopFrameLoop = useCallback(() => {
     const video = videoRef.current
@@ -263,6 +298,10 @@ export function useDesktopVideoSession(
   // ── Teardown / reconnect ────────────────────────────────────────────────
   const teardown = useCallback(() => {
     if (reconnectTimerRef.current) clearTimeout(reconnectTimerRef.current)
+    if (frameWatchdogRef.current) {
+      clearTimeout(frameWatchdogRef.current)
+      frameWatchdogRef.current = null
+    }
     stopFrameLoop()
     ctrlDcRef.current?.close()
     cursorDcRef.current?.close()
@@ -295,14 +334,40 @@ export function useDesktopVideoSession(
     everOpenedThisCycleRef.current = false
 
     setStatus('connecting')
+    firstFrameRef.current = false
     const protocols = wsProtocols()
     const url = wsUrl(deviceId, forcePipeline)
     const ws = protocols ? new WebSocket(url, protocols) : new WebSocket(url)
     ws.binaryType = 'arraybuffer'
     wsRef.current = ws
 
-    const pc = new RTCPeerConnection(STUN_CONFIG)
+    // Agent-advertised ICE servers (incl. an operator-configured TURN
+    // relay) when capabilities have loaded; STUN-only default otherwise.
+    const pc = new RTCPeerConnection(getRtcConfiguration())
     pcRef.current = pc
+
+    // Transport failure policy. `failed` is terminal (ICE exhausted every
+    // candidate pair — typical on UDP-blocked / strict-NAT networks where
+    // only the tunneled signaling WS gets through):
+    // - before any decoded frame → this codec transport never worked here;
+    //   fall back to JPEG, whose DataChannel/WS-binary race rides the same
+    //   path as the signaling WS and works wherever it does.
+    // - after frames flowed → transient network change; normal reconnect
+    //   keeps the codec. `disconnected` is not handled — it self-heals.
+    pc.onconnectionstatechange = () => {
+      if (pcRef.current !== pc || destroyedRef.current) return
+      if (pc.connectionState !== 'failed') return
+      if (!firstFrameRef.current) {
+        // triggerJpegFallback / handleDisconnect are hoisted `function`
+        // declarations below; the mutual reference with connect() is
+        // intentional (see the note on the offer chain's catch).
+        // eslint-disable-next-line react-hooks/immutability
+        triggerJpegFallback('peerconnection-failed')
+      } else {
+        // eslint-disable-next-line react-hooks/immutability
+        handleDisconnect()
+      }
+    }
 
     // Recvonly video transceiver — phase 03 server expects this in the first
     // offer so it can add its TrackLocalStaticSample without renegotiation.
@@ -373,9 +438,17 @@ export function useDesktopVideoSession(
       // `play()` may reject on autoplay restrictions; we catch because the
       // track still dispatches frames for rVFC regardless.
       video.play().catch(() => {})
-      setStatus('streaming')
-      attemptRef.current = 0
-      setAttempt(0)
+      // `ontrack` is SDP-level — it fires when the answer is applied, long
+      // before (and regardless of whether) any RTP arrives. Status flips to
+      // `streaming` only on the first decoded frame (markFirstFrame); until
+      // then a watchdog bounds the wait so a dead media path falls back to
+      // JPEG instead of black-screening forever.
+      if (frameWatchdogRef.current) clearTimeout(frameWatchdogRef.current)
+      frameWatchdogRef.current = setTimeout(() => {
+        frameWatchdogRef.current = null
+        if (pcRef.current !== pc || destroyedRef.current) return
+        if (!firstFrameRef.current) triggerJpegFallback('no-frame-10s')
+      }, FIRST_FRAME_TIMEOUT_MS)
       startFrameLoop()
     }
 
@@ -460,8 +533,9 @@ export function useDesktopVideoSession(
           // handleDisconnect is a hoisted `function` declared below; the
           // mutual reference between connect/handleDisconnect is intentional
           // and safe (no reassignment, function-declaration hoisting handles
-          // it at runtime).
-          // eslint-disable-next-line react-hooks/immutability
+          // it at runtime). The rule reports only the first pre-declaration
+          // access (suppressed in onconnectionstatechange above), so no
+          // directive is needed here.
           handleDisconnect()
         })
     }
@@ -521,23 +595,18 @@ export function useDesktopVideoSession(
             // Server picked JPEG even though the SPA mounted the H.264 hook
             // — we'd be reading audio out of a video transceiver. Tear down
             // and let the page re-mount as JPEG.
-            console.warn('video-session: server selected JPEG; remounting')
-            setForceJpeg(hostId)
-            window.dispatchEvent(new CustomEvent(DESKTOP_FALLBACK_PENDING_EVENT))
-            if (!destroyedRef.current) handleDisconnect()
+            triggerJpegFallback('server-selected-jpeg')
           }
           break
         }
         case 'fallbackPending': {
-          // Server's session-start IDR watchdog fired. Set the sessionStorage
-          // marker so the next mount tells the agent to skip H.264, then
-          // notify the page to re-mount as JPEG. Tear down our PC — the
-          // server has already closed its side.
+          // Server-side watchdog fired (session-start IDR budget, or the
+          // PC never reached Connected). Set the sessionStorage marker so
+          // the next mount tells the agent to skip the codec pipeline,
+          // then notify the page to re-mount as JPEG. Tear down our PC —
+          // the server has already closed its side.
           const reason = typeof msg.reason === 'string' ? msg.reason : 'no-idr'
-          console.warn('video-session: fallbackPending', reason)
-          setForceJpeg(hostId)
-          window.dispatchEvent(new CustomEvent(DESKTOP_FALLBACK_PENDING_EVENT))
-          if (!destroyedRef.current) handleDisconnect()
+          triggerJpegFallback(reason)
           break
         }
         case 'hostLocked':
@@ -567,6 +636,18 @@ export function useDesktopVideoSession(
       if (!destroyedRef.current) handleDisconnect()
     }
   }, [deviceId, teardown, startFrameLoop]) // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Give up on the video-track transport for this session and hand over to
+  // JPEG: set the sessionStorage marker the JPEG hook consumes, notify the
+  // page to re-mount the JPEG view, and tear down our side. Hoisted
+  // `function` for the same mutual-reference reason as handleDisconnect.
+  function triggerJpegFallback(reason: string) {
+    if (destroyedRef.current) return
+    console.warn('video-session: falling back to JPEG:', reason)
+    setForceJpeg(hostId)
+    window.dispatchEvent(new CustomEvent(DESKTOP_FALLBACK_PENDING_EVENT))
+    handleDisconnect()
+  }
 
   function handleDisconnect() {
     if (destroyedRef.current) return

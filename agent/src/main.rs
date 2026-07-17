@@ -16,6 +16,7 @@ mod git;
 mod host;
 mod health_check;
 mod host_api;
+mod ice_servers;
 mod http_pages;
 mod instance_lock;
 mod local_sites;

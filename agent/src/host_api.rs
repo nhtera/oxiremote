@@ -215,6 +215,11 @@ pub async fn api_desktop_capabilities(
             "audio_enabled": audio_enabled,
             "stay_awake_supported": stay_awake_supported,
             "stay_awake_enabled": stay_awake_enabled,
+            // Same list the agent's own PeerConnection uses (`OXI_STUN_URL` /
+            // `OXI_TURN_*`), in browser RTCIceServer shape. Endpoint is
+            // Bearer+cookie authed, so TURN credentials only reach paired
+            // devices.
+            "ice_servers": crate::ice_servers::from_env(),
         });
         (StatusCode::OK, Json(body)).into_response()
     }

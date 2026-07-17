@@ -9,6 +9,7 @@ import { isDiscoveryMode, getCurrentTunnelUrl } from '../lib/discovery-client'
 import { getActiveHost, loadApiKey, loadTunnelBase, storeTunnelBase } from '../lib/api-client'
 import { isAllowedTunnelHost, getNamedTunnelAllowlist } from '../lib/url-validation'
 import { shouldFastRetryOnHandshakeFailure } from '../lib/ws-fast-retry'
+import { getRtcConfiguration } from '../lib/ice-config'
 import {
   attachCursorChannel,
   type CursorSnapshot,
@@ -96,9 +97,6 @@ interface SessionApi {
 // Callback invoked for every raw tile binary message (DC or WS fallback).
 type TileCallback = (buf: ArrayBuffer) => void
 
-const STUN_CONFIG: RTCConfiguration = {
-  iceServers: [{ urls: 'stun:stun.l.google.com:19302' }],
-}
 const DC_OPEN_TIMEOUT_MS = 5000
 const RECONNECT_DELAY_MS = 1500
 const MAX_ATTEMPTS = 3
@@ -266,7 +264,9 @@ export function useDesktopSession(
     ws.binaryType = 'arraybuffer'
     wsRef.current = ws
 
-    const pc = new RTCPeerConnection(STUN_CONFIG)
+    // Agent-advertised ICE servers (incl. an operator-configured TURN
+    // relay) when capabilities have loaded; STUN-only default otherwise.
+    const pc = new RTCPeerConnection(getRtcConfiguration())
     pcRef.current = pc
 
     // Desktop DC: unreliable, ordered=false — latency > reliability for frames.
