@@ -8,7 +8,7 @@ import {
 } from './kv-store'
 import { allow as rateAllow } from './rate-limiter'
 import { corsHeaders, handlePreflight, isAllowedOrigin } from './cors-handler'
-import { handleProxy, proxyCorsHeaders } from './proxy-handler'
+import { handleProxy, proxyCorsHeaders, proxyError } from './proxy-handler'
 
 interface Env {
   DISCOVERY: KVLike
@@ -210,10 +210,10 @@ export default {
       // signalling burst can exceed 20/min easily. Bucket is namespaced
       // (`proxy:` scope) so it doesn't share state with `/api/session/*`.
       if (!rateAllow(clientIp(req), 'proxy', 600)) {
-        return new Response(JSON.stringify({ error: 'rate limited' }), {
-          status: 429,
-          headers: { 'Content-Type': 'application/json', ...proxyCorsHeaders(origin) },
-        })
+        // `rate_limited` is a proxy-level error like the rest, but it says
+        // nothing about whether the agent behind this id is up — clients
+        // classify it as "can't tell", not "host is down".
+        return proxyError('rate_limited', 429, origin)
       }
       const hostKey = proxyMatch[1]
       const upstreamPath = (proxyMatch[2] ?? '/') + url.search

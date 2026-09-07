@@ -35,6 +35,14 @@ export interface ProxyEnv {
 }
 
 const HEX64 = /^[a-f0-9]{64}$/
+// Stamped on every error this proxy generates itself (as opposed to an error
+// the upstream agent returned). Status codes alone are ambiguous: a 404 is
+// either `host_unknown` from the worker or a missing route on the agent, and
+// a health probe cannot tell the two apart — which is exactly how a host that
+// stopped registering with discovery kept rendering as "Online" in the SPA's
+// saved-hosts list. Exposed via `Access-Control-Expose-Headers` so the
+// cross-origin SPA can actually read it.
+export const PROXY_ERROR_HEADER = 'X-OXI-Proxy-Error'
 // Cloudflare Worker subrequest cap is 30 s; leave 5 s headroom so the worker
 // can send a clean 504 instead of a runtime kill.
 const UPSTREAM_TIMEOUT_MS = 25_000
@@ -80,14 +88,22 @@ export function proxyCorsHeaders(origin: string): Record<string, string> {
     'Access-Control-Allow-Methods': 'GET, POST, PUT, PATCH, DELETE, HEAD, OPTIONS',
     'Access-Control-Allow-Headers':
       'Authorization, Content-Type, X-OXI-CSRF, Cache-Control, Pragma',
-    'Access-Control-Expose-Headers': 'Content-Type, X-OXI-CSRF',
+    'Access-Control-Expose-Headers': `Content-Type, X-OXI-CSRF, ${PROXY_ERROR_HEADER}`,
     'Access-Control-Max-Age': '86400',
     Vary: 'Origin',
   }
 }
 
-function jsonError(message: string, status: number, origin: string | null): Response {
-  const headers: Record<string, string> = { 'Content-Type': 'application/json' }
+/**
+ * Build a proxy-generated error. `message` doubles as the machine-readable
+ * code: it goes in the JSON body AND in {@link PROXY_ERROR_HEADER} so a
+ * client can classify the failure without parsing (or even reading) the body.
+ */
+export function proxyError(message: string, status: number, origin: string | null): Response {
+  const headers: Record<string, string> = {
+    'Content-Type': 'application/json',
+    [PROXY_ERROR_HEADER]: message,
+  }
   if (origin) Object.assign(headers, proxyCorsHeaders(origin))
   return new Response(JSON.stringify({ error: message }), { status, headers })
 }
@@ -129,12 +145,12 @@ export async function handleProxy(
   origin: string,
 ): Promise<Response> {
   if (!HEX64.test(hostKey)) {
-    return jsonError('host_invalid', 400, origin)
+    return proxyError('host_invalid', 400, origin)
   }
 
   const target = await resolveProxyTarget(env.DISCOVERY, hostKey)
   if (!target || !target.tunnelUrl) {
-    return jsonError('host_unknown', 404, origin)
+    return proxyError('host_unknown', 404, origin)
   }
 
   // Build the upstream URL by string concatenation. `upstreamPath` already
@@ -174,9 +190,9 @@ export async function handleProxy(
   } catch (err) {
     const isAbort = err instanceof DOMException && err.name === 'TimeoutError'
     if (isAbort || (err instanceof Error && /timeout/i.test(err.message))) {
-      return jsonError('upstream_timeout', 504, origin)
+      return proxyError('upstream_timeout', 504, origin)
     }
-    return jsonError('upstream_unreachable', 502, origin)
+    return proxyError('upstream_unreachable', 502, origin)
   }
 
   // WebSocket upgrade: return upstream directly. The body is the live frame
@@ -188,6 +204,9 @@ export async function handleProxy(
   // HTTP: re-emit with worker-owned CORS headers, stripping any upstream
   // ACAO/ACAC the agent might have set (the agent doesn't know our origin).
   const respHeaders = new Headers(upstreamRes.headers)
+  // The header is ours to set: an upstream response must never be able to
+  // masquerade as a proxy-level failure.
+  respHeaders.delete(PROXY_ERROR_HEADER)
   respHeaders.delete('access-control-allow-origin')
   respHeaders.delete('access-control-allow-credentials')
   respHeaders.delete('access-control-allow-methods')

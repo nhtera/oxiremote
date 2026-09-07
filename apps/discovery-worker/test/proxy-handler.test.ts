@@ -116,6 +116,40 @@ describe('proxy handler', () => {
     expect(body.error).toBe('host_unknown')
   })
 
+  it('tags proxy-generated errors with X-OXI-Proxy-Error and exposes it via CORS', async () => {
+    // Status alone cannot separate "the worker has no upstream for this id"
+    // from "the agent answered 404". The header is what lets a client (the
+    // SPA's reachability probe) tell them apart — without it a host that
+    // stopped registering with discovery still looked alive.
+    fetchSpy.mockResolvedValue(new Response(null, { status: 200 }))
+    const r = await worker.fetch(makeProxyReq('GET', '/api/health'), env)
+    expect(r.status).toBe(404)
+    expect(r.headers.get('x-oxi-proxy-error')).toBe('host_unknown')
+    expect(r.headers.get('access-control-expose-headers')?.toLowerCase()).toContain(
+      'x-oxi-proxy-error',
+    )
+  })
+
+  it('does not tag responses relayed from the agent', async () => {
+    await seedSession(env)
+    // The agent's own 404 must stay indistinguishable from any other
+    // upstream status — only the worker's failures carry the marker.
+    fetchSpy.mockResolvedValue(new Response('not found', { status: 404 }))
+    const r = await worker.fetch(makeProxyReq('GET', '/api/nope'), env)
+    expect(r.status).toBe(404)
+    expect(r.headers.get('x-oxi-proxy-error')).toBeNull()
+  })
+
+  it('strips an upstream-supplied X-OXI-Proxy-Error', async () => {
+    await seedSession(env)
+    fetchSpy.mockResolvedValue(
+      new Response('ok', { status: 200, headers: { 'x-oxi-proxy-error': 'host_unknown' } }),
+    )
+    const r = await worker.fetch(makeProxyReq('GET', '/api/health'), env)
+    expect(r.status).toBe(200)
+    expect(r.headers.get('x-oxi-proxy-error')).toBeNull()
+  })
+
   it('404 when session exists but tunnelUrl is empty', async () => {
     // Agent created the session but never called /update — treated as no
     // upstream by `resolveProxyTarget`.
@@ -261,6 +295,7 @@ describe('proxy handler', () => {
 
     const r = await worker.fetch(makeProxyReq('GET', '/api/health'), env)
     expect(r.status).toBe(502)
+    expect(r.headers.get('x-oxi-proxy-error')).toBe('upstream_unreachable')
     const body = (await r.json()) as { error: string }
     expect(body.error).toBe('upstream_unreachable')
     expect(r.headers.get('access-control-allow-origin')).toBe(ALLOWED_ORIGIN)
@@ -273,6 +308,7 @@ describe('proxy handler', () => {
 
     const r = await worker.fetch(makeProxyReq('GET', '/api/health'), env)
     expect(r.status).toBe(504)
+    expect(r.headers.get('x-oxi-proxy-error')).toBe('upstream_timeout')
     const body = (await r.json()) as { error: string }
     expect(body.error).toBe('upstream_timeout')
   })
@@ -334,6 +370,9 @@ describe('proxy handler', () => {
     const r = await worker.fetch(makeProxyReq('GET', '/api/health'), env)
     expect(r.status).toBe(429)
     expect(r.headers.get('access-control-allow-origin')).toBe(ALLOWED_ORIGIN)
+    // Rate limiting is a proxy-level error too, but it is deliberately NOT
+    // one of the "host is down" codes — clients must read it as "can't tell".
+    expect(r.headers.get('x-oxi-proxy-error')).toBe('rate_limited')
   })
 
   it('proxy rate-limit bucket is isolated from /api/session/* control plane', async () => {
